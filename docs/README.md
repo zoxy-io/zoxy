@@ -4,12 +4,12 @@ How to run, configure and operate zoxy: starting and replacing the process,
 every block a config can carry, what the proxy exposes while it runs, and
 what it does when a resource runs out.
 
-The authoritative list of fields, enums and numeric bounds is the JSON
-Schema shipped as a release asset and emitted locally by `zig build schema`.
-It is generated from the parser, and [zoxy.io/config](https://zoxy.io/config/)
-renders it for the latest release. This document is the tour. The reasoning
-behind each behaviour is in [DESIGN.md](DESIGN.md); a bare `§` reference
-points there.
+The JSON Schema is the authoritative list of fields, enums and numeric
+bounds. It is generated from the parser, shipped as a release asset and
+emitted locally by `zig build schema`.
+[zoxy.io/config](https://zoxy.io/config/) renders it for the latest release.
+This document is the tour. [DESIGN.md](DESIGN.md) explains the reasoning
+behind each behaviour; a bare `§` reference points there.
 
 ## Running zoxy
 
@@ -25,22 +25,23 @@ zoxy --version             # print the version (-V)
 ```
 
 A release build prints its bare version, `zoxy 0.8.2`. A build from source
-after a release adds what distinguishes it, `zoxy 0.8.2 (v0.8.2-5-gabc1234)`,
-and `-dirty` when the tree had uncommitted changes, so the version in a bug
-report identifies the exact build. Packagers can name a build with
-`zig build -Dbuild-id=…`. The same line opens the startup banner.
+after a release adds a suffix that identifies it,
+`zoxy 0.8.2 (v0.8.2-5-gabc1234)`, plus `-dirty` if the tree had uncommitted
+changes, so the version in a bug report names the exact build. Packagers
+can name a build with `zig build -Dbuild-id=…`. The startup banner opens
+with the same line.
 
-A config zoxy will not accept is refused before anything is bound: the
-process prints `zoxy: invalid config '<path>': <reason>` and exits `1`. A
-valid config whose fd budget is above this machine's `RLIMIT_NOFILE` hard
-limit is refused the same way, after the startup banner, so the numbers that
-refused it are on screen with the reason.
+zoxy refuses an invalid config before binding anything: it prints
+`zoxy: invalid config '<path>': <reason>` and exits `1`. A valid config
+whose fd budget exceeds this machine's `RLIMIT_NOFILE` hard limit is
+refused the same way, but after the startup banner, so the numbers behind
+the refusal are on screen next to the reason.
 
 ### Checking a config without running it
 
-`--check` loads the config, opens every file it names, prices the pools and
-measures the fd demand against `RLIMIT_NOFILE`, which is everything a start
-does up to the banner, then exits without binding a port:
+`--check` does everything a start does up to the banner: it loads the
+config, opens every file it names, prices the pools and measures the fd
+demand against `RLIMIT_NOFILE`. Then it exits without binding a port:
 
 ```console
 $ zoxy --check config.json
@@ -63,46 +64,45 @@ budgets (DESIGN.md §5/§8; closed-form except where marked):
   check   config.json: valid, and this box can start it
 ```
 
-The report shows what the config will cost, not only whether it parses, so
-a CI job, a config-management dry run or a pre-deploy hook can run it. The
-report goes to stdout. Reasons for a refusal go to stderr, as they do at
-startup.
+The report shows what the config will cost as well as whether it parses,
+so you can run it from CI, a config-management dry run or a pre-deploy
+hook. The report goes to stdout; the reason for a refusal goes to stderr,
+as at startup.
 
 | exit | meaning |
 |---|---|
 | `0` | the config loads and this machine can start it |
-| `1` | the config is wrong — unreadable, unparseable, semantically refused, or naming a file that will not load |
-| `2` | the config is right and *this machine* cannot fit it: the fd budget is above the `RLIMIT_NOFILE` hard limit |
+| `1` | the config is wrong: unreadable, unparseable, semantically refused, or names a file that will not load |
+| `2` | the config is valid but *this machine* cannot fit it: the fd budget exceeds the `RLIMIT_NOFILE` hard limit |
 
-A CI job branches on the split: a build agent with a stock `RLIMIT_NOFILE`
-may accept `2` on a config sized for production, and must never accept `1`.
+CI can branch on the split: a build agent with a stock `RLIMIT_NOFILE` may
+accept `2` for a config sized for production, but must never accept `1`.
 
-Two things to know before wiring it into a pipeline. It does the full load,
-so it needs the same file permissions the proxy would, and a config naming
-production certificates cannot be checked on an agent that does not hold
-them. And an `access_log` `file` sink is created if it is absent, exactly
-as a start creates it.
+`--check` does the full load, so it needs the same file permissions the
+proxy would: a config naming production certificates cannot be checked on
+an agent that does not hold them. It also creates an `access_log` `file`
+sink if it is absent, as a start does.
 
 ### Signals
 
 The startup banner and the exit tally go to stderr. stdout belongs to the
 access log, whose `stdout` sink writes one JSON line per event. `--check`
-is the exception: it never serves, so its report can use stdout.
+never serves, so its report can use stdout.
 
 | signal | effect |
 |---|---|
 | `SIGTERM`, `SIGINT` | drain in-flight connections, then exit 0 |
-| `SIGHUP` | reopen the access log's `file` sink — rotation, and nothing else |
+| `SIGHUP` | reopen the access log's `file` sink for rotation; nothing else |
 | `SIGUSR1` | ignored |
 
-A completed drain prints the counters once on its way out. A drain that
-gets stuck prints them too, beside a diagnostic naming which plane never
-finished. Those are the only two times counters reach stderr: Prometheus
-exposition is a snapshot, and two of them on one stream would not parse.
-Live counters come from [`/metrics`](#metrics).
+A completed drain prints the counters once on its way out. A stuck drain
+prints them too, with a diagnostic naming the plane that never finished.
+Counters reach stderr only in these two cases: Prometheus exposition is a
+snapshot, and two snapshots on one stream would not parse. Live counters
+come from [`/metrics`](#metrics).
 
-`SIGUSR1` is explicitly ignored rather than left unhandled, because its
-default disposition is to terminate the process.
+`SIGUSR1` is ignored explicitly because its default disposition terminates
+the process.
 
 ### A minimal config
 
@@ -119,20 +119,20 @@ One L4 listener forwarding to one origin:
 }
 ```
 
-That is the whole file. Every other block (`timeouts`, `limits`,
-`access_log`) has defaults. [`config/example.json`](../config/example.json)
-is the same listener with health checks and the access log turned on.
+Every other block (`timeouts`, `limits`, `access_log`) has defaults.
+[`config/example.json`](../config/example.json) is the same listener with
+health checks and the access log turned on.
 
 ### Replacing a running instance
 
 There is no reload. The pools, the ring and every table are sized from the
 config at startup and never grow, so nothing re-reads the file. `SIGHUP`
-means log rotation and nothing else, and hot restart is a non-goal
+only rotates the log, and hot restart is a non-goal
 ([DESIGN.md](DESIGN.md) §1).
 
 Instead, every listener is bound with `SO_REUSEPORT`, so a second process
-can hold the same port as the first. Replacing a config is two commands, in
-this order:
+can hold the same port as the first. Replacing a config takes two commands,
+in this order:
 
 <!-- figure: reuseport-handoff -->
 
@@ -142,29 +142,29 @@ zoxy new-config.json &   # the replacement binds the same port and starts servin
 kill -TERM "$old_pid"    # the old process drains its work, then exits 0
 ```
 
-Start the replacement first. A config zoxy refuses never reaches a
-listener: the new process exits `1` with its reason and the old one, which
-was never signalled, keeps serving. Signalling first would put the port out
-of service for as long as the replacement took to fail. The `--check` line
-is optional; it keeps a bad config from ever reaching a `&`.
+Start the replacement first. A refused config never reaches a listener:
+the new process exits `1` with its reason, and the old one, never
+signalled, keeps serving. Signalling first would leave the port unserved
+for as long as the replacement took to fail. The `--check` line is
+optional; it stops a bad config before it reaches the `&`.
 
-Between the two commands both configs are live. The kernel picks a listener
-per connection by hashing the 4-tuple, so the overlap is a window where
-both answer, not a cutover. That is fine for tuning a timeout, adding an
-endpoint or moving a cluster. For a change that has to take effect at a
-known instant, such as withdrawing a route, stop the old process before
-starting the new one and accept the gap.
+Between the two commands both configs are live. The kernel picks a
+listener for each connection by hashing the 4-tuple, so during the overlap
+both processes answer. That is fine for tuning a timeout, adding an
+endpoint or moving a cluster. If a change must take effect at a known
+instant, such as withdrawing a route, stop the old process before starting
+the new one and accept the gap.
 
 > [!WARNING]
-> The handoff is not lossless by default. Connections the old process had
-> accepted but not yet served are reset when it closes its listener. Linux
-> 5.14 added `net.ipv4.tcp_migrate_req`, off by default, which migrates
-> them to another socket in the group; turn it on where the handoff has to
-> be clean. zoxy keeps the backlog drained because accept never pauses
-> (§8), which narrows the window but cannot close it.
+> The handoff is not lossless by default. When the old process closes its
+> listener, connections it had accepted but not yet served are reset.
+> Linux 5.14 added `net.ipv4.tcp_migrate_req` (off by default) to migrate
+> them to another socket in the group; turn it on where the handoff must
+> be clean. Because accept never pauses (§8), zoxy keeps the backlog
+> drained, which narrows the window but cannot close it.
 
-Both processes must run as the same effective user. The kernel will not add
-a socket to a `SO_REUSEPORT` group bound by a different UID.
+Both processes must run as the same effective user. The kernel will not
+add a socket to a `SO_REUSEPORT` group bound by a different UID.
 
 `timeouts.drain_deadline_ms` bounds how long the old process lingers; the
 default `0` waits for its last connection to finish. Its exit prints the
@@ -172,35 +172,35 @@ final counters.
 
 [Tunnels](#tunnelled-upgrades-websocket) are the exception. A WebSocket has
 no message boundary to finish at, so a draining process refuses new
-upgrades with `503` and cuts the live ones at `drain_deadline_ms`, or five
-seconds in when none is set. `zoxy_tunnels_drained` counts the ones cut.
+upgrades with `503` and cuts live ones at `drain_deadline_ms`, or after
+five seconds if none is set. `zoxy_tunnels_drained` counts the ones cut.
 
 The same two commands add capacity: start N processes on the same port and
 signal none of them. That is the supported way to use more than one core.
 
 ## Configuration
 
-Config is parsed once at startup and never reloaded; a change is a process
-restart. Unknown fields are rejected.
+Config is parsed once at startup and never reloaded; a change needs a
+process restart. Unknown fields are rejected.
 
-The sections below follow a request: what a **listener** accepts, including
-whether it terminates TLS, which **cluster** it routes to, how that cluster
-picks an endpoint and protects it, who zoxy believes the client is, the
-edits and canned bodies applied at the edge, and last the process-wide
-`timeouts` and `limits`. The two remaining process-wide blocks, `admin` and
-`access_log`, are documented under [Observability](#observability).
+The sections below follow a request: what a **listener** accepts,
+including whether it terminates TLS; which **cluster** it routes to; how
+that cluster picks and protects an endpoint; who zoxy believes the client
+is; the edits and canned bodies applied at the edge; and finally the
+process-wide `timeouts` and `limits`. The other two process-wide blocks,
+`admin` and `access_log`, are under [Observability](#observability).
 
 ### Listeners
 
 A listener binds an address and speaks one protocol, named by the key its
-settings live under: `l4` relays bytes without inspecting them, `http` runs
-the HTTP reverse proxy, over HTTP/1.1 and, where the listener allows it,
-[HTTP/2](#http2). Exactly one of the two is required. There is no default.
+settings live under. `l4` relays bytes without inspecting them. `http` runs
+the HTTP reverse proxy over HTTP/1.1 and, where the listener allows it,
+[HTTP/2](#http2). Exactly one of the two is required; there is no default.
 
 `bind` and `tls` sit outside the protocol body because they apply to both.
-Everything else lives inside the body, so a setting that only makes sense
-for one protocol cannot be written for the other: `max_body_bytes` on an
-`l4` listener is a rejected config, not a key that silently does nothing.
+Everything else lives inside it, so a setting for one protocol cannot be
+written for the other: `max_body_bytes` on an `l4` listener is rejected,
+not silently ignored.
 
 ```json
 "listeners": [
@@ -209,21 +209,21 @@ for one protocol cannot be written for the other: `max_body_bytes` on an
 ]
 ```
 
-Listener count is bounded by the config's own ring and fd budgets, which
-are checked at startup and printed in the banner, not by a compiled
-ceiling.
+There is no compiled ceiling on listener count. The config's own ring and
+fd budgets bound it; both are checked at startup and printed in the
+banner.
 
-Each listener is bound with `SO_REUSEPORT`, so several processes on one
-port is the supported way to use more than one core and to
+Each listener is bound with `SO_REUSEPORT`, so running several processes on
+one port is the supported way to use more than one core and to
 [replace a running instance](#replacing-a-running-instance). Every
-connection, accepted and upstream alike, gets `TCP_NODELAY`: Nagle plus
-delayed ACK costs a reused keep-alive connection a 40 ms stall.
+connection, accepted or upstream, gets `TCP_NODELAY`: Nagle plus delayed
+ACK would cost a reused keep-alive connection a 40 ms stall.
 
 #### Routing an `l4` listener by TLS name (SNI)
 
-One `:443` can front several TLS services without terminating any of them.
-Give the `l4` body a route table keyed on the server name, and zoxy reads
-that name out of the ClientHello and relays every byte onward unchanged:
+One `:443` listener can front several TLS services without terminating any
+of them. Give the `l4` body a route table keyed on server name. zoxy reads
+the name from the ClientHello and relays every byte onward unchanged:
 
 ```json
 {
@@ -238,37 +238,38 @@ that name out of the ClientHello and relays every byte onward unchanged:
 }
 ```
 
-zoxy holds no key material and runs no handshake. The backend completes the
-TLS session with the client exactly as it would without a proxy in the
-path, and zoxy never sees a plaintext byte. This is how to front a service
-whose certificate the proxy must not be able to present.
+zoxy holds no key material and runs no handshake. The backend completes
+the TLS session with the client as if no proxy were in the path, and zoxy
+never sees plaintext. Use this to front a service whose certificate the
+proxy must not be able to present.
 
-A route with no `sni` is the catch-all. It answers any connection,
-including one whose hello named nothing at all (an IP-only client, an older
-stack). Without a catch-all, a name the table does not cover is closed.
+A route with no `sni` is the catch-all. It takes any connection, including
+one whose hello names nothing (an IP-only client, an older stack). Without
+a catch-all, a connection naming a server the table does not cover is
+closed.
 
 Matching is exact: `api.example.com` matches that name and not
-`x.api.example.com`. `http` routes match a `host` by the same rule, and
-neither table has wildcards.
+`x.api.example.com`. `http` routes match a `host` by the same rule.
+Neither table has wildcards.
 
 Two combinations are refused at load:
 
 | config | why |
 |---|---|
-| `routes` beside this listener's own `tls` | terminating consumes the hello this reads; the two are different proxies |
-| `limits.relay_buffer_bytes` below 16 KiB | the hello is staged in the relay buffer, and a modern one with post-quantum key shares runs past 2 KiB — a narrow buffer would route short hellos and drop long ones from the same config |
+| `routes` beside this listener's own `tls` | terminating TLS consumes the hello that SNI routing reads |
+| `limits.relay_buffer_bytes` below 16 KiB | the hello is staged in the relay buffer, and one with post-quantum key shares runs past 2 KiB; a smaller buffer would route short hellos and drop long ones |
 
 Four counters report what the table did: `zoxy_l4_sni_routed`,
 `zoxy_l4_sni_absent` (the client named nothing), `zoxy_l4_sni_no_route`
-(named something no route claims) and `zoxy_l4_sni_invalid` (the opening
-bytes were not a ClientHello: a plaintext client, or a handshake this proxy
-could not read).
+(it named something no route claims) and `zoxy_l4_sni_invalid` (the
+opening bytes were not a ClientHello: a plaintext client, or a handshake
+this proxy could not read).
 
-The hello must arrive in one TLS record. Every client sends it that way; a
+The hello must arrive in one TLS record. Every client sends it that way. A
 fragmented first flight is legal but does not occur in practice, and
 reassembling one would mean buffering inside a parser that reads
-attacker-controlled bytes. Such a connection counts `zoxy_l4_sni_invalid`
-and is closed.
+attacker-controlled bytes. Such a connection is counted in
+`zoxy_l4_sni_invalid` and closed.
 
 #### Terminating TLS
 
@@ -282,40 +283,41 @@ routes, cluster and filters are unchanged.
 ]
 ```
 
-Both files are read once at startup, so a missing or unusable file stops
-the proxy with an error naming the file, never mid-handshake. `cert` is a
-PEM chain, leaf first; `key` is the leaf's PEM private key.
+Both files are read once at startup. A missing or unusable file stops
+startup with an error naming it, so the problem never surfaces
+mid-handshake. `cert` is a PEM chain, leaf first; `key` is the leaf's PEM
+private key.
 
-Either protocol may terminate. The handshake runs as a phase ahead of the
-protocol, so routing, filters, redirects and access logs work exactly as
-they do in the clear.
+Either protocol can terminate TLS. The handshake runs as a phase before the
+protocol, so routing, filters, redirects and access logs work as they do
+in the clear.
 
-The key must be **ECDSA P-256 or P-384**. Handshakes run on the event loop,
-where an RSA signature's millisecond would stall every other connection
-sharing it; an ECDSA signature costs about 260 µs. An RSA key is refused at
-startup.
+The key must be **ECDSA P-256 or P-384**; an RSA key is refused at
+startup. Handshakes run on the event loop, where the millisecond an RSA
+signature takes would stall every other connection on that loop. An ECDSA
+signature costs about 260 µs.
 
 `alpn` lists the application protocols the listener offers in ALPN
 (RFC 7301), most preferred first: `http/1.1`, and `h2` for
-[HTTP/2](#http2). Absent, an `http` listener offers `http/1.1` alone:
+[HTTP/2](#http2). Without it, an `http` listener offers only `http/1.1`:
 
 ```json
 "tls": { "cert": "/etc/zoxy/site.crt", "key": "/etc/zoxy/site.key", "alpn": ["h2", "http/1.1"] }
 ```
 
-A client that offers ALPN without naming anything the listener speaks —
-a gRPC client offering only `h2` to a listener that offers only
-`http/1.1` — is refused in the handshake with the
-`no_application_protocol` alert and counted in `zoxy_tls_alpn_refused`. It
-is not handed an HTTP/1.1 session it would then speak HTTP/2 into. A
-client that offers no ALPN is unaffected. Names outside the list, an empty
-list and a repeated name are all refused at load. An `l4` listener relays
-bytes it never parses, so it offers nothing and refuses the key.
+If a client offers ALPN but names nothing the listener speaks (say, a gRPC
+client offering only `h2` to a listener that offers only `http/1.1`), the
+handshake fails with the `no_application_protocol` alert and
+`zoxy_tls_alpn_refused` counts it. The client is never handed an HTTP/1.1
+session it would then speak HTTP/2 into. A client that offers no ALPN is
+unaffected. Unknown names, an empty list and a repeated name are refused
+at load. An `l4` listener never parses the bytes it relays, so it offers
+nothing and refuses the `alpn` key.
 
-A cluster with `proxy_protocol.send` cannot be reached from a terminating
-listener. That header is staged in the relay buffer, which a terminated
-connection's wire bytes do not pass through, so the combination is
-rejected at load rather than sent to the origin as garbage.
+A terminating listener cannot route to a cluster with
+`proxy_protocol.send`. That header is staged in the relay buffer, which a
+terminated connection's wire bytes do not pass through, so the loader
+rejects the combination instead of sending the origin garbage.
 
 Termination is inbound only. The connection zoxy opens to the backend stays
 plaintext.
@@ -325,36 +327,34 @@ It is the largest single line in the startup banner's memory budget; see
 [Limits](#limits).
 
 Session resumption is on and has no settings. Every completed handshake
-hands the client two session tickets, and a client that offers one back
+gives the client two session tickets, and a client that presents one later
 resumes without a signature. Tickets are stateless, each sealed under a key
 zoxy keeps in memory, so resumption costs no per-session memory and the
-banner's budget does not move. Two consequences follow. A restart
-invalidates every outstanding ticket, because the sealing keys are never
-written anywhere, so returning clients pay one full handshake each and
-then resume again. And tickets are not shared between processes, so during
-a `SO_REUSEPORT` handoff a client may land on the process that did not
-issue its ticket and do a full handshake.
+banner's budget does not change. A restart invalidates every outstanding
+ticket, because the sealing keys are never written anywhere; each returning
+client pays one full handshake, then resumes again. Tickets are not shared
+between processes either, so during a `SO_REUSEPORT` handoff a client may
+land on the process that did not issue its ticket and do a full handshake.
 
 The ticket flight also carries the ACK for the client's `Finished`. Without
-it, a client that writes `Finished` and then its request has the second
-write held by its own Nagle for about 45 ms.
+it, a client that writes `Finished` and then its request would have the
+request held by its own Nagle for about 45 ms.
 
-Measured on a `Connection: close` workload, a fresh handshake per request:
-a terminated hop runs at a p50 of 158–161 µs against HAProxy's 429–607 µs.
-On steady keep-alive traffic the two are at parity, about 20k req/s at a
-p50 within a few µs of each other. Bulk transfer is the one band zoxy
-trails on, by a third to two-fifths: 507–542 µs against 383–385 µs at the
-same 100 MiB/s.
+On a `Connection: close` workload, with a fresh handshake per request, a
+terminated hop measures a p50 of 158–161 µs against HAProxy's 429–607 µs.
+On steady keep-alive traffic the two are at parity: about 20k req/s, with
+p50s within a few µs of each other. zoxy trails only on bulk transfer, by a
+third to two-fifths: 507–542 µs against 383–385 µs at the same 100 MiB/s.
 
 #### HTTP/2
 
-An `http` listener speaks HTTP/2 to its clients two ways: over TLS, by
-offering `h2` in `tls.alpn`, and in the clear, by `"h2c": true`, which
-answers a client that opens with HTTP/2's preface (prior knowledge, RFC
-9113 §3.3) and serves HTTP/1.1 as before to one that does not. `h2c` is
-refused beside `tls`. Each stream is one request, run through the same
-routing, filters, redirects and access log as an HTTP/1.1 one; the origin
-leg stays HTTP/1.1, and a body with no length goes to it chunked.
+An `http` listener speaks HTTP/2 to clients in two ways. Over TLS, it
+offers `h2` in `tls.alpn`. In the clear, `"h2c": true` makes it answer a
+client that opens with the HTTP/2 preface (prior knowledge, RFC 9113 §3.3)
+and serve HTTP/1.1 as before to one that does not; `h2c` is refused beside
+`tls`. Each stream is one request and goes through the same routing,
+filters, redirects and access log as an HTTP/1.1 request. The origin leg
+stays HTTP/1.1, and a body with no length is sent to it chunked.
 
 ```json
 "listeners": [
@@ -366,39 +366,45 @@ leg stays HTTP/1.1, and a body with no length goes to it chunked.
 "limits": { "stream_slots": 4096 }
 ```
 
-`limits.stream_slots` is required and has no default: it bounds the
-requests in flight across every HTTP/2 connection, each holding a head
-buffer of its own, and how many to carry is a capacity decision. A stream
-past the pool is refused `REFUSED_STREAM`, which a client retries, and
-counted in `zoxy_h2_shed_streams`; one connection advertises at most 100.
-`limits.h2_connections` bounds the connections speaking HTTP/2 at once,
-each holding a session of about 100 KiB, and defaults to 1024, at most
-`conn_slots`. With none free, a listener offering `h2` beside `http/1.1`
-offers `http/1.1` alone in the handshake; an h2c preface is closed and
-counted in `zoxy_h2_shed_sessions`; and a listener offering `h2` alone
-sheds the connection at accept, before its handshake, in
-`zoxy_shed_h2_sessions`. Both keys are refused unless a listener speaks
-HTTP/2.
+`limits.stream_slots` is required and has no default. It bounds the
+requests in flight across all HTTP/2 connections, each holding its own head
+buffer, and how many to carry is a capacity decision. A stream beyond the
+pool is refused with `REFUSED_STREAM`, which a client retries, and counted
+in `zoxy_h2_shed_streams`. One connection advertises at most 100 streams.
+
+`limits.h2_connections` bounds how many connections speak HTTP/2 at once,
+each holding a session of about 100 KiB. It defaults to 1024, at most
+`conn_slots`. When none is free:
+
+- a listener offering `h2` beside `http/1.1` offers only `http/1.1` in the
+  handshake;
+- an h2c preface is closed and counted in `zoxy_h2_shed_sessions`;
+- a listener offering only `h2` sheds the connection at accept, before its
+  handshake, and counts it in `zoxy_shed_h2_sessions`.
+
+Both keys are refused unless a listener speaks HTTP/2.
 
 A request body reaches its upstream through the stream's relay buffer
-(`limits.relay_buffer_bytes`). A DATA frame the buffer has no room for is
-held until the stream's own send makes room, and its connection reads
-nothing else meanwhile, so the connection's other streams wait. Each held
-frame is counted once in `zoxy_h2_frames_held`. A client that sends before
-it applies the server's window can cause it, and so can a full 16 KiB
-frame of a body without a `content-length`, which overruns the default
-buffer by the octets its chunk framing takes: 38 for the first frame,
-up to 58 behind one still in flight.
+(`limits.relay_buffer_bytes`). A DATA frame that does not fit is held until
+the stream's own send makes room. Meanwhile the connection reads nothing
+else, so its other streams wait. `zoxy_h2_frames_held` counts each held
+frame once. A client that sends before applying the server's window can
+cause this. So can a full 16 KiB frame of a body without a
+`content-length`, which overruns the default buffer by the octets its chunk
+framing adds: 38 for the first frame, up to 58 behind one still in flight.
 
-What fails on a stream ends that stream — reset, or answered `502`/`504`
-— never the connection. What a client spends is bounded per connection:
-resetting streams before their answers end faster than answers end
-(Rapid Reset), and floods of frames that ask for nothing — PING,
-SETTINGS, WINDOW_UPDATE, PRIORITY or unknown types, empty DATA, a field
-block in empty CONTINUATIONs — end the connection with
-`GOAWAY(ENHANCE_YOUR_CALM)`, each counted in its own
-`zoxy_h2_calm_*`. Response trailers are not carried, nor are a
-request's.
+A failure on a stream ends that stream (with a reset, or a `502` or `504`
+answer), never the connection. What a client can spend is bounded per
+connection. Two kinds of abuse end the connection with
+`GOAWAY(ENHANCE_YOUR_CALM)`, each counted in its own `zoxy_h2_calm_*`:
+
+- resetting streams before their answers end, faster than answers end
+  (Rapid Reset);
+- floods of frames that ask for nothing: PING, SETTINGS, WINDOW_UPDATE,
+  PRIORITY or unknown types, empty DATA, or a field block in empty
+  CONTINUATIONs.
+
+Trailers are not carried, on responses or on requests.
 
 #### Tunnelled upgrades (WebSocket)
 
@@ -413,80 +419,80 @@ By default any request carrying `Upgrade` is answered `501`, the same as
 "limits": { "tunnels": 512 }
 ```
 
-One flag per protocol rather than a list of tokens, so the vocabulary lives
-in the schema and an editor rejects `"h2c"` before the loader does.
-Omitting the block, writing `{}`, or setting every flag `false` all mean
-allow none and reserve nothing.
+The block has one flag per protocol, so the vocabulary lives in the schema
+and an editor rejects `"h2c"` before the loader does. Omitting the block,
+writing `{}` and setting every flag `false` all mean the same thing: allow
+none, reserve nothing.
 
 zoxy does not speak WebSocket. It forwards the handshake, recognises the
-origin's `101 Switching Protocols`, and from that point relays bytes both
-ways until one side closes, the same byte relay an `l4` listener runs.
-Routing, filters and health checks apply to the handshake exactly as they
-do to any request.
+origin's `101 Switching Protocols`, and from then on relays bytes both ways
+until one side closes, using the same byte relay as an `l4` listener.
+Routing, filters and health checks apply to the handshake as they do to
+any request.
 
 After `101` the connection is opaque. Filters, routes, header rules and
-canonicalisation stop applying, because there are no more HTTP messages to
-apply them to. That is why the block is an allowlist and not a switch:
-`websocket` is the only token zoxy accepts, and `h2c`, which would carry
-HTTP/2 to an origin zoxy cannot parse, is refused by name at load.
+canonicalisation stop applying, because no more HTTP messages follow. So
+the block is an allowlist: `websocket` is the only token zoxy accepts.
+`h2c`, which would carry HTTP/2 to an origin zoxy cannot parse, is refused
+by name at load.
 
 `limits.tunnels` is required and has no default. How many long-lived
 sessions the origins should carry is a capacity decision zoxy cannot infer
 from a connection count, so a listener that allows an upgrade without it is
 refused at startup. It may not exceed `conn_slots`.
 
-The pool is separate from the buffers ordinary traffic uses. Every other
-pool is sized for concurrent activity, and an idle keep-alive connection
-holds no head buffer, but a tunnel pins its relay buffer for its whole
-life. A separate pool means tunnels cannot starve HTTP. Each costs 8200
-bytes, printed in the startup banner.
+The tunnel pool is separate from the buffers ordinary traffic uses. Every
+other pool is sized for concurrent activity (an idle keep-alive connection
+holds no head buffer), but a tunnel pins its relay buffer for its whole
+life. A separate pool means tunnels cannot starve HTTP. Each tunnel costs
+8200 bytes, and the startup banner prints the cost.
 
-When the pool is full the upgrade is refused with `503` before the
+When the pool is full, the upgrade is refused with `503` before the
 handshake reaches the origin, so a refusal costs no backend connection.
 `zoxy_l7_shed_tunnels` counts those; `zoxy_tunnels_established` counts the
 ones that became sessions.
 
 - `timeouts.tunnel_ms` replaces the other deadlines once a connection
-  becomes a tunnel. `idle_ms` defaults to 60 s and a WebSocket is
-  legitimately idle for hours, its keepalive being application-level
-  ping/pong zoxy cannot see through opaque bytes. Default one hour, floor
-  one second, ceiling one day. Unlike `request_ms` there is no `0` for no
-  cap, because a tunnel holds a pool slot for its whole life.
+  becomes a tunnel. `idle_ms` defaults to 60 s, but a WebSocket can
+  legitimately sit idle for hours: its keepalive is application-level
+  ping/pong, which zoxy cannot see in opaque bytes. Default one hour,
+  minimum one second, maximum one day. Unlike `request_ms`, it has no `0`
+  for no cap, because a tunnel holds a pool slot for its whole life.
 - The upgraded upstream connection leaves the keep-alive pool and is never
   reused for another client. It still counts against the cluster's
   `max_inflight` for as long as the tunnel lives.
 
 The access log writes one line when the tunnel closes: `kind` `http`,
-`status` `101`, the request facts that opened it, and `bytes_in` and
-`bytes_out` for the whole session.
+`status` `101`, the details of the request that opened it, and `bytes_in`
+and `bytes_out` for the whole session.
 
 #### Bounding a request body
 
 An `http` listener caps how large a request body it will carry. The default
-is 1 MiB, nginx's `client_max_body_size`; `0` accepts any size:
+is 1 MiB, as with nginx's `client_max_body_size`; `0` accepts any size:
 
 ```json
 { "bind": "0.0.0.0:80", "http": { "cluster": "api",
   "max_body_bytes": 5242880 } }
 ```
 
-zoxy itself is unharmed by a large upload: the recv → send → recv relay
-keeps per-connection memory constant whatever the stream size, so an
-unbounded body costs one relay buffer and no more. The cap protects the
-origin, which most application stacks assume the proxy in front will do.
+A large upload does not hurt zoxy: the recv → send → recv relay keeps
+per-connection memory constant whatever the stream size, so an unbounded
+body costs one relay buffer. The cap protects the origin, a job most
+application stacks expect the proxy in front to do.
 
-It is per listener rather than in `limits` because it reserves nothing. It
+The cap is per listener, not in `limits`, because it reserves nothing. It
 states policy, like `forwarded` and `upgrades`, and a listener fronting an
-upload endpoint and one fronting an API want different numbers.
+upload endpoint wants a different number from one fronting an API.
 
 A declared `Content-Length` over the cap is answered `413` before the
-origin is dialed, and the connection closes with the body still unread in
-the socket. A chunked body announces no size, so it is measured as it
-arrives: caught before the response leg is armed it gets the same `413`,
-and caught later it can only be a teardown, since by then no status can be
-sent. `zoxy_l7_body_over_limit` counts the first, a client told why, and
-`zoxy_l7_body_cut_mid_stream` the second, a client that lost its
-connection.
+origin is dialled, and the connection closes with the body still unread in
+the socket. A chunked body announces no size, so zoxy measures it as it
+arrives. If it crosses the cap before the response leg is armed, it gets
+the same `413`. After that no status can be sent, so the connection is torn
+down. `zoxy_l7_body_over_limit` counts the first case (the client was told
+why) and `zoxy_l7_body_cut_mid_stream` the second (the client lost its
+connection).
 
 > [!IMPORTANT]
 > Releases up to 0.3.0 bounded nothing. A deployment proxying uploads
@@ -495,9 +501,9 @@ connection.
 
 ### Routing
 
-`"cluster"` is sugar for a single catch-all route. An `http` listener can
-instead carry a route table, matched **longest-prefix within the matching
-host**:
+`"cluster"` is shorthand for a single catch-all route. An `http` listener
+can instead carry a route table, matched **longest-prefix within the
+matching host**:
 
 ```json
 {
@@ -514,18 +520,19 @@ host**:
 ```
 
 A route with no `host` matches any host, and a host-specific route always
-beats an any-host one. Matching uses the **canonical** path, with
-percent-escapes decoded and dot-segments collapsed, and the origin receives
-that same canonical path, so the router and the backend cannot disagree
-about which resource was named. Structure-changing escapes (`%2F`, `%00`,
-truncated escapes) are rejected with `400`. No matching route is a `404`.
+beats an any-host one. Matching uses the **canonical** path (percent-escapes
+decoded, dot-segments collapsed), and the origin receives that same
+canonical path, so the router and the backend cannot disagree about which
+resource was named. Escapes that change structure (`%2F`, `%00`, truncated
+escapes) are rejected with `400`. A request that matches no route gets
+`404`.
 
 #### Pinning a canary with a header
 
-Percentage canaries are [endpoint weights](#weights): put the new version's
-endpoints in the same cluster at low weight and every pick policy honours
-it. A pinned canary, for a specific client, a test account or an internal
-gateway's header, is a route that matches a header:
+For a percentage canary, use [endpoint weights](#weights): put the new
+version's endpoints in the same cluster at a low weight, and every pick
+policy honours it. A pinned canary (a specific client, a test account, an
+internal gateway's header) is a route that matches a header:
 
 ```json
 "routes": [
@@ -535,12 +542,12 @@ gateway's header, is a route that matches a header:
 ]
 ```
 
-Either `{ "present": true }` for any value, or `{ "equals": "..." }` for
-one. Names match case-insensitively (RFC 9110); values do not. There is no
+Use `{ "present": true }` for any value or `{ "equals": "..." }` for one.
+Names match case-insensitively (RFC 9110); values do not. There is no
 substring or regex matching.
 
-**Host, then header, then prefix.** Every key a route states must hold, and
-where several routes match, the most specific wins in that order: a
+**Host, then header, then prefix.** Every key a route states must match.
+When several routes match, the most specific wins, in that order: a
 host-scoped route beats an any-host one, and within a host group a route
 naming a header beats one that does not.
 
@@ -555,45 +562,44 @@ naming a header beats one that does not.
 ]
 ```
 
-Those four can be written in any sequence and answer identically: the table
-is sorted once at startup.
+Those four routes can be written in any order with the same result: the
+table is sorted once at startup.
 
 Config order decides one case. Two routes sharing a host and a prefix but
 naming **different** headers are equally specific, and a request carrying
 both headers matches both. The one written first wins.
 
-Two things to know before relying on this. A request that gains or loses
-the header **moves to a different cluster**, so a `hash` pick holds within
-each cluster but not across the change. And the header is a routing key
-*and* is forwarded, so the origin sees it and can log which side served
-the request.
+A request that gains or loses the header **moves to a different cluster**,
+so a `hash` pick holds within each cluster but not across the change. The
+header is a routing key *and* is forwarded, so the origin sees it and can
+log which side served the request.
 
 `CONNECT` and `TRACE` are answered `501` and never reach a backend.
 `CONNECT` asks the proxy to open an arbitrary destination, which is
 forward-proxy behaviour. `TRACE` echoes a request back, which is the
 Cross-Site Tracing vector.
 
-`OPTIONS` honours `Max-Forwards`. At `0` zoxy answers it with `200` and an
-`Allow` describing zoxy itself, and never dials a backend. Above `0` the
-request is forwarded with the value decremented. The field is read only
+`OPTIONS` honours `Max-Forwards`. At `0`, zoxy answers with `200` and an
+`Allow` describing zoxy itself, and never dials a backend. Above `0`, the
+request is forwarded with the value decremented. zoxy reads the field only
 for `OPTIONS`, and CORS preflights carry no `Max-Forwards`, so ordinary
 traffic is unaffected.
 
-A request may name its authority in the request line itself,
-`GET http://api.example.com/v2/x HTTP/1.1`, which is what a client sends
-when it thinks it is talking to a forward proxy. That form is accepted
-(RFC 9112 requires it), and the authority in the target **wins over the
-`Host` header**: it is what routes, what filters match, what the access
-log records, and what the origin receives as the request's `Host`. Only
-`http` and `https` targets are accepted; any other scheme is a `400`.
+A request may name its authority in the request line itself, as in
+`GET http://api.example.com/v2/x HTTP/1.1`. A client sends this form when
+it thinks it is talking to a forward proxy. zoxy accepts it (RFC 9112
+requires that), and the authority in the target **wins over the `Host`
+header**: it is what routing and filters match, what the access log
+records, and what the origin receives as `Host`. Only `http` and `https`
+targets are accepted; any other scheme gets `400`.
 
 ### Clusters and load balancing
 
-A cluster is a named set of endpoints plus how one is chosen. Endpoints
-are static `IP:port` literals or
+A cluster is a named set of endpoints plus a policy for choosing one.
+Endpoints are static `IP:port` literals or
 [`unix:` socket paths](#reaching-a-local-app-over-a-unix-socket), resolved
-once at load; dynamic DNS is out of scope. Cluster and endpoint counts are
-bounded by the config, not by a compiled ceiling, and the startup banner
+once at load; dynamic DNS is out of scope. Only the config bounds cluster
+and endpoint counts (there is no compiled ceiling), and the startup banner
 prints what the endpoint tables cost.
 
 ```json
@@ -605,33 +611,33 @@ prints what the endpoint tables cost.
 }
 ```
 
-| `pick` | behavior |
+| `pick` | behaviour |
 |---|---|
-| `p2c` *(default)* | two weight-biased candidates; the one carrying less in-flight work wins — HTTP requests and L4 connections both count |
-| `rr` | smooth weighted rotation — exact rotation at equal weights, predictable spread, useful for cache warming |
-| `hash` | the same key always reaches the same endpoint — object form only, naming what the cluster is sticky on |
+| `p2c` *(default)* | of two weight-biased candidates, the one with less in-flight work wins; HTTP requests and L4 connections both count |
+| `rr` | smooth weighted rotation: exact at equal weights, with a predictable spread; useful for cache warming |
+| `hash` | the same key always reaches the same endpoint |
 
 `pick` is either a bare policy string or an object carrying the policy and
-its settings. `hash` takes only the object form, naming its key
+its settings. `hash` takes only the object form, which names its key
 (`source_ip`, `header` or `cookie`).
 
 Upstream connections are pooled process-wide and reusable by any request.
 
 #### Weights
 
-An endpoint is a bare `"IP:port"` string, weight 1, or an object adding a
-relative share, up to 256:
+An endpoint is either a bare `"IP:port"` string (weight 1) or an object
+with a relative weight, up to 256:
 
 ```json
 "endpoints": ["10.0.0.1:8080", { "address": "10.0.0.2:8080", "weight": 3 }]
 ```
 
-Every policy honours weights: a 16-core box can take four times a 4-core
+Every policy honours weights. A 16-core box can take four times a 4-core
 box's share, a canary can start at 1-in-20 and move by editing one number,
-and a pool can be drained gradually by shifting weight. A weight of `0`
-**drains** the endpoint: still health-checked, never picked, not even when
-everything else is ejected. At least one endpoint must hold weight, or the
-config is rejected.
+and shifting weight drains a pool gradually. A weight of `0` **drains** the
+endpoint: it is still health-checked but never picked, not even when
+everything else is ejected. At least one endpoint must have a non-zero
+weight, or the config is rejected.
 
 #### Reaching a local app over a Unix socket
 
@@ -654,25 +660,25 @@ Three reasons to prefer it:
 - **Filesystem permissions as the ACL.** A socket in a directory the app
   user owns is unreachable by anything else on the box, with no firewall
   rule.
-- **Less work per byte.** No checksum, no loopback routing, no TCP state
-  machine, on the leg that runs for every request.
+- **Less work per byte.** No checksums, loopback routing or TCP state
+  machine on the leg every request uses.
 
-The `unix:` prefix is grammar, not part of the path; what reaches the
-kernel is the path you would `ls`. The path must be **absolute** and at
-most 103 bytes: a `sockaddr_un` carries 108 bytes on Linux and 104 on
-macOS, and 103 is the smaller minus the terminator, so one config works on
-both. It must be printable ASCII with no quote or backslash, because the
-address lands verbatim in every access-log line and Prometheus label,
-where one control byte invalidates the whole line or scrape. A path that
-breaks any of these rules is refused at load, never truncated: a shortened
-path names a different socket.
+The `unix:` prefix is not part of the path; the kernel gets the path you
+would `ls`. The path must be **absolute** and at most 103 bytes. A
+`sockaddr_un` holds 108 bytes on Linux and 104 on macOS; 103 is the smaller
+minus the terminator, so one config works on both. The path must be
+printable ASCII with no quote or backslash, because the address appears
+verbatim in every access-log line and Prometheus label, where one control
+byte invalidates the whole line or scrape. A path that breaks any of these
+rules is refused at load, never truncated: a shortened path names a
+different socket.
 
-Everything above the dial is unchanged. The two forms mix in one cluster,
-so a migration can move one endpoint at a time. Weights, `pick`, health
-checks, retries and `max_inflight` work as they do on an IP endpoint,
-`hash` stickiness keys on the path, and the access log, the `endpoint`
-metrics label and the startup banner print the endpoint exactly as
-spelled, `unix:` included:
+Everything above the dial is unchanged. The two forms can mix in one
+cluster, so a migration can move one endpoint at a time. Weights, `pick`,
+health checks, retries and `max_inflight` work as they do on an IP
+endpoint, and `hash` stickiness keys on the path. The access log, the
+`endpoint` metrics label and the startup banner print the endpoint as
+written, `unix:` included:
 
 ```json
 {"upstream":"unix:/run/app.sock", ...}
@@ -690,8 +696,8 @@ filesystem permissions.
 
 #### Accepting on a socket file
 
-`bind` takes the same `unix:` grammar, so a local process reaches zoxy
-through a file rather than a port:
+`bind` takes the same `unix:` grammar, so a local process can reach zoxy
+through a file instead of a port:
 
 ```json
 {
@@ -710,20 +716,19 @@ The socket file's lifecycle:
 | at startup, the path… | zoxy |
 |---|---|
 | does not exist | creates it |
-| is a socket | removes it, then creates it — a killed process must not wedge every later start |
+| is a socket | removes it and creates it again, so a killed process cannot wedge every later start |
 | is anything else (file, directory, symlink) | **refuses to start** and says so |
 
 A clean stop removes the file it made. A `SIGKILL` cannot, which is what
-the second row is for. The third row keeps a typo in `bind` from deleting
-anything, and a symlink is judged as itself rather than followed.
+the second row is for. The third row stops a typo in `bind` from deleting
+anything; a symlink is judged as itself, not followed.
 
 **`mode`** sets the socket's permission bits after the bind, as an octal
-string. It is a string rather than a number because `0660` is not valid
-JSON and `660` is decimal, and the two readings differ by a factor of
-eight in the direction that widens access. Absent leaves whatever the
-umask gives, which under a typical umask is world-connectable; if the
-socket itself is meant to be the ACL rather than the directory holding
-it, set the field.
+string. It is a string because `0660` is not valid JSON and `660` is
+decimal, and the two readings differ by a factor of eight in the direction
+that widens access. Without `mode`, the socket gets whatever the umask
+gives, which under a typical umask is world-connectable. If the socket
+itself, not its directory, is meant to be the ACL, set the field.
 
 A request arriving on a socket file has no client IP, so the loader
 refuses the four things that would need one:
@@ -731,16 +736,16 @@ refuses the four things that would need one:
 | rejected | because |
 |---|---|
 | a `forwarded` block | `X-Forwarded-For` would state an address nobody connected from |
-| a filter with `match.client` | an allowlist would be comparing against a fiction |
-| routing to a `hash` cluster keyed on `source_ip` | every local client would land on one endpoint while looking sticky |
+| a filter with `match.client` | an allowlist would have no address to compare |
+| routing to a `hash` cluster keyed on `source_ip` | every local client would land on one endpoint |
 | routing to a cluster with `proxy_protocol` send | the header announces source *and* destination addresses; this listener has neither |
 
 The last two are checked against every cluster the listener can *reach*,
 which on an `l4` listener includes every name in its
 [SNI table](#routing-an-l4-listener-by-tls-name-sni).
 
-Each is a startup error naming the pair. The access log states the
-absence rather than hiding it:
+Each is a startup error naming the pair. The access log records the
+missing address explicitly:
 
 ```json
 {"client":null, "upstream":"10.0.0.1:8080", ...}
@@ -768,22 +773,20 @@ names what "one client" means:
 
 It keeps **no table**. The kernel spreads one client's connections across
 zoxy processes by hashing the 4-tuple, so a per-process table would be
-consulted by processes that never saw that client. Being a pure function
-of the key and the healthy set, every process agrees without sharing
-anything.
+consulted by processes that never saw that client. The pick is a pure
+function of the key and the healthy set, so every process agrees without
+sharing anything.
 
-When a backend is ejected, only *its* clients move, and they return when
-it recovers. `source_ip` uses all four bytes of an IPv4 address and the
-/64 prefix of an IPv6 one, so stickiness survives privacy-address
-rotation.
+When a backend is ejected, only *its* clients move, and they return when it
+recovers. `source_ip` uses all four bytes of an IPv4 address and the /64
+prefix of an IPv6 one, so stickiness survives privacy-address rotation.
 
-Hashing on client address has an inherent limit: NAT hides many clients
-behind one address, and one heavy client cannot be split. The other two
-keys exist for that case, and where even load matters more than
-stickiness, use `p2c`.
+Hashing on client address has limits: NAT hides many clients behind one
+address, and one heavy client cannot be split. The other two keys handle
+that case. Where even load matters more than stickiness, use `p2c`.
 
 The key is the *observed* client address. Behind another proxy or load
-balancer every connection carries that machine's address and the whole
+balancer, every connection carries that machine's address and the whole
 cluster hashes to one endpoint; see
 [Receiving PROXY protocol](#receiving-proxy-protocol) for how an `l4`
 listener recovers the real client.
@@ -794,9 +797,9 @@ listener recovers the real client.
 "pick": { "policy": "hash", "key": "header", "name": "x-tenant" }
 ```
 
-Hashes the named header's value: stickiness on an identity the client
-states, such as a tenant, a user id or an API key, which survives NAT. A
-request without the header is placed by load like a `p2c` pick. Only
+This hashes the named header's value, so stickiness follows an identity
+the client states (a tenant, a user id, an API key) and survives NAT. A
+request without the header is placed by load, like a `p2c` pick. Only
 `http` listeners can route to a header- or cookie-keyed cluster; an `l4`
 listener never parses a request.
 
@@ -810,15 +813,15 @@ listener never parses a request.
 ```
 
 The named cookie carries the assignment itself: a 16-hex **endpoint tag**
-zoxy mints from the endpoint's address, stable across restarts, processes
-and config reordering. A request with no cookie is placed on the calmest
-backend and the response sets one (`Set-Cookie: srv_id=<tag>; Path=/;
-HttpOnly`, a session cookie with no expiry, plus `; Secure` when the
-listener terminates TLS). A request whose tag names a healthy,
-under-capacity backend goes there and is **not** re-stamped. A tag naming
-an ejected, drained or removed backend is re-placed and the response
-re-announces. Every user behind one NAT address carries their own
-assignment.
+that zoxy derives from the endpoint's address, stable across restarts,
+processes and config reordering. A request with no cookie is placed on the
+least busy backend, and the response sets the cookie
+(`Set-Cookie: srv_id=<tag>; Path=/; HttpOnly`, a session cookie with no
+expiry, plus `; Secure` when the listener terminates TLS). A request whose
+tag names a healthy backend with spare capacity goes there and is **not**
+re-stamped. A tag naming an ejected, drained or removed backend is
+re-placed, and the response sets a new cookie. Every user behind one NAT
+address carries their own assignment.
 
 Pick a cookie name the application does not use; zoxy adds its
 `Set-Cookie` beside the origin's, never in place of them. The tag is not
@@ -831,9 +834,10 @@ repick rate means backends are flapping under a sticky population.
 
 ### Health checks
 
-Per cluster and opt-in. A prober sweeps every checked endpoint, several at
-a time. `fall` consecutive failures eject an endpoint from balancing and
-close its pooled connections; `rise` consecutive successes restore it.
+Health checks are per cluster and opt-in. A prober sweeps every checked
+endpoint, several at a time. `fall` consecutive failures eject an endpoint
+from balancing and close its pooled connections; `rise` consecutive
+successes restore it.
 
 ```json
 "api": {
@@ -842,10 +846,10 @@ close its pooled connections; `rise` consecutive successes restore it.
 }
 ```
 
-`type` is `tcp` (the port accepts) or `http` (a path answered the expected
-status). Defaults: `fall` 3, `rise` 2, `expect_status` 200, and a probe
-budget of `timeouts.connect_ms` unless `timeout_ms` overrides it.
-`timeouts.health_interval_ms` (default 2000) paces the gap between sweeps.
+`type` is `tcp` (the port accepts) or `http` (a path answers with the
+expected status). Defaults: `fall` 3, `rise` 2, `expect_status` 200, and a
+probe budget of `timeouts.connect_ms` unless `timeout_ms` overrides it.
+`timeouts.health_interval_ms` (default 2000) sets the gap between sweeps.
 
 If *every* endpoint in a cluster is ejected, zoxy fails open and uses them
 all. Routing nowhere would turn a probe verdict into an outage.
@@ -854,9 +858,9 @@ all. Routing nowhere would turn a probe verdict into an outage.
 
 A `tcp` check passes whenever the kernel accepts, and the kernel accepts
 from the backlog even when the application behind it never does. A wedged
-process, an exhausted thread pool or a GC-stalled backend looks healthy to
-it while every real request times out. An `http` check catches that but
-needs a path you have to know. `passive_ejection` uses the traffic you
+process, an exhausted thread pool or a GC-stalled backend passes that
+check while every real request times out. An `http` check catches it, but
+you need to know a path to probe. `passive_ejection` uses the traffic you
 already have:
 
 ```json
@@ -867,21 +871,20 @@ already have:
 ```
 
 `fall` consecutive **failed requests** eject the endpoint. A failure is a
-dial that failed, or an exchange that returned no response byte before
-its deadline. A `5xx` response is *not* a failure: a bad deploy answering
-500s is a software bug, and ejecting for it would take out a whole
-cluster. Any response resets the count.
+dial that failed, or an exchange that returned no response byte before its
+deadline. A `5xx` response is *not* a failure: a bad deploy answering 500s
+is a software bug, and ejecting for it would take out a whole cluster. Any
+response resets the count.
 
-After `recovery_ms` the endpoint is let back in and traffic judges it
-again; if it is still dead, `fall` more failures eject it once more.
-Passive detection finds the failure and active checks find the recovery,
-so a cluster that would rather re-test with one probe than with `fall`
-real requests should configure both.
+After `recovery_ms`, the endpoint is let back in and traffic judges it
+again; if it is still dead, `fall` more failures eject it again. Passive
+detection finds the failure and active checks find the recovery. To
+re-test with one probe instead of `fall` real requests, configure both.
 
 Defaults: `fall` 5, higher than a probe's 3 because real traffic carries
 transient failures a probe never sees, and `recovery_ms` 30000. Ejection,
-fail-open and the closing of pooled connections work exactly as they do
-for active checks.
+fail-open and the closing of pooled connections work as they do for active
+checks.
 
 If no cluster has either kind of detection, the startup banner says so:
 
@@ -889,17 +892,17 @@ If no cluster has either kind of detection, the startup banner says so:
 config  1 listener(s), 3 cluster(s), 0 error page(s), access log off, 1 cluster(s) without failure detection
 ```
 
-The line is informational. A multi-endpoint cluster with no checks is
-reasonable behind a service mesh, or when the endpoints are themselves
-load balancers. A cluster is counted only when two of its endpoints are
-reachable, so a single-endpoint cluster never is, nor one whose second
-endpoint is drained with `"weight": 0`.
+The note is informational. A multi-endpoint cluster with no checks is
+reasonable behind a service mesh, or when the endpoints are themselves load
+balancers. A cluster is counted only when two of its endpoints are
+reachable, so a single-endpoint cluster never is, and neither is one whose
+second endpoint is drained with `"weight": 0`.
 
 ### Per-endpoint in-flight cap
 
 `max_inflight` caps the concurrent work zoxy will ask of **one endpoint**.
-It is per server, so a three-endpoint cluster with a cap of 100 admits up
-to 300, the same shape as HAProxy's `server ... maxconn`.
+It applies per endpoint, so a three-endpoint cluster with a cap of 100
+admits up to 300, like HAProxy's `server ... maxconn`.
 
 ```json
 "api": {
@@ -909,28 +912,29 @@ to 300, the same shape as HAProxy's `server ... maxconn`.
 ```
 
 An endpoint at its cap is skipped, so requests keep flowing while any
-endpoint has room. When *every* endpoint is full zoxy refuses: an HTTP
+endpoint has room. When *every* endpoint is full, zoxy refuses: an HTTP
 request is answered `503` and an L4 connection is closed, since a byte
-relay has no way to say "try later". Absent, a cluster is uncapped.
+relay has no way to say "try later". Without `max_inflight`, a cluster is
+uncapped.
 
-This is the one limit that fails **closed**. An ejected cluster means zoxy
-does not know whether the endpoints work, so trying is better than
-refusing; a capped one means zoxy knows they are full.
+This is the one limit that fails **closed**. When every endpoint is
+ejected, zoxy does not know whether they work, so trying beats refusing.
+When every endpoint is at its cap, zoxy knows they are full.
 
-Both protocols count against the same figure: an in-flight HTTP request
-and a live L4 connection are each one unit of work.
-`zoxy_l7_shed_endpoint_inflight` and `zoxy_l4_shed_endpoint_inflight`
-count refusals, kept apart from `zoxy_l7_shed_upstream_slots`, which means
-zoxy ran out of its own slots and wants a wider pool rather than a busier
-backend.
+Both protocols count against the same figure: an in-flight HTTP request and
+a live L4 connection are each one unit of work.
+`zoxy_l7_shed_endpoint_inflight` and `zoxy_l4_shed_endpoint_inflight` count
+refusals. They are separate from `zoxy_l7_shed_upstream_slots`, which means
+zoxy ran out of its own slots and needs a wider pool.
 
 ### Client address
 
-One address is used everywhere it matters: the `source_ip` hash pick, a
-filter's `client` match, the access log. Three blocks decide what it is
-and who hears it. A listener learns it and states it; a cluster states it
-to its origins. A deployment that needs one usually needs another: learn
-the address first, then pass it on in whichever form the origin can read.
+zoxy uses one client address everywhere it matters: the `source_ip` hash
+pick, a filter's `client` match and the access log. Three blocks decide
+what that address is and who is told it. A listener learns it and states
+it; a cluster states it to its origins. A deployment that needs one block
+usually needs another: learn the address first, then pass it on in a form
+the origin can read.
 
 #### Receiving PROXY protocol
 
@@ -938,7 +942,7 @@ Behind a load balancer, zoxy sees only the balancer. That breaks more than
 logging: a `source_ip`-keyed hash pick reads the client address, so every
 connection hashes alike and the whole fleet lands on one endpoint. An `l4`
 listener can instead require each connection to open with a PROXY protocol
-header, v1 or v2, which is what AWS NLB, GCP and HAProxy emit:
+header, v1 or v2, as AWS NLB, GCP and HAProxy send:
 
 ```json
 {
@@ -951,24 +955,23 @@ header, v1 or v2, which is what AWS NLB, GCP and HAProxy emit:
 ```
 
 `require` is the only mode. A listener that accepted a header whenever one
-happened to show up would let any client choose its own address, and with
-it its own sticky backend and its own access-log lines. The PROXY protocol
-spec forbids that of receivers, and HAProxy gates the same feature behind
-an explicit `accept-proxy`. A `require` listener closes any connection
-that does not open with a valid header, so it is unusable by anything
-except the proxy in front of it. Turn it on only where the listener is
-reachable exclusively through that proxy.
+showed up would let any client choose its own address, and with it its
+sticky backend and its access-log lines. The PROXY protocol spec forbids
+that for receivers, and HAProxy gates the same feature behind an explicit
+`accept-proxy`. A `require` listener closes any connection that does not
+open with a valid header, so only the proxy in front of it can use it. Turn
+it on only where the listener is reachable exclusively through that proxy.
 
-What the header announces is what zoxy believes everywhere the client
-address is used. A header that announces nothing (v1 `UNKNOWN`, v2
-`LOCAL`, the shapes a balancer's own health checks arrive in) is accepted
-and keeps the observed peer. Headers are capped at 512 bytes: v2 TLVs
-within the cap are skipped, and a declared length past it is refused at
-once. Header bytes never count toward the log's `bytes_in`.
+zoxy uses the announced address everywhere it uses the client address. A
+header that announces nothing (v1 `UNKNOWN` or v2 `LOCAL`, the forms a
+balancer's own health checks arrive in) is accepted and keeps the observed
+peer. Headers are capped at 512 bytes: v2 TLVs within the cap are skipped,
+and a declared length past it is refused at once. Header bytes never count
+towards the log's `bytes_in`.
 
 `zoxy_l4_proxy_header_accepted` and `zoxy_l4_proxy_header_invalid` count
 the verdicts. A rising `invalid` means something other than the configured
-proxy is reaching the listener. `http` listeners reject the block: the L7
+proxy is reaching the listener. `http` listeners reject the block; the L7
 receive phase does not exist yet.
 
 #### X-Forwarded-For
@@ -987,21 +990,21 @@ allowlists, per-client rate limits. An `http` listener can add
 }
 ```
 
-There is no default mode. Each answer is a security bug in the other's
+There is no default mode. Each mode is a security bug in the other's
 position, and zoxy cannot tell from the inside which position it is in.
 
 | mode | behaviour | use when |
 |---|---|---|
-| `replace` | state the peer zoxy observed, discard any inbound chain | **at the edge** — an inbound chain is client-controlled there, so honouring it lets a caller pick the address your allowlists then trust |
-| `append` | extend the inbound chain with the observed peer | **only behind proxies you own** — anywhere else this is the forgery above, appended to |
+| `replace` | state the peer zoxy observed, discard any inbound chain | **at the edge**, where the inbound chain is client-controlled and honouring it lets a caller pick the address your allowlists trust |
+| `append` | extend the inbound chain with the observed peer | **only behind proxies you own**; anywhere else it extends a forged chain |
 
-Omit the block and the header is passed through untouched.
+Omit the block and the header passes through untouched.
 
-The carried chain is bounded. A chain grows by an address per hop and
-nothing in HTTP caps it, so past `forwarded_chain_bytes_max` (512) it is
-dropped *whole*, leaving the line stating only the observed peer. A
+The carried chain is bounded. A chain grows by one address per hop and
+nothing in HTTP caps it, so past `forwarded_chain_bytes_max` (512) zoxy
+drops it *whole*, and the header states only the observed peer. A
 truncated chain would read as complete. `zoxy_forwarded_chain_dropped`
-counts that.
+counts the drops.
 
 Filters may not set `X-Forwarded-For`; the loader rejects it. A filter can
 only write a constant, which would pin one fixed address to every client.
@@ -1010,8 +1013,9 @@ only write a constant, which would pin one fixed address to every client.
 
 An origin behind an `l4` relay has no header to read an address from, so
 the only way to tell it who connected is to open the upstream connection
-with a PROXY protocol header. A *cluster* opts in, because this states
-what its origins expect, the same unit as HAProxy's `send-proxy`:
+with a PROXY protocol header. A *cluster* opts in, because the setting
+states what its origins expect; HAProxy's `send-proxy` sits at the same
+level:
 
 ```json
 "clusters": {
@@ -1023,9 +1027,9 @@ what its origins expect, the same unit as HAProxy's `send-proxy`:
 ```
 
 `send` is `v1` (text, readable in a tcpdump) or `v2` (binary, what cloud
-load balancers speak). The header names the client zoxy believes, which
-behind a `require` listener is the client the *fronting* proxy announced,
-so a chain of proxies carries one identity end to end.
+load balancers speak). The header names the client zoxy believes. Behind a
+`require` listener, that is the client the *fronting* proxy announced, so
+a chain of proxies carries one identity end to end.
 
 The header is per *connection*, with two consequences:
 
@@ -1035,24 +1039,24 @@ The header is per *connection*, with two consequences:
   use [`forwarded`](#x-forwarded-for) instead.
 - Health probes do not send the header. A `tcp` check is unaffected, since
   it proves the port accepts and sends nothing, but an `http` check
-  against a sending cluster probes bare. If the origin strictly requires
-  the header, use `tcp` checks there.
+  against a sending cluster probes without it. If the origin strictly
+  requires the header, use `tcp` checks there.
 
-`zoxy_l4_proxy_header_sent` counts headers staged, one per dialed
+`zoxy_l4_proxy_header_sent` counts headers staged, one per dialled
 connection to a sending cluster.
 
 ### Filters
 
 An `http` listener can carry `request_filters`, a list of rules evaluated
-top-down against each request. Each rule has a match predicate, where an
-absent field matches anything, and a list of actions applied in order.
-Nothing caps the list but the file you write.
+top-down against each request. Each rule has a match predicate (an absent
+field matches anything) and a list of actions applied in order. The list
+has no length cap.
 
-Order decides. The first terminal action a matching rule carries
-(`reject`, `redirect`, `respond` or `allow`) ends the walk, and no rule
-beneath it is read. The first three answer the request; `allow` forwards
-it. Write the specific rule above the general one. This is the opposite
-of [routes](#routing), which are sorted by specificity at load.
+Order matters. The first terminal action (`reject`, `redirect`, `respond`
+or `allow`) in a matching rule ends the walk, and no rule below it is read.
+The first three answer the request; `allow` forwards it. Put specific rules
+above general ones. [Routes](#routing) work the opposite way: they are
+sorted by specificity at load.
 
 ```json
 "request_filters": [
@@ -1074,30 +1078,29 @@ of [routes](#routing), which are sorted by specificity at load.
 ]
 ```
 
-Match on `method`, `host`, `path_prefix`, header predicates (`present`,
-`equals`, `contains`), and `client`, a list of CIDR ranges the
-connection's address must fall inside. Actions are `reject` with a
-status, `redirect`, `respond` (answer from a configured body), `allow`
-(forward and stop reading rules), `header_set`, `header_add`,
-`header_remove`, and `rewrite_prefix`.
+Rules match on `method`, `host`, `path_prefix`, header predicates
+(`present`, `equals`, `contains`), and `client`, a list of CIDR ranges the
+connection's address must fall inside. Actions are `reject` with a status,
+`redirect`, `respond` (answer from a configured body), `allow` (forward and
+stop reading rules), `header_set`, `header_add`, `header_remove`, and
+`rewrite_prefix`.
 
-Only `reject`, `redirect`, `respond` and `allow` end the walk. A rule
-whose actions are all edits, such as the `header_set` above or a
-`rewrite_prefix`, records what the render should do and evaluation
-carries on, so an edit never shields a request from a `reject` written
-beneath it. An `allow` does, which is how an allowlist is written; see
+A rule whose actions are all edits, such as the `header_set` above or a
+`rewrite_prefix`, records what the render should do, and evaluation
+continues. An edit therefore never shields a request from a `reject` below
+it. An `allow` does, which is how you write an allowlist; see
 [matching the client address](#matching-the-client-address).
 
-Rules compile into immutable tables at load and are interpreted with
-bounded loops: no plugins, no scripting, nothing that can allocate or run
-unbounded. A rewrite changes only what is *forwarded*. Routing already
-chose the cluster from the original path, so a rewrite never re-routes.
+Rules compile into immutable tables at load and run in bounded loops. There
+are no plugins and no scripting, and nothing can allocate or run unbounded.
+A rewrite changes only what is *forwarded*: routing has already chosen the
+cluster from the original path, so a rewrite never re-routes.
 
 #### Matching the client address
 
 `client` is a list of CIDR ranges the connection's address must fall
-inside: any-of across the list, conjoined with the rest of the match. On
-its own it refuses a range:
+inside. It matches if the address is in any range on the list, and the
+rest of the match must hold too. With `reject`, it refuses a range:
 
 ```json
 "request_filters": [
@@ -1106,9 +1109,8 @@ its own it refuses a range:
 ]
 ```
 
-With `allow` it admits one range and refuses everyone else. `/admin` from
-the office ranges and nowhere else is two rules whose order is the whole
-rule:
+With `allow`, it admits one range and refuses everyone else. Limiting
+`/admin` to the office ranges takes two rules, in this order:
 
 ```json
 "request_filters": [
@@ -1119,15 +1121,15 @@ rule:
 ]
 ```
 
-`allow` answers nothing and edits nothing. It forwards the request and
-stops the walk, so the office ranges never reach the `reject` beneath and
-everyone else does. `true` is the only value it takes.
+`allow` neither answers nor edits. It forwards the request and stops the
+walk, so the office ranges never reach the `reject` below, and everyone
+else does. `true` is its only value.
 
 > [!IMPORTANT]
-> The rule that admits must be terminal. A `header_set` in its place is
-> an edit, and edits do not stop the walk, so the `reject` beneath would
-> still answer `403` to the office too. Tagging a range for the origin to
-> judge is a useful idiom, but it is a rule with no rule beneath it:
+> The rule that admits must be terminal. A `header_set` in its place is an
+> edit, and edits do not stop the walk, so the `reject` below would still
+> answer `403` to the office too. Tagging a range for the origin to judge
+> is a useful idiom, but only in a rule with no rule below it:
 >
 > ```json
 > "request_filters": [
@@ -1137,19 +1139,19 @@ everyone else does. `true` is the only value it takes.
 > ```
 
 The address matched is the one zoxy believes: the TCP peer, or the
-[PROXY-protocol-announced client](#receiving-proxy-protocol) on a
-listener that requires the header. Never an `X-Forwarded-For` chain,
-which any client can write. Prefixes run to `/32` for IPv4 and `/64` for
-IPv6 (the same rule sticky hashing uses), the `/len` is mandatory, and
+[PROXY-protocol-announced client](#receiving-proxy-protocol) on a listener
+that requires the header. It is never taken from an `X-Forwarded-For`
+chain, which any client can write. Prefixes run to `/32` for IPv4 and `/64`
+for IPv6 (the same rule sticky hashing uses). The `/len` is mandatory, and
 host bits past the prefix are rejected: `10.0.0.1/8` is a typo for one of
 two different ranges, and zoxy will not guess which.
 
 #### Redirects
 
 The two most common edge rules are one action each. Both belong on the
-plaintext `:80` listener: a request that arrived over TLS and is sent back
-to `https://` is a loop, and since the scheme is what the rule states
-rather than what the hop was, only the config can keep the two apart.
+plaintext `:80` listener. Redirecting a request that arrived over TLS to
+`https://` creates a loop, and because the rule states the scheme instead
+of reading it from the hop, only the config can keep the two apart.
 
 ```json
 "request_filters": [
@@ -1160,19 +1162,19 @@ rather than what the hop was, only the config can keep the two apart.
 ]
 ```
 
-The apex rule is written first because the rule under it matches
-*everything*: reversed, `www.example.com` takes the catch-all's 301 to its
-own name and never reaches the 308. A bare catch-all shadows every rule
-beneath it, so a listener that redirects is usually a listener that does
-nothing else. It still needs a `cluster` or `routes` the loader can check,
-but filters run before routing, so nothing is ever dialed.
+The apex rule comes first because the rule below it matches *everything*.
+In the reverse order, `www.example.com` would get the catch-all's 301 to
+its own name and never reach the 308. A bare catch-all shadows every rule
+below it, so a redirecting listener usually does nothing else. It still
+needs a `cluster` or `routes` for the loader to check, but filters run
+before routing, so nothing is ever dialled.
 
-A composed target replaces the scheme, which is required because behind a
-TLS terminator every hop zoxy sees is plaintext, and optionally the host.
-The request's own path and query are carried through. A fixed `location`
-is the other form, sent verbatim. Statuses are `301`, `302`, `307`, `308`.
-Redirects count as `zoxy_l7_redirected` and log as `redirected`, separate
-from rejects, so refused traffic and relocated traffic never blur.
+A composed target replaces the scheme and, optionally, the host. The scheme
+is required because behind a TLS terminator every hop zoxy sees is
+plaintext. The request's own path and query are carried through. The other
+form is a fixed `location`, sent verbatim. Statuses are `301`, `302`, `307`
+and `308`. Redirects count as `zoxy_l7_redirected` and log as `redirected`,
+separately from rejects.
 
 #### Response filters
 
@@ -1193,22 +1195,22 @@ from rejects, so refused traffic and relocated traffic never blur.
 
 A response rule matches on `status` (exact codes), `status_class`
 (`"1xx"` through `"5xx"`), and response-header predicates with the same
-`present`, `equals` and `contains` vocabulary. Its actions are the three
-header verbs only. `reject`, `allow` and `rewrite_prefix` are request-side
-ideas, and the loader says so by name if you reach for them here.
+`present`, `equals` and `contains` vocabulary. Its only actions are the
+three header verbs. `reject`, `allow` and `rewrite_prefix` are request-side
+actions, and the loader names them in its error if you use them here.
 
-The same guardrails hold in both directions: filters may not touch the
+The same guardrails apply in both directions. Filters may not touch the
 headers zoxy owns (`Content-Length`, `Transfer-Encoding`, `Connection` and
-the hop-by-hop set, `X-Forwarded-For`), and a response head that no
-longer fits after edits is answered `502`. Responses zoxy generates itself
-(`404`, `503`, filter rejects, a `respond` action's body) are not origin
-responses and carry no edits.
+the hop-by-hop set, `X-Forwarded-For`), and a response head that no longer
+fits after edits is answered `502`. Responses zoxy generates itself (`404`,
+`503`, filter rejects, a `respond` action's body) are not origin responses
+and get no edits.
 
 ### Response bodies
 
-Every status zoxy sends itself is empty by default. `bodies` names content
-once, from a file read at startup or inline for one-liners, and anything
-that serves content references it by name:
+Every response zoxy generates itself has an empty body by default. `bodies`
+defines content once, from a file read at startup or inline for
+one-liners, and anything that serves content refers to it by name:
 
 ```json
 "bodies": {
@@ -1220,30 +1222,30 @@ that serves content references it by name:
 "error_pages": { "404": "not-found", "503": "maintenance" }
 ```
 
-Each name is read once and rendered once, however many places serve it,
-so the same maintenance page on `error_pages` and three filter rules is
-one buffer. A name that does not exist is a startup error. `content_type`
-is required; nothing is guessed from a filename. Files are read at
-startup like the rest of the config, so **changing one needs a restart**.
+Each body is read and rendered once, however many places serve it, so the
+same maintenance page used by `error_pages` and three filter rules is one
+buffer. Referring to a name that does not exist is a startup error.
+`content_type` is required; nothing is guessed from a filename. Files are
+read at startup like the rest of the config, so **changing one needs a
+restart**.
 
-`error_pages` accepts only the statuses zoxy actually sends: `400`,
-`403`, `404`, `408`, `413`, `414`, `429`, `431`, `501`, `502`, `503`,
-`504`. A page for anything else is refused at load.
+`error_pages` accepts only the statuses zoxy sends: `400`, `403`, `404`,
+`408`, `413`, `414`, `429`, `431`, `501`, `502`, `503`, `504`. A page for
+anything else is refused at load.
 
-Every response zoxy answers *itself* (those pages, the empty defaults, the
-redirects) carries a `Date` and `Server: zoxy`. Responses from an origin
-are forwarded with the origin's own headers and gain neither, so
-`Server: zoxy` on a `503` tells you the proxy raised it and the backend
-was never asked.
+Every response zoxy generates *itself* (these pages, the empty defaults,
+redirects) carries `Date` and `Server: zoxy`. Responses from an origin keep
+the origin's own headers and gain neither, so `Server: zoxy` on a `503`
+tells you the proxy raised it and the backend was never asked.
 
 Bodies live in memory. A `503` is raised because something ran out, so an
-error page whose delivery needed a resource would fail exactly when it is
-needed. The cost is capped per body, counted in the startup banner, and
-paid once per process.
+error page that needed a resource to be delivered would fail exactly when
+it is needed. The cost is capped per body, counted in the startup banner
+and paid once per process.
 
-**Listing a status is the opt-in, including for sheds.** Leave `503` out
-and overload answers an empty `503` as before; put it in and the page is
-served. There is no second switch.
+**Listing a status opts in, including for sheds.** Leave `503` out and
+overload gets an empty `503`; list it and the page is served. There is no
+second switch.
 
 #### Serving a body directly
 
@@ -1257,10 +1259,10 @@ served. There is no second switch.
 ```
 
 `respond` answers from a body instead of forwarding: a `robots.txt`, a
-maintenance window, a health target the balancer serves itself. It stops
-the request like `reject` and `redirect` do, but counts as
-`zoxy_l7_responded` and logs as `responded`, since refusing traffic and
-serving it are different facts. Statuses are `200` plus the error set.
+maintenance page, a health target the balancer serves itself. Like
+`reject` and `redirect`, it ends the request, but it counts as
+`zoxy_l7_responded` and logs as `responded`. Statuses are `200` plus the
+error statuses listed above.
 
 ### Timeouts
 
@@ -1277,67 +1279,67 @@ serving it are different facts. Statuses are `200` plus the error set.
 }
 ```
 
-The whole block is optional, and so is every field in it; the values
-above are the defaults. An explicit `0` disables the three caps. For
-`connect_ms` and `idle_ms` it is rejected, since a zero-length dial or
-idle budget is a mistake rather than a policy.
+The block and every field in it are optional; the values above are the
+defaults. An explicit `0` disables the three caps. For `connect_ms` and
+`idle_ms`, `0` is rejected: a zero-length dial or idle budget is a mistake,
+not a policy.
 
 > [!WARNING]
 > `connect_ms` must be **strictly below** `head_ms`, which must be at or
 > below `idle_ms`, or the config is rejected at load. zoxy keeps one timer
 > per connection and never moves it earlier once armed. The first deadline
-> is the dial budget and the dial's completion re-arms it to the idle one,
-> so an idle budget that does not exceed the dial budget would reap late
-> instead of taking effect. This bites when only one field is tuned:
-> raising `connect_ms` past the default 60 s `idle_ms` is rejected just
-> the same. `head_ms` sits between them for the same reason: it is
-> re-based down from the idle deadline when the client's first byte
-> lands, and down again to `connect_ms` at the dial.
+> is the dial budget, and the dial's completion re-arms the timer to the
+> idle budget, so an idle budget no longer than the dial budget would reap
+> late instead of taking effect. Tuning only one field can trip this:
+> raising `connect_ms` past the default 60 s `idle_ms` is rejected too.
+> `head_ms` sits between them for the same reason: it is re-based down from
+> the idle deadline when the client's first byte lands, and down again to
+> `connect_ms` at the dial.
 
 | field | default | meaning |
 |---|---|---|
 | `connect_ms` | `5000` | per-try upstream connect budget |
-| `head_ms` | derived | budget for reading one request head — what a slowloris meets, and is answered `408` for. A connection that has said nothing at all is not under it, so a monitoring probe that connects and leaves earns silence. 10 s, clamped between `connect_ms` and `idle_ms` so it never changes a config that predates it |
-| `idle_ms` | `60000` | how long a connection may stay quiet — between requests, or before its first byte |
+| `head_ms` | derived | budget for reading one request head; a slowloris gets `408`. It applies from the first byte, so a probe that connects and leaves gets no reply. 10 s, clamped between `connect_ms` and `idle_ms` so older configs behave as before |
+| `idle_ms` | `60000` | how long a connection may stay quiet, between requests or before its first byte |
 | `drain_deadline_ms` | `0` | how long a `SIGTERM` drain waits before reaping stragglers; `0` waits for the last connection |
-| `max_lifetime_ms` | `0` | absolute connection-age cap regardless of activity; `0` disables |
-| `request_ms` | `0` | cap on one L7 exchange, **not** refreshed by activity — bounds a request that is merely slow, where `idle_ms` only bounds one that has stalled; `0` disables |
-| `tunnel_ms` | `3600000` | whole life of a [tunnelled upgrade](#tunnelled-upgrades-websocket), replacing the three above once one is established; 1 s to 1 day, and `0` is **not** legal |
+| `max_lifetime_ms` | `0` | absolute connection-age cap, regardless of activity; `0` disables |
+| `request_ms` | `0` | cap on one L7 exchange, **not** refreshed by activity. Bounds a slow request; `idle_ms` only bounds a stalled one. `0` disables |
+| `tunnel_ms` | `3600000` | whole life of a [tunnelled upgrade](#tunnelled-upgrades-websocket); replaces the three above once one is established. 1 s to 1 day; `0` is **not** allowed |
 | `health_interval_ms` | `2000` | pause between health-probe sweeps |
-| `loop_watchdog_ms` | absent | kill this process if its event loop completes nothing for this long. Absent is off; 2 s minimum |
+| `loop_watchdog_ms` | absent | kill the process if its event loop completes nothing for this long. Off when absent; 2 s minimum |
 
-`loop_watchdog_ms` is the one deadline here that is not about a
-connection. Every other row is a timer the event loop delivers, so none
-of them can bound the loop itself: a loop parked in a blocking call
-delivers nothing, including the timer that would have reported it, and
-what you see is a process that is alive, passing health checks, holding
-its listeners and answering nothing. Set this and the kernel gets a bound
-the loop cannot silence: an `alarm(2)`, pushed out by a tick the loop has
-to deliver, which fires only when the loop stops. The process writes one
-line to stderr and exits **6**, so a supervisor replaces it.
+`loop_watchdog_ms` is the only deadline here that is not about a
+connection. The event loop delivers every other timer in this table, so
+none of them can bound the loop itself. A loop stuck in a blocking call
+delivers nothing, including the timer that would report it: the process is
+alive, passes health checks, holds its listeners and answers nothing. This
+setting gives the kernel a bound the loop cannot silence: an `alarm(2)`,
+pushed out by a tick the loop must deliver, which fires only when the loop
+stops. The process then writes one line to stderr and exits **6**, so a
+supervisor replaces it.
 
-It is off unless you name a number, because what counts as a stall
-depends on the box (one that swaps has longer legitimate pauses) and a
-false positive restarts a healthy proxy. Under `SO_REUSEPORT` it matters
-most: the kernel keeps hashing new connections onto a stalled process, so
-one that exits is replaced while one that hangs takes its share of the
+It is off unless you set a value, because what counts as a stall depends on
+the machine (one that swaps has longer legitimate pauses), and a false
+positive restarts a healthy proxy. It matters most under `SO_REUSEPORT`:
+the kernel keeps hashing new connections onto a stalled process, so a
+process that exits is replaced, while one that hangs takes its share of the
 group down with it.
 
-`drain_deadline_ms` defaults to waiting indefinitely. nginx, HAProxy and
-Caddy all wait forever by default, Traefik picks 10 s and Envoy 600 s.
-Whatever sent the signal already owns the upper bound (systemd's
-`TimeoutStopSec`, Kubernetes' `terminationGracePeriodSeconds`) and ends
-the wait with `SIGKILL`. Set a number here when you want zoxy to give up
-before your platform does.
+`drain_deadline_ms` waits indefinitely by default, as nginx, HAProxy and
+Caddy do; Traefik defaults to 10 s and Envoy to 600 s. Whatever sent the
+signal already owns the upper bound (systemd's `TimeoutStopSec`,
+Kubernetes' `terminationGracePeriodSeconds`) and ends the wait with
+`SIGKILL`. Set a number here if you want zoxy to give up before your
+platform does.
 
 ### Limits
 
-Optional. The compiled constants are hard ceilings; this block sizes the
-actual pools anywhere from 1 up to them, so a small deployment neither
-reserves nor demands the ceiling's resources. The conditional keys,
-`tls_engines`, `tunnels`, `h2_connections` and `stream_slots`, are absent
-below: each is refused unless the feature it sizes is configured. They are
-described further down.
+The block is optional. The compiled constants are hard ceilings; this block
+sizes the actual pools anywhere from 1 up to them, so a small deployment
+neither reserves nor demands the ceiling's resources. The conditional keys
+(`tls_engines`, `tunnels`, `h2_connections` and `stream_slots`) are left
+out of the example below, because each is refused unless the feature it
+sizes is configured. They are described further down.
 
 ```json
 "limits": {
@@ -1350,68 +1352,69 @@ described further down.
 }
 ```
 
-The defaults are lean: 1386 connection slots, 1386 relay buffer pairs,
+The defaults are small: 1386 connection slots, 1386 relay buffer pairs and
 1311 upstream slots, roughly 34 MiB of pools, sized to start under a stock
-4096 `RLIMIT_NOFILE`. The ceiling is 11457 of each. Raising the pools
-raises the file-descriptor demand, which zoxy asserts against
-`RLIMIT_NOFILE` at startup rather than discovering as `EMFILE` later.
+4096 `RLIMIT_NOFILE`. The ceiling is 11457 of each. Larger pools demand
+more file descriptors, which zoxy asserts against `RLIMIT_NOFILE` at
+startup instead of discovering as `EMFILE` later.
 
-`head_buffers` and `upstream_head_buffers` bound *request heads in flight*
-rather than open connections. Idle keep-alive connections and parked
-origin connections hold no head buffer, so these default to their
-never-shedding ceilings (`conn_slots` and `upstream_slots`) and are the
-knobs a keep-alive-heavy deployment trades down for memory.
-`head_buffer_bytes` sizes every head buffer and is therefore the largest
-HTTP head accepted; oversize requests are answered `414` or `431`. Raise
-it for big-cookie or JWT traffic. 1 KiB to 1 MiB, default 8 KiB.
+`head_buffers` and `upstream_head_buffers` bound *request heads in flight*,
+not open connections. Idle keep-alive connections and parked origin
+connections hold no head buffer, so these default to their never-shedding
+ceilings (`conn_slots` and `upstream_slots`). A keep-alive-heavy deployment
+can lower them to save memory. `head_buffer_bytes` sizes every head buffer,
+so it is also the largest HTTP head accepted; larger requests are answered
+`414` or `431`. Raise it for big-cookie or JWT traffic. 1 KiB to 1 MiB,
+default 8 KiB.
 
 `tls_engines` bounds *TLS sessions in flight*, handshaking or terminated,
-and is zero unless some listener has a `tls` block. It decides what a TLS
-deployment costs: an engine is by far the largest per-connection object
-zoxy holds, about 92 KiB plus a 32 KiB plaintext buffer, so 1024 of them
-is roughly 170 MiB. It defaults to your connection slots capped at 1024,
-and the startup banner prints the total. Lower it if that is more
-concurrent TLS than you serve.
+and is zero unless a listener has a `tls` block. It decides what a TLS
+deployment costs: an engine is the largest per-connection object zoxy
+holds, about 92 KiB plus a 32 KiB plaintext buffer, so 1024 of them is
+roughly 170 MiB. It defaults to `conn_slots` capped at 1024, and the
+startup banner prints the total. Lower it if you serve less concurrent TLS
+than that.
 
 `tunnels` bounds concurrent
-[tunnelled upgrades](#tunnelled-upgrades-websocket) and is zero unless
-some listener names an `upgrades` allowlist, in which case it is
-**required**, since no default can be derived for it. Each costs one
-relay-buffer pair (8200 bytes), held for the tunnel's whole life, which
-is why they are reserved apart from `relay_buffers`.
+[tunnelled upgrades](#tunnelled-upgrades-websocket). It is zero unless a
+listener has an `upgrades` allowlist, in which case it is **required**,
+since no default can be derived for it. Each tunnel holds one relay-buffer
+pair (8200 bytes) for its whole life, which is why tunnels are reserved
+apart from `relay_buffers`.
 
 `h2_connections` and `stream_slots` size [HTTP/2](#http2) and are zero
-unless some listener speaks it, in which case `stream_slots` is
-**required**. Each HTTP/2 connection holds a session of about 100 KiB and
-each stream slot a head buffer; the banner prints both.
+unless a listener speaks it, in which case `stream_slots` is **required**.
+Each HTTP/2 connection holds a session of about 100 KiB and each stream
+slot a head buffer; the banner prints both.
 
 `keepalive_requests` lives on an `http` listener beside `max_body_bytes`,
 not in `limits`, because it reserves nothing and states policy. It bounds
 how many requests one client connection may serve: **1000 by default**,
-nginx's figure, and `0` is unlimited. It is the one bound that reaches a
-*busy* connection. `idle_ms` reaps one that stops speaking and
+nginx's figure; `0` is unlimited. It is the only bound that reaches a
+*busy* connection. `idle_ms` reaps one that goes quiet and
 `max_lifetime_ms` one that has been open too long, but neither touches a
-connection that keeps asking, which is the one holding a conn slot and,
-on every request, a head buffer and an upstream lease. Past the cap the
-next response announces `Connection: close`, never a silent reset, and the
-client reconnects. On HTTP/2 the cap counts a connection's streams. The
-stream that reaches it ends the connection with `GOAWAY(NO_ERROR)`: the
-streams before it finish, and any the client opened after it are refused
-with `REFUSED_STREAM`, for it to retry on a new connection.
-`zoxy_l7_keepalive_requests_capped` counts each capped connection once,
-and only where the cap is the *binding* reason, so a rising count is the
-cap working rather than churn it coincided with.
+connection that keeps sending requests, and that is the one holding a conn
+slot and, on every request, a head buffer and an upstream lease. Past the
+cap, the next response announces `Connection: close` (never a silent
+reset) and the client reconnects. On HTTP/2 the cap counts a connection's
+streams. The stream that reaches it ends the connection with
+`GOAWAY(NO_ERROR)`: earlier streams finish, and any the client opened after
+it are refused with `REFUSED_STREAM`, for the client to retry on a new
+connection. `zoxy_l7_keepalive_requests_capped` counts each capped
+connection once, and only where the cap is the *binding* reason, so a
+rising count means the cap is working, not churn it happened to coincide
+with.
 
-A parked *upstream* connection is not capped, where nginx caps both. It
-is shared across clients and carries the reuse the design rests on, and
-the occupancy this bounds is a client's, not an origin's. An origin that
-wants its own bound can announce it, and zoxy honours what an origin says
-about persistence.
+Parked *upstream* connections are not capped, though nginx caps both. They
+are shared across clients and carry the reuse the design rests on, and the
+occupancy this cap bounds is a client's, not an origin's. An origin that
+wants its own bound can announce it; zoxy honours what an origin says about
+persistence.
 
-`cq_fill_eighths` trades connection ceiling for `io_uring`
-completion-queue burst headroom; `access_log_buffer_bytes` sizes the
-access log's staging buffers. What zoxy does when one of these pools runs
-out is [Under load](#under-load).
+`cq_fill_eighths` trades connection ceiling for `io_uring` completion-queue
+burst headroom; `access_log_buffer_bytes` sizes the access log's staging
+buffers. [Under load](#under-load) covers what zoxy does when one of these
+pools runs out.
 
 ## Observability
 
@@ -1424,16 +1427,16 @@ every lifecycle counter, and live pool-occupancy gauges.
 "admin": { "bind": "127.0.0.1:9100" }
 ```
 
-One scrape is served at a time from a slot reserved outside the data-path
-pools, so a scrape and a request can never shed one another. This listener
+One scrape is served at a time, from a slot reserved outside the data-path
+pools, so a scrape and a request can never shed each other. This listener
 is the only way to read live counters; no signal prints them, because a
 second snapshot on one stream invalidates the first.
 
-The gauges matter as much as the counters: a `shed_*` counter only moves
-once a wall is hit, while `zoxy_conn_slots_in_use` against
+Watch the gauges as well as the counters: a `shed_*` counter moves only
+once a limit is hit, while `zoxy_conn_slots_in_use` against
 `zoxy_conn_slots_capacity` shows the approach.
 
-The scrape also says **which backend**, per cluster and endpoint:
+The scrape also shows **which backend**, per cluster and endpoint:
 
 ```text
 zoxy_endpoint_responses{cluster="api",endpoint="10.0.0.1:8080"} 4182
@@ -1442,20 +1445,20 @@ zoxy_endpoint_health_down{cluster="api",endpoint="10.0.0.2:8080"} 2
 zoxy_endpoint_healthy{cluster="api",endpoint="10.0.0.2:8080"} 0
 ```
 
-Dial failures, responses served and the health transitions
+Dial failures, responses served and health transitions
 (`endpoint_health_down` and `_up`) carry both labels. The "every endpoint
 was full" sheds carry only `cluster`, since no single endpoint was full.
-Two gauges read live state: `zoxy_endpoint_inflight` is the level the
+Two gauges show live state: `zoxy_endpoint_inflight` is the level the
 balancer compares, and `zoxy_endpoint_healthy` is the prober's current
-verdict, rendered for health-checked clusters only. Each labeled family
-sums to the bare process total it breaks down, an identity the simulator
-asserts on every seed. Label cardinality is bounded by the config
+verdict, rendered for health-checked clusters only. Each labelled family
+sums to the unlabelled process total it breaks down, an identity the
+simulator asserts on every seed. The config bounds label cardinality
 (endpoints and cluster names, never request data), and the startup banner
-prices what the labels and their render buffers cost.
+prices the labels and their render buffers.
 
 #### Rate, Errors, Duration
 
-Two families give a scrape the rest of the RED triad:
+Two families complete the RED triad:
 
 ```text
 zoxy_cluster_responses{cluster="api",class="2xx"} 4182
@@ -1466,7 +1469,7 @@ zoxy_cluster_duration_seconds_sum{cluster="api"} 12.884901888
 zoxy_cluster_duration_seconds_count{cluster="api"} 4199
 ```
 
-`cluster_responses` is the status the client actually received, classed.
+`cluster_responses` counts the status the client received, by class.
 Without it, only statuses the proxy generated had counters (the `shed_`
 ladder, `l7_bad_gateway`, `l7_gateway_timeout`), and an origin returning
 `500` to every request showed up only in the access log.
@@ -1474,20 +1477,20 @@ ladder, `l7_bad_gateway`, `l7_gateway_timeout`), and an origin returning
 `cluster_duration_seconds` is a standard Prometheus histogram, so
 `histogram_quantile` works on it directly.
 
-Both are labelled by **cluster**, not endpoint. The per-endpoint families
-are what make a large deployment's exposition large, and per-endpoint
-`5xx` is already acted on by [passive ejection](#passive-ejection).
-Cluster is the granularity that answers "which backend got slow" without
-multiplying the axis that already dominates.
+Both are labelled by **cluster**, not endpoint. Per-endpoint families are
+what make a large deployment's exposition large, and per-endpoint `5xx` is
+already acted on by [passive ejection](#passive-ejection). Cluster
+granularity answers "which backend got slow" without multiplying the axis
+that already dominates.
 
-The bucket ladder is compiled in: eighteen boundaries, 2.5× apart from
-25 µs to 10 s, so every zoxy's histogram is directly comparable to every
+The bucket ladder is compiled in: eighteen boundaries, 2.5× apart, from
+25 µs to 10 s. Every zoxy's histogram is therefore comparable with every
 other's, and `_sum` and `_count` give an exact mean whatever the buckets
 do.
 
 Only **completed** exchanges are observed. An exchange the client cut off
 mid-response is not in the histogram, so p99 measures how long serving
-takes rather than how long clients wait before giving up. Those show as
+takes, not how long clients wait before giving up. Those exchanges show as
 `outcome: aborted` in the access log. `_count` therefore equals
 `zoxy_l7_responses` exactly, an identity the simulator asserts on every
 seed.
@@ -1505,21 +1508,21 @@ timeouts included) and one per L4 connection.
 {"time":"2026-07-31T09:14:22.481Z","kind":"http","outcome":"ok","client":"10.1.2.3:52344","method":"GET","host":"api.example.com","path":"/v1/items","status":200,"upstream_reused":true,"upstream_replayed":false,"duration_us":1873,"bytes_in":142,"bytes_out":4096,"cluster":"api","upstream":"10.0.0.7:8080"}
 ```
 
-`outcome` is what `status` cannot tell you: an origin answering `503` and
-zoxy shedding a request with `503` are the same three digits and opposite
-events. It reads `ok`, `rejected`, `shed`, `timed_out`, `upstream_failed`,
-`aborted`, or `closed`. The last is for L4 connections and for
-[tunnels](#tunnelled-upgrades-websocket), which end the way a relay ends
-rather than the way an exchange does.
+`outcome` tells you what `status` cannot: an origin answering `503` and
+zoxy shedding a request with `503` share a status code but are opposite
+events. Its values are `ok`, `rejected`, `shed`, `timed_out`,
+`upstream_failed`, `aborted` and `closed`. `closed` is for L4 connections
+and [tunnels](#tunnelled-upgrades-websocket), which end as a relay ends,
+not as an exchange does.
 
-Logging never blocks the event loop, so a sink that stalls costs dropped
-lines rather than latency. `zoxy_access_log_dropped` counts them exactly.
+Logging never blocks the event loop: a stalled sink costs dropped lines,
+not latency. `zoxy_access_log_dropped` counts them exactly.
 
 #### Logging request headers
 
-By default a zoxy line and the backend's line for the same request share
-no key, so a slow request cannot be attributed to a hop. Naming headers
-fixes that without changing a byte on the wire:
+By default, zoxy's line and the backend's line for the same request share
+no key, so you cannot attribute a slow request to a hop. Naming headers to
+log fixes that without changing a byte on the wire:
 
 ```json
 "access_log": {
@@ -1533,55 +1536,55 @@ fixes that without changing a byte on the wire:
 {"...":"...","status":200,"upstream_reused":true,"upstream_replayed":false,"request_headers":{"x-request-id":"7f3c…","user-agent":"curl/8.6.0"},"response_headers":{"x-cache":"HIT"},"duration_us":1873}
 ```
 
-zoxy does not mint an identifier. It is usually not the outermost hop: a
-CDN, cloud LB or ingress in front almost always sets `X-Request-ID` or
-`traceparent`, and that header reaches the origin untouched, so logging it
-at both ends is the whole join. The same mechanism serves other purposes:
-`User-Agent` for traffic analysis, a tenant header for multi-tenant
-routing, the origin's `X-Cache` on the way out.
+zoxy does not generate a request identifier. It is usually not the
+outermost hop: a CDN, cloud load balancer or ingress in front almost always
+sets `X-Request-ID` or `traceparent`, and that header reaches the origin
+untouched, so logging it at both ends is all the join needs. The same
+mechanism serves other uses: `User-Agent` for traffic analysis, a tenant
+header for multi-tenant routing, the origin's `X-Cache` on the way out.
 
-Names are matched case-insensitively and logged lowercased. A header that
-did not arrive is omitted rather than logged as null. A repeated header
-logs its first value, the one zoxy itself read. Values are truncated at
-256 bytes with a trailing `...`, and up to 8 headers may be named across
-both lists. `response_headers` is ignored for L4 lines, which have no
-response to read. Absent lists leave the line exactly as it was.
+Names match case-insensitively and are logged in lowercase. A header that
+did not arrive is omitted, not logged as null. A repeated header logs its
+first value, the one zoxy itself read. Values are truncated at 256 bytes
+with a trailing `...`. Up to 8 headers may be named across both lists.
+`response_headers` is ignored for L4 lines, which have no response to read.
+Without the lists, the line is unchanged.
 
 The values are held per connection for the life of a request, so naming
-headers costs memory proportional to `conn_slots`, which the startup
-banner prints. A wider line also needs a staging buffer that can hold
-one; zoxy refuses to start rather than dropping every line that carries
-them.
+headers costs memory proportional to `conn_slots`; the startup banner
+prints it. A wider line also needs a staging buffer that can hold it. If
+the buffer is too small, zoxy refuses to start instead of dropping every
+line that carries headers.
 
-`sink` is either `stdout`, the process's own standard output, inherited
-rather than opened, so it costs no file descriptor and has no rotation
-story of its own, or `file` with a `path`:
+`sink` is either `stdout` or `file`. `stdout` is the process's own standard
+output, inherited, not opened, so it costs no file descriptor and has no
+rotation of its own. `file` takes a `path`:
 
 ```json
 "access_log": { "sink": "file", "path": "/var/log/zoxy/access.log" }
 ```
 
 The file is created if absent and opened append-only at startup, never
-truncated, which is what makes copy-truncate rotation (logrotate) safe:
-every write lands at the current end, wherever the rotation just put it.
+truncated. That makes copy-truncate rotation (logrotate) safe: every write
+lands at the current end of the file, wherever rotation just left it.
 
-Move-based rotation is served by `SIGHUP`, which reopens the configured
-path. The new fd opens *first*: a reopen that cannot open its file keeps
-the old one and counts `zoxy_access_log_reopen_failed`, because a failed
-rotation must not destroy a working log. The swap happens only between
-writes, never under one, so every line accepted after the signal lands in
-the new file. `zoxy_access_log_reopened` counts the rotations that took.
-A successful reopen also heals a sink that had broken, since what broke
-was the fd the rotation just replaced. On a `stdout` sink, or with no log
-configured, `SIGHUP` is a no-op.
+For move-based rotation, send `SIGHUP`, which reopens the configured path.
+The new fd opens *first*: if the reopen cannot open its file, zoxy keeps
+the old one and counts `zoxy_access_log_reopen_failed`, so a failed
+rotation never destroys a working log. The swap happens only between
+writes, never during one, so every line accepted after the signal lands in
+the new file. `zoxy_access_log_reopened` counts successful rotations. A
+successful reopen also repairs a sink that had broken, since what broke was
+the fd the rotation just replaced. On a `stdout` sink, or with no log
+configured, `SIGHUP` does nothing.
 
 ### Proxy-Status
 
-The access log answers you. This answers the client. A `503` from an
-overloaded zoxy and a `503` from a healthy zoxy relaying an overloaded
-backend are indistinguishable on the wire, and only one of them is your
-problem. Setting `proxy_status` on an `http` listener makes the pages
-zoxy renders *itself* say so, in an RFC 9209 `Proxy-Status` field:
+The access log informs you; `Proxy-Status` informs the client. A `503` from
+an overloaded zoxy and a `503` from a healthy zoxy relaying an overloaded
+backend look the same on the wire, and only one of them is your problem.
+Set `proxy_status` on an `http` listener and the pages zoxy renders
+*itself* say which, in an RFC 9209 `Proxy-Status` field:
 
 ```json
 {
@@ -1605,91 +1608,90 @@ Four causes carry a token, and only those four:
 
 | cause | status | `error=` |
 |---|---|---|
-| no route matched — zoxy never dialed a backend, so the origin was not asked about this path | `404` | `destination_not_found` |
-| a [filter](#filters) refused on policy — zoxy's rule, not the origin's answer | the status the rule names (`400`/`403`/`404`/`429`) | `http_request_denied` |
-| a zoxy limit, any rung of the shed ladder — slots, buffers, tunnels, per-endpoint in-flight | `503` | `connection_limit_reached` |
-| the backend was dialed and did not answer in time | `504` | `http_response_timeout` |
+| no route matched; no backend was dialled | `404` | `destination_not_found` |
+| a [filter](#filters) refused on policy | the rule's status (`400`/`403`/`404`/`429`) | `http_request_denied` |
+| a zoxy limit: any shed-ladder rung (slots, buffers, tunnels, per-endpoint in-flight) | `503` | `connection_limit_reached` |
+| the backend was dialled and did not answer in time | `504` | `http_response_timeout` |
 
 The token names the **cause, not the status**. A filter rejecting with
-`404` and an empty routing table answering `404` are the same three
-digits and different advice: one means "ask someone else", the other
-means "you were refused".
+`404` and an empty routing table answering `404` share a status code but
+give different advice: one means "ask someone else", the other means "you
+were refused".
 
-Everything else is silent. A `400`, `413`, `414` or `431` that is the
-request's own fault gets nothing, because 9209's only fitting token
-(`http_request_error`) restates the status line. A `502` is skipped for
-the opposite reason: a refused dial, a reset mid-response and a malformed
-origin head are three different 9209 causes that zoxy answers at one
-place, so any single token would be right by accident. A `Proxy-Status`
-from zoxy therefore always carries something the status line did not.
+Everything else gets no field. A `400`, `413`, `414` or `431` that is the
+request's own fault gets nothing, because RFC 9209's only fitting token
+(`http_request_error`) restates the status line. A `502` is skipped for the
+opposite reason: a refused dial, a reset mid-response and a malformed
+origin head are three different 9209 causes that zoxy handles in one place,
+so any single token would be right only by accident. A `Proxy-Status` from
+zoxy therefore always says something the status line does not.
 
 What it does not do:
 
-- **No `next-hop`.** 9209 allows naming the backend; that publishes your
-  topology to every client that can provoke an error. The endpoint is in
-  the access log.
+- **No `next-hop`.** RFC 9209 allows naming the backend, but that would
+  publish your topology to every client that can provoke an error. The
+  endpoint is in the access log.
 - **An upstream proxy's field survives.** `Proxy-Status` is a List, and
   zoxy sets it only on pages it renders itself. A relayed response carries
   whatever the hop before it wrote, unedited, so a chain reads back in
   order.
-- **Configured error pages win.** A status you gave a body for in
+- **Configured error pages win.** A status you gave a body in
   `error_pages` is sent exactly as you wrote it, header included or not.
 - **Forwarded responses are untouched.** An origin's own `503` is relayed
   as the origin wrote it.
 
 > [!IMPORTANT]
-> Off by default, and per listener, on the same reasoning as
+> Off by default and set per listener, for the same reason as
 > [`forwarded`](#x-forwarded-for): the field states which of *this
 > proxy's* limits a caller hit. Inside a mesh that is a diagnostic; at an
-> untrusted edge it is a capacity disclosure, and zoxy cannot tell from
-> the inside which side of that line a listener is on.
+> untrusted edge it is a capacity disclosure, and zoxy cannot tell from the
+> inside which side of that line a listener is on.
 
 ## Under load
 
 When a resource is exhausted, zoxy degrades the newest work, keeps serving
 admitted work, and never allocates, blocks or dies. Every limit has a
-defined answer rather than an unbounded queue.
+defined answer instead of an unbounded queue.
 
 - **Exhaustion sheds at a defined point.** No connection slot: the socket
-  is closed with an RST, so the client learns immediately instead of
-  timing out. No relay buffer or upstream slot for an HTTP request: a
-  static `503` from constant memory, and the connection is kept when the
-  client's byte stream is still on a message boundary, because closing
-  costs more than the work being shed.
+  is closed with an RST, so the client learns immediately instead of timing
+  out. No relay buffer or upstream slot for an HTTP request: a static `503`
+  from constant memory. The connection is kept if the client's byte stream
+  is still on a message boundary, because closing costs more than the work
+  being shed.
 - **A tunnel is refused before it costs anything.** No tunnel slot: the
-  upgrade is answered `503` before the handshake is forwarded, so a
-  refusal never spends an origin connection.
-- **Watermarks before walls.** Each pool raises a pressure flag at 3/4
+  upgrade is answered `503` before the handshake is forwarded, so a refusal
+  never spends an origin connection.
+- **Watermarks before limits.** Each pool raises a pressure flag at 3/4
   occupancy and lowers it only once it has drained back to 1/2; the gap
-  stops the flag flapping around a single threshold. While it is raised,
-  idle timeouts are cut to a quarter, so quiet connections return their
-  resources before the wall is reached.
+  stops the flag flapping around a single threshold. While the flag is
+  raised, idle timeouts are cut to a quarter, so quiet connections return
+  their resources before the pool runs out.
 - **Accept never pauses.** The kernel backlog stays drained even while
-  shedding, so clients get an immediate signal rather than a timeout.
-- **`SIGTERM` drains.** Listeners close, keep-alive stops being honoured,
-  in-flight work finishes under `drain_deadline_ms`, then the process
-  exits 0.
-- **A stalled loop is a death, not a hang, if you ask for one.**
-  `timeouts.loop_watchdog_ms` arms an `alarm(2)` that a tick the loop
-  delivers keeps pushing out, so a loop that stops delivering is ended by
-  the kernel with exit **6** and one line on stderr. Off unless
-  configured.
-- **The budget is printed, not hoped for.** Startup prints the closed-form
-  memory, file-descriptor and ring-op totals it will never exceed, and
-  asserts the fd count against `RLIMIT_NOFILE` before serving anything.
+  shedding, so clients get an immediate signal instead of a timeout.
+- **`SIGTERM` drains.** Listeners close, keep-alive is no longer honoured,
+  in-flight work finishes under `drain_deadline_ms`, then the process exits
+  0.
+- **A stalled loop can exit instead of hanging.**
+  `timeouts.loop_watchdog_ms` arms an `alarm(2)` that each tick the loop
+  delivers pushes out, so a loop that stops delivering is ended by the
+  kernel with exit **6** and one line on stderr. Off unless configured.
+- **The budget is printed up front.** Startup prints the closed-form
+  memory, file-descriptor and ring-op totals the process will never exceed,
+  and asserts the fd count against `RLIMIT_NOFILE` before serving anything.
 
-[DESIGN.md](DESIGN.md) §8 documents each rung and why it answers the way
-it does.
+[DESIGN.md](DESIGN.md) §8 documents each rung and why it answers the way it
+does.
 
 ## Further reading
 
-- [DESIGN.md](DESIGN.md) — the settled design: what is shipped and how it
-  works. The bare `§` references in this document, in the source and in commit
-  messages all point here.
-- [TIGER_STYLE.md](TIGER_STYLE.md) — the coding rules the tree is held to:
-  static allocation only, bounded loops, assertion density, explicitly-sized
-  integers.
-- [IMPLEMENTATION_NOTES.md](IMPLEMENTATION_NOTES.md) — measured findings,
+- [DESIGN.md](DESIGN.md): the settled design, covering what has shipped and
+  how it works. The bare `§` references in this document, in the source and
+  in commit messages all point here.
+- [TIGER_STYLE.md](TIGER_STYLE.md): the coding rules the tree is held to
+  (static allocation only, bounded loops, assertion density,
+  explicitly sized integers).
+- [IMPLEMENTATION_NOTES.md](IMPLEMENTATION_NOTES.md): measured findings,
   shelved experiments and open technical questions.
-- [zoxy.io/config](https://zoxy.io/config/) — every field, bound and default,
+- [zoxy.io/config](https://zoxy.io/config/): every field, bound and default,
   rendered from the JSON Schema of the latest release.
