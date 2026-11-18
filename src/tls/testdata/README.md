@@ -58,3 +58,32 @@ openssl x509 -req -in leaf.csr -CA origin-ca.pem -CAkey origin-ca-key.pem \
   -set_serial 2 -not_before 20190101000000Z -not_after 20490101000000Z \
   -extfile leaf.ext -out origin-cert.pem   # leaf.ext: CA:FALSE, the SAN, serverAuth
 ```
+
+## Client trust fixtures (#304, mutual TLS on a listener)
+
+The same shape for the other direction, valid 2019 to 2049:
+
+- `client-ca.pem`: a P-256 CA (`CA:TRUE`) a listener's `client_ca` trusts.
+  Its key was deleted once it had signed the leaf.
+- `client-cert.pem` and `client-key.pem`: the client leaf it signed,
+  `CN=client.zoxy.test`, `CA:FALSE`, `extendedKeyUsage=clientAuth`, and
+  its key, which a test client presents. Its SHA-256 fingerprint is
+  `F1FD192CFF76490BAF1534F777226E96DBB03D9751A657648E0955116D0D4FCB`.
+
+`other-ca.pem` above serves as the anchor a client chain does *not*
+reach, and `origin-ca.pem` as a CA certificate presented as a client,
+which must be refused for being a CA. Same warning: throwaway, committed
+on purpose, trusted by nothing outside these tests.
+
+```sh
+openssl ecparam -name prime256v1 -genkey -noout -out client-ca-key.pem
+openssl req -new -x509 -key client-ca-key.pem -subj "/CN=zoxy test client CA" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign" \
+  -not_before 20190101000000Z -not_after 20490101000000Z -out client-ca.pem
+openssl ecparam -name prime256v1 -genkey -noout -out client-key.pem
+openssl req -new -key client-key.pem -subj "/CN=client.zoxy.test" -out leaf.csr
+openssl x509 -req -in leaf.csr -CA client-ca.pem -CAkey client-ca-key.pem \
+  -set_serial 2 -not_before 20190101000000Z -not_after 20490101000000Z \
+  -extfile leaf.ext -out client-cert.pem   # leaf.ext: CA:FALSE, clientAuth
+```

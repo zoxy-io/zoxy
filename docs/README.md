@@ -350,6 +350,41 @@ On steady keep-alive traffic the two are at parity: about 20k req/s, with
 p50s within a few µs of each other. zoxy trails only on bulk transfer, by a
 third to two-fifths: 507–542 µs against 383–385 µs at the same 100 MiB/s.
 
+#### Requiring a client certificate (mutual TLS)
+
+A terminating listener can ask every client for a certificate and verify
+it against a CA bundle:
+
+```json
+{
+    "bind": "0.0.0.0:443",
+    "tls": {
+        "cert": "/etc/zoxy/cert.pem",
+        "key": "/etc/zoxy/key.pem",
+        "client_ca": { "path": "/etc/zoxy/clients-ca.pem" }
+    },
+    "http": { "cluster": "api" }
+}
+```
+
+The bundle is read and parsed at load, so a missing or empty one stops
+startup with an error naming it. A client's chain must reach one of its
+CAs, be valid now, and start with an end-entity certificate: a CA
+certificate presented as a client is refused.
+
+`verify` is `"required"` by default. A client that presents no
+certificate is refused with the `certificate_required` alert. Set
+`"verify": "optional"` to let such clients in unauthenticated while a
+fleet migrates onto mutual TLS; a certificate that *is* presented must
+still verify. Every refusal is counted in `zoxy_tls_client_cert_refused`,
+apart from `zoxy_tls_handshake_failed`, because only issuing or trusting
+certificates fixes it.
+
+Two things are deliberately not checked. Revocation (CRLs, OCSP) is
+unbounded work for a proxy that allocates nothing after startup, so issue
+short-lived client certificates instead. Extended key usage is not read,
+so use a CA that issues nothing but client certificates.
+
 #### HTTP/2
 
 An `http` listener speaks HTTP/2 to clients in two ways. Over TLS, it

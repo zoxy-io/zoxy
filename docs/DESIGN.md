@@ -871,6 +871,33 @@ Rules:
   RFC requires an answer whose content the client already knows. Counted
   as `tls_alpn_refused`, disjoint from `tls_handshake_failed`: nothing
   failed, and only an operator can change the outcome.
+- **A listener may require a client certificate** (#304). `tls.client_ca`
+  names a CA bundle, read and parsed into anchors at load through the
+  loader's file seam — the cluster `tls.ca` path from #296, so one
+  trust store serves both directions. zssl runs the protocol
+  (CertificateRequest, the client's CertificateVerify against its leaf)
+  and hands the chain to the engine, which judges it with
+  `trust.verifyClientChain`: the server-side path rules without a name,
+  since a client certificate names no host this proxy asked for, and an
+  end-entity leaf only. `verify` is `required` by default — §6's
+  `require` precedent: a client must not choose what the proxy
+  believes — and `optional` exists for migrating a fleet, spelled out
+  where it is used. A missing certificate is owed RFC 8446's
+  `certificate_required`, the second alert this proxy sends, and for
+  the ALPN refusal's reason: it says only what the client already
+  knows. A chain that fails gets the bare teardown. Both count as
+  `tls_client_cert_refused`, disjoint from `tls_handshake_failed`.
+  The verified identity is the leaf's SHA-256 fingerprint: fixed width,
+  allocation-free, unambiguous where a subject DN is not, and the form
+  operators already pin with. **Revocation is not checked** — CRLs and
+  OCSP are unbounded work for a bounded-memory design, so short-lived
+  certificates are the mitigation — and extended key usage is not read,
+  so a client CA should issue client certificates alone. The engine
+  count is unchanged — verification runs inside a handshake the pool
+  already holds — but the client's CertificateVerify adds a libcrypto
+  signature check to that handshake, and `libcrypto_heap_bytes`' per
+  session price has not yet been re-measured with it (`zig build
+  tls-heap-proof` drives a handshake without client auth).
 - **An address is a string, and `unix:` extends its grammar** (#303,
   #305). `bind` and `endpoints` stay single scalars rather than becoming
   tagged objects or gaining a second key — they are the two most-written

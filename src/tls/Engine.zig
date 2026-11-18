@@ -35,6 +35,7 @@ const zssl = @import("zssl");
 const Credentials = @import("Credentials.zig");
 const Tickets = @import("Tickets.zig");
 const alpn = @import("alpn.zig");
+const trust = @import("trust.zig");
 
 const assert = std.debug.assert;
 
@@ -128,6 +129,14 @@ peer_closed: bool,
 /// down rather than reading again, so it asks this after the drain, the
 /// same way it asks `close_staged`.
 refused: bool,
+/// #304's mutual TLS, per handshake. The anchors a client's chain must
+/// reach (borrowed from the listener's config, empty when it asks no
+/// certificate), the verified leaf's fingerprint once one has been, and
+/// whether a presented chain was refused — which is how the transport
+/// tells a client-certificate failure from every other one.
+client_anchors: []const []const u8,
+client_fingerprint: ?[trust.fingerprint_bytes]u8,
+client_cert_refused: bool,
 
 /// What a drive step hands back *synchronously*: plaintext the caller
 /// consumes before returning, and the peer's orderly close. Ciphertext
@@ -278,14 +287,26 @@ pub const Config = struct {
     /// borrowing rule as `credentials`: the server owns them for the
     /// process, an engine only reads them.
     tickets: ?*const Tickets = null,
-    /// Wall-clock seconds now. Only meaningful when `tickets` is set —
-    /// it is the stamp a sealed ticket carries and the clock an offered
-    /// one is aged against.
+    /// Wall-clock seconds now. Read when `tickets` is set — the stamp a
+    /// sealed ticket carries and the clock an offered one is aged
+    /// against — and when `client_auth` is, as the instant a client's
+    /// chain must be valid at (#304).
     now_unix: u64 = 0,
     /// The listener's ALPN offer (#271), most preferred first: canonical
     /// `tls/alpn.zig` tokens, or empty to negotiate none. Borrowed like
     /// `credentials` — the listener's for the process.
     alpn_protocols: []const []const u8 = &.{},
+    /// The listener's #304 client-certificate policy, or null to ask no
+    /// client for one. Its anchors are borrowed like `credentials`.
+    client_auth: ?ClientAuth = null,
+};
+
+pub const ClientAuth = struct {
+    /// DER trust anchors a client's chain must reach, parsed at load.
+    anchors: []const []const u8,
+    /// Refuse a client that presents no certificate (`certificate_required`)
+    /// rather than completing unauthenticated.
+    require: bool,
 };
 
 /// What one slot's plaintext buffer must be, given the head size the
@@ -336,6 +357,10 @@ pub fn init(engine: *Engine, config: *const Config) !void {
     assert(engine.body_plaintext.len >= plaintext_bytes_min);
     engine.tickets = config.tickets;
     engine.now_unix = config.now_unix;
+    engine.client_anchors = if (config.client_auth) |auth| auth.anchors else &.{};
+    engine.client_fingerprint = null;
+    engine.client_cert_refused = false;
+    assert(config.client_auth == null or engine.client_anchors.len >= 1);
     assert(config.alpn_protocols.len <= alpn.protocols_max);
     for (config.alpn_protocols) |token| assert(alpn.Protocol.fromToken(token) != null);
     // The seed *is* the private scalar: x25519 clamps internally, so
@@ -370,6 +395,13 @@ pub fn init(engine: *Engine, config: *const Config) !void {
         .psk_lookup = if (config.tickets != null) .{
             .context = engine,
             .lookup = openOfferedTicket,
+        } else null,
+        // zssl runs the protocol — CertificateRequest, the client's
+        // CertificateVerify against its leaf — and hands the chain here,
+        // where the anchors and the clock are (#304).
+        .client_auth = if (config.client_auth) |auth| .{
+            .require = auth.require,
+            .chain_verifier = .{ .context = engine, .verify = verifyClientChain },
         } else null,
     });
     engine.records = .init(&engine.record_storage);
@@ -659,6 +691,69 @@ pub fn refuseApplicationProtocol(engine: *Engine) void {
     assert(wire.len >= 1);
     engine.stage(wire);
     engine.refused = true;
+}
+
+/// A client that presented no certificate where the listener requires
+/// one is owed RFC 8446 §4.4.2.4's `certificate_required` (#304) — it
+/// says only what the client already knows, so it is no oracle. A chain
+/// that fails verification gets the bare teardown every other failure
+/// gets. zssl answers an empty record when the alert cannot be sealed;
+/// then there is nothing to stage and the teardown goes alone.
+pub fn refuseMissingCertificate(engine: *Engine) void {
+    assert(!engine.refused);
+    assert(!engine.isConnected());
+    assert(engine.outboundRoom() >= control_record_bytes_max);
+    const wire = engine.hs.sendAlert(.certificate_required, &engine.out);
+    if (wire.len >= 1) engine.stage(wire);
+    engine.refused = true;
+}
+
+/// The verified client's leaf fingerprint (#304), or null when the
+/// listener asked for none or the client was let in without one.
+pub fn clientFingerprint(engine: *const Engine) ?*const [trust.fingerprint_bytes]u8 {
+    if (engine.client_fingerprint) |*fingerprint| return fingerprint;
+    return null;
+}
+
+/// Whether a presented client chain was refused (#304).
+pub fn clientCertRefused(engine: *const Engine) bool {
+    return engine.client_cert_refused;
+}
+
+/// zssl's chain verifier for #304: the client's chain, leaf first, while
+/// its bytes are live. The fingerprint is taken here for that reason.
+fn verifyClientChain(context: *anyopaque, chain: zssl.certificate_list.CertificateList) bool {
+    const engine: *Engine = @ptrCast(@alignCast(context));
+    assert(engine.client_anchors.len >= 1);
+    assert(engine.client_fingerprint == null);
+    var entries: [trust.chain_max][]const u8 = undefined;
+    var count: u32 = 0;
+    var iterator = chain.iterator();
+    // A list that will not iterate, or runs past the longest chain this
+    // proxy verifies, is refused whole — never verified on a prefix.
+    while (iterator.next() catch return refuseClientChain(engine)) |entry| {
+        if (count == trust.chain_max) return refuseClientChain(engine);
+        entries[count] = entry;
+        count += 1;
+    }
+    assert(count <= trust.chain_max);
+    // An empty list is the client saying it has none (§4.4.2). zssl hands
+    // it here too, and decides at the client's Finished whether that is
+    // `certificate_required` or an unauthenticated session — `require`'s
+    // call, not this verifier's. There is simply no identity to keep.
+    if (count == 0) return true;
+    const now_sec = std.math.cast(i64, engine.now_unix) orelse return refuseClientChain(engine);
+    if (!trust.verifyClientChain(engine.client_anchors, entries[0..count], now_sec)) {
+        return refuseClientChain(engine);
+    }
+    engine.client_fingerprint = trust.leafFingerprint(entries[0]);
+    return true;
+}
+
+fn refuseClientChain(engine: *Engine) bool {
+    assert(engine.client_fingerprint == null);
+    engine.client_cert_refused = true;
+    return false;
 }
 
 /// True once `refuseApplicationProtocol` has staged the refusal.

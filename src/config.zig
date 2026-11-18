@@ -552,7 +552,25 @@ pub const Config = struct {
             /// code has to say which, rather than inherit a silence the
             /// loader never produces.
             alpn: []const []const u8,
+            /// #304: the CAs a client's certificate must chain to, and
+            /// whether presenting one is required. Null asks no client
+            /// for a certificate — the handshake every listener had.
+            client_ca: ?ClientCa = null,
         };
+
+        /// A listener's mutual-TLS policy (#304). Per listener, never per
+        /// certificate: verifying a peer is a property of the socket, so
+        /// it sits beside the credential set rather than inside it (§5).
+        pub const ClientCa = struct {
+            /// DER anchors, parsed at load into the config arena.
+            anchors: []const []const u8,
+            verify: ClientVerify,
+        };
+
+        /// `required` refuses a handshake that presents no certificate;
+        /// `optional` completes it unauthenticated. Either way a
+        /// certificate that *is* presented must verify (#304).
+        pub const ClientVerify = enum { required, optional };
     };
 
     pub const Cluster = struct {
@@ -884,6 +902,9 @@ pub const ValidationError = error{
     ListenerForwardedModeUnknown,
     ListenerProxyProtocolModeUnknown,
     ListenerTlsWithSniRoutes,
+    ListenerTlsClientVerifyUnknown,
+    ListenerTlsClientCaUnreadable,
+    ListenerTlsClientCaInvalid,
     RouteSniIsAddress,
     RouteHeaderMatchKind,
     LimitRelayBufferUnderSniRouting,
@@ -1126,6 +1147,7 @@ pub fn parseWithFiles(
         clusters,
         limits.head_buffer_bytes,
         bodies,
+        files,
     );
     const admin_bind = try resolveAdminBind(parsed.admin);
     const error_pages = try resolveErrorPages(arena, parsed.error_pages, bodies);
@@ -2756,6 +2778,8 @@ pub const TlsJson = struct {
     cert: []const u8,
     key: []const u8,
     alpn: ?[]const []const u8 = null,
+    /// #304: verify clients against these CAs; absent asks none.
+    client_ca: ?ClientCaJson = null,
 
     pub const schema_doc =
         "TLS termination for this listener: where its certificate chain and " ++
@@ -2781,6 +2805,35 @@ pub const TlsJson = struct {
             .min_items = 1,
             .max_items = alpn.protocols_max,
             .items = SchemaItems.alpn_protocol,
+        },
+        .client_ca = .{
+            .desc = "Ask every client for a certificate and verify it against " ++
+                "these CAs (mutual TLS). Absent asks none.",
+        },
+    };
+};
+
+/// A listener's #304 client-certificate policy: one CA bundle, and
+/// whether a client must present a certificate at all.
+pub const ClientCaJson = struct {
+    path: []const u8,
+    verify: []const u8 = "required",
+
+    pub const schema_doc =
+        "Mutual TLS: the CA bundle a client's certificate must chain to. " ++
+        "Revocation is not checked; issue short-lived client certificates, " ++
+        "from a CA that issues nothing but client certificates.";
+    pub const schema_fields = .{
+        .path = .{
+            .desc = "Path to a PEM bundle of the CA certificates to trust, read once at load.",
+            .min_length = 1,
+        },
+        .verify = .{
+            .desc = "required (the default) refuses a client that presents no " ++
+                "certificate; optional lets it in unauthenticated, for migrating " ++
+                "a fleet onto mutual TLS. A certificate that is presented must " ++
+                "verify either way.",
+            .enum_type = Config.Listener.ClientVerify,
         },
     };
 };
@@ -4540,6 +4593,7 @@ fn resolveListeners(
     clusters: []const Config.Cluster,
     head_buffer_bytes: u32,
     bodies: []ResolvedBody,
+    files: FileSource,
 ) ParseError![]const Config.Listener {
     assert(clusters.len >= 1);
     if (listeners_json.len == 0) {
@@ -4561,6 +4615,7 @@ fn resolveListeners(
             clusters,
             head_buffer_bytes,
             bodies,
+            files,
         );
     }
 
@@ -4603,12 +4658,13 @@ fn resolveListener(
     clusters: []const Config.Cluster,
     head_buffer_bytes: u32,
     bodies: []ResolvedBody,
+    files: FileSource,
 ) ParseError!Config.Listener {
     assert(clusters.len >= 1);
     assert(head_buffer_bytes >= 1);
     const bind_address = try resolveBindAddress(arena, listener_json.bind);
     const protocol = try protocolOf(listener_json);
-    const tls = try resolveTls(arena, listener_json.tls, protocol);
+    const tls = try resolveTls(arena, listener_json.tls, protocol, files);
     // The tag dispatches, and every field it does not carry is one this
     // arm cannot be handed (#305): the seven "this key is meaningless on
     // that protocol" errors this replaced were the loader restating a
@@ -5995,6 +6051,7 @@ fn resolveTls(
     arena: std.mem.Allocator,
     tls_json: ?TlsJson,
     protocol: Config.Listener.Protocol,
+    files: FileSource,
 ) ParseError!?Config.Listener.Tls {
     const tls = tls_json orelse return null;
     if (tls.cert.len == 0) return error.ListenerTlsCertPathEmpty;
@@ -6003,7 +6060,33 @@ fn resolveTls(
         .cert_path = tls.cert,
         .key_path = tls.key,
         .alpn = try resolveAlpn(arena, tls.alpn, protocol),
+        .client_ca = try resolveClientCa(arena, tls.client_ca, files),
     };
+}
+
+/// A listener's #304 client CA, read through the loader's file seam and
+/// parsed into anchors exactly as a cluster's `tls.ca` is (§7): a bundle
+/// that cannot be read, or holds no certificate, fails here at load, not
+/// at the first client's handshake.
+fn resolveClientCa(
+    arena: std.mem.Allocator,
+    client_ca_json: ?ClientCaJson,
+    files: FileSource,
+) ParseError!?Config.Listener.ClientCa {
+    const client_ca = client_ca_json orelse return null;
+    const verify = std.meta.stringToEnum(Config.Listener.ClientVerify, client_ca.verify) orelse
+        return error.ListenerTlsClientVerifyUnknown;
+    if (client_ca.path.len == 0) return error.ListenerTlsClientCaUnreadable;
+    const pem = files.read(files.context, arena, client_ca.path, constants.origin_ca_bytes_max) catch |err| switch (err) {
+        error.FileUnreadable, error.FileTooLarge => return error.ListenerTlsClientCaUnreadable,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    const anchors = trust.parseAnchors(arena, pem) catch |err| switch (err) {
+        error.AnchorsInvalid, error.AnchorsTooMany => return error.ListenerTlsClientCaInvalid,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    assert(anchors.len >= 1);
+    return .{ .anchors = anchors, .verify = verify };
 }
 
 /// A terminating listener's ALPN offer (#271), as canonical tokens.
@@ -8455,6 +8538,8 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "ClusterTlsServerNameInvalid", .gap = .literal_syntax },
     .{ .name = "ClusterTlsCaUnreadable", .gap = .filesystem },
     .{ .name = "ClusterTlsCaInvalid", .gap = .filesystem },
+    .{ .name = "ListenerTlsClientCaUnreadable", .gap = .filesystem },
+    .{ .name = "ListenerTlsClientCaInvalid", .gap = .filesystem },
     .{ .name = "LimitUpstreamH2TlsOverEngines", .gap = .budget },
     .{ .name = "ListenerL4RequestKeyedHash", .gap = .cross_block },
     .{ .name = "ListenerModeInvalid", .gap = .literal_syntax },
@@ -10589,6 +10674,8 @@ const TestCaFiles = struct {
         assert(limit >= 1);
         const bytes: []const u8 = if (std.mem.eql(u8, path, "/ca.pem"))
             @embedFile("tls/testdata/origin-ca.pem")
+        else if (std.mem.eql(u8, path, "/client-ca.pem"))
+            @embedFile("tls/testdata/client-ca.pem")
         else if (std.mem.eql(u8, path, "/garbage.pem"))
             "not a certificate"
         else
@@ -10603,6 +10690,33 @@ fn expectH2ParseError(expected: ParseError, json_bytes: []const u8) !void {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     try std.testing.expectError(expected, parseWithFiles(arena_state.allocator(), json_bytes, TestCaFiles.source));
+}
+
+test "config: a listener's client_ca is read at load, required unless it says optional (#304)" {
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"tls\":{\"cert\":\"/c.pem\",\"key\":\"/k.pem\"";
+    const tail = "},\"http\":{\"cluster\":\"a\"}}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
+    inline for (.{
+        .{ ",\"client_ca\":{\"path\":\"/client-ca.pem\"}", Config.Listener.ClientVerify.required },
+        .{ ",\"client_ca\":{\"path\":\"/client-ca.pem\",\"verify\":\"optional\"}", Config.Listener.ClientVerify.optional },
+    }) |case| {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parseWithFiles(arena_state.allocator(), head ++ case[0] ++ tail, TestCaFiles.source);
+        const client_ca = parsed.listeners[0].tls.?.client_ca.?;
+        try std.testing.expectEqual(case[1], client_ca.verify);
+        try std.testing.expectEqual(@as(usize, 1), client_ca.anchors.len);
+    }
+    // Absent asks no client for a certificate, as every listener did.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parseWithFiles(arena_state.allocator(), head ++ tail, TestCaFiles.source);
+        try std.testing.expect(parsed.listeners[0].tls.?.client_ca == null);
+    }
+    try expectH2ParseError(error.ListenerTlsClientVerifyUnknown, head ++ ",\"client_ca\":{\"path\":\"/client-ca.pem\",\"verify\":\"maybe\"}" ++ tail);
+    try expectH2ParseError(error.ListenerTlsClientCaUnreadable, head ++ ",\"client_ca\":{\"path\":\"/missing.pem\"}" ++ tail);
+    try expectH2ParseError(error.ListenerTlsClientCaInvalid, head ++ ",\"client_ca\":{\"path\":\"/garbage.pem\"}" ++ tail);
 }
 
 test "config: an h2 cluster names the server its origins prove and the CA they reach, read at load (§7)" {

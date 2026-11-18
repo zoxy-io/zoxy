@@ -128,6 +128,57 @@ pub fn verifyChain(
     // RFC 9525 §6.3: the name is matched in the subjectAltName alone.
     if (leaf.subjectAltName().len == 0) return false;
     leaf.verifyHostName(server_name) catch return false;
+    return pathVerifies(anchors, chain, &certificates, now_sec);
+}
+
+/// The verdict on a *client's* chain, leaf first, at `now_sec` (#304).
+/// The server's path rules exactly, without a name: a client
+/// certificate names no host this proxy could have asked for, so the
+/// identity is the certificate itself (`leafFingerprint`). Extended
+/// key usage is not read — a CA trusted here for clients should issue
+/// only client certificates, and DESIGN §4 says so where `client_ca`
+/// is configured.
+pub fn verifyClientChain(
+    anchors: []const []const u8,
+    chain: []const []const u8,
+    now_sec: i64,
+) bool {
+    assert(anchors.len >= 1);
+    assert(anchors.len <= anchors_max);
+    if (chain.len == 0 or chain.len > chain_max) return false;
+    var certificates: [chain_max]Certificate.Parsed = undefined;
+    for (chain, 0..) |der, index| certificates[index] = parsed(der) orelse return false;
+    // A CA presenting itself as a client is a key that signs other
+    // identities, not an identity: an end-entity leaf only.
+    if (isCa(certificates[0])) return false;
+    return pathVerifies(anchors, chain, &certificates, now_sec);
+}
+
+/// The bytes that name a verified client (#304): SHA-256 over the leaf's
+/// DER. Fixed width and allocation-free, so it fits a per-connection
+/// slot and a header without a bound to argue; unambiguous where a
+/// subject DN is not (two CAs may issue the same DN); and the form
+/// operators already pin with (`openssl x509 -fingerprint -sha256`).
+pub const fingerprint_bytes = std.crypto.hash.sha2.Sha256.digest_length;
+
+pub fn leafFingerprint(leaf_der: []const u8) [fingerprint_bytes]u8 {
+    assert(leaf_der.len >= 1);
+    assert(leaf_der.len <= certificate_bytes_max);
+    var digest: [fingerprint_bytes]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(leaf_der, &digest, .{});
+    return digest;
+}
+
+/// Each certificate signed by the next, each issuer a CA, and the last
+/// anchored — the path half both verdicts share.
+fn pathVerifies(
+    anchors: []const []const u8,
+    chain: []const []const u8,
+    certificates: *const [chain_max]Certificate.Parsed,
+    now_sec: i64,
+) bool {
+    assert(chain.len >= 1);
+    assert(chain.len <= chain_max);
     var index: usize = 0;
     while (index + 1 < chain.len) : (index += 1) {
         const issuer = certificates[index + 1];
@@ -267,6 +318,44 @@ test "trust: a leaf its CA signed verifies for its name, alone or with the root 
     try testing.expect(verifyChain(anchors, &.{ leaf, root }, "origin.zoxy.test", now_2030));
 }
 
+const client_ca_pem = @embedFile("testdata/client-ca.pem");
+const client_leaf_pem = @embedFile("testdata/client-cert.pem");
+
+test "trust: a client chain verifies against its CA with no name, and its fingerprint is the leaf's (#304)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const anchors = try parseAnchors(arena, client_ca_pem);
+    const leaf = try firstDer(arena, client_leaf_pem);
+    try testing.expect(verifyClientChain(anchors, &.{leaf}, now_2030));
+    try testing.expect(verifyClientChain(anchors, &.{ leaf, anchors[0] }, now_2030));
+    // The fixture's own fingerprint, as `openssl x509 -fingerprint
+    // -sha256` printed it when it was made (testdata/README.md).
+    var expected: [fingerprint_bytes]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "F1FD192CFF76490BAF1534F777226E96DBB03D9751A657648E0955116D0D4FCB");
+    try testing.expectEqualSlices(u8, &expected, &leafFingerprint(leaf));
+}
+
+test "trust: a client chain to another anchor, outside its window, or led by a CA is refused (#304)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const anchors = try parseAnchors(arena, client_ca_pem);
+    const other = try parseAnchors(arena, other_ca_pem);
+    const leaf = try firstDer(arena, client_leaf_pem);
+    try testing.expect(!verifyClientChain(other, &.{leaf}, now_2030));
+    // 2018 and 2050.
+    try testing.expect(!verifyClientChain(anchors, &.{leaf}, 1_514_764_800));
+    try testing.expect(!verifyClientChain(anchors, &.{leaf}, 2_524_608_000));
+    // A CA presenting itself is refused even where it is the anchor: it
+    // is a key that signs identities, not one.
+    try testing.expect(!verifyClientChain(anchors, &.{anchors[0]}, now_2030));
+    try testing.expect(!verifyClientChain(anchors, &.{}, now_2030));
+    // A server leaf from another PKI is no client of this one.
+    const origin_leaf = try firstDer(arena, leaf_pem);
+    try testing.expect(!verifyClientChain(anchors, &.{origin_leaf}, now_2030));
+}
+
 test "trust: another name, another anchor, or a time outside the window is refused" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -333,4 +422,7 @@ fn fuzzChain(context: void, smith: *testing.Smith) !void {
     var input: [2048]u8 = undefined;
     const input_len = smith.slice(&input);
     _ = verifyChain(anchors, &.{input[0..input_len]}, "origin.zoxy.test", now_2030);
+    // The client half (#304) parses the same untrusted bytes by its own
+    // path — no name, and an end-entity check the server half lacks.
+    _ = verifyClientChain(anchors, &.{input[0..input_len]}, now_2030);
 }
