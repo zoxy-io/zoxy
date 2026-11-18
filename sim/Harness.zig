@@ -860,6 +860,8 @@ fn wireClusters(
 ) void {
     assert(harness.endpoints_http_count >= 1);
     assert(harness.endpoints_http_count <= harness.endpoints_http.len);
+    const l4_max_inflight = deriveMaxInflight(harness.clean, random);
+    const http_max_inflight = deriveMaxInflight(harness.clean, random);
     harness.clusters = .{
         .{
             .name = "origin-l4",
@@ -869,7 +871,8 @@ fn wireClusters(
             .check = health.check_l4,
             .passive_ejection = health.passive_l4,
             .panic_threshold_percent = derivePanicThreshold(random, health.check_l4 != null or health.passive_l4 != null),
-            .max_inflight = deriveMaxInflight(harness.clean, random),
+            .max_inflight = l4_max_inflight,
+            .slow_start_ms = deriveSlowStart(random, l4_max_inflight, health.check_l4 != null or health.passive_l4 != null),
             .max_total_inflight = deriveMaxInflight(harness.clean, random),
             .proxy_protocol_send = harness.proxy_protocol_send_l4,
         },
@@ -885,7 +888,8 @@ fn wireClusters(
             .check = health.check_http,
             .passive_ejection = health.passive_http,
             .panic_threshold_percent = derivePanicThreshold(random, health.check_http != null or health.passive_http != null),
-            .max_inflight = deriveMaxInflight(harness.clean, random),
+            .max_inflight = http_max_inflight,
+            .slow_start_ms = deriveSlowStart(random, http_max_inflight, health.check_http != null or health.passive_http != null),
             .max_total_inflight = deriveMaxInflight(harness.clean, random),
             .retries = harness.retries_http,
         },
@@ -1182,6 +1186,17 @@ fn deriveHeadTimeoutMs(
     assert(drawn > connect_ms);
     assert(drawn <= idle_ms);
     return drawn;
+}
+
+/// A cluster's #391 slow-start window: only where the loader allows one —
+/// a cap to ramp and something to restore from — and then on half, short
+/// enough that a restored endpoint's ramp runs out inside a scenario.
+fn deriveSlowStart(random: std.Random, max_inflight: ?u32, ejects: bool) ?u32 {
+    if (max_inflight == null or !ejects) return null;
+    if (!random.boolean()) return null;
+    const window_ms = 1 + random.uintAtMost(u32, 199);
+    assert(window_ms >= 1 and window_ms <= 200);
+    return window_ms;
 }
 
 fn deriveMaxInflight(clean: bool, random: std.Random) ?u32 {

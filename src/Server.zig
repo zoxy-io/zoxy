@@ -4606,6 +4606,8 @@ pub fn Server(comptime IoType: type) type {
             return .{
                 .l7 = server.upstreams.leased_counts,
                 .l4 = server.l4_inflight,
+                .restored_at_ns = server.health.restored_at_ns,
+                .now_ns = server.io.nowNs(),
             };
         }
 

@@ -624,6 +624,12 @@ pub const Config = struct {
         /// at the cap is shed; a retry continues a request the cap
         /// already admitted, so it is never refused by it.
         max_total_inflight: ?u32 = null,
+        /// #391's slow start: for this long after an endpoint comes back
+        /// into rotation — a probe's `rise` or a passive cooldown's end —
+        /// its `max_inflight` ramps linearly from 1 to the configured cap,
+        /// so the first origin to recover is not handed every pick at
+        /// once. Null leaves a restored endpoint at its full cap.
+        slow_start_ms: ?u32 = null,
 
         /// How many further endpoints one request may dial after a
         /// refused or unreachable first try (#181), 0 for none — the
@@ -873,6 +879,9 @@ pub const ValidationError = error{
     ClusterPassiveEjectionRecoveryMaxBelowBase,
     ClusterMaxInflightOutOfRange,
     ClusterMaxTotalInflightOutOfRange,
+    ClusterSlowStartOutOfRange,
+    ClusterSlowStartWithoutMaxInflight,
+    ClusterSlowStartWithoutHealth,
     ClusterPanicThresholdOutOfRange,
     ClusterPanicThresholdWithoutHealth,
     ClusterRetriesOutOfRange,
@@ -3281,6 +3290,8 @@ pub const ClusterJson = struct {
     max_inflight: ?u32 = null,
     /// Optional #392 cap on the cluster's total in-flight work.
     max_total_inflight: ?u32 = null,
+    /// Optional #391 recovery ramp for `max_inflight`.
+    slow_start_ms: ?u32 = null,
     /// Optional #181 dial retries across this cluster's endpoints;
     /// absent means none, which is what every config written before the
     /// key existed asked for.
@@ -3328,6 +3339,15 @@ pub const ClusterJson = struct {
             .desc = "Cap on concurrent in-flight work per endpoint; absent leaves the cluster uncapped.",
             .minimum = 1,
             .maximum = constants.endpoint_inflight_max,
+        },
+        .slow_start_ms = .{
+            .desc = "For this long after an endpoint returns from ejection, raise its " ++
+                "max_inflight linearly from 1 to the configured cap, so the first " ++
+                "origin to recover is not handed every new request at once. " ++
+                "Requires max_inflight, and check or passive_ejection. Absent, a " ++
+                "restored endpoint takes its full cap at once.",
+            .minimum = 1,
+            .maximum = constants.timeout_ms_max,
         },
         .max_total_inflight = .{
             .desc = "Cap on this cluster's total in-flight work in this process, all " ++
@@ -4348,6 +4368,7 @@ fn resolveClusters(
             .hash_key = picked.hash_key,
             .max_inflight = try resolveMaxInflight(entry.cluster.max_inflight),
             .max_total_inflight = try resolveMaxTotalInflight(entry.cluster.max_total_inflight),
+            .slow_start_ms = try resolveSlowStart(&entry.cluster),
             .retries = try resolveRetries(entry.cluster.retries),
             .proxy_protocol_send = try resolveClusterProxyProtocol(entry.cluster.proxy_protocol),
             .protocol = try resolveClusterProtocol(entry.cluster.protocol),
@@ -5997,6 +6018,19 @@ fn resolvePanicThreshold(cluster: *const ClusterJson) ValidationError!?u8 {
     assert(threshold >= constants.panic_threshold_percent_min);
     assert(threshold <= constants.panic_threshold_percent_max);
     return threshold;
+}
+
+/// Resolve #391's slow start. It ramps `max_inflight`, so a cluster with
+/// no cap has nothing to ramp; and it starts at a restore, so a cluster
+/// nothing ejects from never starts it. Refused in both cases rather
+/// than loaded inert.
+fn resolveSlowStart(cluster: *const ClusterJson) ValidationError!?u32 {
+    const window_ms = cluster.slow_start_ms orelse return null;
+    if (window_ms < 1 or window_ms > constants.timeout_ms_max) return error.ClusterSlowStartOutOfRange;
+    if (cluster.max_inflight == null) return error.ClusterSlowStartWithoutMaxInflight;
+    if (cluster.check == null and cluster.passive_ejection == null) return error.ClusterSlowStartWithoutHealth;
+    assert(window_ms >= 1);
+    return window_ms;
 }
 
 /// Resolve #392's cluster-wide cap. Absent leaves it uncapped; zero would
@@ -8604,6 +8638,8 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "ClusterTlsOnH2c", .gap = .cross_block },
     .{ .name = "ClusterRetriesOnHttp2", .gap = .cross_block },
     .{ .name = "ClusterPanicThresholdWithoutHealth", .gap = .cross_block },
+    .{ .name = "ClusterSlowStartWithoutMaxInflight", .gap = .cross_block },
+    .{ .name = "ClusterSlowStartWithoutHealth", .gap = .cross_block },
     .{ .name = "ClusterTlsOnL4Listener", .gap = .cross_block },
     .{ .name = "ClusterTlsWithUpgrades", .gap = .cross_block },
     .{ .name = "ClusterTlsHttpCheck", .gap = .cross_block },
@@ -10101,6 +10137,27 @@ test "config: a panic threshold resolves where health can eject, and nowhere els
         error.ClusterPanicThresholdWithoutHealth,
         head ++ "\"panic_threshold_percent\":50" ++ tail,
     );
+}
+
+test "config: slow start needs a cap to ramp and something to restore from (#391)" {
+    const head =
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],
+    ;
+    const tail =
+        \\}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    ;
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++
+            "\"max_inflight\":8,\"passive_ejection\":{},\"slow_start_ms\":30000" ++ tail);
+        try std.testing.expectEqual(@as(?u32, 30_000), parsed.clusters[0].slow_start_ms);
+    }
+    try expectParseError(error.ClusterSlowStartWithoutMaxInflight, head ++ "\"passive_ejection\":{},\"slow_start_ms\":1000" ++ tail);
+    try expectParseError(error.ClusterSlowStartWithoutHealth, head ++ "\"max_inflight\":8,\"slow_start_ms\":1000" ++ tail);
+    try expectParseError(error.ClusterSlowStartOutOfRange, head ++ "\"max_inflight\":8,\"passive_ejection\":{},\"slow_start_ms\":0" ++ tail);
 }
 
 test "config: max_total_inflight resolves, defaults to uncapped, rejects the useless (#392)" {

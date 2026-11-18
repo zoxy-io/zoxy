@@ -2483,6 +2483,18 @@ the loop thread.
 | upstream head buffers | beside the slot, as it is obtained | static `503`, then keep or close per pressure | **stream** — `503` on it |
 | **origin capacity** — every endpoint at its `max_inflight` | endpoint pick | static `503` (L7) / close (L4) | **stream** — `503` on it |
 | **cluster share** — the cluster's total at its `max_total_inflight` (#392) | endpoint pick, first try only | static `503` (L7) / close (L4) | **stream** — `503` on it |
+
+`max_inflight` can also ramp (#391). With `slow_start_ms`, an endpoint
+restored by a probe's `rise` or a passive cooldown's end has a cap that
+rises linearly from 1 to `max_inflight` across the window, read off the
+prober's own restore stamps (the ones #394's backoff keys on) against the
+loop clock, at the same capacity check. Never 0, so a restored endpoint
+always takes some traffic to show it recovered; and the origin-capacity
+rung above answers what does not fit, so a cluster whose only eligible
+endpoint is ramping sheds rather than overruns it. The effective cap is
+not exported as a gauge of its own — the in-flight gauge and the rung's
+counters show it working — which is the one part of #391's ask left
+open.
 | tunnels | the upgrade request, **before** it is forwarded | static `503`, then keep or close per pressure | — no upgrade reaches HTTP/2 |
 | request deadline | timer completion | `504` if no response byte was sent — a timed-out dial included; teardown once a response byte is on the wire or the stall is the client's own body | **stream** — `504`, or its reset |
 | head-read budget | timer completion | `408` for a client that began a head and stopped; **silence earns none** — a connection that said nothing was never under the budget | **connection**, while h2c's preface is read; after it, the idle window |
