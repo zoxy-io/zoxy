@@ -487,7 +487,8 @@ pub const Config = struct {
         };
 
         /// What the listener speaks (§6, §7): `l4` relays bytes blindly,
-        /// `http` runs the HTTP/1.1 reverse-proxy state machine.
+        /// `http` runs the reverse-proxy exchange — HTTP/1.1, with HTTP/2
+        /// as a front end on it (#275).
         ///
         /// Named in the config by the key the listener's settings live
         /// under, and required (#305). It was once an optional string
@@ -2525,11 +2526,14 @@ pub const ListenerJson = struct {
                 "the origins is the cluster's own tls block.",
         },
         .http = .{
-            .desc = "Speak HTTP/1.1 as a reverse proxy, with routing, filters " ++
-                "and body limits.",
+            .desc = "Speak HTTP as a reverse proxy, with routing, filters and " ++
+                "body limits: HTTP/1.1, plus HTTP/2 over TLS (h2 in tls.alpn) " ++
+                "or in the clear (http.h2c).",
         },
         .l4 = .{
-            .desc = "Speak L4: relay bytes to one cluster without inspecting them.",
+            .desc = "Speak L4: relay bytes to a cluster without parsing them as " ++
+                "HTTP. One cluster, or one chosen by the TLS server name the " ++
+                "client asked for (routes).",
         },
     };
 };
@@ -2567,7 +2571,7 @@ pub const HttpListenerJson = struct {
     h2c: bool = false,
 
     pub const schema_doc =
-        "An HTTP/1.1 listener's settings. Exactly one of `cluster` or " ++
+        "An HTTP listener's settings. Exactly one of `cluster` or " ++
         "`routes` selects the upstream.";
     pub const schema_one_of = [_][]const u8{ "cluster", "routes" };
     pub const schema_fields = .{
@@ -3189,14 +3193,16 @@ pub const ClusterJson = struct {
     proxy_protocol: ?ClusterProxyProtocolJson = null,
     /// Optional §7 origin protocol; absent is HTTP/1.1.
     protocol: []const u8 = "http1",
-    /// TLS to the origins; required by, and only legal with, `h2`.
+    /// TLS to the origins: required by `h2`, optional with `http1`
+    /// (#296), refused with `h2c`.
     tls: ?ClusterTlsJson = null,
 
     pub const schema_doc = "One upstream cluster: its endpoints, pick policy and health checks.";
     pub const schema_fields = .{
         .endpoints = .{
-            .desc = "Endpoints: IP:port literals (port must be non-zero), each " ++
-                "optionally written as an object that adds a pick weight.",
+            .desc = "Endpoints: IP:port literals (port must be non-zero) or " ++
+                "`unix:` socket paths, each optionally written as an object " ++
+                "that adds a pick weight.",
             .min_items = 1,
         },
         .pick = .{

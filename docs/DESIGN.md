@@ -837,16 +837,19 @@ Rules:
   sends. Inside the listener's block, #297's certificate set is a
   `certificates` list and #304's `client_ca` is that list's sibling
   rather than a certificate's, because verifying a peer is per-listener
-  and not per-credential; writing #304 against today's one-pair shape
-  would mean relocating a field it had just added. The cluster's block
+  and not per-credential. With `cert`/`key` kept as the one-pair spelling
+  (below), `client_ca` sits at `tls.client_ca` in either spelling, so
+  neither feature relocates a field the other added and #304 does not
+  wait on #297 (#400). The cluster's block
   carries the server name to verify and send as SNI, which §7's endpoints
   cannot supply — they are resolved addresses, and an address is not an
   identity. Decided here, implemented with the features that need it: a
   key with no feature behind it is not a freeze, it is a promise.
 
-  All three of those features ship *after* 1.0.0, which turns this record
-  from a convenience into the contract they are held to. Two of them add
-  keys and are additive by nature. The certificate set is not: today's
+  The cluster's block shipped before 1.0.0 (#296, in 0.11.0). The
+  listener's two ship *after* it, which turns this record from a
+  convenience into the contract they are held to. `client_ca` adds a key
+  and is additive by nature. The certificate set is not: today's
   `tls` is one `{cert, key}` pair, and a freeze means a config that was
   valid at 1.0.0 stays valid. So `cert`/`key` survive as the one-pair
   spelling of `certificates`, the way `endpoints` already accepts a bare
@@ -906,6 +909,69 @@ Rules:
   pacing is not that. Moving it in would not be tidying two homes into
   one; it would be a per-cluster prober, which is a different design and
   a different budget.
+- **The cluster's next keys are placed before they are built** (#400).
+  Seven upstream-resilience issues (#390–#396) each add to the cluster
+  block. Each is opt-in, so its keys are additive and none has to ship
+  before 1.0.0, but where they go depends on keys that exist today, and
+  those can only change before the freeze. Decided here on the `tls`
+  record's terms: a placement, not a promise that the feature ships.
+  - **`max_inflight` keeps its name and its meaning: per endpoint.** It
+    is a cluster field that caps each endpoint, which is also what
+    HAProxy's `maxconn` on a `server` line means, and renaming it would
+    break every config that sets it. A cap on the cluster's total
+    (#392), if one is built, is `max_total_inflight`, a name that cannot
+    be read as the per-endpoint cap. Slow start's window (#391) sits
+    beside it, whichever of the cap or the weight it ends up ramping.
+  - **A retry budget lives inside `retries`** (#393). `"retries": 2`
+    stays the short spelling of `{"count": 2}`, the pairing `endpoints`
+    and `pick` already make between a bare value and an object, and the
+    budget is a field of that object. The object form is for clusters
+    that retry, so its `count` has a minimum of 1; the bare `0` stays
+    the default and the one way to say "none". A sibling `retry_budget`
+    would instead be a cross-field rule — a budget with no retries to
+    bound — which the nested shape refuses by construction. That object form is the third copy of the
+    short-spelling parser `EndpointJson` and `PickJson` already
+    duplicate, so the slice that adds it extracts the shared one first.
+  - **The health threshold is one key at the cluster's top level.**
+    #390's `panic_threshold_percent` reads the one mask `check` and
+    `passive_ejection` both write (§7), so it belongs to neither block.
+    #394's ejection ceiling asks a narrower question — how much capacity
+    *passive* verdicts alone may remove — and is declined rather than
+    given a second key: the threshold already bounds the total that
+    health verdicts remove, whichever detector removed it, and one
+    bound is simpler to reason about than two that interact. #394's
+    cooldown growth is passive ejection's own and would live in
+    `passive_ejection`.
+  - **A standby tier is a field on the endpoint object** (#396):
+    `{"address": …, "priority": 1}`, where `0` — the default, and what a
+    bare string means — is the primary and a higher number is used only
+    when the levels below it cannot serve, which is Envoy's priority
+    ordering and the reason for its name. One list keeps one endpoint
+    index, so health, weights, hash stickiness and per-endpoint metrics
+    are untouched, and an integer grows to a third tier where a
+    `standby` boolean could not.
+  - **Probe jitter needs no key** (#395). No operator wants processes
+    probing in lockstep, so it is a property of the prober rather than
+    a setting. Held to the first sweep's start, by less than one
+    `health_interval_ms`, it de-phases processes that started together
+    and leaves the interval meaning exactly what it means now: the
+    pause between sweeps.
+  - **An absent key keeps its 1.0.0 meaning.** The freeze promises that
+    a config stays valid; for the features above, which decide where
+    traffic goes or when work is refused, it also promises that the
+    config keeps behaving the same. Each is off unless named — #390's
+    threshold absent is today's fail-open at zero healthy — and no 1.x
+    release turns one on by default. Envoy's 50 % panic default is
+    declined on §7's own ground for making passive ejection opt-in:
+    sending traffic back to endpoints the checks have ejected is a
+    judgement about the operator's origins, and only the operator can
+    make it.
+  - **`pick` keeps its shape.** The tagged form
+    (`{"hash": {"header": "x-tenant"}}`) was the one improvement #305
+    left for the freeze to stop, and it stays declined: the schema
+    already carries both of `pick`'s forks with nothing conceded, so the
+    gain is cosmetic, and the cost is breaking one of the most-written
+    fields in every config.
 - **The config surface has a generated JSON Schema.** `zig build schema`
   reflects over the `*Json` parse structs and their co-located metadata
   (`src/config_schema.zig`) to emit a draft 2020-12 schema — structure,
@@ -2289,7 +2355,9 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   (success-rate and stddev maths, panic thresholds) and *aggregate*
   retry budgets. The previous iteration proved them buildable here;
   simplicity says they wait for a demonstrated need, and fail-open plus
-  a consecutive count is why the simple thing sufficed. The per-request
+  a consecutive count is why the simple thing sufficed. §5 has placed
+  their keys ahead of the freeze (#400), which settles where each would
+  go and not whether any is built. The per-request
   dial retry above is not one of them: it bounds itself per request and
   per connect deadline, where a retry budget is the cluster-wide cap
   that keeps a partial outage from pushing its whole load onto the
