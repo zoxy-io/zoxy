@@ -312,6 +312,10 @@ pub const Counters = struct {
     /// endpoint count — a pick that found every candidate at its
     /// `max_inflight` is a shed, and its own counter says so.
     upstream_panic_picks: Value = Value.init(0),
+    /// Picks that went to a #396 standby tier because every tier below it
+    /// had nothing usable — ejected, drained or full. A rising rate is
+    /// failover spending its reserved capacity.
+    upstream_standby_picks: Value = Value.init(0),
     /// Upgrade requests refused for want of a §5 tunnel (#180). Its own
     /// rung rather than a share of the other sheds: each of those says
     /// "widen this pool", and they name different pools. Counted before
@@ -1209,6 +1213,7 @@ pub const Labeled = struct {
     /// are decided over its whole routable set, not by one endpoint.
     ejected_picks: []Value,
     panic_picks: []Value,
+    standby_picks: []Value,
     /// #392's sheds, per cluster: a cluster-wide cap names the cluster
     /// and nothing narrower.
     l7_shed_total_inflight: []Value,
@@ -1308,6 +1313,7 @@ pub const Labeled = struct {
         l4_shed_inflight,
         ejected_picks,
         panic_picks,
+        standby_picks,
         l7_shed_total_inflight,
         l4_shed_total_inflight,
 
@@ -1317,6 +1323,7 @@ pub const Labeled = struct {
                 .l4_shed_inflight => "cluster_l4_shed_inflight",
                 .ejected_picks => "cluster_upstream_ejected_picks",
                 .panic_picks => "cluster_upstream_panic_picks",
+                .standby_picks => "cluster_upstream_standby_picks",
                 .l7_shed_total_inflight => "cluster_l7_shed_total_inflight",
                 .l4_shed_total_inflight => "cluster_l4_shed_total_inflight",
             };
@@ -1361,6 +1368,7 @@ pub const Labeled = struct {
         labeled.l4_shed_inflight = try allocValues(arena, cluster_count);
         labeled.ejected_picks = try allocValues(arena, cluster_count);
         labeled.panic_picks = try allocValues(arena, cluster_count);
+        labeled.standby_picks = try allocValues(arena, cluster_count);
         labeled.l7_shed_total_inflight = try allocValues(arena, cluster_count);
         labeled.l4_shed_total_inflight = try allocValues(arena, cluster_count);
         // Holes stay empty — the one answer to "what did init leave
@@ -1972,6 +1980,7 @@ pub const Labeled = struct {
             counters.get("l4_shed_endpoint_inflight"));
         assert(tableTotal(labeled.ejected_picks) == counters.get("upstream_ejected_picks"));
         assert(tableTotal(labeled.panic_picks) == counters.get("upstream_panic_picks"));
+        assert(tableTotal(labeled.standby_picks) == counters.get("upstream_standby_picks"));
         assert(tableTotal(labeled.l7_shed_total_inflight) == counters.get("l7_shed_total_inflight"));
         assert(tableTotal(labeled.l4_shed_total_inflight) == counters.get("l4_shed_total_inflight"));
         // #299's two families partition the same total, because both are
@@ -2388,7 +2397,7 @@ test "counters: labeled render speaks the exposition dialect" {
         type_lines += 1;
         search = at + "# TYPE ".len;
     }
-    try std.testing.expectEqual(@as(usize, 15), type_lines);
+    try std.testing.expectEqual(@as(usize, 16), type_lines);
     try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE zoxy_cluster_upstream_panic_picks counter\n") != null);
 }
 
@@ -2407,7 +2416,8 @@ test "counters: labeled render bound is exact at the maximum values" {
         labeled.l4_shed_inflight,        labeled.cluster_responses,
         labeled.cluster_duration_sum_ns, labeled.cluster_duration_count,
         labeled.ejected_picks,           labeled.panic_picks,
-        labeled.l7_shed_total_inflight,  labeled.l4_shed_total_inflight,
+        labeled.standby_picks,           labeled.l7_shed_total_inflight,
+        labeled.l4_shed_total_inflight,
     }) |table| {
         for (table) |*value| value.set(std.math.maxInt(u64));
     }

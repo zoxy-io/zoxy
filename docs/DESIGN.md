@@ -2200,7 +2200,7 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   having nothing that could eject. Two counters make it visible, each
   partitioned by cluster: `upstream_panic_picks`, every pick made in
   panic, and `upstream_ejected_picks`, every pick that landed on an
-  ejected endpoint — which also ends the zero-healthy fail-open being a
+  ejected endpoint (#396 adds `upstream_standby_picks` beside them) — which also ends the zero-healthy fail-open being a
   dial that went out with nothing to say it had.
 
   **Recovery is where active checks earn their place.** Passive
@@ -2235,6 +2235,23 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   accrues no passive verdict at all: it is never picked, so it sees no
   traffic to be judged by — the drain filter running before health is
   what makes that true rather than a special case.
+
+  **A cluster may hold endpoints in standby** (#396), as `priority` on
+  the endpoint object — the placement §5's #400 record made, so one list
+  keeps one endpoint index for health, weights, stickiness and metrics.
+  A pick narrows to the lowest tier with something usable: health, then
+  capacity, then the tier. A tiered cluster first tries the *healthy*
+  endpoints of every tier, whatever its panic threshold says, because a
+  usable standby is what failover exists for and reopening an ejected
+  primary is what it exists to avoid; only when no tier has a healthy
+  endpoint with room does panic or fail-open run, and their set narrows
+  to the lowest tier too. Spill is by capacity: primaries at their
+  `max_inflight` drop out of the set and the next tier takes the
+  excess, up to its own caps, which are the standby's admission limit.
+  Proportional spill as primaries fail (Envoy's overprovisioning factor)
+  is not modelled — the tiers are strict, and `max_inflight` is the
+  dial. The policy runs within the tier, so a `hash` key stays put while
+  its tier's eligible set does.
 
   Opt-in, like `check`, and for a reason worth stating: passive ejection
   removes capacity by *inference*. The failure it prevents is visible

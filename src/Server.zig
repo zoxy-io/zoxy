@@ -4412,6 +4412,10 @@ pub fn Server(comptime IoType: type) type {
                 server.counters.increment("upstream_panic_picks");
                 server.labeled.incrementCluster(.panic_picks, cluster_index);
             }
+            if (chosen.standby) {
+                server.counters.increment("upstream_standby_picks");
+                server.labeled.incrementCluster(.standby_picks, cluster_index);
+            }
         }
 
         /// §8 kernel-pressure rung: a non-orderly op failure on a live

@@ -785,6 +785,16 @@ pub const interim_responses_max: u8 = 8;
 /// the set holds the first try plus this many retries.
 pub const cluster_retries_max: u16 = 3;
 
+/// The deepest #396 standby tier an endpoint may name: priority 0 is the
+/// primary, and each higher level is used only when every level below it
+/// has nothing usable. Eight levels is Envoy's practical range and far
+/// past any failover chain a cluster would describe.
+pub const endpoint_priority_max: u8 = 7;
+comptime {
+    assert(endpoint_priority_max >= 1);
+    assert(endpoint_priority_max < std.math.maxInt(u8));
+}
+
 /// The ceiling on a cluster's #393 retry budget: retry dials in flight at
 /// once. Each holds an upstream slot while it dials, so more than the
 /// pool could never be in flight — the budget is a cap *below* that.

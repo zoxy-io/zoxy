@@ -584,6 +584,10 @@ pub const Config = struct {
         /// still probed (§7), never picked — the balancer treats it as
         /// administratively out, so not even fail-open reaches it.
         weights: ?[]const u16 = null,
+        /// #396's standby tiers, parallel to `endpoints` — or null when
+        /// every endpoint is a primary (priority 0), which is every config
+        /// before the key, so the table exists only where tiers do.
+        priorities: ?[]const u8 = null,
         /// The §7 endpoint-pick policy the balancer runs for this
         /// cluster. The JSON field is optional and defaults to `p2c`
         /// (the §7 default), with `rr` kept for strict rotation
@@ -978,6 +982,7 @@ pub const ValidationError = error{
     /// A `unix:` endpoint path that is not absolute (#303).
     EndpointUnixPathRelative,
     EndpointWeightOverLimit,
+    EndpointPriorityOverLimit,
     EndpointWeightsAllZero,
     TimeoutZero,
     TimeoutOverLimit,
@@ -3540,10 +3545,13 @@ pub const RetriesJson = struct {
 pub const EndpointJson = struct {
     address: []const u8,
     weight: u32 = 1,
+    /// #396's standby tier: 0, the default and what a bare string means,
+    /// is the primary.
+    priority: u8 = 0,
 
     pub const schema_doc =
         "One endpoint: an IP:port literal, a `unix:` socket path, or an " ++
-        "object carrying either and a relative pick weight.";
+        "object carrying either with a relative pick weight and a standby tier.";
     pub const schema_fields = .{
         .address = .{
             .desc = "Endpoint literal: `IP:port` (port must be non-zero), or " ++
@@ -3558,6 +3566,15 @@ pub const EndpointJson = struct {
             .minimum = 0,
             .maximum = constants.endpoint_weight_max,
         },
+        .priority = .{
+            .desc = "Standby tier: 0 (the default) is the primary. A request goes " ++
+                "to the lowest tier with an endpoint that is healthy and under its " ++
+                "max_inflight, so a higher tier takes traffic only when every tier " ++
+                "below it is ejected, drained or full. The pick policy runs within " ++
+                "the chosen tier.",
+            .minimum = 0,
+            .maximum = constants.endpoint_priority_max,
+        },
     };
 
     /// The object form as a plain struct, so `innerParse` reads it with
@@ -3566,16 +3583,17 @@ pub const EndpointJson = struct {
     const ObjectForm = struct {
         address: []const u8,
         weight: u32 = 1,
+        priority: u8 = 0,
     };
 
     const short_token: std.json.TokenType = .string;
 
     fn fromShort(literal: []const u8) error{}!EndpointJson {
-        return .{ .address = literal, .weight = 1 };
+        return .{ .address = literal, .weight = 1, .priority = 0 };
     }
 
     fn fromObject(object: ObjectForm) error{}!EndpointJson {
-        return .{ .address = object.address, .weight = object.weight };
+        return .{ .address = object.address, .weight = object.weight, .priority = object.priority };
     }
 
     pub fn jsonParse(
@@ -4431,6 +4449,7 @@ fn resolveClusters(
             .name = entry.name,
             .endpoints = endpoints.addresses,
             .weights = endpoints.weights,
+            .priorities = try resolvePriorities(arena, entry.cluster.endpoints),
             .pick = picked.pick,
             .check = try resolveCheck(entry.cluster.check, connect_timeout_ms),
             .passive_ejection = try resolvePassiveEjection(entry.cluster.passive_ejection),
@@ -4661,6 +4680,34 @@ fn resolveBindAddress(
     return .{ .ip = std.Io.net.IpAddress.parseLiteral(literal) catch {
         return error.ListenerBindInvalid;
     } };
+}
+
+/// A cluster's #396 tiers, materialized only where some endpoint is not a
+/// primary — the `weights` rule, so an untiered cluster carries nothing.
+fn resolvePriorities(
+    arena: std.mem.Allocator,
+    endpoints_json: []const EndpointJson,
+) ParseError!?[]const u8 {
+    assert(endpoints_json.len >= 1);
+    var tiered = false;
+    for (endpoints_json) |entry| {
+        if (entry.priority > constants.endpoint_priority_max) return error.EndpointPriorityOverLimit;
+        tiered = tiered or entry.priority != 0;
+    }
+    if (!tiered) return null;
+    // Tiers are relative: the lowest one a cluster names is its primary,
+    // so `{"priority": 1}` on every endpoint is a cluster of primaries,
+    // and a pick reported `standby` always had a lower tier to pass over.
+    var lowest: u8 = constants.endpoint_priority_max;
+    for (endpoints_json) |entry| lowest = @min(lowest, entry.priority);
+    var distinct = false;
+    for (endpoints_json) |entry| distinct = distinct or entry.priority != lowest;
+    if (!distinct) return null;
+    const priorities = try arena.alloc(u8, endpoints_json.len);
+    for (endpoints_json, priorities) |entry, *priority| priority.* = entry.priority - lowest;
+    assert(priorities.len == endpoints_json.len);
+    assert(std.mem.indexOfScalar(u8, priorities, 0) != null);
+    return priorities;
 }
 
 fn resolveEndpoints(
@@ -10238,6 +10285,48 @@ test "config: slow start needs a cap to ramp and something to restore from (#391
     try expectParseError(error.ClusterSlowStartWithoutMaxInflight, head ++ "\"passive_ejection\":{},\"slow_start_ms\":1000" ++ tail);
     try expectParseError(error.ClusterSlowStartWithoutHealth, head ++ "\"max_inflight\":8,\"slow_start_ms\":1000" ++ tail);
     try expectParseError(error.ClusterSlowStartOutOfRange, head ++ "\"max_inflight\":8,\"passive_ejection\":{},\"slow_start_ms\":0" ++ tail);
+}
+
+test "config: an endpoint may name a standby tier (#396)" {
+    const head =
+        \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":
+    ;
+    const tail =
+        \\}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    ;
+    // Untiered: no table at all, every config before the key.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ "[\"127.0.0.1:2\",{\"address\":\"127.0.0.1:3\",\"priority\":0}]" ++ tail);
+        try std.testing.expect(parsed.clusters[0].priorities == null);
+    }
+    // A bare string is a primary beside a standby.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ "[\"127.0.0.1:2\",{\"address\":\"127.0.0.1:3\",\"priority\":1}]" ++ tail);
+        try std.testing.expectEqualSlices(u8, &.{ 0, 1 }, parsed.clusters[0].priorities.?);
+    }
+    try expectParseError(error.EndpointPriorityOverLimit, head ++ "[{\"address\":\"127.0.0.1:3\",\"priority\":8}]" ++ tail);
+    // Relative: the lowest tier named is the primary, so one tier
+    // everywhere is no tiering, and 2-over-1 is 1-over-0.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++
+            "[{\"address\":\"127.0.0.1:2\",\"priority\":1},{\"address\":\"127.0.0.1:3\",\"priority\":1}]" ++ tail);
+        try std.testing.expect(parsed.clusters[0].priorities == null);
+    }
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++
+            "[{\"address\":\"127.0.0.1:2\",\"priority\":2},{\"address\":\"127.0.0.1:3\",\"priority\":1}]" ++ tail);
+        try std.testing.expectEqualSlices(u8, &.{ 1, 0 }, parsed.clusters[0].priorities.?);
+    }
 }
 
 test "config: retries take a bare count or an object with a budget (#393)" {
