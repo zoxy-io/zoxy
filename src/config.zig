@@ -3631,12 +3631,20 @@ pub const CheckJson = struct {
     rise: u8 = constants.health_probe_rise_default,
     /// Budget for one whole probe; absent means `timeouts.connect_ms`.
     timeout_ms: ?u32 = null,
-    /// Required for `http`, rejected for `tcp`.
+    /// Required for `http`, rejected for `tcp` and `grpc`.
     path: ?[]const u8 = null,
-    /// `Host` for an `http` probe; absent sends the endpoint literal.
+    /// `Host` for an `http` probe; absent sends the endpoint literal, or
+    /// `localhost` for a `unix:` endpoint, whose path names no host.
     host: ?[]const u8 = null,
-    expect_status: u16 = 200,
-    /// The service a `grpc` probe asks about; absent asks about the server.
+    /// The status an `http` probe accepts; absent is 200. Optional so
+    /// that naming it under `tcp` or `grpc`, where nothing reads a
+    /// status, is refused like the other `http` fields rather than
+    /// parsed and ignored (#400).
+    expect_status: ?u16 = null,
+    /// The service a `grpc` probe asks about; absent asks about the
+    /// server. An empty name is refused rather than read as absence:
+    /// absence is how the server is asked for, and one spelling is
+    /// what the schema's `minLength` already says.
     service: ?[]const u8 = null,
 
     pub const schema_doc = "Active health checks for a cluster's endpoints.";
@@ -3661,15 +3669,17 @@ pub const CheckJson = struct {
             .maximum = constants.timeout_ms_max,
         },
         .path = .{
-            .desc = "Canonical origin-form path an http probe requests; required for http, rejected for tcp.",
+            .desc = "Canonical origin-form path an http probe requests; required for http, rejected for tcp and grpc.",
             .min_length = 1,
         },
         .host = .{
-            .desc = "Host header an http probe sends; absent sends the endpoint's own IP:port literal.",
+            .desc = "Host header an http probe sends; absent sends the endpoint's " ++
+                "own IP:port literal, or localhost for a unix: endpoint.",
             .min_length = 1,
         },
         .expect_status = .{
-            .desc = "The only response status an http probe accepts as healthy.",
+            .desc = "The only response status an http probe accepts as healthy; " ++
+                "absent is 200. Rejected for tcp and grpc.",
             .minimum = 100,
             .maximum = 599,
         },
@@ -3688,9 +3698,9 @@ pub const CheckJson = struct {
     pub const schema_variants = [_]SchemaVariants{.{
         .on = "type",
         .branches = &.{
-            .{ .value = "tcp", .default = true, .forbid = &.{ "path", "host", "service" } },
+            .{ .value = "tcp", .default = true, .forbid = &.{ "path", "host", "expect_status", "service" } },
             .{ .value = "http", .require = &.{"path"}, .forbid = &.{"service"} },
-            .{ .value = "grpc", .forbid = &.{ "path", "host" } },
+            .{ .value = "grpc", .forbid = &.{ "path", "host", "expect_status" } },
         },
     }};
 };
@@ -5720,21 +5730,27 @@ fn resolveCheck(
         .tcp => blk: {
             // A TCP probe sends nothing and reads nothing, so every
             // HTTP-shaped field here would be inert.
-            if (check.path != null or check.host != null) {
+            if (check.path != null or check.host != null or check.expect_status != null) {
                 return error.ClusterCheckHttpFieldOnTcp;
             }
             break :blk null;
         },
         .http => try resolveHttpCheck(&check),
         .grpc => blk: {
-            // The health protocol fixes the path, and the authority is
-            // the cluster's: an operator's would be inert.
-            if (check.path != null or check.host != null) {
+            // The health protocol fixes the path and the verdict (a
+            // SERVING answer, not a status), and the authority is the
+            // cluster's: an operator's would be inert.
+            if (check.path != null or check.host != null or check.expect_status != null) {
                 return error.ClusterCheckHttpFieldOnGrpc;
             }
             break :blk null;
         },
     };
+    // Absent asks about the server; an empty name would be a second
+    // spelling of that, and the schema's `minLength` refuses it.
+    if (check.service) |named| {
+        if (named.len == 0) return error.ClusterCheckServiceInvalid;
+    }
     const service = check.service orelse "";
     if (!grpcServiceValid(service)) return error.ClusterCheckServiceInvalid;
     return .{
@@ -5786,13 +5802,14 @@ fn resolveHttpCheck(check: *const CheckJson) ParseError!Config.Cluster.Check.Htt
             }
         }
     }
-    if (check.expect_status < 100 or check.expect_status > 599) {
+    const expect_status = check.expect_status orelse 200;
+    if (expect_status < 100 or expect_status > 599) {
         return error.ClusterCheckStatusInvalid;
     }
     return .{
         .path = path,
         .host = check.host,
-        .expect_status = check.expect_status,
+        .expect_status = expect_status,
     };
 }
 
@@ -7836,6 +7853,27 @@ test "config: a check block rejects every shape it cannot run" {
     try expectParseError(
         error.ClusterCheckServiceInvalid,
         head ++ "{\"type\":\"grpc\",\"service\":\"" ++ long_service ++ "\"}" ++ tail,
+    );
+    // Absence asks about the server; an empty name was a second spelling
+    // of it that the loader took and the schema refused (#400).
+    try expectParseError(
+        error.ClusterCheckServiceInvalid,
+        head ++ "{\"type\":\"grpc\",\"service\":\"\"}" ++ tail,
+    );
+    // A status is an http probe's verdict alone: a tcp probe reads
+    // nothing, and a grpc one is judged on SERVING. Named beside either,
+    // it used to be parsed and ignored, and never range-checked (#400).
+    try expectParseError(
+        error.ClusterCheckHttpFieldOnTcp,
+        head ++ "{\"expect_status\":204}" ++ tail,
+    );
+    try expectParseError(
+        error.ClusterCheckHttpFieldOnTcp,
+        head ++ "{\"type\":\"tcp\",\"expect_status\":9999}" ++ tail,
+    );
+    try expectParseError(
+        error.ClusterCheckHttpFieldOnGrpc,
+        head ++ "{\"type\":\"grpc\",\"expect_status\":204}" ++ tail,
     );
 }
 

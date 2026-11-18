@@ -442,10 +442,19 @@ pub fn Checker(comptime IoType: type) type {
                 const http = check.http.?;
                 const cluster = &checker.server.config.clusters[probe.target_cluster];
                 const endpoint = cluster.endpoints[probe.target_endpoint];
+                // An operator's `host` wins. Without one an IP endpoint
+                // names itself, but a socket path names no host — `unix:/…`
+                // is not one RFC 9110 allows — so `localhost` stands in,
+                // the gRPC probe's rule (`ProbeLeg.authorize`) and curl's
+                // for `--unix-socket`.
+                const named: ?[]const u8 = http.host orelse switch (endpoint) {
+                    .unix => "localhost",
+                    .ip => null,
+                };
                 // `Connection: close` because the probe never reuses this
                 // socket: it asks one question and hangs up, which also frees
                 // the origin from parking a connection nobody will return to.
-                const rendered = if (http.host) |host|
+                const rendered = if (named) |host|
                     std.fmt.bufPrint(
                         &probe.request,
                         "GET {s} HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n",
