@@ -10,6 +10,7 @@ const std = @import("std");
 const constants = @import("../constants.zig");
 const Credentials = @import("Credentials.zig");
 const Engine = @import("Engine.zig");
+const certificate_set = @import("certificate_set.zig");
 const trust = @import("trust.zig");
 const zssl = @import("zssl");
 
@@ -21,6 +22,8 @@ const client_ca_pem = @embedFile("testdata/client-ca.pem");
 const client_cert_pem = @embedFile("testdata/client-cert.pem");
 const client_key_pem = @embedFile("testdata/client-key.pem");
 const other_ca_pem = @embedFile("testdata/other-ca.pem");
+const origin_cert_pem = @embedFile("testdata/origin-cert.pem");
+const origin_key_pem = @embedFile("testdata/origin-key.pem");
 
 /// Room for the largest record on the wire — a max-size plaintext record
 /// plus its header and AEAD tag — with slack for a second alongside it.
@@ -96,13 +99,27 @@ const Client = struct {
     /// `credentials` is what the client answers a CertificateRequest
     /// with (#304); null answers with an empty certificate list.
     fn initPresenting(client: *Client, credentials: ?*const zssl.Credentials) !void {
+        return client.initFull(credentials, "spike.zoxy.test", null);
+    }
+
+    /// The full form: what to present, which server to name (#297), and
+    /// optionally a verifier shown the server's chain — the one way to see
+    /// which certificate the server actually sent.
+    fn initFull(
+        client: *Client,
+        credentials: ?*const zssl.Credentials,
+        server_name: []const u8,
+        chain_verifier: ?zssl.certificate_list.ChainVerifier,
+    ) !void {
         client.hs = .init(&.{
             .client_random = @splat(0x52),
             .x25519_private = @splat(0x51),
-            .server_name = "spike.zoxy.test",
+            .server_name = server_name,
             // The fixture is self-signed and what these tests exercise is
-            // zoxy's engine, not this client's trust decisions.
-            .certificate_policy = .insecure_no_verification,
+            // zoxy's engine, not this client's trust decisions — except
+            // where a test asks to see the chain.
+            .certificate_policy = if (chain_verifier != null) .leaf_signature else .insecure_no_verification,
+            .chain_verifier = chain_verifier,
             .reassembly = &client.reassembly,
             .client_credentials = credentials,
             .client_auth_flight = if (credentials != null) &client.auth_flight else &.{},
@@ -579,3 +596,87 @@ test "engine: a client certificate from another CA is refused, optional or not (
         try std.testing.expect(bed.engine.clientFingerprint() == null);
     }
 }
+
+test "engine: the ClientHello's server name chooses among a listener's certificates (#297)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var default_credentials = try Credentials.load(arena, cert_pem, key_pem, .{});
+    defer default_credentials.deinit();
+    var origin_credentials = try Credentials.load(arena, origin_cert_pem, origin_key_pem, .{});
+    defer origin_credentials.deinit();
+    const choices = [_]certificate_set.Choice{
+        .{ .credentials = &default_credentials, .names = try trust.dnsNames(arena, default_credentials.chain[0]) },
+        .{ .credentials = &origin_credentials, .names = try trust.dnsNames(arena, origin_credentials.chain[0]) },
+    };
+    // Each name gets its own certificate; one neither covers, the default.
+    const cases = [_]struct { name: []const u8, chosen: usize }{
+        .{ .name = "origin.zoxy.test", .chosen = 1 },
+        .{ .name = "spike.zoxy.test", .chosen = 0 },
+        .{ .name = "nobody.zoxy.test", .chosen = 0 },
+    };
+    for (cases) |case| {
+        var engine: Engine = undefined;
+        var plaintext: [Engine.plaintext_bytes_min]u8 = undefined;
+        var body_plaintext: [Engine.plaintext_bytes_min]u8 = undefined;
+        engine.bindPlaintext(&plaintext, &body_plaintext, constants.head_buffer_bytes_default);
+        try engine.init(&.{
+            .x25519_seed = @splat(0x42),
+            .random = @splat(0x43),
+            .credentials = &default_credentials,
+            .certificates = &choices,
+        });
+        defer engine.deinit();
+        var shown: ShownLeaf = .{};
+        var client: Client = undefined;
+        try client.initFull(null, case.name, .{ .context = &shown, .verify = ShownLeaf.record });
+        defer client.hs.deinit();
+        var to_server: Peer = .{};
+        var to_client: Peer = .{};
+        try client.hello(&to_server);
+        var rounds: u8 = 0;
+        while (!(engine.isConnected() and client.hs.state == .connected)) : (rounds += 1) {
+            try std.testing.expect(rounds < rounds_max);
+            // A few bytes per delivery, so the hello arrives in pieces and
+            // the choice has to wait for the whole record before it is made.
+            const wire = to_server.take();
+            var offset: usize = 0;
+            while (offset < wire.len) {
+                const end = @min(offset + 7, wire.len);
+                try engine.feed(wire[offset..end], &to_client.sink());
+                offset = end;
+            }
+            const staged = engine.outbound();
+            if (staged.len > 0) {
+                to_client.write(staged);
+                engine.outboundSent(staged.len);
+            }
+            try client.feed(to_client.take(), &to_server);
+        }
+        try std.testing.expectEqual(case.chosen, engine.chosenCertificate());
+        // What the client was actually shown, not only what the engine
+        // says it chose: the chosen certificate's own leaf.
+        try std.testing.expectEqualSlices(u8, choices[case.chosen].credentials.chain[0], shown.leaf());
+    }
+}
+
+/// The server's leaf as a client was shown it (#297), captured by zssl's
+/// chain verifier while the bytes are live.
+const ShownLeaf = struct {
+    bytes: [4096]u8 = undefined,
+    len: usize = 0,
+
+    fn record(context: *anyopaque, chain: zssl.certificate_list.CertificateList) bool {
+        const self: *ShownLeaf = @ptrCast(@alignCast(context));
+        var iterator = chain.iterator();
+        const first = (iterator.next() catch return false) orelse return false;
+        if (first.len > self.bytes.len) return false;
+        @memcpy(self.bytes[0..first.len], first);
+        self.len = first.len;
+        return true;
+    }
+
+    fn leaf(self: *const ShownLeaf) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};

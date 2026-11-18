@@ -103,6 +103,20 @@ const tls_cert_path = work_directory ++ "/cert.pem";
 const tls_key_path = work_directory ++ "/key.pem";
 const tls_cert_pem = @embedFile("tls_cert_pem");
 const tls_key_pem = @embedFile("tls_key_pem");
+/// #297: the terminating listener's second certificate, for
+/// `tls_sni_name`, and the CA the SNI leg's client verifies it against.
+/// The default above is self-signed for another name, so a handshake that
+/// verifies under this CA for this name proves the server name chose.
+const tls_sni_cert_path = work_directory ++ "/sni-cert.pem";
+const tls_sni_key_path = work_directory ++ "/sni-key.pem";
+const tls_sni_ca_path = work_directory ++ "/sni-ca.pem";
+const tls_sni_cert_pem = @embedFile("tls_sni_cert_pem");
+const tls_sni_key_pem = @embedFile("tls_sni_key_pem");
+const tls_sni_ca_pem = @embedFile("tls_sni_ca_pem");
+const tls_sni_name = "origin.zoxy.test";
+/// The SNI leg: one connection naming `tls_sni_name`, one request on it.
+const tls_sni_connections: u32 = 1;
+const tls_sni_requests: u32 = 1;
 /// Requests the HTTPS leg issues on one terminated connection. More than
 /// one on purpose: the second is a keep-alive turnaround, which is the
 /// L7 state a directed test with a single `Connection: close` client
@@ -118,7 +132,7 @@ const tls_alpn_refusal_connections: u32 = 1;
 /// Everything the last leg opens, as one term: the scrapes before it
 /// subtract the leg whole, so a connection added to it cannot be counted
 /// in the run's total and forgotten in theirs.
-const https_leg_connections: u32 = tls_connections + tls_alpn_refusal_connections;
+const https_leg_connections: u32 = tls_connections + tls_alpn_refusal_connections + tls_sni_connections;
 /// Tickets a completed handshake is expected to issue — `constants
 /// .tls_tickets_per_handshake`, spelled here rather than imported like
 /// the counter names: the gate reads what the binary *wrote*, so a drift
@@ -293,7 +307,7 @@ const exchanges_per_pass: u32 =
 const http_exchanges: u32 = load_passes * exchanges_per_pass;
 const access_log_lines_expected: u32 = http_exchanges + sticky_exchanges +
     body_exchanges + allowlist_exchanges + h2c_exchanges + h2_origin_exchanges +
-    h2_tls_lines + https_loop_lines + tls_requests + l4_connections;
+    h2_tls_lines + https_loop_lines + tls_requests + tls_sni_requests + l4_connections;
 
 /// What the resident set may grow by between the two passes. Measured at
 /// exactly zero, run after run — the tolerance is headroom for page
@@ -840,7 +854,7 @@ fn accessLogPassed(lines: *const LogCounts) bool {
     // and a log that told them apart would be the defect.
     const http_lines_expected = http_exchanges + sticky_exchanges +
         body_exchanges + allowlist_exchanges + h2c_exchanges + h2_origin_exchanges +
-        h2_tls_lines + https_loop_lines + tls_requests;
+        h2_tls_lines + https_loop_lines + tls_requests + tls_sni_requests;
     assert(access_log_lines_expected == http_lines_expected + l4_connections);
     var passed = true;
     if (lines.http != http_lines_expected) {
@@ -1918,22 +1932,25 @@ fn tlsPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
     const host = try std.fmt.bufPrint(&host_buffer, "127.0.0.1:{d}", .{ports.tls});
     var passed = try alpnRefusalPassed(io, ports.tls);
     enterStage(.https_handshake);
-    try single_client.connectTls(io, ports.tls);
-    defer single_client.close();
+    {
+        try single_client.connectTls(io, ports.tls);
+        defer single_client.close();
 
-    var request: u32 = 0;
-    enterStage(.https_request);
-    while (request < tls_requests) : (request += 1) {
-        current_https_request.store(request + 1, .release);
-        // Keep-alive throughout: the turnaround is what is being tested,
-        // and it is also what leaves the connection for `close_notify`
-        // to end rather than a response the proxy closed on.
-        const response = try single_client.get(host, "/", .keep_alive, null);
-        if (!expectTlsResponse(response, request)) passed = false;
+        var request: u32 = 0;
+        enterStage(.https_request);
+        while (request < tls_requests) : (request += 1) {
+            current_https_request.store(request + 1, .release);
+            // Keep-alive throughout: the turnaround is what is being tested,
+            // and it is also what leaves the connection for `close_notify`
+            // to end rather than a response the proxy closed on.
+            const response = try single_client.get(host, "/", .keep_alive, null);
+            if (!expectTlsResponse(response, request)) passed = false;
+        }
+        assert(request == tls_requests);
+        enterStage(.https_close_notify);
+        try single_client.endTls();
     }
-    assert(request == tls_requests);
-    enterStage(.https_close_notify);
-    try single_client.endTls();
+    if (!try sniPassed(arena, io, ports.tls, host)) passed = false;
 
     enterStage(.https_scrape);
     const scrape = try scrape_module.parse(try scrape_module.fetch(arena, io, ports.admin));
@@ -1941,7 +1958,10 @@ fn tlsPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
         // One session, completed: the handshake ran once and finished.
         // The https leg's own, and the §7 TLS leg's verified loop into
         // this proxy's own listener.
-        .{ .name = "tls_handshakes_completed", .expected = 1 + h2_tls_handshakes + https_loop_handshakes },
+        .{
+            .name = "tls_handshakes_completed",
+            .expected = 1 + tls_sni_connections + h2_tls_handshakes + https_loop_handshakes,
+        },
         // And nothing on the failure side. Stated as equalities against
         // zero rather than left unread, because every one of these is a
         // rung a working run must never reach — a session that failed and
@@ -1960,7 +1980,8 @@ fn tlsPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
         // Every completed handshake is issued its tickets, the loop's too.
         .{
             .name = "tls_tickets_issued",
-            .expected = (1 + h2_tls_handshakes + https_loop_handshakes) * tls_tickets_per_handshake,
+            .expected = (1 + tls_sni_connections + h2_tls_handshakes + https_loop_handshakes) *
+                tls_tickets_per_handshake,
         },
         // And nothing resumed: this client is offered tickets and never
         // returns one, so a count here would mean the counter fires on
@@ -1994,6 +2015,33 @@ fn tlsPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
         );
         passed = false;
     }
+    return passed;
+}
+
+/// The #297 leg: a client naming `tls_sni_name` and trusting only the CA
+/// that issued its certificate. The listener's default is self-signed for
+/// another name, so this handshake completes only if zoxy chose by the
+/// server name — and an outside implementation is what judges it.
+fn sniPassed(arena: std.mem.Allocator, io: Io, port: u16, host: []const u8) !bool {
+    assert(port != 0);
+    assert(host.len >= 1);
+    var bundle: std.crypto.Certificate.Bundle = .empty;
+    defer bundle.deinit(arena);
+    try bundle.addCertsFromFilePath(arena, io, .now(io, .real), Io.Dir.cwd(), tls_sni_ca_path);
+    var lock: Io.RwLock = .init;
+    single_client.connectTlsVerifying(io, port, .{ .explicit = tls_sni_name }, .{ .bundle = .{
+        .gpa = arena,
+        .io = io,
+        .lock = &lock,
+        .bundle = &bundle,
+    } }) catch |err| {
+        std.debug.print("FAIL: a client naming {s} could not verify what it was shown: {t}\n", .{ tls_sni_name, err });
+        return false;
+    };
+    defer single_client.close();
+    const response = try single_client.get(host, "/", .keep_alive, null);
+    const passed = expectTlsResponse(response, 0);
+    try single_client.endTls();
     return passed;
 }
 
@@ -2452,6 +2500,8 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
         ports.tls,
         tls_cert_path,
         tls_key_path,
+        tls_sni_cert_path,
+        tls_sni_key_path,
         try std.fmt.allocPrint(arena, h2_tls_listener_template, .{ ports.h2_tls, tls_cert_path, tls_key_path }),
         origin_port,
         health_probe_timeout_ms,
@@ -2544,7 +2594,8 @@ const config_template =
     \\        {{ "bind": "127.0.0.1:{d}", "l4": {{ "cluster": "origin" }} }},
     \\        {{ "bind": "127.0.0.1:{d}",
     \\          "http": {{ "routes": [{{ "host": "127.0.0.1", "prefix": "/", "cluster": "origin" }}] }},
-    \\          "tls": {{ "cert": "{s}", "key": "{s}" }} }},
+    \\          "tls": {{ "cert": "{s}", "key": "{s}",
+    \\                   "certificates": [{{ "cert": "{s}", "key": "{s}" }}] }} }},
     \\        {s}
     \\    ],
     \\    "clusters": {{
@@ -2605,6 +2656,9 @@ fn prepareWorkDirectory(io: Io) !void {
     // decision.
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = tls_cert_path, .data = tls_cert_pem });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = tls_key_path, .data = tls_key_pem });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = tls_sni_cert_path, .data = tls_sni_cert_pem });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = tls_sni_key_path, .data = tls_sni_key_pem });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = tls_sni_ca_path, .data = tls_sni_ca_pem });
     // The #301 pre-flight's negative case, written beside the real one so
     // both reach the same binary through the same argument.
     try Io.Dir.cwd().writeFile(io, .{

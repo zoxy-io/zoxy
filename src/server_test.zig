@@ -2031,14 +2031,14 @@ test "tls: the engine pool hands out what the config provisioned, and no more" {
     defer bed.tearDown();
 
     const credentials = &bed.tls_credentials[0].?;
-    const first = try bed.server.acquireTlsEngine(credentials, &.{}, null);
-    const second = try bed.server.acquireTlsEngine(credentials, &.{}, null);
+    const first = try bed.server.acquireTlsEngine(credentials, &.{}, &.{}, null);
+    const second = try bed.server.acquireTlsEngine(credentials, &.{}, &.{}, null);
     try std.testing.expect(first != second);
     // Exhausted at exactly the provisioned count: the wall a shed rung
     // will report is this null, not a larger pool than the banner priced.
     try std.testing.expectError(
         error.EnginesExhausted,
-        bed.server.acquireTlsEngine(credentials, &.{}, null),
+        bed.server.acquireTlsEngine(credentials, &.{}, &.{}, null),
     );
 
     // Each slot's plaintext destination is bound and sized by the engine's
@@ -2053,7 +2053,7 @@ test "tls: the engine pool hands out what the config provisioned, and no more" {
     try std.testing.expect(first.plaintext.ptr != second.plaintext.ptr);
 
     bed.server.releaseTlsEngine(first);
-    const reused = try bed.server.acquireTlsEngine(credentials, &.{}, null);
+    const reused = try bed.server.acquireTlsEngine(credentials, &.{}, &.{}, null);
     try std.testing.expectEqual(first, reused);
     bed.server.releaseTlsEngine(reused);
     bed.server.releaseTlsEngine(second);
@@ -2076,7 +2076,7 @@ test "tls: two engines from one seed produce one handshake, replayed" {
         });
         defer bed.tearDown();
 
-        const engine = try bed.server.acquireTlsEngine(&bed.tls_credentials[0].?, &.{}, null);
+        const engine = try bed.server.acquireTlsEngine(&bed.tls_credentials[0].?, &.{}, &.{}, null);
         // The ServerHello random is the engine's seeded input made
         // visible: it goes on the wire verbatim, so comparing it compares
         // what the peer would see.

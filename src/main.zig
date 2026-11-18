@@ -152,6 +152,7 @@ fn serve(init: std.process.Init, arena: std.mem.Allocator, config_path: []const 
     try server.init(arena, &global_io, &config, config.limits);
     if (resources.tls_credentials.len > 0) {
         server.setTlsCredentials(resources.tls_credentials);
+        server.setTlsCertificateSets(resources.tls_certificate_sets);
     }
     // Before `start`, which is a change #311 forced and an improvement on
     // its own terms. The serving watchdog is armed at the end of `start`,
@@ -178,6 +179,10 @@ const StartupResources = struct {
     /// One slot per listener, null where the listener is plaintext —
     /// empty when nothing terminates TLS.
     tls_credentials: []const ?zoxy.tls.Credentials,
+    /// #297: per listener, the certificates a server name chooses among
+    /// (the default first), empty where it holds one. One slot per
+    /// listener whenever `tls_credentials` has any, empty otherwise.
+    tls_certificate_sets: []const []const zoxy.tls.certificate_set.Choice,
 };
 
 /// The §5/§8 startup gauntlet: raise `RLIMIT_NOFILE` to the demand, open
@@ -213,7 +218,91 @@ fn openStartupResources(
     // under traffic (§4).
     const tls_credentials = try loadTlsCredentials(io, arena, config);
     assert(tls_credentials.len == 0 or tls_credentials.len == config.listeners.len);
-    return .{ .log_sink_fd = log_sink_fd, .tls_credentials = tls_credentials };
+    const tls_certificate_sets = try loadTlsCertificateSets(io, arena, config, tls_credentials);
+    assert(tls_certificate_sets.len == tls_credentials.len);
+    return .{
+        .log_sink_fd = log_sink_fd,
+        .tls_credentials = tls_credentials,
+        .tls_certificate_sets = tls_certificate_sets,
+    };
+}
+
+/// Every listener's further certificates (#297), loaded beside its
+/// default and named by the DNS names each leaf covers. Same verdicts as
+/// the default pair, plus one of its own: a further certificate that
+/// names no DNS host could never be chosen, so it stops startup rather
+/// than sit in the table as a typo nobody notices.
+fn loadTlsCertificateSets(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    config: *const zoxy.config.Config,
+    credentials: []const ?zoxy.tls.Credentials,
+) ![]const []const zoxy.tls.certificate_set.Choice {
+    if (credentials.len == 0) return &.{};
+    assert(credentials.len == config.listeners.len);
+    const sets = try arena.alloc([]const zoxy.tls.certificate_set.Choice, credentials.len);
+    for (config.listeners, credentials, sets, 0..) |listener, *default_credentials, *set, index| {
+        set.* = &.{};
+        const tls = listener.tls orelse continue;
+        if (tls.certificates.len == 0) continue;
+        set.* = try loadCertificateSet(io, arena, tls, &default_credentials.*.?, index);
+    }
+    assert(sets.len == credentials.len);
+    return sets;
+}
+
+/// One listener's set: its default first, then each further pair loaded
+/// in config order.
+fn loadCertificateSet(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    tls: zoxy.config.Config.Listener.Tls,
+    default_credentials: *const zoxy.tls.Credentials,
+    index: usize,
+) ![]const zoxy.tls.certificate_set.Choice {
+    assert(tls.certificates.len >= 1);
+    const choices = try arena.alloc(zoxy.tls.certificate_set.Choice, 1 + tls.certificates.len);
+    choices[0] = .{
+        .credentials = default_credentials,
+        .names = try leafNames(arena, default_credentials, tls.cert_path, index),
+    };
+    const loaded = try arena.alloc(zoxy.tls.Credentials, tls.certificates.len);
+    for (tls.certificates, loaded, choices[1..]) |certificate, *credentials, *choice| {
+        const cert_pem = try readPemFile(io, arena, certificate.cert_path);
+        const key_pem = try readPemFile(io, arena, certificate.key_path);
+        credentials.* = zoxy.tls.Credentials.load(arena, cert_pem, key_pem, .{}) catch |err| {
+            std.debug.print(
+                "zoxy: listener {d} cannot use '{s}' + '{s}': {t}\n",
+                .{ index, certificate.cert_path, certificate.key_path, err },
+            );
+            return err;
+        };
+        choice.* = .{ .credentials = credentials, .names = try leafNames(arena, credentials, certificate.cert_path, index) };
+        if (choice.names.len == 0) {
+            std.debug.print(
+                "zoxy: listener {d}: '{s}' names no DNS host, so no server name could choose it\n",
+                .{ index, certificate.cert_path },
+            );
+            return error.CertificateNamesNoHost;
+        }
+    }
+    assert(choices[0].credentials == default_credentials);
+    return choices;
+}
+
+/// The DNS names a loaded certificate's leaf covers, or a startup error
+/// naming the file.
+fn leafNames(
+    arena: std.mem.Allocator,
+    credentials: *const zoxy.tls.Credentials,
+    cert_path: []const u8,
+    index: usize,
+) ![]const []const u8 {
+    assert(credentials.chain.len >= 1);
+    return zoxy.tls.trust.dnsNames(arena, credentials.chain[0]) catch |err| {
+        std.debug.print("zoxy: listener {d}: cannot read the names in '{s}': {t}\n", .{ index, cert_path, err });
+        return err;
+    };
 }
 
 /// What `--check` exits with (#301). Three answers rather than two,

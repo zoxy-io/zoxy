@@ -169,6 +169,35 @@ pub fn leafFingerprint(leaf_der: []const u8) [fingerprint_bytes]u8 {
     return digest;
 }
 
+/// The DNS names a leaf certificate covers, lowercased, in the order its
+/// subjectAltName lists them (#297) — what a listener with several
+/// certificates selects one by. Other name kinds (IP, email, URI) are
+/// skipped: a server name in a ClientHello is a DNS name (RFC 6066 §3).
+/// Allocates into the startup arena; never on the serving path.
+pub fn dnsNames(
+    arena: std.mem.Allocator,
+    leaf_der: []const u8,
+) error{ CertificateInvalid, NamesTooMany, OutOfMemory }![]const []const u8 {
+    const leaf = parsed(leaf_der) orelse return error.CertificateInvalid;
+    const san = leaf.subjectAltName();
+    if (san.len == 0) return &.{};
+    const general_names = Tlv.read(san, 0, san.len) orelse return error.CertificateInvalid;
+    var names: std.ArrayList([]const u8) = .empty;
+    var cursor = general_names.start;
+    var seen: u32 = 0;
+    while (cursor < general_names.end) : (seen += 1) {
+        if (seen == constants.tls_certificate_names_max) return error.NamesTooMany;
+        const name = Tlv.read(san, cursor, general_names.end) orelse return error.CertificateInvalid;
+        assert(name.end > cursor);
+        cursor = name.end;
+        // `[2] IMPLICIT IA5String`: a dNSName (RFC 5280 §4.2.1.6).
+        if (name.tag != 0x82 or name.end == name.start) continue;
+        try names.append(arena, try std.ascii.allocLowerString(arena, san[name.start..name.end]));
+    }
+    assert(names.items.len <= constants.tls_certificate_names_max);
+    return names.items;
+}
+
 /// Each certificate signed by the next, each issuer a CA, and the last
 /// anchored — the path half both verdicts share.
 fn pathVerifies(
@@ -356,6 +385,23 @@ test "trust: a client chain to another anchor, outside its window, or led by a C
     try testing.expect(!verifyClientChain(anchors, &.{origin_leaf}, now_2030));
 }
 
+test "trust: a leaf's DNS names are read off its subjectAltName, lowercased (#297)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const origin_leaf = try firstDer(arena, leaf_pem);
+    const names = try dnsNames(arena, origin_leaf);
+    try testing.expectEqual(@as(usize, 1), names.len);
+    try testing.expectEqualStrings("origin.zoxy.test", names[0]);
+    // The fuzz seed is that same leaf, so the fuzzer starts in the walk.
+    try testing.expectEqualStrings("origin.zoxy.test", (try dnsNames(arena, leaf_der_seed))[0]);
+    const spike = try dnsNames(arena, try firstDer(arena, self_signed_pem));
+    try testing.expectEqualStrings("spike.zoxy.test", spike[0]);
+    // A client certificate names no host at all.
+    try testing.expectEqual(@as(usize, 0), (try dnsNames(arena, try firstDer(arena, client_leaf_pem))).len);
+    try testing.expectError(error.CertificateInvalid, dnsNames(arena, "not a certificate"));
+}
+
 test "trust: another name, another anchor, or a time outside the window is refused" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -410,8 +456,23 @@ test "trust: garbage in a chain is refused, never a panic, and a bundle without 
 }
 
 test "fuzz: trust — any chain octets are judged, never a panic" {
-    try testing.fuzz({}, fuzzChain, .{ .corpus = &.{ "\x30\x82\x01", "\x30\x03\xa3\x01\x00" } });
+    try testing.fuzz({}, fuzzChain, .{ .corpus = &.{ "\x30\x82\x01", "\x30\x03\xa3\x01\x00", leaf_der_seed } });
 }
+
+/// The origin leaf as DER, decoded at comptime: a seed that starts the
+/// fuzzer inside a real certificate — its SAN included, which is what
+/// `dnsNames` walks (#297) — rather than leaving it to find one.
+const leaf_der_seed: []const u8 = blk: {
+    @setEvalBranchQuota(1_000_000);
+    const begin_at = std.mem.indexOf(u8, leaf_pem, begin_marker).? + begin_marker.len;
+    const end_at = std.mem.indexOf(u8, leaf_pem, end_marker).?;
+    const body = leaf_pem[begin_at..end_at];
+    const decoder = std.base64.Base64DecoderWithIgnore.init(std.base64.standard_alphabet_chars, '=', " \t\r\n");
+    var der: [decoder.calcSizeUpperBound(body.len)]u8 = undefined;
+    const length = decoder.decode(&der, body) catch unreachable;
+    const seed = der[0..length].*;
+    break :blk &seed;
+};
 
 var fuzz_arena_buffer: [64 * 1024]u8 = undefined;
 
@@ -425,4 +486,8 @@ fn fuzzChain(context: void, smith: *testing.Smith) !void {
     // The client half (#304) parses the same untrusted bytes by its own
     // path — no name, and an end-entity check the server half lacks.
     _ = verifyClientChain(anchors, &.{input[0..input_len]}, now_2030);
+    // #297's walk of the SAN, a third path over the same bytes. Errors
+    // are verdicts; only a panic or an overrun is a finding.
+    const names = dnsNames(fixed.allocator(), input[0..input_len]) catch return;
+    assert(names.len <= constants.tls_certificate_names_max);
 }

@@ -55,6 +55,11 @@ pub const tls = struct {
     pub const Engine = @import("tls/Engine.zig");
     pub const libcrypto_heap = @import("tls/libcrypto_heap.zig");
     pub const Tickets = @import("tls/Tickets.zig");
+    /// A listener's certificates chosen by server name (#297).
+    pub const certificate_set = @import("tls/certificate_set.zig");
+    /// Chain verification and a leaf's DNS names — `main` reads the names
+    /// a listener's certificates are chosen by (#297).
+    pub const trust = @import("tls/trust.zig");
     pub const TestClient = @import("tls/TestClient.zig").TestClient;
     /// What a client captures from one session to offer on the next. Named
     /// here so a gate can hold one without naming zssl itself (§4).
@@ -112,6 +117,7 @@ test {
     _ = tls.Tickets;
     _ = @import("tls/alpn.zig");
     _ = @import("tls/trust.zig");
+    _ = @import("tls/certificate_set.zig");
     _ = @import("tls/OriginClient.zig");
     _ = @import("tls/engine_test.zig");
     _ = tls.TestClient;

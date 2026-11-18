@@ -556,6 +556,18 @@ pub const Config = struct {
             /// whether presenting one is required. Null asks no client
             /// for a certificate — the handshake every listener had.
             client_ca: ?ClientCa = null,
+            /// #297: further certificates, chosen by the server name a
+            /// ClientHello asks for against each one's DNS names. The pair
+            /// above stays the default — what a client that names nothing,
+            /// or nothing these cover, is shown.
+            certificates: []const Certificate = &.{},
+        };
+
+        /// One more certificate a listener can present (#297): paths only,
+        /// read by `main` like the default pair.
+        pub const Certificate = struct {
+            cert_path: []const u8,
+            key_path: []const u8,
         };
 
         /// A listener's mutual-TLS policy (#304). Per listener, never per
@@ -939,6 +951,8 @@ pub const ValidationError = error{
     LimitRelayBufferOverTlsRecord,
     ListenerTlsCertPathEmpty,
     ListenerTlsKeyPathEmpty,
+    ListenerTlsCertificatesEmpty,
+    ListenerTlsCertificatesOverLimit,
     ListenerTlsAlpnEmpty,
     ListenerTlsAlpnUnknown,
     ListenerTlsAlpnDuplicate,
@@ -2810,6 +2824,8 @@ pub const TlsJson = struct {
     alpn: ?[]const []const u8 = null,
     /// #304: verify clients against these CAs; absent asks none.
     client_ca: ?ClientCaJson = null,
+    /// #297: more certificates, chosen by the client's server name.
+    certificates: ?[]const CertificateJson = null,
 
     pub const schema_doc =
         "TLS termination for this listener: where its certificate chain and " ++
@@ -2839,6 +2855,35 @@ pub const TlsJson = struct {
         .client_ca = .{
             .desc = "Ask every client for a certificate and verify it against " ++
                 "these CAs (mutual TLS). Absent asks none.",
+        },
+        .certificates = .{
+            .desc = "More certificates for this listener, each chosen when a " ++
+                "client's server name (SNI) matches one of its DNS names: an exact " ++
+                "name first, then a one-label wildcard. `cert` and `key` above stay " ++
+                "the default, shown to a client that names nothing or nothing " ++
+                "these cover.",
+            .min_items = 1,
+            .max_items = constants.tls_certificates_max - 1,
+        },
+    };
+};
+
+/// One more certificate a listener can present (#297).
+pub const CertificateJson = struct {
+    cert: []const u8,
+    key: []const u8,
+
+    pub const schema_doc =
+        "A certificate chain and its key, chosen by the client's server name " ++
+        "against the DNS names in the certificate's subjectAltName.";
+    pub const schema_fields = .{
+        .cert = .{
+            .desc = "Path to the PEM certificate chain, leaf first.",
+            .min_length = 1,
+        },
+        .key = .{
+            .desc = "Path to the leaf's PEM private key (ECDSA P-256 or P-384).",
+            .min_length = 1,
         },
     };
 };
@@ -4387,7 +4432,7 @@ pub const dto_types = .{
     ResponseFilterJson, ResponseMatchJson,   RedirectJson,             BodyJson,
     TlsJson,            PassiveEjectionJson, HttpListenerJson,         L4ListenerJson,
     L4RouteJson,        RouteHeaderJson,     ResponseActionJson,       ClusterTlsJson,
-    ClusterTlsCaJson,
+    ClusterTlsCaJson,   CertificateJson,
 };
 
 comptime {
@@ -4792,6 +4837,9 @@ fn resolveListeners(
             bodies,
             files,
         );
+    }
+    if (tlsCertificateCount(listeners) > constants.tls_certificates_max) {
+        return error.ListenerTlsCertificatesOverLimit;
     }
 
     // Duplicate binds in O(n log n), for the reason `resolveClusters`
@@ -6286,7 +6334,40 @@ fn resolveTls(
         .key_path = tls.key,
         .alpn = try resolveAlpn(arena, tls.alpn, protocol),
         .client_ca = try resolveClientCa(arena, tls.client_ca, files),
+        .certificates = try resolveCertificates(arena, tls.certificates),
     };
+}
+
+/// A listener's #297 further certificates, paths checked for shape only;
+/// `main` reads them, as it reads the default pair.
+fn resolveCertificates(
+    arena: std.mem.Allocator,
+    certificates_json: ?[]const CertificateJson,
+) ParseError![]const Config.Listener.Certificate {
+    const entries = certificates_json orelse return &.{};
+    if (entries.len == 0) return error.ListenerTlsCertificatesEmpty;
+    if (entries.len >= constants.tls_certificates_max) return error.ListenerTlsCertificatesOverLimit;
+    const certificates = try arena.alloc(Config.Listener.Certificate, entries.len);
+    for (entries, certificates) |entry, *certificate| {
+        if (entry.cert.len == 0) return error.ListenerTlsCertPathEmpty;
+        if (entry.key.len == 0) return error.ListenerTlsKeyPathEmpty;
+        certificate.* = .{ .cert_path = entry.cert, .key_path = entry.key };
+    }
+    assert(certificates.len < constants.tls_certificates_max);
+    return certificates;
+}
+
+/// Every certificate the process will load, each listener's default
+/// included (#297): each holds a key on the libcrypto heap, a static
+/// reservation sized for `tls_certificates_max` of them.
+fn tlsCertificateCount(listeners: []const Config.Listener) u64 {
+    var count: u64 = 0;
+    for (listeners) |listener| {
+        const tls = listener.tls orelse continue;
+        count += 1 + tls.certificates.len;
+    }
+    assert(count <= listeners.len * @as(u64, constants.tls_certificates_max));
+    return count;
 }
 
 /// A listener's #304 client CA, read through the loader's file seam and
@@ -8779,6 +8860,7 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "ClusterTlsCaInvalid", .gap = .filesystem },
     .{ .name = "ListenerTlsClientCaUnreadable", .gap = .filesystem },
     .{ .name = "ListenerTlsClientCaInvalid", .gap = .filesystem },
+    .{ .name = "ListenerTlsCertificatesOverLimit", .gap = .budget },
     .{ .name = "LimitUpstreamH2TlsOverEngines", .gap = .budget },
     .{ .name = "ListenerL4RequestKeyedHash", .gap = .cross_block },
     .{ .name = "ListenerModeInvalid", .gap = .literal_syntax },
@@ -11053,6 +11135,52 @@ fn expectH2ParseError(expected: ParseError, json_bytes: []const u8) !void {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     try std.testing.expectError(expected, parseWithFiles(arena_state.allocator(), json_bytes, TestCaFiles.source));
+}
+
+test "config: a listener may hold more certificates, counted across the process (#297)" {
+    const tail = "\"http\":{\"cluster\":\"a\"}}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"tls\":{\"cert\":\"/c.pem\",\"key\":\"/k.pem\"";
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++
+            ",\"certificates\":[{\"cert\":\"/a.pem\",\"key\":\"/ak.pem\"},{\"cert\":\"/b.pem\",\"key\":\"/bk.pem\"}]}," ++ tail);
+        const tls = parsed.listeners[0].tls.?;
+        // The pair above stays the default; the list is what SNI chooses among.
+        try std.testing.expectEqualStrings("/c.pem", tls.cert_path);
+        try std.testing.expectEqual(@as(usize, 2), tls.certificates.len);
+        try std.testing.expectEqualStrings("/b.pem", tls.certificates[1].cert_path);
+        try std.testing.expectEqualStrings("/bk.pem", tls.certificates[1].key_path);
+    }
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ "}," ++ tail);
+        try std.testing.expectEqual(@as(usize, 0), parsed.listeners[0].tls.?.certificates.len);
+    }
+    try expectParseError(error.ListenerTlsCertificatesEmpty, head ++ ",\"certificates\":[]}," ++ tail);
+    try expectParseError(error.ListenerTlsCertPathEmpty, head ++ ",\"certificates\":[{\"cert\":\"\",\"key\":\"/k\"}]}," ++ tail);
+    try expectParseError(error.ListenerTlsKeyPathEmpty, head ++ ",\"certificates\":[{\"cert\":\"/c\",\"key\":\"\"}]}," ++ tail);
+    // The ceiling is the process's, each listener's default included: two
+    // listeners of 129 is over where either alone is not.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const half = constants.tls_certificates_max / 2;
+    var list: std.ArrayList(u8) = .empty;
+    for (0..half) |index| try list.print(arena, "{s}{{\"cert\":\"/{d}.pem\",\"key\":\"/{d}.key\"}}", .{ if (index == 0) "" else ",", index, index });
+    const listener = "\"tls\":{{\"cert\":\"/c.pem\",\"key\":\"/k.pem\",\"certificates\":[{s}]}},\"http\":{{\"cluster\":\"a\"}}";
+    const one = try std.fmt.allocPrint(arena, "{{\"listeners\":[{{\"bind\":\"127.0.0.1:1\"," ++ listener ++ "}}]," ++
+        "\"clusters\":{{\"a\":{{\"endpoints\":[\"127.0.0.1:2\"]}}}},\"timeouts\":{{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}}}", .{list.items});
+    {
+        var ok_state: std.heap.ArenaAllocator = undefined;
+        defer ok_state.deinit();
+        _ = try expectParseOk(&ok_state, one);
+    }
+    const two = try std.fmt.allocPrint(arena, "{{\"listeners\":[{{\"bind\":\"127.0.0.1:1\"," ++ listener ++ "}},{{\"bind\":\"127.0.0.1:3\"," ++ listener ++ "}}]," ++
+        "\"clusters\":{{\"a\":{{\"endpoints\":[\"127.0.0.1:2\"]}}}},\"timeouts\":{{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}}}", .{ list.items, list.items });
+    try expectParseError(error.ListenerTlsCertificatesOverLimit, two);
 }
 
 test "config: a listener's client_ca is read at load, required unless it says optional (#304)" {

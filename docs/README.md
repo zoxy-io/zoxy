@@ -291,6 +291,10 @@ startup with an error naming it, so the problem never surfaces
 mid-handshake. `cert` is a PEM chain, leaf first; `key` is the leaf's PEM
 private key.
 
+A listener can hold more certificates and choose one per connection by the
+server name the client asks for (SNI); see
+[Several certificates on one listener](#several-certificates-on-one-listener).
+
 Either protocol can terminate TLS. The handshake runs as a phase before the
 protocol, so routing, filters, redirects and access logs work as they do
 in the clear.
@@ -395,6 +399,48 @@ or not, since an origin reached through a mutual-TLS listener may be
 reachable through a plaintext one too. Filters may not set or remove it.
 The header rides each request rather than the pooled origin connection,
 so connection reuse across clients stays sound.
+
+#### Several certificates on one listener
+
+One `:443` listener can serve several hosts, each with its own
+certificate. `certificates` lists further certificate and key pairs, and
+each connection gets the one whose names cover the server name in the
+client's ClientHello (SNI):
+
+```json
+"tls": {
+    "cert": "/etc/zoxy/default.pem",
+    "key": "/etc/zoxy/default.key",
+    "certificates": [
+        { "cert": "/etc/zoxy/api.pem", "key": "/etc/zoxy/api.key" },
+        { "cert": "/etc/zoxy/wildcard.pem", "key": "/etc/zoxy/wildcard.key" }
+    ]
+}
+```
+
+The names are read from each certificate's subjectAltName DNS entries at
+startup; there is nothing to list in the config, so the config cannot
+disagree with the certificate. The common name is not consulted (RFC 9525).
+A name is matched case-insensitively, in this order:
+
+1. An exact name, in any certificate, `cert` first and then the list in
+   order.
+2. A wildcard: `*.example.com` covers `api.example.com`, but neither
+   `example.com` nor `a.b.example.com`.
+3. Otherwise, and for a client that sends no server name, the default
+   pair in `cert` and `key`.
+
+Every file is read once at startup. A pair in the list whose certificate
+names no DNS host could never be chosen, so it stops startup instead. One
+process loads at most 256 certificates across all its listeners, each
+listener's default included, because every key is held in the fixed
+libcrypto heap; the loader refuses more. A new certificate takes a
+restart, like any other config change.
+
+zoxy does not check that a route's `host` is covered by some certificate.
+A route host can be an IP address, and the default certificate is what a
+client that asked for an uncovered name is shown; a verifying client then
+refuses the handshake itself.
 
 #### HTTP/2
 
