@@ -250,7 +250,10 @@ closed.
 
 Matching is exact: `api.example.com` matches that name and not
 `x.api.example.com`. `http` routes match a `host` by the same rule.
-Neither table has wildcards.
+Neither table has wildcards, and `*` is refused at load in any host or
+server name (`RouteHostWildcard`). The character is reserved, so a
+wildcard rule can be added later without changing what an existing
+config means.
 
 Two combinations are refused at load:
 
