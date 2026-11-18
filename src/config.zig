@@ -9,6 +9,7 @@
 //! for the process lifetime.
 
 const std = @import("std");
+const trust = @import("tls/trust.zig");
 
 const constants = @import("constants.zig");
 const router = @import("http/router.zig");
@@ -627,10 +628,28 @@ pub const Config = struct {
         /// `http` listeners route to an `h2c` cluster, and none that
         /// carries an upgrade: HTTP/2 has no `101`.
         protocol: Protocol = .http1,
+        /// TLS to the origins (§7; #296 for HTTP/2 origins): the name every
+        /// origin must prove, which is also the SNI sent, and the anchors
+        /// its chain must reach — parsed from the `ca` bundle at load.
+        /// Present exactly when `protocol` is `h2`.
+        tls: ?Tls = null,
 
-        pub const Protocol = enum(u1) {
+        pub const Protocol = enum(u2) {
             http1,
+            /// HTTP/2 by prior knowledge, in the clear (RFC 9113 §3.3).
             h2c,
+            /// HTTP/2 over TLS, selected in ALPN (RFC 9113 §3.2).
+            h2,
+
+            /// Whether the origins speak HTTP/2, on a shared connection.
+            pub fn http2(protocol: Protocol) bool {
+                return protocol != .http1;
+            }
+        };
+
+        pub const Tls = struct {
+            server_name: []const u8,
+            anchors: []const []const u8,
         };
 
         pub const Pick = enum(u2) {
@@ -942,6 +961,17 @@ pub const ValidationError = error{
     /// An `http` listener carrying an upgrade to an `h2c` cluster: the
     /// tunnel would need a `101`, which HTTP/2 does not have.
     ClusterH2cWithUpgrades,
+    /// `tls` on a cluster that does not speak `h2`, or `h2` without it:
+    /// TLS to an origin is HTTP/2's here (#296 has the HTTP/1.1 half).
+    ClusterTlsWithoutH2,
+    ClusterH2WithoutTls,
+    ClusterTlsServerNameInvalid,
+    ClusterTlsCaUnreadable,
+    /// The bundle holds no certificate, or a block that is not one.
+    ClusterTlsCaInvalid,
+    /// The libcrypto heap is reserved for `tls_engines_max` sessions, and
+    /// the origin connections a TLS cluster may open count against it.
+    LimitH2OriginTlsOverEngines,
     LimitCqFillOutOfRange,
     LimitConnSlotsOverCqFill,
     LimitAccessLogBufferOutOfRange,
@@ -1006,7 +1036,7 @@ pub fn parseWithFiles(
     // timeout, so that value must already be known to be in range before
     // any check inherits it.
     try validateTimeouts(&parsed.timeouts);
-    const clusters = try resolveClusters(arena, &parsed.clusters, parsed.timeouts.connect_ms);
+    const clusters = try resolveClusters(arena, &parsed.clusters, parsed.timeouts.connect_ms, files);
     // Limits resolve before listeners, off the raw DTO counts: the route
     // prefixes inside `resolveListeners` are gated against the resolved
     // `head_buffer_bytes` — a prefix longer than the head can never
@@ -1037,9 +1067,11 @@ pub fn parseWithFiles(
         // because clusters resolve before limits do — the `check` blocks
         // are already settled by the time the budget is priced.
         constants.healthProbeConcurrency(checkedEndpointsOf(clusters)),
-        // The h2c endpoints the origin pools are sized for (§7), known for
-        // the same reason.
+        // The HTTP/2 endpoints the origin pools are sized for (§7), and
+        // whether their connections hold TLS sessions, known for the same
+        // reason.
         h2cEndpointsOf(clusters),
+        originTls(clusters),
     );
     // Bodies before listeners (#159): a `respond` action names one, and
     // both consumers render through the same load-time cache — so the
@@ -1626,6 +1658,7 @@ fn resolveLimits(
     log_header_count: u32,
     health_probes: u32,
     h2c_endpoints: u32,
+    origin_tls: bool,
 ) ValidationError!Config.Limits {
     assert(listeners_count >= 1);
     assert(health_probes >= 1);
@@ -1647,6 +1680,7 @@ fn resolveLimits(
     try rejectRelayBufferShape(features, relay_buffer_bytes);
     const feature_pools = try resolveFeaturePools(limits_json, conn_slots, features);
     const origin_pools = try resolveOriginPools(limits_json, upstream_slots, h2c_endpoints);
+    try rejectTlsSessionsOverHeap(feature_pools.tls_engines, origin_pools.connections, origin_tls);
     const cq_fill_eighths = try resolveCqFill(
         limits_json.cq_fill_eighths,
         conn_slots,
@@ -1761,13 +1795,31 @@ fn resolveOriginPools(
     return .{ .connections = @intCast(connections), .streams = streams };
 }
 
+/// The libcrypto heap is one reservation for every TLS session this
+/// process holds (§4): the listeners' engines, and the origin connections
+/// where a cluster reaches its origins over TLS (§7).
+fn rejectTlsSessionsOverHeap(tls_engines: u32, origin_connections: u32, origin_tls: bool) ValidationError!void {
+    assert(tls_engines <= constants.tls_engines_max);
+    if (!origin_tls) return;
+    if (tls_engines + origin_connections > constants.tls_engines_max) return error.LimitH2OriginTlsOverEngines;
+}
+
 /// How many endpoints the `h2c` clusters name between them.
 fn h2cEndpointsOf(clusters: []const Config.Cluster) u32 {
     var count: u32 = 0;
     for (clusters) |*cluster| {
-        if (cluster.protocol == .h2c) count += @intCast(cluster.endpoints.len);
+        if (cluster.protocol.http2()) count += @intCast(cluster.endpoints.len);
     }
     return count;
+}
+
+/// Whether some HTTP/2 cluster reaches its origins over TLS (§7): the
+/// origin connections then hold libcrypto sessions.
+pub fn originTls(clusters: []const Config.Cluster) bool {
+    for (clusters) |*cluster| {
+        if (cluster.tls != null) return true;
+    }
+    return false;
 }
 
 /// The CQ fill is the one limit an operator tightens for headroom, not a
@@ -3010,6 +3062,8 @@ pub const ClusterJson = struct {
     proxy_protocol: ?ClusterProxyProtocolJson = null,
     /// Optional §7 origin protocol; absent is HTTP/1.1.
     protocol: []const u8 = "http1",
+    /// TLS to the origins; required by, and only legal with, `h2`.
+    tls: ?ClusterTlsJson = null,
 
     pub const schema_doc = "One upstream cluster: its endpoints, pick policy and health checks.";
     pub const schema_fields = .{
@@ -3048,12 +3102,44 @@ pub const ClusterJson = struct {
         },
         .protocol = .{
             .desc = "What the origins speak: http1 (the default; each exchange " ++
-                "leases a pooled connection) or h2c (HTTP/2 by prior knowledge; " ++
-                "exchanges share connections as streams, and an answer's " ++
-                "trailers reach the client — what gRPC needs). Only http " ++
-                "listeners without upgrades may route to an h2c cluster.",
+                "leases a pooled connection), h2c (HTTP/2 by prior knowledge) or " ++
+                "h2 (HTTP/2 over TLS, which needs `tls`). Over HTTP/2, exchanges " ++
+                "share connections as streams and an answer's trailers reach the " ++
+                "client — what gRPC needs. Only http listeners without upgrades " ++
+                "may route to an HTTP/2 cluster.",
             .enum_type = Config.Cluster.Protocol,
         },
+        .tls = .{
+            .desc = "TLS to this cluster's origins: the name each must prove and " ++
+                "the CA bundle its chain must reach. Required by protocol h2, " ++
+                "and only legal with it.",
+        },
+    };
+};
+
+pub const ClusterTlsJson = struct {
+    server_name: []const u8,
+    ca: ClusterTlsCaJson,
+
+    pub const schema_doc = "TLS to a cluster's origins: every chain is verified, never skipped.";
+    pub const schema_fields = .{
+        .server_name = .{
+            .desc = "The DNS name every origin's certificate must carry in its " ++
+                "subjectAltName (RFC 9525), and the SNI sent. An endpoint address " ++
+                "is not an identity, so it is configured.",
+            .min_length = 1,
+            .max_length = constants.host_bytes_max,
+        },
+        .ca = .{ .desc = "The trust anchors an origin's chain must reach." },
+    };
+};
+
+pub const ClusterTlsCaJson = struct {
+    path: []const u8,
+
+    pub const schema_doc = "A PEM bundle of the CA certificates to trust, read once at load.";
+    pub const schema_fields = .{
+        .path = .{ .desc = "Path to the PEM bundle.", .min_length = 1 },
     };
 };
 
@@ -3908,7 +3994,8 @@ pub const dto_types = .{
     ForwardedJson,      ProxyProtocolJson,   ClusterProxyProtocolJson, EndpointJson,
     ResponseFilterJson, ResponseMatchJson,   RedirectJson,             BodyJson,
     TlsJson,            PassiveEjectionJson, HttpListenerJson,         L4ListenerJson,
-    L4RouteJson,        RouteHeaderJson,     ResponseActionJson,
+    L4RouteJson,        RouteHeaderJson,     ResponseActionJson,       ClusterTlsJson,
+    ClusterTlsCaJson,
 };
 
 comptime {
@@ -3936,6 +4023,7 @@ fn resolveClusters(
     arena: std.mem.Allocator,
     clusters_json: *const ClustersJson,
     connect_timeout_ms: u32,
+    files: FileSource,
 ) ParseError![]const Config.Cluster {
     assert(connect_timeout_ms >= 1);
     if (clusters_json.entries.len < constants.clusters_min) {
@@ -3977,13 +4065,9 @@ fn resolveClusters(
             .retries = try resolveRetries(entry.cluster.retries),
             .proxy_protocol_send = try resolveClusterProxyProtocol(entry.cluster.proxy_protocol),
             .protocol = try resolveClusterProtocol(entry.cluster.protocol),
+            .tls = try resolveClusterTls(arena, entry.cluster.tls, files),
         };
-        // The prober speaks HTTP/1.1, which an h2c origin need not.
-        if (clusters[index].protocol == .h2c) {
-            if (clusters[index].check) |check| {
-                if (check.kind == .http) return error.ClusterH2cHttpCheck;
-            }
-        }
+        try rejectClusterProtocolShape(&clusters[index]);
     }
     assert(clusters.len == count);
     return clusters;
@@ -5809,6 +5893,64 @@ fn rejectTlsClusterSend(
     }
 }
 
+/// What an HTTP/2 cluster may be (§7): probed by `tcp` only, since the
+/// prober speaks HTTP/1.1, which such an origin need not; and over TLS
+/// exactly when it is `h2`.
+fn rejectClusterProtocolShape(cluster: *const Config.Cluster) ValidationError!void {
+    if (cluster.protocol.http2()) {
+        if (cluster.check) |check| {
+            if (check.kind == .http) return error.ClusterH2cHttpCheck;
+        }
+    }
+    if (cluster.tls != null and cluster.protocol != .h2) return error.ClusterTlsWithoutH2;
+    if (cluster.tls == null and cluster.protocol == .h2) return error.ClusterH2WithoutTls;
+}
+
+/// A cluster's TLS block (§7): the name checked as a DNS name, and the CA
+/// bundle read through the loader's file seam and parsed into anchors —
+/// a bundle that holds no certificate fails here, at load, not at the
+/// first handshake.
+fn resolveClusterTls(
+    arena: std.mem.Allocator,
+    tls_json: ?ClusterTlsJson,
+    files: FileSource,
+) ParseError!?Config.Cluster.Tls {
+    const tls = tls_json orelse return null;
+    if (!dnsName(tls.server_name)) return error.ClusterTlsServerNameInvalid;
+    if (tls.ca.path.len == 0) return error.ClusterTlsCaUnreadable;
+    const pem = files.read(files.context, arena, tls.ca.path, constants.origin_ca_bytes_max) catch |err| switch (err) {
+        error.FileUnreadable, error.FileTooLarge => return error.ClusterTlsCaUnreadable,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    const anchors = trust.parseAnchors(arena, pem) catch |err| switch (err) {
+        error.AnchorsInvalid, error.AnchorsTooMany => return error.ClusterTlsCaInvalid,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    assert(anchors.len >= 1);
+    return .{ .server_name = tls.server_name, .anchors = anchors };
+}
+
+/// A DNS name a certificate can carry: labels of letters, digits and
+/// hyphens, dot-separated, none empty — no address literal, which RFC
+/// 9525's DNS-ID cannot match, and no wildcard, which is a certificate's
+/// to say.
+fn dnsName(name: []const u8) bool {
+    if (name.len == 0 or name.len > constants.host_bytes_max) return false;
+    var labels = std.mem.splitScalar(u8, name, '.');
+    var letters = false;
+    var count: u32 = 0;
+    while (labels.next()) |label| : (count += 1) {
+        if (label.len == 0 or label.len > 63) return false;
+        if (label[0] == '-' or label[label.len - 1] == '-') return false;
+        for (label) |byte| {
+            if (std.ascii.isAlphabetic(byte)) letters = true;
+            if (!std.ascii.isAlphanumeric(byte) and byte != '-') return false;
+        }
+    }
+    assert(count >= 1);
+    return letters;
+}
+
 /// A cluster's origin protocol (§7): the closed vocabulary, which the
 /// schema states too.
 fn resolveClusterProtocol(protocol: []const u8) ValidationError!Config.Cluster.Protocol {
@@ -5826,7 +5968,7 @@ fn rejectH2cRoutes(
     assert(listener.routes.len >= 1);
     for (listener.routes) |route| {
         assert(route.cluster_index < clusters.len);
-        if (clusters[route.cluster_index].protocol != .h2c) continue;
+        if (!clusters[route.cluster_index].protocol.http2()) continue;
         if (listener.protocol == .l4) return error.ClusterH2cOnL4Listener;
         if (listener.upgrades.any()) return error.ClusterH2cWithUpgrades;
     }
@@ -7963,6 +8105,12 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "ClusterH2cHttpCheck", .gap = .cross_block },
     .{ .name = "ClusterH2cOnL4Listener", .gap = .cross_block },
     .{ .name = "ClusterH2cWithUpgrades", .gap = .cross_block },
+    .{ .name = "ClusterTlsWithoutH2", .gap = .cross_block },
+    .{ .name = "ClusterH2WithoutTls", .gap = .cross_block },
+    .{ .name = "ClusterTlsServerNameInvalid", .gap = .literal_syntax },
+    .{ .name = "ClusterTlsCaUnreadable", .gap = .filesystem },
+    .{ .name = "ClusterTlsCaInvalid", .gap = .filesystem },
+    .{ .name = "LimitH2OriginTlsOverEngines", .gap = .budget },
     .{ .name = "ListenerL4RequestKeyedHash", .gap = .cross_block },
     .{ .name = "ListenerModeInvalid", .gap = .literal_syntax },
     .{ .name = "ListenerModeWithoutUnixBind", .gap = .cross_block },
@@ -9996,6 +10144,71 @@ test "config: an h2c cluster is reached over HTTP/2, sizes the origin pools, and
     try expectParseError(error.ClusterH2cOnL4Listener, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"}}]," ++ h2c ++ timeouts ++ "}");
     try expectParseError(error.ClusterH2cWithUpgrades, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"," ++
         "\"upgrades\":{\"websocket\":true}}}]," ++ h2c ++ timeouts ++ ",\"limits\":{\"tunnels\":4}}");
+}
+
+/// The CA bundles the h2 cluster tests name, served the way `main` reads
+/// a file: a fixture by path, and nothing anywhere else.
+const TestCaFiles = struct {
+    fn read(
+        context: ?*anyopaque,
+        arena: std.mem.Allocator,
+        path: []const u8,
+        limit: u32,
+    ) error{ FileUnreadable, FileTooLarge, OutOfMemory }![]const u8 {
+        _ = context;
+        assert(limit >= 1);
+        const bytes: []const u8 = if (std.mem.eql(u8, path, "/ca.pem"))
+            @embedFile("tls/testdata/origin-ca.pem")
+        else if (std.mem.eql(u8, path, "/garbage.pem"))
+            "not a certificate"
+        else
+            return error.FileUnreadable;
+        return try arena.dupe(u8, bytes);
+    }
+
+    const source: FileSource = .{ .read = read };
+};
+
+fn expectH2ParseError(expected: ParseError, json_bytes: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    try std.testing.expectError(expected, parseWithFiles(arena_state.allocator(), json_bytes, TestCaFiles.source));
+}
+
+test "config: an h2 cluster names the server its origins prove and the CA they reach, read at load (§7)" {
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"}}]," ++
+        "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"],";
+    const tail = "}},\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
+    const tls = "\"tls\":{\"server_name\":\"origin.zoxy.test\",\"ca\":{\"path\":\"/ca.pem\"}}";
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parseWithFiles(arena_state.allocator(), head ++ "\"protocol\":\"h2\"," ++ tls ++ tail, TestCaFiles.source);
+        const cluster = parsed.clusters[0];
+        try std.testing.expectEqual(Config.Cluster.Protocol.h2, cluster.protocol);
+        try std.testing.expectEqualStrings("origin.zoxy.test", cluster.tls.?.server_name);
+        try std.testing.expectEqual(@as(usize, 1), cluster.tls.?.anchors.len);
+        try std.testing.expect(originTls(parsed.clusters));
+        try std.testing.expect(parsed.limits.h2_origin_connections >= 1);
+    }
+    // TLS is h2's, and h2 is TLS's.
+    try expectH2ParseError(error.ClusterH2WithoutTls, head ++ "\"protocol\":\"h2\"" ++ tail);
+    try expectH2ParseError(error.ClusterTlsWithoutH2, head ++ "\"protocol\":\"h2c\"," ++ tls ++ tail);
+    try expectH2ParseError(error.ClusterTlsWithoutH2, head ++ tls ++ tail);
+    // A name that is no DNS name, a bundle that cannot be read, or holds
+    // no certificate.
+    inline for (.{ "", "10.0.0.1", "bad_name.test", "-a.test", "a..test" }) |name| {
+        try expectH2ParseError(error.ClusterTlsServerNameInvalid, head ++ "\"protocol\":\"h2\"," ++
+            "\"tls\":{\"server_name\":\"" ++ name ++ "\",\"ca\":{\"path\":\"/ca.pem\"}}" ++ tail);
+    }
+    try expectH2ParseError(error.ClusterTlsCaUnreadable, head ++ "\"protocol\":\"h2\"," ++
+        "\"tls\":{\"server_name\":\"origin.zoxy.test\",\"ca\":{\"path\":\"/missing.pem\"}}" ++ tail);
+    try expectH2ParseError(error.ClusterTlsCaInvalid, head ++ "\"protocol\":\"h2\"," ++
+        "\"tls\":{\"server_name\":\"origin.zoxy.test\",\"ca\":{\"path\":\"/garbage.pem\"}}" ++ tail);
+    // The libcrypto heap holds every TLS session: listeners' and origins'.
+    try expectH2ParseError(error.LimitH2OriginTlsOverEngines, head ++ "\"protocol\":\"h2\"," ++ tls ++
+        "}},\"limits\":{\"h2_origin_connections\":4096}," ++
+        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}");
 }
 
 test "config: a listener speaking HTTP/2 sizes its pools, and only one does (#275)" {

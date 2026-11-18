@@ -643,6 +643,12 @@ const Http1Bed = struct {
         /// The bed's origin speaks HTTP/2 by prior knowledge (§7): the
         /// cluster is `h2c`, and `h2_origin` answers in place of `origin`.
         origin_h2: bool = false,
+        /// That origin is behind TLS (the cluster is `h2`): the proxy must
+        /// verify it as `origin_tls_name` against the fixtures' CA, and it
+        /// selects from `origin_tls_alpn`.
+        origin_tls: bool = false,
+        origin_tls_name: []const u8 = "origin.zoxy.test",
+        origin_tls_alpn: []const []const u8 = &.{"h2"},
         h2_origin_connections: u32 = 2,
         h2_origin_streams: u32 = 2,
         /// The #181 dial-retry budget on the bed's one cluster.
@@ -807,6 +813,29 @@ const Http1Bed = struct {
         };
     }
 
+    /// The bed's one cluster: its endpoints and policies, and what its
+    /// origins speak — HTTP/1.1, h2c, or HTTP/2 over TLS verified against
+    /// the origin trust fixtures (§7). Split from `setUp` for the length
+    /// limit.
+    fn installCluster(bed: *Http1Bed, arena: std.mem.Allocator, options: Options) !void {
+        bed.clusters = .{.{
+            .name = "origin",
+            .endpoints = bed.endpoints[0..bed.endpoints_count],
+            .check = options.check,
+            .passive_ejection = options.passive_ejection,
+            .max_inflight = options.max_inflight,
+            .pick = options.pick,
+            .hash_key = options.hash_key,
+            .retries = options.retries,
+            .protocol = if (options.origin_tls) .h2 else if (options.origin_h2) .h2c else .http1,
+        }};
+        if (!options.origin_tls) return;
+        bed.clusters[0].tls = .{
+            .server_name = options.origin_tls_name,
+            .anchors = try trust.parseAnchors(arena, @embedFile("tls/testdata/origin-ca.pem")),
+        };
+    }
+
     /// The listener this scenario binds. Split from `setUp` for the
     /// length limit, on the seam #303 made natural: what a listener
     /// accepts on is one decision, and everything `setUp` does around it
@@ -882,7 +911,7 @@ const Http1Bed = struct {
             .buffer_group_bytes = options.head_buffer_bytes,
         });
         bed.installEndpoints(options);
-        bed.clusters = .{.{ .name = "origin", .endpoints = bed.endpoints[0..bed.endpoints_count], .check = options.check, .passive_ejection = options.passive_ejection, .max_inflight = options.max_inflight, .pick = options.pick, .hash_key = options.hash_key, .retries = options.retries, .protocol = if (options.origin_h2) .h2c else .http1 }};
+        try bed.installCluster(arena, options);
         bed.routes = .{.{ .host = options.route_host, .prefix = options.route_prefix, .cluster_index = 0 }};
         bed.installListener(options);
         bed.buildConfig(options);
@@ -915,7 +944,7 @@ const Http1Bed = struct {
             .interim_then_close_after_served = options.origin_interim_then_close_after_served,
             .close_second_at_accept = options.close_second_at_accept,
         };
-        bed.h2_origin = .{};
+        bed.h2_origin = .{ .tls = options.origin_tls, .tls_alpn = options.origin_tls_alpn };
         if (options.origin_h2) {
             assert(!options.unix_origin);
             if (options.origin_listens) try bed.h2_origin.start(arena, &bed.sim_io, originAddress());
@@ -1271,6 +1300,7 @@ test "h2c: an HTTP/1.1 request on an h2c listener is still HTTP/1.1, and a prefa
 
 const ResponseReader = @import("http/h2/ResponseReader.zig");
 const H2TestOrigin = @import("http/h2/TestOrigin.zig").TestOrigin(SimIo);
+const trust = @import("tls/trust.zig");
 const H2Session = @import("http/h2/Session.zig");
 const H2Slot = @import("http/h2/Connection.zig").Slot;
 
@@ -2003,6 +2033,82 @@ test "h2 origin: an answer the origin never finishes ends the exchange at its de
     try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 200 OK\r\n"));
     try std.testing.expect(std.mem.endsWith(u8, bed.client.response(), "4\r\npart\r\n"));
     try bed.expectDrained();
+}
+
+fn h2TlsOriginOptions(seed: u64) Http1Bed.Options {
+    var options = h2OriginOptions(seed);
+    options.origin_tls = true;
+    return options;
+}
+
+test "h2 origin over TLS: a verified origin is reached by its name, h2 selected, and its trailers come back" {
+    for ([_]bool{ false, true }) |partial_io| {
+        var options = h2TlsOriginOptions(90 + @as(u64, @intFromBool(partial_io)));
+        options.partial_io = partial_io;
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, options);
+        defer bed.tearDown();
+        bed.h2_origin.body = "sealed";
+        bed.h2_origin.trailers = &.{.{ "grpc-status", "0" }};
+
+        try bed.exchange("GET /x HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+
+        const response = bed.client.response();
+        try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expect(std.mem.endsWith(u8, response, "6\r\nsealed\r\n0\r\ngrpc-status: 0\r\n\r\n"));
+        try std.testing.expectEqualStrings("GET", bed.h2_origin.last_method.slice());
+        try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("h2_origin_tls_failed"));
+        try std.testing.expectEqual(@as(u32, 0), bed.h2_origin.tls_failures);
+        try bed.expectDrained();
+    }
+}
+
+test "h2 origin over TLS: bodies past every window go whole both ways, records waiting their turn" {
+    for ([_]bool{ false, true }) |partial_io| {
+        var options = h2TlsOriginOptions(94 + @as(u64, @intFromBool(partial_io)));
+        options.partial_io = partial_io;
+        options.relay_buffer_bytes = constants.relay_buffer_bytes_min;
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, options);
+        defer bed.tearDown();
+        bed.h2_origin.body = &h2_origin_answer;
+
+        try bed.exchange(h2_origin_upload);
+
+        try std.testing.expectEqual(@as(u64, h2_origin_upload_body.len), bed.h2_origin.last_body_len);
+        const response = bed.client.response();
+        try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 OK\r\n"));
+        const body_start = std.mem.indexOf(u8, response, "\r\n\r\n").? + 4;
+        var scanner: parser.ChunkedScanner = .{};
+        var copy: [2 * constants.head_buffer_bytes_default]u8 = undefined;
+        const wire = copy[0 .. response.len - body_start];
+        @memcpy(wire, response[body_start..]);
+        const dechunked = try scanner.dechunk(wire);
+        try std.testing.expect(dechunked.done);
+        try std.testing.expectEqualSlices(u8, &h2_origin_answer, wire[0..dechunked.payload_len]);
+        try bed.expectDrained();
+    }
+}
+
+test "h2 origin over TLS: a certificate for another name, or no h2, fails the dial — a 502, counted" {
+    const Case = struct { name: []const u8, alpn: []const []const u8 };
+    const cases = [_]Case{
+        .{ .name = "elsewhere.zoxy.test", .alpn = &.{"h2"} },
+        .{ .name = "origin.zoxy.test", .alpn = &.{} },
+    };
+    for (cases, 0..) |case, index| {
+        var options = h2TlsOriginOptions(92 + @as(u64, index));
+        options.origin_tls_name = case.name;
+        options.origin_tls_alpn = case.alpn;
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, options);
+        defer bed.tearDown();
+        try bed.exchange("GET /x HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+        try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 502 "));
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("h2_origin_tls_failed"));
+        try std.testing.expectEqual(@as(u32, 0), bed.h2_origin.requests);
+        try bed.expectDrained();
+    }
 }
 
 test "h2 origin: an origin nobody answers for is a 502, and a mute one a 504" {

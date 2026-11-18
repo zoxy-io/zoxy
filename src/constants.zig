@@ -1279,6 +1279,35 @@ pub const h2_origin_connections_max: u32 = 4096;
 /// its read, its send, its timer, and one cancel.
 pub const h2_origin_ops_max: u32 = 4;
 
+/// The largest CA bundle a cluster's `tls.ca` may name (§7): read once at
+/// load into the config arena.
+pub const origin_ca_bytes_max: u32 = 1024 * 1024;
+
+/// The most trust anchors one cluster names (§7): a curated bundle of the
+/// operator's own CAs, not a system store.
+pub const origin_anchors_max: u32 = 128;
+
+/// The largest certificate an origin's chain or a bundle may carry, in DER.
+pub const origin_certificate_bytes_max: u32 = 8 * 1024;
+
+/// The longest chain an origin may present: a leaf, its intermediates,
+/// and the root it may send along.
+pub const origin_chain_max: u32 = 8;
+
+/// The handshake's reassembly for a TLS origin connection: what holds the
+/// origin's Certificate message whole while its chain is judged.
+pub const origin_tls_reassembly_bytes: u32 = 24 * 1024;
+
+comptime {
+    // Every anchor the bundle may hold fits its byte ceiling, base64 and
+    // armor included (4/3, and the markers).
+    assert(origin_anchors_max * (origin_certificate_bytes_max / 3 * 4 + 64) <= 2 * origin_ca_bytes_max);
+    // A chain of three maximal certificates — leaf, intermediate, root —
+    // fits the reassembly, framing included; a longer one is refused there.
+    assert(origin_tls_reassembly_bytes >= 3 * origin_certificate_bytes_max);
+    assert(origin_chain_max >= 2);
+}
+
 /// Kernel maximum for an IORING_SETUP_CQSIZE completion queue
 /// (IORING_MAX_CQ_ENTRIES = 2 × IORING_MAX_ENTRIES) on current kernels.
 /// The upper wall on any requested CQ depth — a request past this fails
@@ -1956,7 +1985,9 @@ pub fn memoryBytesTotal(sizes: *const PoolSizes) u64 {
     if (sizes.tls_engines == 0) {
         assert(sizes.tls_engine_bytes == 0);
         assert(sizes.tls_plaintext_bytes == 0);
-        assert(sizes.libcrypto_heap_bytes == 0);
+        // The heap is held for the origin connections' TLS too (§7): zero,
+        // or the whole compiled reservation, and nothing between.
+        assert(sizes.libcrypto_heap_bytes == 0 or sizes.libcrypto_heap_bytes == libcrypto_heap_bytes);
     } else {
         assert(sizes.tls_engine_bytes > 0);
         assert(sizes.tls_engine_bytes <= tls_engine_bytes_max);

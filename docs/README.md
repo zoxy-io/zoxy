@@ -655,10 +655,29 @@ halves run at once: the origin may answer while the request is still
 arriving, and the call ends once both have. `idle_ms` bounds a silence on
 it, refreshed by every message either way. `request_ms` (off by default)
 caps its whole length, so a deployment carrying long-lived streams leaves
-it off or sizes it for them. Origins reached over TLS are not yet
-supported.
+it off or sizes it for them.
 
-Two pools carry it, both zero unless some cluster speaks `h2c`.
+Origins behind TLS are `"protocol": "h2"`, which requires a `tls` block:
+
+```json
+"greeter": {
+    "endpoints": ["10.0.0.5:443"],
+    "protocol": "h2",
+    "tls": { "server_name": "greeter.internal", "ca": { "path": "/etc/zoxy/internal-ca.pem" } }
+}
+```
+
+Every handshake is verified, never skipped. The origin must select `h2`
+in ALPN. Its chain must reach a certificate in the `ca` bundle, through
+CAs only. The leaf must carry `server_name` in its subjectAltName (RFC
+9525; a common name alone does not count). `server_name` is also the SNI
+sent, and is configured because an endpoint address is not an identity.
+The bundle is read once at load, so a missing or empty file stops the
+config, not the first request. A handshake that fails is a `502` for the
+requests waiting on it, counted in `zoxy_h2_origin_tls_failed`. TLS to an
+HTTP/1.1 origin is not yet supported (#296).
+
+Two pools carry it, both zero unless some cluster speaks `h2c` or `h2`.
 `limits.h2_origin_connections` bounds the origin connections, two per
 `h2c` endpoint by default. `limits.h2_origin_streams` bounds the requests
 on them at once, one per upstream slot by default and never more; each
@@ -1440,7 +1459,10 @@ Each HTTP/2 connection holds a session of about 100 KiB and each stream
 slot a head buffer; the banner prints both.
 `h2_origin_connections` and `h2_origin_streams` size
 [HTTP/2 to the origin](#http2-to-the-origin-and-grpc) and are zero unless
-a cluster speaks `h2c`. Both have defaults, and the banner prints them.
+a cluster speaks `h2c` or `h2`. Both have defaults, and the banner prints
+them. Over TLS, each origin connection also holds a TLS session on the
+libcrypto heap. `tls_engines` and the origin connections together may not
+exceed the heap's 1024 sessions.
 
 `keepalive_requests` lives on an `http` listener beside `max_body_bytes`,
 not in `limits`, because it reserves nothing and states policy. It bounds
