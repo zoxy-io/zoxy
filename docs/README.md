@@ -1023,6 +1023,28 @@ need.
 If *every* endpoint in a cluster is ejected, zoxy fails open and uses them
 all. Routing nowhere would turn a probe verdict into an outage.
 
+That rule waits until nothing is healthy. If 6 of 10 equal endpoints are
+ejected, the other 4 each carry two and a half times their usual load,
+which is how an overloaded cluster ejects the rest. `panic_threshold_percent`
+moves the fail-open point up:
+
+```json
+"api": {
+    "endpoints": ["10.0.0.1:8080", "10.0.0.2:8080", "10.0.0.3:8080", "10.0.0.4:8080"],
+    "check": { "type": "http", "path": "/healthz" },
+    "panic_threshold_percent": 50
+}
+```
+
+While at least that share of the cluster's weight is healthy, health
+checks steer traffic as usual. Below it, zoxy picks over every endpoint
+as if none were ejected. A drained endpoint (`"weight": 0`) counts on
+neither side and is never picked, a retry still skips the endpoints its
+request already tried, and `max_inflight` still caps each endpoint. The
+value is 1 to 99. Leave it out to fail open only at zero healthy, as
+before. It requires `check` or `passive_ejection`, because without one
+nothing is ever ejected.
+
 ### Passive ejection
 
 A `tcp` check passes whenever the kernel accepts, and the kernel accepts

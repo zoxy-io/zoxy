@@ -888,6 +888,20 @@ pub const passive_ejection_fall_default: u8 = 5;
 /// `check`, whose `rise` restores from probe traffic rather than real.
 pub const passive_ejection_recovery_ms_default: u32 = 30_000;
 
+/// The legal range of a cluster's #390 `panic_threshold_percent`. Zero
+/// is the absent rule — fail open only at zero healthy — so it has its
+/// spelling already; 100 would panic at the first ejection, which is
+/// health checks that never steer. Envoy defaults to 50; zoxy has no
+/// default, because sending traffic to ejected endpoints is a judgement
+/// about the operator's origins (§5, #400).
+pub const panic_threshold_percent_min: u8 = 1;
+pub const panic_threshold_percent_max: u8 = 99;
+comptime {
+    assert(panic_threshold_percent_min >= 1);
+    assert(panic_threshold_percent_max < 100);
+    assert(panic_threshold_percent_min <= panic_threshold_percent_max);
+}
+
 /// Default `timeouts.health_interval_ms`: the pause between health-probe
 /// sweeps when the config omits it (§7). HAProxy's `inter` default. What
 /// bounds a single probe is the check's own `timeout_ms`, which defaults

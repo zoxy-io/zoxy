@@ -529,6 +529,13 @@ pub const Balancer = struct {
     /// routing nowhere would turn a probe verdict into an outage of its
     /// own, and a same-port TCP probe cannot know better than the dial.
     ///
+    /// #390 moves that fail-open point up. With a panic threshold the
+    /// health pass is skipped outright once the healthy share of the
+    /// cluster's routable weight falls below it, so four survivors of ten
+    /// do not each carry two and a half times their load. Judged over the
+    /// whole routable set, not this request's untried remainder: panic
+    /// is the cluster's state, and a retry must not tip it.
+    ///
     /// **May return zero**, but only for a request that has tried
     /// something: at least one endpoint holds weight (the loader rejects
     /// an all-zero cluster and `init` re-proves it), so the drain filter
@@ -544,13 +551,15 @@ pub const Balancer = struct {
         assert(cluster.endpoints.len >= 1);
         assert(cluster.endpoints.len <= eligible.len);
         var count: u16 = 0;
-        for (0..cluster.endpoints.len) |endpoint_index| {
-            const index: u16 = @intCast(endpoint_index);
-            if (weightOf(cluster, index) == 0) continue;
-            if (alreadyTried(tried, index)) continue;
-            if (healthy[keys.key(cluster_index, index)]) {
-                eligible[count] = index;
-                count += 1;
+        if (healthSteers(keys, cluster_index, cluster, healthy)) {
+            for (0..cluster.endpoints.len) |endpoint_index| {
+                const index: u16 = @intCast(endpoint_index);
+                if (weightOf(cluster, index) == 0) continue;
+                if (alreadyTried(tried, index)) continue;
+                if (healthy[keys.key(cluster_index, index)]) {
+                    eligible[count] = index;
+                    count += 1;
+                }
             }
         }
         if (count == 0) {
@@ -565,6 +574,43 @@ pub const Balancer = struct {
         assert(count >= 1 or tried.len >= 1);
         assert(count <= cluster.endpoints.len);
         return count;
+    }
+
+    /// Whether the health mask filters this cluster's picks (#390): while
+    /// the healthy share of its routable weight is at or above its panic
+    /// threshold. Without a threshold, always — the zero-healthy fallback
+    /// in `candidateEndpoints` is then the whole rule, as it was before
+    /// the key. A drained endpoint counts on neither side: weight `0` is
+    /// not capacity the cluster has, healthy or not.
+    fn healthSteers(
+        keys: upstream.EndpointKeys,
+        cluster_index: u16,
+        cluster: *const config_module.Config.Cluster,
+        healthy: []const bool,
+    ) bool {
+        const threshold = cluster.panic_threshold_percent orelse return true;
+        assert(threshold >= constants.panic_threshold_percent_min);
+        assert(threshold <= constants.panic_threshold_percent_max);
+        var routable_weight: u64 = 0;
+        var healthy_weight: u64 = 0;
+        for (0..cluster.endpoints.len) |endpoint_index| {
+            const index: u16 = @intCast(endpoint_index);
+            const weight = weightOf(cluster, index);
+            routable_weight += weight;
+            if (healthy[keys.key(cluster_index, index)]) healthy_weight += weight;
+        }
+        // `init` proves some endpoint holds weight, so the share is defined.
+        assert(routable_weight >= 1);
+        assert(healthy_weight <= routable_weight);
+        // Cross-multiplied, so the share needs no division or rounding:
+        // healthy / routable >= threshold / percent_whole.
+        return healthy_weight * percent_whole >= @as(u64, threshold) * routable_weight;
+    }
+
+    /// The whole a `panic_threshold_percent` is a part of.
+    const percent_whole: u64 = 100;
+    comptime {
+        assert(constants.panic_threshold_percent_max < percent_whole);
     }
 
     /// §8 capacity over the candidates: an endpoint already carrying its
@@ -1361,6 +1407,131 @@ test "balancer: a fully-ejected cluster fails open to every endpoint" {
     for (expected) |want_index| {
         const picked = balancer.pick(0, &testLoad(&counts), &healthy, &test_client, .none, test_untried).dial;
         try std.testing.expectEqual(want_index, picked.endpoint_index);
+    }
+}
+
+test "balancer: below its panic threshold a cluster picks over every routable endpoint (#390)" {
+    const quad = [_]io_module.Address{
+        ipEndpoint("127.0.0.1:1"), ipEndpoint("127.0.0.1:2"),
+        ipEndpoint("127.0.0.1:3"), ipEndpoint("127.0.0.1:4"),
+    };
+    const clusters = [_]config_module.Config.Cluster{
+        .{ .name = "panicky", .endpoints = &quad, .pick = .rr, .panic_threshold_percent = 50 },
+        .{ .name = "default", .endpoints = &quad, .pick = .rr },
+    };
+    const config = testConfig(&clusters);
+    const keys = testKeysFor(&config);
+
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
+    var balancer: Balancer = undefined;
+    try balancer.init(balancer_arena.allocator(), &config, keys);
+    const counts: [test_counts_len]u16 = @splat(0);
+
+    // Exactly at the threshold — two of four healthy, half the weight —
+    // health still steers, so rotation stays on the healthy pair.
+    var healthy = test_healthy_all;
+    healthy[keys.key(0, 2)] = false;
+    healthy[keys.key(0, 3)] = false;
+    for ([_]u16{ 0, 1, 0, 1 }) |want_index| {
+        const picked = balancer.pick(0, &testLoad(&counts), &healthy, &test_client, .none, test_untried).dial;
+        try std.testing.expectEqual(want_index, picked.endpoint_index);
+    }
+    // One more ejection leaves a quarter of the weight healthy, under
+    // half: the cluster panics, and rotation covers all four.
+    healthy[keys.key(0, 1)] = false;
+    var seen: [quad.len]bool = @splat(false);
+    for (0..2 * quad.len) |_| {
+        const picked = balancer.pick(0, &testLoad(&counts), &healthy, &test_client, .none, test_untried).dial;
+        seen[picked.endpoint_index] = true;
+    }
+    for (seen) |reached| try std.testing.expect(reached);
+
+    // The same mask on a cluster with no threshold keeps the old rule:
+    // the one healthy endpoint left takes every pick.
+    healthy[keys.key(1, 1)] = false;
+    healthy[keys.key(1, 2)] = false;
+    healthy[keys.key(1, 3)] = false;
+    for (0..quad.len) |_| {
+        const picked = balancer.pick(1, &testLoad(&counts), &healthy, &test_client, .none, test_untried).dial;
+        try std.testing.expectEqual(@as(u16, 0), picked.endpoint_index);
+    }
+}
+
+test "balancer: a drained endpoint is no part of the panic share, nor of panic's picks (#390)" {
+    const quad = [_]io_module.Address{
+        ipEndpoint("127.0.0.1:1"), ipEndpoint("127.0.0.1:2"),
+        ipEndpoint("127.0.0.1:3"), ipEndpoint("127.0.0.1:4"),
+    };
+    const weights = [_]u16{ 1, 1, 0, 1 };
+    const clusters = [_]config_module.Config.Cluster{.{
+        .name = "draining",
+        .endpoints = &quad,
+        .pick = .rr,
+        .weights = &weights,
+        .panic_threshold_percent = 60,
+    }};
+    const config = testConfig(&clusters);
+    const keys = testKeysFor(&config);
+
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
+    var balancer: Balancer = undefined;
+    try balancer.init(balancer_arena.allocator(), &config, keys);
+    const counts: [test_counts_len]u16 = @splat(0);
+
+    // Two of the three routable endpoints are healthy: two thirds, over
+    // 60 percent, so health steers. Counting the drained endpoint as
+    // capacity would make it two of four, under the threshold, and
+    // panic would put endpoint 3 in rotation.
+    var healthy = test_healthy_all;
+    healthy[keys.key(0, 3)] = false;
+    for (0..8) |_| {
+        const picked = balancer.pick(0, &testLoad(&counts), &healthy, &test_client, .none, test_untried).dial;
+        try std.testing.expect(picked.endpoint_index == 0 or picked.endpoint_index == 1);
+    }
+    // In panic the ejected come back, and the drained still does not.
+    healthy[keys.key(0, 1)] = false;
+    var seen: [quad.len]bool = @splat(false);
+    for (0..8) |_| {
+        const picked = balancer.pick(0, &testLoad(&counts), &healthy, &test_client, .none, test_untried).dial;
+        seen[picked.endpoint_index] = true;
+    }
+    try std.testing.expect(seen[0] and seen[1] and seen[3]);
+    try std.testing.expect(!seen[2]);
+}
+
+test "balancer: a retry cannot tip its cluster into panic (#390)" {
+    const quad = [_]io_module.Address{
+        ipEndpoint("127.0.0.1:1"), ipEndpoint("127.0.0.1:2"),
+        ipEndpoint("127.0.0.1:3"), ipEndpoint("127.0.0.1:4"),
+    };
+    const clusters = [_]config_module.Config.Cluster{
+        .{ .name = "retrying", .endpoints = &quad, .pick = .rr, .panic_threshold_percent = 50 },
+    };
+    const config = testConfig(&clusters);
+    const keys = testKeysFor(&config);
+
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
+    var balancer: Balancer = undefined;
+    try balancer.init(balancer_arena.allocator(), &config, keys);
+    const counts: [test_counts_len]u16 = @splat(0);
+
+    // Half the cluster is healthy, so it steers. A retry that already
+    // tried endpoint 0 has one healthy endpoint left among its untried
+    // three — a third, which would panic if the share were judged over
+    // the request's remainder. It is the cluster's state, so the retry
+    // goes to the other healthy endpoint. Only once every healthy one is
+    // tried does the zero-healthy fallback reach the ejected, as it did
+    // before the threshold existed.
+    var healthy = test_healthy_all;
+    healthy[keys.key(0, 2)] = false;
+    healthy[keys.key(0, 3)] = false;
+    const tried = [_]u16{0};
+    for (0..4) |_| {
+        const picked = balancer.pick(0, &testLoad(&counts), &healthy, &test_client, .none, &tried).dial;
+        try std.testing.expectEqual(@as(u16, 1), picked.endpoint_index);
     }
 }
 

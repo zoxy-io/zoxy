@@ -2126,10 +2126,31 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   a backend for it turns our exhaustion into their outage.
 
   An **absolute consecutive count** suffices where Envoy needs
-  success-rate outlier detection with a panic threshold, and fail-open
-  is why: a cluster with every endpoint ejected balances as if none
-  were, so the correlated-failure objection is already answered. That is
-  what keeps this two numbers rather than a windowed statistics model.
+  success-rate outlier detection, and fail-open is why: a cluster with
+  every endpoint ejected balances as if none were. That is what keeps
+  this two numbers rather than a windowed statistics model.
+
+  **Fail-open at zero answers the total outage, not the partial one**
+  (#390). Six ejections of ten leave four endpoints each carrying two
+  and a half times their load — the overload that ejects the next one,
+  whether the verdicts were right or a probe path failed under load. So
+  a cluster may set `panic_threshold_percent`: while the healthy share of
+  its routable weight is at or above it, health steers; below it, the
+  balancer picks over every routable endpoint, ejected included. It is
+  the fail-open rule with its trigger moved, not a second mechanism —
+  absent, the trigger stays at zero healthy, and the same code runs.
+  The share is judged over the whole routable set rather than a retry's
+  untried remainder, because panic is the cluster's state and one
+  request's exclusions must not tip it; and drains, retry exclusions and
+  `max_inflight` all still apply inside panic, since each says *not
+  here* where health only says *we suspect*. A steering cluster still
+  falls back the old way for a retry that has tried every healthy
+  endpoint: the zero-healthy rule then runs over its untried remainder.
+  Opt-in, because sending traffic back to endpoints the checks ejected is
+  a judgement about the operator's origins that only the operator can
+  make (§5). A
+  cluster with neither `check` nor `passive_ejection` refuses the key,
+  having nothing that could eject.
 
   **Recovery is where active checks earn their place.** Passive
   detection needs traffic and an ejected endpoint receives none, so it
@@ -2360,10 +2381,12 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   its per-connection budgets gets `GOAWAY(ENHANCE_YOUR_CALM)` (§8).
 
 - **Still deferred**: circuit breakers, Envoy-style *outlier detection*
-  (success-rate and stddev maths, panic thresholds) and *aggregate*
-  retry budgets. The previous iteration proved them buildable here;
-  simplicity says they wait for a demonstrated need, and fail-open plus
-  a consecutive count is why the simple thing sufficed. §5 has placed
+  (success-rate and stddev maths) and *aggregate* retry budgets. The
+  previous iteration proved them buildable here; simplicity says they
+  wait for a demonstrated need, and fail-open plus a consecutive count
+  is why the simple thing sufficed. Panic thresholds left this list
+  with #390, whose need was the partial outage fail-open at zero cannot
+  see (above). §5 has placed
   their keys ahead of the freeze (#400), which settles where each would
   go and not whether any is built. The per-request
   dial retry above is not one of them: it bounds itself per request and
