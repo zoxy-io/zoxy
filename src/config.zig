@@ -2340,18 +2340,18 @@ pub const LimitsJson = struct {
             .maximum = constants.stream_slots_max,
         },
         .h2_origin_connections = .{
-            .desc = "Connections to the endpoints of h2c clusters (§7), each " ++
-                "carrying many exchanges as HTTP/2 streams. Only legal when some " ++
-                "cluster speaks h2c; defaults to two per h2c endpoint. A request " ++
-                "with no connection to carry it is answered 503.",
+            .desc = "Connections to the endpoints of HTTP/2 clusters (h2c or h2), " ++
+                "each carrying many exchanges as streams. Only allowed when some " ++
+                "cluster speaks HTTP/2; defaults to two per HTTP/2 endpoint. A " ++
+                "request with no connection to carry it is answered 503.",
             .minimum = 1,
             .maximum = constants.h2_origin_connections_max,
         },
         .h2_origin_streams = .{
-            .desc = "Exchanges on h2c connections at once (§7), each holding a " ++
-                "buffer for its answer: a head, a relay buffer's window, and a " ++
-                "trailer section. Only legal when some cluster speaks h2c; " ++
-                "defaults to upstream_slots, and may not exceed it.",
+            .desc = "Exchanges on HTTP/2 origin connections at once, each holding " ++
+                "a buffer for its answer: a head, a relay buffer's window and a " ++
+                "trailer section. Only allowed when some cluster speaks HTTP/2; " ++
+                "defaults to upstream_slots and may not exceed it.",
             .minimum = 1,
             .maximum = constants.upstream_slots_max,
         },
@@ -3122,7 +3122,7 @@ pub const ClusterJson = struct {
                 "leases a pooled connection), h2c (HTTP/2 by prior knowledge) or " ++
                 "h2 (HTTP/2 over TLS, which needs `tls`). Over HTTP/2, exchanges " ++
                 "share connections as streams and an answer's trailers reach the " ++
-                "client — what gRPC needs. Only http listeners without upgrades " ++
+                "client, which gRPC needs. Only http listeners without upgrades " ++
                 "may route to an HTTP/2 cluster.",
             .enum_type = Config.Cluster.Protocol,
         },
@@ -3142,8 +3142,8 @@ pub const ClusterTlsJson = struct {
     pub const schema_fields = .{
         .server_name = .{
             .desc = "The DNS name every origin's certificate must carry in its " ++
-                "subjectAltName (RFC 9525), and the SNI sent. An endpoint address " ++
-                "is not an identity, so it is configured.",
+                "subjectAltName, also sent as SNI. An endpoint address is not an " ++
+                "identity, so the name is configured.",
             .min_length = 1,
             .max_length = constants.host_bytes_max,
         },
@@ -3558,7 +3558,7 @@ pub const CheckJson = struct {
             .maximum = 599,
         },
         .service = .{
-            .desc = "The service a grpc probe asks grpc.health.v1.Health/Check about; absent asks about the server as a whole.",
+            .desc = "The service a grpc probe asks grpc.health.v1.Health/Check about. If absent, the probe asks about the server as a whole.",
             .min_length = 1,
             .max_length = constants.health_check_grpc_service_bytes_max,
         },
