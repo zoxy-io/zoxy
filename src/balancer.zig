@@ -412,6 +412,13 @@ pub const Balancer = struct {
     pub const Pick = struct {
         address: io_module.Address,
         endpoint_index: u16,
+        /// The chosen endpoint is one the health mask has ejected — the
+        /// fail-open rule, or a panic (#390), sent traffic there. What a
+        /// caller counts so the pick is not invisible.
+        ejected: bool,
+        /// The cluster was below its panic threshold when this pick ran,
+        /// so health did not steer it (#390). Always false without one.
+        panicked: bool,
     };
 
     /// What a pick concluded. The two empty answers are different rungs
@@ -462,17 +469,24 @@ pub const Balancer = struct {
         // would exclude nothing and read as a retry that had somewhere
         // left to go, which is the quiet direction to be wrong in.
         for (tried) |index| assert(index < cluster.endpoints.len);
+        const steers = healthSteers(balancer.keys, cluster_index, cluster, healthy);
         if (tried.len == 0 and cluster.endpoints.len == 1 and cluster.max_inflight == null) {
             // Neither a rotation nor a draw: uncapped single-endpoint
             // clusters stay branch-cheap and policy state is untouched.
             // The mask is moot too — one endpoint ejected is the
-            // fail-open case. A cap has to be read, so it takes the
-            // general path below — and so does a retry, which must see
-            // its own exclusion rather than this endpoint again.
-            return .{ .dial = .{ .address = cluster.endpoints[0], .endpoint_index = 0 } };
+            // fail-open case — read only to report `ejected` (#390). A
+            // cap has to be read, so it takes the general path below — and
+            // so does a retry, which must see its own exclusion rather
+            // than this endpoint again.
+            return .{ .dial = .{
+                .address = cluster.endpoints[0],
+                .endpoint_index = 0,
+                .ejected = !healthy[balancer.keys.key(cluster_index, 0)],
+                .panicked = !steers,
+            } };
         }
         const eligible = balancer.eligible_scratch;
-        const candidates = candidateEndpoints(balancer.keys, cluster_index, cluster, healthy, tried, eligible);
+        const candidates = candidateEndpoints(balancer.keys, cluster_index, cluster, healthy, steers, tried, eligible);
         if (candidates == 0) {
             // A single-endpoint cluster cannot retry, and neither can one
             // whose every routable endpoint this request has already
@@ -503,9 +517,12 @@ pub const Balancer = struct {
         };
         assert(chosen < cluster.endpoints.len);
         assert(!alreadyTried(tried, chosen)); // The exclusion is not advisory.
+        const ejected = !healthy[balancer.keys.key(cluster_index, chosen)];
         return .{ .dial = .{
             .address = cluster.endpoints[chosen],
             .endpoint_index = chosen,
+            .ejected = ejected,
+            .panicked = !steers,
         } };
     }
 
@@ -545,13 +562,15 @@ pub const Balancer = struct {
         cluster_index: u16,
         cluster: *const config_module.Config.Cluster,
         healthy: []const bool,
+        steers: bool,
         tried: []const u16,
         eligible: []u16,
     ) u16 {
         assert(cluster.endpoints.len >= 1);
         assert(cluster.endpoints.len <= eligible.len);
+        assert(steers or cluster.panic_threshold_percent != null);
         var count: u16 = 0;
-        if (healthSteers(keys, cluster_index, cluster, healthy)) {
+        if (steers) {
             for (0..cluster.endpoints.len) |endpoint_index| {
                 const index: u16 = @intCast(endpoint_index);
                 if (weightOf(cluster, index) == 0) continue;
@@ -1407,6 +1426,9 @@ test "balancer: a fully-ejected cluster fails open to every endpoint" {
     for (expected) |want_index| {
         const picked = balancer.pick(0, &testLoad(&counts), &healthy, &test_client, .none, test_untried).dial;
         try std.testing.expectEqual(want_index, picked.endpoint_index);
+        // Fail-open lands on the ejected, and is not a panic: the
+        // cluster has no threshold (#390's counters tell them apart).
+        try std.testing.expect(picked.ejected and !picked.panicked);
     }
 }
 
@@ -1436,14 +1458,19 @@ test "balancer: below its panic threshold a cluster picks over every routable en
     for ([_]u16{ 0, 1, 0, 1 }) |want_index| {
         const picked = balancer.pick(0, &testLoad(&counts), &healthy, &test_client, .none, test_untried).dial;
         try std.testing.expectEqual(want_index, picked.endpoint_index);
+        try std.testing.expect(!picked.panicked and !picked.ejected);
     }
     // One more ejection leaves a quarter of the weight healthy, under
-    // half: the cluster panics, and rotation covers all four.
+    // half: the cluster panics, and rotation covers all four. Every pick
+    // says so, and the ones landing on the ejected say that too — the
+    // two flags the counters read (#390).
     healthy[keys.key(0, 1)] = false;
     var seen: [quad.len]bool = @splat(false);
     for (0..2 * quad.len) |_| {
         const picked = balancer.pick(0, &testLoad(&counts), &healthy, &test_client, .none, test_untried).dial;
         seen[picked.endpoint_index] = true;
+        try std.testing.expect(picked.panicked);
+        try std.testing.expectEqual(picked.endpoint_index != 0, picked.ejected);
     }
     for (seen) |reached| try std.testing.expect(reached);
 
@@ -1455,6 +1482,7 @@ test "balancer: below its panic threshold a cluster picks over every routable en
     for (0..quad.len) |_| {
         const picked = balancer.pick(1, &testLoad(&counts), &healthy, &test_client, .none, test_untried).dial;
         try std.testing.expectEqual(@as(u16, 0), picked.endpoint_index);
+        try std.testing.expect(!picked.panicked and !picked.ejected);
     }
 }
 

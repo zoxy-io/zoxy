@@ -286,6 +286,19 @@ pub const Counters = struct {
     /// single-endpoint cluster it fires on every dial failure, which is
     /// the honest reading — a retry budget there can never be spent.
     upstream_retries_exhausted: Value = Value.init(0),
+    /// Picks that chose an endpoint the health mask had ejected: the
+    /// fail-open rule at zero healthy, or a cluster below its #390 panic
+    /// threshold. Every one of them was invisible before this counter —
+    /// the dial just went out — and it is the number that says health
+    /// checks have stopped steering, whether the origins are really down
+    /// or a probe path is failing under load.
+    upstream_ejected_picks: Value = Value.init(0),
+    /// Picks made while their cluster sat below its #390 panic threshold,
+    /// healthy endpoint or not. A rising rate is the cluster *in* panic;
+    /// zero wherever no threshold is configured. Only picks that chose an
+    /// endpoint count — a pick that found every candidate at its
+    /// `max_inflight` is a shed, and its own counter says so.
+    upstream_panic_picks: Value = Value.init(0),
     /// Upgrade requests refused for want of a §5 tunnel (#180). Its own
     /// rung rather than a share of the other sheds: each of those says
     /// "widen this pool", and they name different pools. Counted before
@@ -1167,6 +1180,12 @@ pub const Labeled = struct {
     cluster_duration_sum_ns: []Value,
     cluster_duration_count: []Value,
     l4_shed_inflight: []Value,
+    /// #390's two pick families, per cluster: picks that landed on an
+    /// ejected endpoint, and picks made below the panic threshold. Per
+    /// cluster because both are a cluster's state — fail-open and panic
+    /// are decided over its whole routable set, not by one endpoint.
+    ejected_picks: []Value,
+    panic_picks: []Value,
     /// Exact byte bound on one `render` of this config — the runtime
     /// sibling of `Counters.render_bytes_max`, tight the same way, and
     /// the term the caller sizes its buffer (and the memory banner its
@@ -1260,11 +1279,15 @@ pub const Labeled = struct {
     pub const ClusterFamily = enum {
         l7_shed_inflight,
         l4_shed_inflight,
+        ejected_picks,
+        panic_picks,
 
         fn name(family: ClusterFamily) []const u8 {
             return switch (family) {
                 .l7_shed_inflight => "cluster_l7_shed_inflight",
                 .l4_shed_inflight => "cluster_l4_shed_inflight",
+                .ejected_picks => "cluster_upstream_ejected_picks",
+                .panic_picks => "cluster_upstream_panic_picks",
             };
         }
     };
@@ -1305,6 +1328,8 @@ pub const Labeled = struct {
         labeled.cluster_duration_sum_ns = try allocValues(arena, cluster_count);
         labeled.cluster_duration_count = try allocValues(arena, cluster_count);
         labeled.l4_shed_inflight = try allocValues(arena, cluster_count);
+        labeled.ejected_picks = try allocValues(arena, cluster_count);
+        labeled.panic_picks = try allocValues(arena, cluster_count);
         // Holes stay empty — the one answer to "what did init leave
         // here", and the tripwire `incrementEndpoint` asserts against.
         @memset(labeled.endpoint_labels, "");
@@ -1912,6 +1937,8 @@ pub const Labeled = struct {
             counters.get("l7_shed_endpoint_inflight"));
         assert(tableTotal(labeled.l4_shed_inflight) ==
             counters.get("l4_shed_endpoint_inflight"));
+        assert(tableTotal(labeled.ejected_picks) == counters.get("upstream_ejected_picks"));
+        assert(tableTotal(labeled.panic_picks) == counters.get("upstream_panic_picks"));
         // #299's two families partition the same total, because both are
         // written at `finishExchange` beside the `l7_responses` it
         // increments — one observation per completed exchange, and every
@@ -2316,16 +2343,18 @@ test "counters: labeled render speaks the exposition dialect" {
     try std.testing.expect(std.mem.indexOf(u8, with_observations, "zoxy_cluster_duration_seconds_count{cluster=\"api\"} 2\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_observations, "zoxy_cluster_duration_seconds_sum{cluster=\"api\"} 0.003030000\n") != null);
 
-    // One TYPE line per family: four endpoint counters, two cluster
-    // counters, #299's status classes and histogram, the inflight gauge,
-    // and healthy (a checked cluster exists).
+    // One TYPE line per family: four endpoint counters, four cluster
+    // counters (the two inflight sheds and #390's two pick families),
+    // #299's status classes and histogram, the inflight gauge, and
+    // healthy (a checked cluster exists).
     var type_lines: usize = 0;
     var search: usize = 0;
     while (std.mem.indexOfPos(u8, text, search, "# TYPE ")) |at| {
         type_lines += 1;
         search = at + "# TYPE ".len;
     }
-    try std.testing.expectEqual(@as(usize, 11), type_lines);
+    try std.testing.expectEqual(@as(usize, 13), type_lines);
+    try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE zoxy_cluster_upstream_panic_picks counter\n") != null);
 }
 
 test "counters: labeled render bound is exact at the maximum values" {
@@ -2342,6 +2371,7 @@ test "counters: labeled render bound is exact at the maximum values" {
         labeled.health_up,               labeled.l7_shed_inflight,
         labeled.l4_shed_inflight,        labeled.cluster_responses,
         labeled.cluster_duration_sum_ns, labeled.cluster_duration_count,
+        labeled.ejected_picks,           labeled.panic_picks,
     }) |table| {
         for (table) |*value| value.set(std.math.maxInt(u64));
     }

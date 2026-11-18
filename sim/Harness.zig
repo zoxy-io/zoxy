@@ -868,6 +868,7 @@ fn wireClusters(
             .pick = picks.l4,
             .check = health.check_l4,
             .passive_ejection = health.passive_l4,
+            .panic_threshold_percent = derivePanicThreshold(random, health.check_l4 != null or health.passive_l4 != null),
             .max_inflight = deriveMaxInflight(harness.clean, random),
             .proxy_protocol_send = harness.proxy_protocol_send_l4,
         },
@@ -882,6 +883,7 @@ fn wireClusters(
             .hash_key = picks.http_hash_key,
             .check = health.check_http,
             .passive_ejection = health.passive_http,
+            .panic_threshold_percent = derivePanicThreshold(random, health.check_http != null or health.passive_http != null),
             .max_inflight = deriveMaxInflight(harness.clean, random),
             .retries = harness.retries_http,
         },
@@ -1217,6 +1219,23 @@ const HealthDraw = struct {
 
 const Check = zoxy.config.Config.Cluster.Check;
 const PassiveEjection = zoxy.config.Config.Cluster.PassiveEjection;
+
+/// A cluster's #390 panic threshold. Drawn only where something can
+/// eject — the loader refuses the key anywhere else, and a draw there
+/// would shift every such seed's stream for a key that could not act —
+/// and on a third of those, across the whole legal range: a threshold
+/// only moves where a cluster fails open, so both sides of it have to
+/// keep meeting traffic.
+fn derivePanicThreshold(random: std.Random, ejects: bool) ?u8 {
+    if (!ejects) return null;
+    if (random.uintLessThan(u8, 3) != 0) return null;
+    const min = zoxy.constants.panic_threshold_percent_min;
+    const max = zoxy.constants.panic_threshold_percent_max;
+    const threshold = min + random.uintAtMost(u8, max - min);
+    assert(threshold >= min);
+    assert(threshold <= max);
+    return threshold;
+}
 
 /// A cluster's #230 passive-ejection draw. A third of adversary seeds
 /// opt in, and never a clean one: the signals are a failed dial and an

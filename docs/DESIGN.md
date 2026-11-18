@@ -2150,7 +2150,11 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   a judgement about the operator's origins that only the operator can
   make (§5). A
   cluster with neither `check` nor `passive_ejection` refuses the key,
-  having nothing that could eject.
+  having nothing that could eject. Two counters make it visible, each
+  partitioned by cluster: `upstream_panic_picks`, every pick made in
+  panic, and `upstream_ejected_picks`, every pick that landed on an
+  ejected endpoint — which also ends the zero-healthy fail-open being a
+  dial that went out with nothing to say it had.
 
   **Recovery is where active checks earn their place.** Passive
   detection needs traffic and an ejected endpoint receives none, so it
