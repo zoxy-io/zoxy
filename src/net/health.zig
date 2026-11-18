@@ -109,6 +109,13 @@ pub fn Checker(comptime IoType: type) type {
         passive_configured: bool,
         /// Endpoints currently ejected; the gauge level (§8).
         unhealthy_count: u32,
+        /// When the first sweep is scheduled to begin, on the loop's clock
+        /// (#395): `start`
+        /// plus its random offset, or 0 while the prober has not started
+        /// or never will. Kept so an oracle that times a sweep can time it
+        /// from where the sweep began, rather than from a process start
+        /// the offset has deliberately moved it away from.
+        first_sweep_at_ns: u64,
         state: State,
         /// The sweep cursor: the *next* endpoint to hand out, not the one
         /// being probed. It advances at the hand-off (`dispatchNext`) and
@@ -820,6 +827,7 @@ pub fn Checker(comptime IoType: type) type {
             checker.ejectable_count = 0;
             checker.passive_configured = false;
             checker.unhealthy_count = 0;
+            checker.first_sweep_at_ns = 0;
             checker.state = .off;
             checker.cursor_cluster = 0;
             checker.cursor_endpoint = 0;
@@ -901,9 +909,19 @@ pub fn Checker(comptime IoType: type) type {
         }
 
         /// Begin probing, or stay `.off` when no cluster opted in. The
-        /// first sweep runs now rather than an interval from now: a
-        /// fresh process should learn its endpoints' state before the
-        /// first interval elapses.
+        /// first sweep starts within the first interval rather than an
+        /// interval from now: a fresh process should learn its endpoints'
+        /// state before the first interval elapses.
+        ///
+        /// Within it, not at its start (#395). Processes started together
+        /// — a rollout, an SO_REUSEPORT fleet — would otherwise sweep the
+        /// same origins at the same instant on every interval for as long
+        /// as they live, since nothing ever re-phases them. A random
+        /// offset under one `health_interval_ms` de-phases them once, and
+        /// every pause after it is the configured interval exactly. The
+        /// offset comes from `fillRandom`: the OS CSPRNG in production, so
+        /// processes differ, and the scenario's stream in the simulator,
+        /// so a seed replays the same schedule.
         pub fn start(checker: *Self) void {
             assert(checker.state == .off);
             assert(checker.armedCount() == 0);
@@ -915,7 +933,28 @@ pub fn Checker(comptime IoType: type) type {
             // dispatches nothing and rests immediately, which makes this
             // the rest timer alone, on the interval it already had.
             if (checker.checked_count == 0 and !checker.passive_configured) return;
-            checker.startSweep();
+            const offset_ns = checker.startOffsetNs();
+            checker.first_sweep_at_ns = checker.server.io.nowNs() + offset_ns;
+            if (offset_ns == 0) return checker.startSweep();
+            // Resting, so the first sweep arrives through `onRest` like
+            // every later one, and a drain before it cancels the one
+            // timer it would cancel at any other rest.
+            checker.state = .resting;
+            checker.armRest(offset_ns);
+        }
+
+        /// The first sweep's offset into the first interval (#395),
+        /// uniform over `[0, health_interval_ms)` up to a modulo bias no
+        /// schedule could notice: the interval is at most
+        /// `timeout_ms_max`, which is far below 2^64 nanoseconds.
+        fn startOffsetNs(checker: *Self) u64 {
+            const interval_ns = @as(u64, checker.server.config.health_interval_ms) * std.time.ns_per_ms;
+            assert(interval_ns >= std.time.ns_per_ms);
+            var entropy: [8]u8 = undefined;
+            checker.server.io.fillRandom(&entropy);
+            const offset_ns = std.mem.readInt(u64, &entropy, .little) % interval_ns;
+            assert(offset_ns < interval_ns);
+            return offset_ns;
         }
 
         /// Drain (§8): discard every in-flight probe's verdict and cancel
@@ -1313,14 +1352,17 @@ pub fn Checker(comptime IoType: type) type {
             assert(checker.state == .probing);
             assert(checker.armedCount() == 0);
             checker.state = .resting;
+            checker.armRest(@as(u64, checker.server.config.health_interval_ms) * std.time.ns_per_ms);
+        }
+
+        /// Arm the one rest timer: the pause between sweeps, or the
+        /// first sweep's offset (`start`). Both end in `onRest`.
+        fn armRest(checker: *Self, duration_ns: u64) void {
+            assert(checker.state == .resting);
+            assert(!checker.armed_rest);
+            assert(checker.armedCount() == 0);
             checker.armed_rest = true;
-            checker.server.io.timerStart(
-                &checker.op_rest,
-                @as(u64, checker.server.config.health_interval_ms) * std.time.ns_per_ms,
-                Self,
-                checker,
-                onRest,
-            );
+            checker.server.io.timerStart(&checker.op_rest, duration_ns, Self, checker, onRest);
         }
 
         fn onRest(checker: *Self, result: Io.TimerError!void) void {

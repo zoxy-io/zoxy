@@ -990,6 +990,9 @@ successes restore it.
 expected status). Defaults: `fall` 3, `rise` 2, `expect_status` 200, and a
 probe budget of `timeouts.connect_ms` unless `timeout_ms` overrides it.
 `timeouts.health_interval_ms` (default 2000) sets the gap between sweeps.
+The first sweep starts at a random point within the first interval, so
+processes started together (a rollout, or several behind `SO_REUSEPORT`)
+do not probe the same origins in step for as long as they run.
 An `http` probe sends `host` as its `Host` header. Without it, the probe
 sends the endpoint's `IP:port`, or `localhost` for a `unix:` endpoint,
 whose path is not a host name. `path`, `host` and `expect_status` belong
