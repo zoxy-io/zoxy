@@ -32,6 +32,7 @@ const std = @import("std");
 
 const client_module = @import("client.zig");
 const h2c_module = @import("h2c.zig");
+const h2_origin_module = @import("h2_origin.zig");
 const origin_module = @import("origin.zig");
 const scrape_module = @import("scrape.zig");
 
@@ -232,11 +233,20 @@ const refused_path = "/refused";
 const h2c_exchanges: u32 = h2c_module.streams;
 const h2c_connections: u32 = 1;
 
+/// The §7 leg: HTTP/1.1 requests routed to an `h2c` cluster, each on a
+/// connection of its own, one after the other — so both reach the origin
+/// over one shared HTTP/2 connection, and each comes back chunked with
+/// the origin's trailer section in its last chunk. Runs after the h2c leg.
+const h2_origin_exchanges: u32 = 2;
+const h2_origin_client_connections: u32 = h2_origin_exchanges;
+const h2_origin_prefix = "/grpc.Smoke";
+
 const exchanges_per_pass: u32 =
     @as(u32, keep_alive_connections) * requests_per_connection + large_requests;
 const http_exchanges: u32 = load_passes * exchanges_per_pass;
 const access_log_lines_expected: u32 = http_exchanges + sticky_exchanges +
-    body_exchanges + allowlist_exchanges + h2c_exchanges + tls_requests + l4_connections;
+    body_exchanges + allowlist_exchanges + h2c_exchanges + h2_origin_exchanges +
+    tls_requests + l4_connections;
 
 /// What the resident set may grow by between the two passes. Measured at
 /// exactly zero, run after run — the tolerance is headroom for page
@@ -264,7 +274,7 @@ const readiness_probes: u32 = 1;
 const connections_expected: u32 = keep_alive_connections +
     load_passes * large_requests + l4_connections + sticky_connections +
     body_connections + allowlist_connections + h2c_connections + https_leg_connections +
-    readiness_probes;
+    h2_origin_client_connections + readiness_probes;
 
 /// What the harness holds open against the origin at its peak: every live
 /// client connection can have an upstream connection of its own, parked or
@@ -434,6 +444,7 @@ const loop_watchdog_exit_code: u8 = 6;
 /// storage that outlives no scope and moves for no reason, which is what
 /// static means here (§5's discipline, applied to the harness).
 var origin: origin_module.Origin = undefined;
+var h2_origin: h2_origin_module.H2Origin = undefined;
 /// The clients start *closed* rather than undefined, so `connect` can
 /// assert it is not overwriting a live connection — which is what makes
 /// one slot safely reusable below.
@@ -468,6 +479,7 @@ const Stage = enum {
     bodies_leg,
     allowlist_leg,
     h2c_leg,
+    h2_origin_leg,
     https_alpn_refusal,
     https_handshake,
     https_request,
@@ -488,6 +500,7 @@ const Stage = enum {
             .bodies_leg => "the bodies leg (#159)",
             .allowlist_leg => "the allowlist leg (#331)",
             .h2c_leg => "the h2c leg (#275)",
+            .h2_origin_leg => "the h2 origin leg (§7)",
             .https_alpn_refusal => "the ALPN refusal (#271)",
             .https_handshake => "the https handshake",
             .watchdog_leg => "the loop-watchdog leg (#311)",
@@ -562,6 +575,8 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     // is what releases the origin tasks parked in `read` on its upstream
     // connections.
     defer origin.stop();
+    try h2_origin.start(io);
+    defer h2_origin.stop();
 
     const ports = try reservePorts(io);
     try writeConfig(arena, io, &ports, origin.port);
@@ -594,6 +609,8 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     const allowlist_ok = try allowlistPassed(arena, io, &ports);
     enterStage(.h2c_leg);
     const h2c_ok = try h2cPassed(arena, io, &ports);
+    enterStage(.h2_origin_leg);
+    const h2_origin_ok = try h2OriginPassed(arena, io, &ports);
     // Last, so its scrape sees the whole run — and so a wedged handshake
     // cannot cost the legs above their verdicts.
     const tls_ok = try tlsPassed(arena, io, &ports);
@@ -614,8 +631,8 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     const memory_ok = memoryPassed(&memory);
     const drain_ok = drainPassed(drained_cleanly);
     const passed = log_ok and counters.passed and sticky_ok and bodies_ok and
-        allowlist_ok and h2c_ok and tls_ok and memory_ok and drain_ok and check_ok and
-        watchdog_ok;
+        allowlist_ok and h2c_ok and h2_origin_ok and tls_ok and memory_ok and drain_ok and
+        check_ok and watchdog_ok;
     return report(io, &lines, &counters, &memory, passed);
 }
 
@@ -763,7 +780,7 @@ fn accessLogPassed(lines: *const LogCounts) bool {
     // terminated request is an ordinary request by the time it is logged,
     // and a log that told them apart would be the defect.
     const http_lines_expected = http_exchanges + sticky_exchanges +
-        body_exchanges + allowlist_exchanges + h2c_exchanges + tls_requests;
+        body_exchanges + allowlist_exchanges + h2c_exchanges + h2_origin_exchanges + tls_requests;
     assert(access_log_lines_expected == http_lines_expected + l4_connections);
     var passed = true;
     if (lines.http != http_lines_expected) {
@@ -1043,7 +1060,7 @@ fn identitiesPassed(first: *const scrape_module.Scrape) bool {
     // `tls_requests`); the whole-run equality is asserted on the last of
     // their scrapes.
     const opened_so_far = connections_expected - sticky_connections -
-        body_connections - allowlist_connections - h2c_connections - https_leg_connections;
+        body_connections - allowlist_connections - h2c_connections - h2_origin_client_connections - https_leg_connections;
     if (accepted != opened_so_far) {
         std.debug.print(
             "FAIL: {d} connections accepted, not the {d} opened before this scrape\n",
@@ -1313,7 +1330,7 @@ fn stickyPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
     // the #159 and TLS legs open after it — the whole-run equality lands
     // on the last scrape of the run.
     const opened_by_here = connections_expected - body_connections -
-        allowlist_connections - h2c_connections - https_leg_connections;
+        allowlist_connections - h2c_connections - h2_origin_client_connections - https_leg_connections;
     const accepted = counterOf(&scrape, "accepted") orelse return false;
     if (accepted != opened_by_here) {
         std.debug.print(
@@ -1365,7 +1382,7 @@ fn bodiesPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
     // Short the #331 and TLS legs' connections, which open after this
     // scrape; the last of them carries the whole-run equality.
     const opened_by_here = connections_expected - allowlist_connections - h2c_connections -
-        https_leg_connections;
+        h2_origin_client_connections - https_leg_connections;
     const accepted = counterOf(&scrape, "accepted") orelse return false;
     if (accepted != opened_by_here) {
         std.debug.print(
@@ -1463,6 +1480,87 @@ fn h2cPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
         passed = false;
     }
     return passed;
+}
+
+/// The §7 leg: each request answered by the h2c origin, chunked, with its
+/// body, the origin's tag, the listener's stamp, and the trailer section
+/// the origin ended the stream with — and the two exchanges sharing one
+/// origin connection.
+fn h2OriginPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
+    assert(ports.http != 0);
+    assert(ports.admin != 0);
+    var passed = true;
+    var index: u32 = 0;
+    while (index < h2_origin_exchanges) : (index += 1) {
+        var response_buffer: [4096]u8 = undefined;
+        const response = h2OriginExchange(io, ports.http, &response_buffer) catch |err| {
+            std.debug.print("FAIL: the h2 origin leg's exchange {d} did not complete ({t})\n", .{ index, err });
+            return false;
+        };
+        if (!expectH2OriginResponse(response)) {
+            std.debug.print("FAIL: the h2 origin leg's exchange {d} came back:\n{s}\n", .{ index, response });
+            passed = false;
+        }
+    }
+    const scrape = try scrape_module.parse(try scrape_module.fetch(arena, io, ports.admin));
+    const connections = counterOf(&scrape, "h2_origin_connections") orelse return false;
+    if (connections != 1 or h2_origin.accepted.load(.monotonic) != 1) {
+        std.debug.print(
+            "FAIL: h2_origin_connections reads {d} and the origin accepted {d}, not one shared\n",
+            .{ connections, h2_origin.accepted.load(.monotonic) },
+        );
+        passed = false;
+    }
+    if (h2_origin.protocol_errors.load(.monotonic) != 0) {
+        std.debug.print("FAIL: the h2 origin refused what the proxy sent it\n", .{});
+        passed = false;
+    }
+    if (h2_origin.answered.load(.monotonic) != h2_origin_exchanges) {
+        std.debug.print("FAIL: the h2 origin answered {d} streams, not {d}\n", .{
+            h2_origin.answered.load(.monotonic), h2_origin_exchanges,
+        });
+        passed = false;
+    }
+    return passed;
+}
+
+/// One request on a connection of its own, read to the close it asks for.
+fn h2OriginExchange(io: Io, port: u16, buffer: []u8) ![]const u8 {
+    var address: Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+    var stream = try address.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var write_buffer: [512]u8 = undefined;
+    var writer = stream.writer(io, &write_buffer);
+    try writer.interface.print(
+        "GET " ++ h2_origin_prefix ++ "/Ping HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\n" ++
+            client_module.request_id_header ++ ": " ++ client_module.request_id_value ++
+            "\r\nConnection: close\r\n\r\n",
+        .{port},
+    );
+    try writer.interface.flush();
+    var read_buffer: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buffer);
+    var response_bytes: usize = 0;
+    // Bounded by the buffer: each read adds at least an octet, or ends.
+    while (response_bytes < buffer.len) {
+        const got = reader.interface.readSliceShort(buffer[response_bytes..]) catch break;
+        if (got == 0) break;
+        response_bytes += got;
+    }
+    assert(response_bytes <= buffer.len);
+    return buffer[0..response_bytes];
+}
+
+fn expectH2OriginResponse(response: []const u8) bool {
+    const chunked_body = std.fmt.comptimePrint("{x}\r\n", .{h2_origin_module.body.len}) ++
+        h2_origin_module.body ++ "\r\n";
+    const trailers = "0\r\n" ++ h2_origin_module.trailer_name ++ ": " ++
+        h2_origin_module.trailer_value ++ "\r\n\r\n";
+    if (!std.mem.startsWith(u8, response, "HTTP/1.1 200 ")) return false;
+    if (std.mem.indexOf(u8, response, "transfer-encoding: chunked\r\n") == null) return false;
+    if (std.mem.indexOf(u8, response, h2_origin_module.tag_header ++ ": " ++ h2_origin_module.tag_value) == null) return false;
+    if (std.mem.indexOf(u8, response, "X-Zoxy-Smoke: 1\r\n") == null) return false;
+    return std.mem.endsWith(u8, response, "\r\n\r\n" ++ chunked_body ++ trailers);
 }
 
 /// The #331 leg's refusal, judged on what a policy reject *is*: the
@@ -2143,6 +2241,7 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
     assert(ports.http != 0);
     const config_json = try std.fmt.allocPrint(arena, config_template, .{
         ports.http,
+        h2_origin_prefix,
         allowed_path,
         allowed_path,
         refused_path,
@@ -2154,6 +2253,7 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
         origin_port,
         health_probe_timeout_ms,
         origin_port,
+        h2_origin.port,
         not_found_body,
         robots_path,
         ports.admin,
@@ -2181,7 +2281,8 @@ const config_template =
     \\        {{ "bind": "127.0.0.1:{d}", "http": {{
     \\          "routes": [
     \\              {{ "host": "127.0.0.1", "prefix": "/", "cluster": "origin" }},
-    \\              {{ "host": "127.0.0.1", "prefix": "/sticky", "cluster": "sticky" }}
+    \\              {{ "host": "127.0.0.1", "prefix": "/sticky", "cluster": "sticky" }},
+    \\              {{ "host": "127.0.0.1", "prefix": "{s}", "cluster": "grpc" }}
     \\          ],
     \\          "request_filters": [
     \\              {{ "match": {{ "path_prefix": "/robots.txt" }},
@@ -2210,7 +2311,8 @@ const config_template =
     \\        "sticky": {{
     \\            "endpoints": ["127.0.0.1:{d}"],
     \\            "pick": {{ "policy": "hash", "key": "cookie", "name": "zoxy-smoke-srv" }}
-    \\        }}
+    \\        }},
+    \\        "grpc": {{ "endpoints": ["127.0.0.1:{d}"], "protocol": "h2c" }}
     \\    }},
     \\    "bodies": {{
     \\        "gone": {{ "inline": "{s}", "content_type": "text/plain" }},
