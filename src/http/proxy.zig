@@ -149,6 +149,7 @@ pub const RenderScratch = struct {
     response_edits: [constants.response_edits_max]filter.AppliedHeaderEdit,
     forwarded: [constants.forwarded_value_bytes_max]u8,
     hops: [max_forwards_digits_max]u8,
+    client_cert: [render.client_cert_hex_bytes]u8,
     sticky: [sticky_value_bytes_max]u8,
     head: render.HeadScratch,
 };
@@ -1814,6 +1815,7 @@ pub fn Proxy(comptime IoType: type) type {
             };
             const forwarded = planForwarded(server, stream, request, &scratch.forwarded);
             const hops = planMaxForwards(request, &scratch.hops);
+            const client_cert = planClientCert(stream, &scratch.client_cert);
             // No close announcement upstream (the `false` below): the
             // connection is a parking candidate (§5), and stripping the
             // client's Connection header already made persistence the wire
@@ -1825,6 +1827,7 @@ pub fn Proxy(comptime IoType: type) type {
                 false,
                 forwarded,
                 hops,
+                client_cert,
                 // The participating `Upgrade` travels only when this
                 // listener agreed to carry it (#180); the gate already
                 // refused every other spelling.
@@ -1843,6 +1846,21 @@ pub fn Proxy(comptime IoType: type) type {
             stream.l7.request_leg = .sending_head;
             server.storeExchangeDeadline(stream, server.idleTimeoutMs());
             armRequestHeadSend(server, stream);
+        }
+
+        /// The verified client's certificate fingerprint as lowercase hex
+        /// (#304), or null when this connection has none: a plaintext
+        /// listener, one with no `client_ca`, or an `optional` one the
+        /// client entered without a certificate. Per request rather than
+        /// per upstream connection, so pooling across clients stays sound
+        /// (§3): the identity travels in each request, never in the leg.
+        fn planClientCert(
+            stream: *const StreamType,
+            scratch: *[render.client_cert_hex_bytes]u8,
+        ) ?[]const u8 {
+            comptime assert(render.client_cert_hex_bytes == TlsEngine.client_fingerprint_hex_bytes);
+            const engine = stream.conn.tls orelse return null;
+            return engine.clientFingerprintHex(scratch);
         }
 
         /// Resolve this listener's §7 client-address forwarding into the

@@ -5556,6 +5556,12 @@ fn validateEditableHeaderName(name: []const u8) ParseError!void {
     if (std.ascii.eqlIgnoreCase(name, render.forwarded_for_name)) {
         return error.FilterHeaderNameReserved;
     }
+    // The verified client's identity (#304), for the same reason and a
+    // sharper one: a filter writing it would hand the origin an identity
+    // no certificate proved, and removing it would hide one that did.
+    if (std.ascii.eqlIgnoreCase(name, render.client_cert_name)) {
+        return error.FilterHeaderNameReserved;
+    }
     // Reserved for the same reason and a stricter one (#240): the value
     // is not merely computed but *required* to be — RFC 9110 §7.6.2 has
     // each hop forward its own decrement, so a rule writing a constant
@@ -11010,6 +11016,11 @@ test "config: a filter may not name the header zoxy manages" {
     // Case-insensitively, per RFC 9110 field-name comparison.
     try expectParseError(error.FilterHeaderNameReserved, head ++
         "{\"actions\":[{\"header_remove\":\"x-forwarded-for\"}]}" ++ tail);
+    // The verified client's identity is the proxy's to write (#304).
+    try expectParseError(error.FilterHeaderNameReserved, head ++
+        "{\"actions\":[{\"header_set\":{\"name\":\"X-Client-Cert-SHA256\",\"value\":\"00\"}}]}" ++ tail);
+    try expectParseError(error.FilterHeaderNameReserved, head ++
+        "{\"actions\":[{\"header_remove\":\"x-client-cert-sha256\"}]}" ++ tail);
     // A neighbouring name is still editable — the guard is the header, not
     // a prefix of it.
     {

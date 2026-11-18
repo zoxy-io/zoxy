@@ -73,6 +73,9 @@ pub fn TestClient(comptime IoType: type) type {
         /// Caller-owned reassembly for the server's flight — the
         /// certificate chain is the big part.
         reassembly: [16 * 1024]u8,
+        /// The client's own Certificate and CertificateVerify, when it
+        /// presents one to a mutual-TLS listener (#304).
+        auth_flight: [zssl.Credentials.chain_bytes_max + 1024]u8,
         socket: IoType.Socket,
         connect_completion: IoType.Completion,
         cancel_completion: IoType.Completion,
@@ -220,6 +223,9 @@ pub fn TestClient(comptime IoType: type) type {
             /// that issued it instead of running a full handshake. The
             /// storage is the caller's and must outlive the client.
             resume_with: ?*const SessionTicket = null,
+            /// What to answer a CertificateRequest with (#304); null
+            /// answers with an empty certificate list.
+            client_credentials: ?*const zssl.Credentials = null,
             /// ALPN protocols to offer, most preferred first (#271), or
             /// empty to offer none. Raw strings rather than zoxy's own
             /// vocabulary on purpose: a client may name anything, and the
@@ -259,6 +265,8 @@ pub fn TestClient(comptime IoType: type) type {
                     null,
                 .alpn_protocols = options.alpn,
                 .reassembly = &client.reassembly,
+                .client_credentials = options.client_credentials,
+                .client_auth_flight = if (options.client_credentials != null) &client.auth_flight else &.{},
             });
             client.records = .init(&client.storage);
             client.connect_completion = .{};

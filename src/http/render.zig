@@ -47,6 +47,10 @@ pub const protected_names = [_][]const u8{
 /// only write a constant, and one fixed address for every client is the
 /// opposite of forwarding one.
 pub const forwarded_for_name = "X-Forwarded-For";
+/// The verified client's leaf fingerprint, lowercase hex (#304).
+pub const client_cert_name = "X-Client-Cert-SHA256";
+/// SHA-256's 32 octets as hex: the value's one legal width.
+pub const client_cert_hex_bytes: u32 = 2 * std.crypto.hash.sha2.Sha256.digest_length;
 
 /// The second header this proxy writes on the client's behalf, and for a
 /// stricter reason (#240): RFC 9110 §7.6.2 requires each intermediary to
@@ -168,6 +172,11 @@ pub fn renderRequestHead(
     /// with a verdict attached, and by the time it reaches this file the
     /// only question left is where the bytes go.
     max_forwards: ?[]const u8,
+    /// The verified client's certificate fingerprint, as lowercase hex,
+    /// or null when the connection carries no verified client (#304).
+    /// Every inbound copy is stripped either way — a header this proxy
+    /// writes is one a client must never be able to write for it.
+    client_cert_sha256: ?[]const u8,
     /// True when this request is a protocol upgrade this listener has
     /// agreed to carry (#180): the participating `Upgrade` travels and
     /// the proxy writes its own `Connection: upgrade`.
@@ -214,6 +223,7 @@ pub fn renderRequestHead(
             .forwarded_for = forwarded_for != null,
             .host = request.authority != null,
             .max_forwards = max_forwards != null,
+            .client_cert = request.carries_client_cert,
         },
         keep_upgrade,
         scratch,
@@ -229,6 +239,10 @@ pub fn renderRequestHead(
     if (max_forwards) |value| {
         assert(value.len >= 1);
         try staging.appendHeaderLine(max_forwards_name, value);
+    }
+    if (client_cert_sha256) |value| {
+        assert(value.len == client_cert_hex_bytes);
+        try staging.appendHeaderLine(client_cert_name, value);
     }
     // A carried upgrade announces the opposite of a close: this hop is
     // continuing, in a different protocol. The two are mutually exclusive
@@ -447,6 +461,12 @@ const Suppress = struct {
     /// §7.6.2 requires the *updated* value travel, so the received one
     /// must not travel beside it.
     max_forwards: bool = false,
+    /// A client's own `X-Client-Cert-SHA256` arrived (#304). Unlike the
+    /// three above this one does not depend on whether this hop writes a
+    /// replacement: an inbound copy is stripped on every listener, since
+    /// an origin reached from a mutual-TLS listener may be reached from
+    /// a plaintext one too.
+    client_cert: bool = false,
 
     /// Whether this hop writes any of the three. Hoisted out of the
     /// header walk for the same reason `has_suppressing_edit` is: all
@@ -456,7 +476,8 @@ const Suppress = struct {
     /// walk rather than a tag dispatch on every header (§9: the render is
     /// the top user-CPU cost under load).
     fn any(suppress: Suppress) bool {
-        return suppress.forwarded_for or suppress.host or suppress.max_forwards;
+        return suppress.forwarded_for or suppress.host or suppress.max_forwards or
+            suppress.client_cert;
     }
 
     fn claims(suppress: Suppress, tag: parser.HeaderName) bool {
@@ -468,6 +489,7 @@ const Suppress = struct {
             .x_forwarded_for => suppress.forwarded_for,
             .host => suppress.host,
             .max_forwards => suppress.max_forwards,
+            .x_client_cert_sha256 => suppress.client_cert,
             else => false,
         };
     }
@@ -672,16 +694,40 @@ test "render: request strips hop-by-hop and nominated, keeps the rest" {
     const request = try parser.parseRequestHead(head, false, &storage, null);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
 
-    const rendered = try renderRequestHead(&request, .{ .path = "/p", .query = "" }, &.{}, false, null, null, false, &test_head_scratch, &buffer);
+    const rendered = try renderRequestHead(&request, .{ .path = "/p", .query = "" }, &.{}, false, null, null, null, false, &test_head_scratch, &buffer);
     try testing.expectEqualStrings(
         "GET /p HTTP/1.1\r\nHost: a\r\nX-Keep: yes\r\n\r\n",
         rendered,
     );
 
-    const closed = try renderRequestHead(&request, .{ .path = "/p", .query = "" }, &.{}, true, null, null, false, &test_head_scratch, &buffer);
+    const closed = try renderRequestHead(&request, .{ .path = "/p", .query = "" }, &.{}, true, null, null, null, false, &test_head_scratch, &buffer);
     try testing.expectEqualStrings(
         "GET /p HTTP/1.1\r\nHost: a\r\nX-Keep: yes\r\nConnection: close\r\n\r\n",
         closed,
+    );
+}
+
+test "render: a client's own X-Client-Cert-SHA256 never travels, and the verified one does (#304)" {
+    // Any spelling, any listener: the inbound copy is a forgery surface
+    // whether or not this hop writes one of its own.
+    const head = "GET /p HTTP/1.1\r\nHost: a\r\nx-client-cert-sha256: forged\r\n" ++
+        "X-Keep: yes\r\nX-CLIENT-CERT-SHA256: forged-again\r\n\r\n";
+    var storage: parser.HeaderStorage = undefined;
+    const request = try parser.parseRequestHead(head, false, &storage, null);
+    try testing.expect(request.carries_client_cert);
+    var buffer: [oracle_buffer_bytes]u8 = undefined;
+
+    // No verified client: the forged copies go, nothing replaces them.
+    const stripped = try renderRequestHead(&request, .{ .path = "/p", .query = "" }, &.{}, false, null, null, null, false, &test_head_scratch, &buffer);
+    try testing.expectEqualStrings("GET /p HTTP/1.1\r\nHost: a\r\nX-Keep: yes\r\n\r\n", stripped);
+
+    // A verified client: exactly one line, the proxy's.
+    const fingerprint = "f1fd192cff76490baf1534f777226e96dbb03d9751a657648e0955116d0d4fcb";
+    comptime assert(fingerprint.len == client_cert_hex_bytes);
+    const verified = try renderRequestHead(&request, .{ .path = "/p", .query = "" }, &.{}, false, null, null, fingerprint, false, &test_head_scratch, &buffer);
+    try testing.expectEqualStrings(
+        "GET /p HTTP/1.1\r\nHost: a\r\nX-Keep: yes\r\nX-Client-Cert-SHA256: " ++ fingerprint ++ "\r\n\r\n",
+        verified,
     );
 }
 
@@ -699,6 +745,7 @@ test "render: an absolute-form authority replaces the client's Host" {
         .{ .path = "/v2/x", .query = "" },
         &.{},
         false,
+        null,
         null,
         null,
         false,
@@ -730,7 +777,7 @@ test "render: filter edits set, add, and remove headers" {
         .{ .kind = .remove, .name = "cookie", .value = "" },
     };
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = try renderRequestHead(&request, .{ .path = "/p", .query = "" }, &edits, false, null, null, false, &test_head_scratch, &buffer);
+    const rendered = try renderRequestHead(&request, .{ .path = "/p", .query = "" }, &edits, false, null, null, null, false, &test_head_scratch, &buffer);
     // Surviving source headers first (Host, kept X-Trace, X-Keep), then the
     // injected set/add lines; the source X-Env and Cookie are gone.
     try testing.expectEqualStrings(
@@ -760,7 +807,7 @@ test "render: an edit that overflows the buffer is Oversize" {
     var tight: [34]u8 = undefined;
     try testing.expectError(
         error.Oversize,
-        renderRequestHead(&request, .{ .path = "/p", .query = "" }, &edits, false, null, null, false, &test_head_scratch, &tight),
+        renderRequestHead(&request, .{ .path = "/p", .query = "" }, &edits, false, null, null, null, false, &test_head_scratch, &tight),
     );
 }
 
@@ -793,7 +840,7 @@ test "render: the edited oracle skips a head that grows past head_buffer_bytes_d
         .{ .kind = .remove, .name = "X-Fuzz-Remove", .value = "" },
     };
     var render_buf: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = try renderRequestHead(&parsed, .{ .path = "/", .query = "" }, &edits, false, null, null, false, &test_head_scratch, &render_buf);
+    const rendered = try renderRequestHead(&parsed, .{ .path = "/", .query = "" }, &edits, false, null, null, null, false, &test_head_scratch, &render_buf);
     try testing.expect(rendered.len > constants.head_buffer_bytes_default);
     // Must return cleanly instead of panicking in the reparse precondition.
     checkRequestRenderEdited(&source);
@@ -807,7 +854,7 @@ test "render: nominating a protected header does not strip it" {
     var storage: parser.HeaderStorage = undefined;
     const request = try parser.parseRequestHead(head, false, &storage, null);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = try renderRequestHead(&request, .{ .path = "/u", .query = "" }, &.{}, false, null, null, false, &test_head_scratch, &buffer);
+    const rendered = try renderRequestHead(&request, .{ .path = "/u", .query = "" }, &.{}, false, null, null, null, false, &test_head_scratch, &buffer);
     try testing.expectEqualStrings(
         "POST /u HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\n",
         rendered,
@@ -825,7 +872,7 @@ test "render: a nomination on a second Connection line still strips" {
     const request = try parser.parseRequestHead(head, false, &storage, null);
     try testing.expect(request.connection_nominates_header);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = try renderRequestHead(&request, .{ .path = "/", .query = "" }, &.{}, false, null, null, false, &test_head_scratch, &buffer);
+    const rendered = try renderRequestHead(&request, .{ .path = "/", .query = "" }, &.{}, false, null, null, null, false, &test_head_scratch, &buffer);
     // Both Connection lines are hop-by-hop; X-Nominated goes because the
     // second line named it; X-Keep is untouched.
     try testing.expectEqualStrings(
@@ -845,7 +892,7 @@ test "render: standard Connection options do not nominate a same-named header" {
     var storage: parser.HeaderStorage = undefined;
     const request = try parser.parseRequestHead(head, false, &storage, null);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = try renderRequestHead(&request, .{ .path = "/", .query = "" }, &.{}, false, null, null, false, &test_head_scratch, &buffer);
+    const rendered = try renderRequestHead(&request, .{ .path = "/", .query = "" }, &.{}, false, null, null, null, false, &test_head_scratch, &buffer);
     // Connection stripped (hop-by-hop) and Keep-Alive stripped (a
     // hop-by-hop name); the "Close" header survives — close nominates
     // nothing.
@@ -860,7 +907,7 @@ test "render: framing headers travel with the body" {
     var storage: parser.HeaderStorage = undefined;
     const request = try parser.parseRequestHead(head, false, &storage, null);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = try renderRequestHead(&request, .{ .path = "/u", .query = "" }, &.{}, false, null, null, false, &test_head_scratch, &buffer);
+    const rendered = try renderRequestHead(&request, .{ .path = "/u", .query = "" }, &.{}, false, null, null, null, false, &test_head_scratch, &buffer);
 
     var reparse_storage: parser.HeaderStorage = undefined;
     const reparsed = try parser.parseRequestHead(rendered, false, &reparse_storage, null);
@@ -871,7 +918,7 @@ test "render: client version is preserved" {
     var storage: parser.HeaderStorage = undefined;
     const request = try parser.parseRequestHead("GET / HTTP/1.0\r\n\r\n", false, &storage, null);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = try renderRequestHead(&request, .{ .path = "/", .query = "" }, &.{}, false, null, null, false, &test_head_scratch, &buffer);
+    const rendered = try renderRequestHead(&request, .{ .path = "/", .query = "" }, &.{}, false, null, null, null, false, &test_head_scratch, &buffer);
     try testing.expectEqualStrings("GET / HTTP/1.0\r\n\r\n", rendered);
 }
 
@@ -948,7 +995,7 @@ test "render: a head that no longer fits is Oversize" {
     const request = try parser.parseRequestHead(head, false, &storage, null);
     const target = parser.CanonicalTarget{ .path = "/path", .query = "" };
     var small: [16]u8 = undefined;
-    try testing.expectError(error.Oversize, renderRequestHead(&request, target, &.{}, false, null, null, false, &test_head_scratch, &small));
+    try testing.expectError(error.Oversize, renderRequestHead(&request, target, &.{}, false, null, null, null, false, &test_head_scratch, &small));
 }
 
 // Fuzzing (§9 gate 2): whatever the parser accepts, the renderer must
@@ -988,7 +1035,7 @@ fn checkRequestRender(input: []const u8) void {
     const target = oracleTarget(&request, &scratch) orelse return;
 
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = renderRequestHead(&request, target, &.{}, false, null, null, false, &test_head_scratch, &buffer) catch unreachable;
+    const rendered = renderRequestHead(&request, target, &.{}, false, null, null, null, false, &test_head_scratch, &buffer) catch unreachable;
 
     // The oracle buffer carries slack past `head_buffer_bytes_default` so normalization
     // growth never truncates the comparison; production renders into an
@@ -1024,6 +1071,10 @@ fn checkRequestRender(input: []const u8) void {
         for (hop_by_hop_names) |hop_name| {
             assert(!std.ascii.eqlIgnoreCase(header.name, hop_name));
         }
+        // No client's copy of the proxy's identity header survives, in
+        // any spelling the fuzzer finds (#304): rendered with no verified
+        // client, so any copy here would be one the client wrote.
+        assert(header.tag != .x_client_cert_sha256);
     }
 }
 
@@ -1048,7 +1099,7 @@ fn checkRequestRenderEdited(input: []const u8) void {
         .{ .kind = .remove, .name = "X-Fuzz-Remove", .value = "" },
     };
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = renderRequestHead(&request, target, &edits, false, null, null, false, &test_head_scratch, &buffer) catch return;
+    const rendered = renderRequestHead(&request, target, &edits, false, null, null, null, false, &test_head_scratch, &buffer) catch return;
 
     // The appended edits can push an already-large head past `head_buffer_bytes_default`
     // — the oversize-after-edits verdict (431 in production, which renders
@@ -1168,6 +1219,7 @@ fn checkRequestRenderForwarded(input: []const u8) void {
         &.{},
         false,
         forwarded_for,
+        null,
         null,
         false,
         &test_head_scratch,

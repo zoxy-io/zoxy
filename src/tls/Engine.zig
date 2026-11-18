@@ -715,6 +715,23 @@ pub fn clientFingerprint(engine: *const Engine) ?*const [trust.fingerprint_bytes
     return null;
 }
 
+/// The fingerprint's width as lowercase hex: what the origin's header
+/// and the access log carry (#304).
+pub const client_fingerprint_hex_bytes: u32 = 2 * trust.fingerprint_bytes;
+
+/// The verified client's fingerprint as lowercase hex, written into
+/// `out`, or null when there is none. One formatter for the header and
+/// the log line, so the two can never spell one client two ways.
+pub fn clientFingerprintHex(
+    engine: *const Engine,
+    out: *[client_fingerprint_hex_bytes]u8,
+) ?[]const u8 {
+    const fingerprint = engine.clientFingerprint() orelse return null;
+    out.* = std.fmt.bytesToHex(fingerprint.*, .lower);
+    assert(out.len == client_fingerprint_hex_bytes);
+    return out;
+}
+
 /// Whether a presented client chain was refused (#304).
 pub fn clientCertRefused(engine: *const Engine) bool {
     return engine.client_cert_refused;

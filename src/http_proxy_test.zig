@@ -864,6 +864,8 @@ const Http1Bed = struct {
         /// standing in for what `main` does — this file runs under the Io
         /// seam, where a filesystem is what does not exist.
         tls: bool = false,
+        /// #304: the TLS listener's client CA, when `tls` is set.
+        tls_client_ca: ?config_module.Config.Listener.ClientCa = null,
         /// Socket-ring size, null for SimIo's own default (§9). The default
         /// is narrower than a head buffer, so no delivery can fill one in a
         /// single read; a scenario that needs the shape production takes
@@ -1101,6 +1103,7 @@ const Http1Bed = struct {
                     .cert_path = "cert.pem",
                     .key_path = "key.pem",
                     .alpn = options.alpn,
+                    .client_ca = options.tls_client_ca,
                 }
             else
                 null,
@@ -3747,6 +3750,53 @@ test "h2: a client refused in ALPN on an h2 listener leaves no session held" {
     try std.testing.expect(client.refusedForAlpn());
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("tls_alpn_refused"));
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("h2_connections"));
+    try bed.expectDrained();
+}
+
+test "tls: a verified client's fingerprint reaches the origin and the log, and a forged one never does (#304)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const anchors = try trust.parseAnchors(arena, @embedFile("tls/testdata/client-ca.pem"));
+    var client_credentials = try Credentials.load(
+        arena,
+        @embedFile("tls/testdata/client-cert.pem"),
+        @embedFile("tls/testdata/client-key.pem"),
+        .{},
+    );
+    defer client_credentials.deinit();
+
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 304,
+        .tls = true,
+        .tls_client_ca = .{ .anchors = anchors, .verify = .required },
+        .access_log = true,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    var client: TlsClient = undefined;
+    try client.start(&bed.sim_io, Http1Bed.bindAddress(), .{
+        .host_name = fixture_host_name,
+        // The client claims an identity of its own; only the verified one
+        // may reach the origin.
+        .app_data = "GET / HTTP/1.1\r\nHost: a\r\nX-Client-Cert-SHA256: forged\r\n\r\n",
+        .exchange_end = .http_response,
+        .client_credentials = &client_credentials.inner,
+    });
+    var wind_down: TlsWindDown = .{ .bed = &bed };
+    wind_down.attach(&client);
+    try bed.sim_io.run();
+
+    const fingerprint = "f1fd192cff76490baf1534f777226e96dbb03d9751a657648e0955116d0d4fcb";
+    const heard = bed.origin.conns[0].request_buffer[0..bed.origin.conns[0].request_len];
+    try std.testing.expect(std.mem.indexOf(u8, heard, "\r\nX-Client-Cert-SHA256: " ++ fingerprint ++ "\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, heard, "forged") == null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, heard, "X-Client-Cert-SHA256"));
+    const line = try onlyAccessLogLine(&bed);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"client_cert_sha256\":\"" ++ fingerprint ++ "\"") != null);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("tls_handshakes_completed"));
     try bed.expectDrained();
 }
 

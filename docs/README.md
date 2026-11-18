@@ -385,6 +385,17 @@ unbounded work for a proxy that allocates nothing after startup, so issue
 short-lived client certificates instead. Extended key usage is not read,
 so use a CA that issues nothing but client certificates.
 
+A verified client's identity is its certificate's SHA-256 fingerprint, the
+value `openssl x509 -noout -fingerprint -sha256` prints, in lowercase hex
+without colons. The origin receives it on every request as
+`X-Client-Cert-SHA256`, and the access log as `client_cert_sha256`. A
+client never gets to write that header: an inbound
+`X-Client-Cert-SHA256` is stripped on **every** HTTP listener, mutual TLS
+or not, since an origin reached through a mutual-TLS listener may be
+reachable through a plaintext one too. Filters may not set or remove it.
+The header rides each request rather than the pooled origin connection,
+so connection reuse across clients stays sound.
+
 #### HTTP/2
 
 An `http` listener speaks HTTP/2 to clients in two ways. Over TLS, it
@@ -1790,6 +1801,11 @@ events. Its values are `ok`, `rejected`, `shed`, `timed_out`,
 `upstream_failed`, `aborted` and `closed`. `closed` is for L4 connections
 and [tunnels](#tunnelled-upgrades-websocket), which end as a relay ends,
 not as an exchange does.
+
+A connection whose client presented a verified certificate
+([mutual TLS](#requiring-a-client-certificate-mutual-tls)) adds
+`"client_cert_sha256"`, the certificate's fingerprint. Lines without one
+are unchanged.
 
 Logging never blocks the event loop: a stalled sink costs dropped lines,
 not latency. `zoxy_access_log_dropped` counts them exactly.
