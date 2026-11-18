@@ -2556,9 +2556,6 @@ gRPC-shaped (`content-type: application/grpc`, a body, then trailers
 - Counters at exit: `h2_origin_connections 3`, `h2_origin_idle_closed 3`.
 
 Open, and not settled here:
-- The live gate (`zig build smoke`) has no h2c origin yet. The harness
-  links only the `h2` codec, so it needs a small HTTP/2 server of its own.
-  Until then this run is the evidence for the libxev path.
 - `pickSlot` dials a second connection to an endpoint only when every one
   it has carries `concurrent_streams_max` legs. Legs past the origin's own
   `SETTINGS_MAX_CONCURRENT_STREAMS` wait for a stream to free rather than
@@ -2578,8 +2575,16 @@ Open, and not settled here:
   whole records wait in the buffer and fill it, which zssl assumes never
   happens. The client now asks `canReceive` before reading, and holds two
   records of wire. No simulator seed reached that state; the live run did,
-  on its first large body. The live gate still has no TLS origin leg.
-  TLS to an HTTP/1.1 origin is the rest of #296.
+  on its first large body. TLS to an HTTP/1.1 origin is the rest of #296.
+
+- The live gate now drives both. The h2c leg reaches `smoke/h2_origin.zig`.
+  The TLS leg loops the proxy through its own fourth listener, which
+  terminates TLS with the fixture leaf and offers `h2` alone. The `h2`
+  cluster pins that leaf as its anchor, so the shipped binary's handshake,
+  verification and ALPN run under libxev on a real kernel, and the harness
+  links no TLS of its own (§9). A second cluster naming another
+  `server_name` must be refused: a 502, `h2_origin_tls_failed 1`, and its
+  aborted handshake counted on the listener's side.
 
 ## Reached is not covered — the `@panic` probe (2026-07-28, #106)
 
