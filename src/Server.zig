@@ -43,6 +43,7 @@ const H2Origin = @import("http/h2/origin_pool.zig");
 const OriginClient = @import("tls/OriginClient.zig");
 const h2_origin_fields = @import("http/h2/origin.zig");
 const upstream_module = @import("net/upstream.zig");
+const upstream_tls_module = @import("net/upstream_tls.zig");
 
 const assert = std.debug.assert;
 
@@ -138,6 +139,10 @@ pub fn Server(comptime IoType: type) type {
         /// held to, as the pools were sized (`initOriginPools`).
         h2_origin_window: u31,
         h2_origin_head_bytes: u32,
+        /// TLS sessions for HTTPS origins' connections (#296), one per
+        /// upstream connection to an `http1` cluster with `tls`, each a
+        /// whole client with its buffers inline. Empty unless one exists.
+        upstream_tls: Pool(UpstreamTls.Session),
         /// Where a leg's request head is mapped to an origin's fields: one
         /// per process, used inside one call and never across one.
         h2_origin_scratch: OriginScratch,
@@ -424,6 +429,7 @@ pub fn Server(comptime IoType: type) type {
         const H2Driver = H2Connection.Driver(IoType);
         const H2ExchangeType = H2Exchange.Exchange(IoType);
         pub const OriginMux = H2Origin.Mux(IoType);
+        pub const UpstreamTls = upstream_tls_module.Driver(IoType);
 
         /// `h2_origin_scratch`'s shape: a parse's headers, the fields an
         /// origin is sent, and the octets of the names they lowercase.
@@ -671,6 +677,7 @@ pub fn Server(comptime IoType: type) type {
             try server.initTlsEngines(arena, &options);
             try server.initH2Pools(arena, &options);
             try server.initOriginPools(arena, &options);
+            try server.initUpstreamTls(arena, &options);
             server.l4_inflight = try arena.alloc(u16, keys.count);
             @memset(server.l4_inflight, 0);
             server.listeners = try arena.alloc(ListenerState, config.listeners.len);
@@ -909,7 +916,7 @@ pub fn Server(comptime IoType: type) type {
         pub fn h2OriginBytes(config: *const config_module.Config) u64 {
             const limits = &config.limits;
             if (limits.h2_origin_connections == 0) return 0;
-            const tls: u64 = if (config_module.originTls(config.clusters)) @sizeOf(OriginClient) else 0;
+            const tls: u64 = if (config_module.h2OriginTls(config.clusters)) @sizeOf(OriginClient) else 0;
             return @sizeOf(OriginMux.Slot) + h2OriginLayout(limits).bytes() + tls;
         }
 
@@ -995,11 +1002,33 @@ pub fn Server(comptime IoType: type) type {
             assert(server.h2_origin_staging.slots.len == options.h2_origin_streams);
         }
 
+        /// The HTTPS origins' sessions (#296), reserved as §5 prices them:
+        /// each a client, idle until a dial takes it.
+        fn initUpstreamTls(server: *Self, arena: std.mem.Allocator, options: *const InitOptions) error{OutOfMemory}!void {
+            assert(options.upstream_tls_sessions <= options.upstream_slots);
+            try server.upstream_tls.init(arena, options.upstream_tls_sessions);
+            for (server.upstream_tls.slots) |*session| {
+                session.client.started = false;
+                session.stream = null;
+                // Dead until a session's socket arms them.
+                session.op_send = .{};
+                session.op_recv = .{};
+            }
+            assert(server.upstream_tls.slots.len == options.upstream_tls_sessions);
+        }
+
+        /// What one HTTPS origin session costs (§5, #296): the pool element,
+        /// its client's buffers inline.
+        pub fn upstreamTlsSessionBytes(limits: *const config_module.Config.Limits) u64 {
+            if (limits.upstream_tls_sessions == 0) return 0;
+            return @sizeOf(UpstreamTls.Session);
+        }
+
         /// A TLS client per origin connection, where some cluster speaks
         /// `h2` (§7): each wired to its slot once, its buffers inline.
         fn initOriginTls(server: *Self, arena: std.mem.Allocator, options: *const InitOptions) error{OutOfMemory}!void {
             assert(options.h2_origin_connections >= 1);
-            if (!config_module.originTls(server.config.clusters)) return;
+            if (!config_module.h2OriginTls(server.config.clusters)) return;
             server.h2_origin_tls = try arena.alloc(OriginClient, options.h2_origin_connections);
             for (server.h2_origins.slots, server.h2_origin_tls) |*slot, *client| {
                 client.started = false;
@@ -1020,6 +1049,13 @@ pub fn Server(comptime IoType: type) type {
             return stream.upstream_socket != null or stream.h2_origin.attached();
         }
 
+        /// Whether the exchange's socket speaks TLS to an HTTPS origin
+        /// (#296): its ops go to the session riding the slot.
+        fn upstreamTls(stream: *const StreamType) bool {
+            const upstream = stream.upstream orelse return false;
+            return upstream.tls != null and stream.upstream_socket != null;
+        }
+
         pub fn upstreamSend(
             server: *Self,
             stream: *StreamType,
@@ -1028,6 +1064,7 @@ pub fn Server(comptime IoType: type) type {
             comptime callback: fn (*StreamType, Io.SendError!u32) void,
         ) void {
             if (stream.h2_origin.attached()) return OriginMux.send(server, stream, bytes, completion, callback);
+            if (upstreamTls(stream)) return UpstreamTls.send(server, stream, bytes, completion, callback);
             server.io.send(stream.upstream_socket.?, bytes, completion, StreamType, stream, callback);
         }
 
@@ -1039,12 +1076,14 @@ pub fn Server(comptime IoType: type) type {
             comptime callback: fn (*StreamType, Io.RecvError!u32) void,
         ) void {
             if (stream.h2_origin.attached()) return OriginMux.recv(server, stream, buffer, completion, callback);
+            if (upstreamTls(stream)) return UpstreamTls.recv(server, stream, buffer, completion, callback);
             server.io.recv(stream.upstream_socket.?, buffer, completion, StreamType, stream, callback);
         }
 
         /// Force what the exchange has armed on its upstream to deliver.
         pub fn upstreamShutdown(server: *Self, stream: *StreamType) void {
             if (stream.h2_origin.attached()) return OriginMux.shutdown(server, stream);
+            if (upstreamTls(stream)) return UpstreamTls.shutdown(server, stream);
             if (stream.upstream_socket) |socket| server.io.shutdown(socket, .both);
         }
 
@@ -1055,6 +1094,7 @@ pub fn Server(comptime IoType: type) type {
                 assert(stream.upstream_socket == null);
                 return OriginMux.detach(server, stream);
             }
+            if (upstreamTls(stream)) return UpstreamTls.close(server, stream);
             if (stream.upstream_socket) |socket| server.io.closeNow(socket);
             stream.upstream_socket = null;
         }
@@ -4532,6 +4572,10 @@ pub fn Server(comptime IoType: type) type {
             if (leased.head_buffer != null) {
                 server.releaseUpstreamHeadBuffer(leased);
             }
+            // The same chokepoint for an HTTPS origin's session (#296):
+            // every release path — teardown, reap, ejection, replay —
+            // gives it back here, so none can leak a libcrypto session.
+            if (leased.tls != null) UpstreamTls.release(server, leased);
             server.upstreams.release(leased);
             server.updateUpstreamPressure();
         }

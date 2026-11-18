@@ -189,6 +189,9 @@ pub fn Budget(comptime IoType: type) type {
                 .h2_origin_bytes = ServerType.h2OriginBytes(config),
                 .h2_origin_streams = limits.h2_origin_streams,
                 .h2_origin_stream_bytes = ServerType.h2OriginStreamBytes(&limits),
+                // Zero unless an HTTPS cluster exists (#296).
+                .upstream_tls_sessions = limits.upstream_tls_sessions,
+                .upstream_tls_session_bytes = ServerType.upstreamTlsSessionBytes(&limits),
             };
         }
 
@@ -479,9 +482,11 @@ pub fn Budget(comptime IoType: type) type {
         ) std.Io.Writer.Error!void {
             assert(sizes.h2_connections == 0 or sizes.h2_session_bytes > 0);
             assert(sizes.h2_origin_connections == 0 or sizes.h2_origin_bytes > 0);
+            assert(sizes.upstream_tls_sessions == 0 or sizes.upstream_tls_session_bytes > 0);
             try emit(sink,
                 \\          + h2 sessions {d} x {d} B + stream heads {d} x {d} B
                 \\          + h2 origins {d} x {d} B + origin streams {d} x {d} B
+                \\          + https origin sessions {d} x {d} B
                 \\          + config arena {d} KiB (measured, not closed-form)
                 \\
             , .{
@@ -493,6 +498,8 @@ pub fn Budget(comptime IoType: type) type {
                 sizes.h2_origin_bytes,
                 sizes.h2_origin_streams,
                 sizes.h2_origin_stream_bytes,
+                sizes.upstream_tls_sessions,
+                sizes.upstream_tls_session_bytes,
                 config_arena_bytes / 1024,
             });
         }

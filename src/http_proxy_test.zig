@@ -89,10 +89,12 @@ const HttpClient = struct {
     reads: bool = true,
     sent_len: u32 = 0,
     send_in_flight: bool = false,
-    /// Twice the proxy's head buffer: a response that fills that buffer and
-    /// then grows in the render exceeds it, and the separate-excess scenario
-    /// needs the whole response in one place to compare against.
-    receive_buffer: [2 * constants.head_buffer_bytes_default]u8 = undefined,
+    /// Past twice the proxy's head buffer: a response that fills that
+    /// buffer and then grows in the render exceeds it, and the
+    /// separate-excess scenario needs the whole response in one place to
+    /// compare against — and an HTTPS origin's answer spans several TLS
+    /// records (#296).
+    receive_buffer: [64 * 1024]u8 = undefined,
     received_len: u32 = 0,
     outcome: Outcome = .pending,
 
@@ -558,6 +560,233 @@ const HttpOrigin = struct {
     }
 };
 
+/// An HTTPS origin for the #296 scenarios: HTTP/1.1 behind TLS, serving the
+/// trust fixtures' leaf for `origin.zoxy.test` through `TestTlsServer`. It
+/// reads one request at a time — a head and a `Content-Length` body, which
+/// it counts rather than keeps — answers `response`, and keeps the
+/// connection unless told to close. What it heard is recorded for the
+/// scenarios to assert on.
+const HttpsOrigin = struct {
+    io: *SimIo = undefined,
+    listener: SimIo.Listener = undefined,
+    accept_completion: SimIo.Completion = .{},
+    listening: bool = false,
+    response: []const u8 = "",
+    close_after_response: bool = false,
+    /// Read every request, and answer none.
+    mute: bool = false,
+    /// What ALPN selects from: `http/1.1`, nothing, or a protocol the
+    /// proxy did not offer.
+    alpn: []const []const u8 = &.{"http/1.1"},
+    tls_servers: []TestTlsServer = &.{},
+    conns: [conns_max]Conn = @splat(.{}),
+    accepted_count: u32 = 0,
+    requests: u32 = 0,
+    requests_served: u32 = 0,
+    tls_failures: u32 = 0,
+    /// The last request's head as decrypted, and its body's length.
+    last_head: [512]u8 = undefined,
+    last_head_len: u32 = 0,
+    last_body_len: u64 = 0,
+
+    const conns_max: u32 = 4;
+
+    const Conn = struct {
+        origin: *HttpsOrigin = undefined,
+        socket: SimIo.Socket = undefined,
+        tls: *TestTlsServer = undefined,
+        recv_completion: SimIo.Completion = .{},
+        send_completion: SimIo.Completion = .{},
+        receiving: bool = false,
+        sending: bool = false,
+        failing: bool = false,
+        closed: bool = false,
+        head: [4096]u8 = undefined,
+        head_len: u32 = 0,
+        body_expected: ?u64 = null,
+        body_seen: u64 = 0,
+        answering: bool = false,
+        response_sent: u32 = 0,
+
+        fn armRecv(conn: *Conn) void {
+            if (conn.receiving or conn.closed or conn.failing or conn.answering) return;
+            const buffer = conn.tls.recvBuffer();
+            if (buffer.len == 0) return;
+            conn.receiving = true;
+            conn.origin.io.recv(conn.socket, buffer, &conn.recv_completion, Conn, conn, onRecv);
+        }
+
+        fn onRecv(conn: *Conn, result: Io.RecvError!u32) void {
+            conn.receiving = false;
+            const received = result catch return conn.fail();
+            if (conn.failing) return conn.fail();
+            conn.tls.received(received) catch return conn.fail();
+            conn.advance();
+        }
+
+        /// Plaintext into the request, owed octets out, and a read again.
+        fn advance(conn: *Conn) void {
+            var scratch: [16 * 1024]u8 = undefined;
+            var passes: u32 = 0;
+            while (conn.tls.plaintext_len >= 1) : (passes += 1) {
+                assert(passes < 64);
+                const taken = conn.tls.takePlaintext(&scratch);
+                conn.feed(scratch[0..taken]);
+                conn.tls.process() catch return conn.fail();
+            }
+            conn.pushSend();
+            conn.armRecv();
+        }
+
+        /// A request's head, then its body's octets, counted.
+        fn feed(conn: *Conn, bytes: []const u8) void {
+            var rest = bytes;
+            if (conn.body_expected == null) {
+                const take = @min(rest.len, conn.head.len - conn.head_len);
+                @memcpy(conn.head[conn.head_len..][0..take], rest[0..take]);
+                conn.head_len += @intCast(take);
+                const end = std.mem.indexOf(u8, conn.head[0..conn.head_len], "\r\n\r\n") orelse return;
+                const head_len: u32 = @intCast(end + 4);
+                conn.body_expected = contentLength(conn.head[0..head_len]);
+                conn.origin.requests += 1;
+                const kept: u32 = @min(head_len, conn.origin.last_head.len);
+                @memcpy(conn.origin.last_head[0..kept], conn.head[0..kept]);
+                conn.origin.last_head_len = kept;
+                rest = conn.head[head_len..conn.head_len];
+                conn.body_seen = 0;
+            }
+            conn.body_seen += rest.len;
+            if (conn.body_seen < conn.body_expected.?) return;
+            assert(conn.body_seen == conn.body_expected.?);
+            conn.origin.last_body_len = conn.body_seen;
+            if (conn.origin.mute) return;
+            conn.answering = true;
+            conn.response_sent = 0;
+        }
+
+        /// The head's `Content-Length`, compared without case, or none.
+        fn contentLength(head: []const u8) u64 {
+            const name = "content-length: ";
+            if (head.len < name.len) return 0;
+            for (0..head.len - name.len) |at| {
+                if (!std.ascii.eqlIgnoreCase(head[at..][0..name.len], name)) continue;
+                const value_end = std.mem.indexOfPos(u8, head, at, "\r\n").?;
+                return std.fmt.parseUnsigned(u64, head[at + name.len .. value_end], 10) catch unreachable;
+            }
+            return 0;
+        }
+
+        /// What TLS owes, or the answer's next record once nothing is.
+        fn pushSend(conn: *Conn) void {
+            if (conn.sending or conn.closed or conn.failing) return;
+            const tls = conn.tls;
+            const response = conn.origin.response;
+            if (!tls.owes()) {
+                if (!conn.answering or !tls.connected) return;
+                assert(conn.response_sent < response.len);
+                _ = tls.seal(response[conn.response_sent..]) catch return conn.fail();
+            }
+            conn.sending = true;
+            conn.origin.io.send(conn.socket, tls.wire(), &conn.send_completion, Conn, conn, onSend);
+        }
+
+        fn onSend(conn: *Conn, result: Io.SendError!u32) void {
+            conn.sending = false;
+            const sent = result catch return conn.fail();
+            if (conn.failing) return conn.fail();
+            conn.response_sent += conn.tls.sent(sent);
+            if (conn.answering and conn.response_sent == conn.origin.response.len) return conn.answered();
+            conn.tls.process() catch return conn.fail();
+            conn.advance();
+        }
+
+        /// The answer is out: the next request, or the close.
+        fn answered(conn: *Conn) void {
+            conn.origin.requests_served += 1;
+            conn.answering = false;
+            conn.head_len = 0;
+            conn.body_expected = null;
+            if (conn.origin.close_after_response) {
+                assert(!conn.receiving);
+                conn.origin.io.closeNow(conn.socket);
+                conn.closed = true;
+                return;
+            }
+            conn.advance();
+        }
+
+        /// Shut, and closed once nothing is armed on the socket.
+        fn fail(conn: *Conn) void {
+            if (conn.closed) return;
+            if (!conn.tls.connected and !conn.failing) conn.origin.tls_failures += 1;
+            if (!conn.failing) {
+                conn.failing = true;
+                conn.origin.io.shutdown(conn.socket, .both);
+            }
+            if (conn.receiving or conn.sending) return;
+            conn.origin.io.closeNow(conn.socket);
+            conn.closed = true;
+        }
+    };
+
+    fn start(origin: *HttpsOrigin, arena: std.mem.Allocator, io: *SimIo, address: std.Io.net.IpAddress) !void {
+        origin.io = io;
+        origin.tls_servers = try arena.alloc(TestTlsServer, conns_max);
+        for (origin.tls_servers) |*server| server.started = false;
+        origin.listener = try io.listen(&.{ .ip = address }, null);
+        origin.listening = true;
+        origin.armAccept();
+    }
+
+    fn armAccept(origin: *HttpsOrigin) void {
+        origin.io.accept(origin.listener, &origin.accept_completion, HttpsOrigin, origin, onAccept);
+    }
+
+    fn onAccept(origin: *HttpsOrigin, result: Io.AcceptError!SimIo.Socket) void {
+        const socket = result catch |err| {
+            assert(err == error.Canceled);
+            return;
+        };
+        assert(origin.accepted_count < conns_max);
+        const conn = &origin.conns[origin.accepted_count];
+        const tls = &origin.tls_servers[origin.accepted_count];
+        origin.accepted_count += 1;
+        conn.* = .{ .origin = origin, .socket = socket, .tls = tls };
+        var key_share: [48]u8 = @splat(0x5a);
+        key_share[47] = @intCast(origin.accepted_count);
+        tls.start(origin.alpn, key_share) catch {
+            origin.tls_failures += 1;
+            origin.io.closeNow(socket);
+            conn.closed = true;
+            return origin.armAccept();
+        };
+        conn.armRecv();
+        origin.armAccept();
+    }
+
+    fn lastHead(origin: *const HttpsOrigin) []const u8 {
+        return origin.last_head[0..origin.last_head_len];
+    }
+
+    /// Close what is still open at scenario end, as `HttpOrigin` does.
+    fn closeRemaining(origin: *HttpsOrigin) void {
+        for (origin.conns[0..origin.accepted_count], origin.tls_servers[0..origin.accepted_count]) |*conn, *tls| {
+            if (!conn.closed) {
+                origin.io.closeNow(conn.socket);
+                conn.closed = true;
+            }
+            tls.finish();
+        }
+    }
+
+    fn stopListening(origin: *HttpsOrigin) void {
+        if (origin.listening) {
+            origin.io.listenClose(origin.listener);
+            origin.listening = false;
+        }
+    }
+};
+
 /// Single-listener L7 harness: one http listener, a scripted origin, one
 /// client.
 /// One per-endpoint labeled value (#179). `Labeled`'s read path is the
@@ -589,6 +818,8 @@ const Http1Bed = struct {
     origin: HttpOrigin,
     /// The HTTP/2 origin an `origin_h2` scenario answers from (§7).
     h2_origin: H2TestOrigin,
+    /// The HTTPS origin an `origin_https` scenario answers from (#296).
+    https_origin: HttpsOrigin,
     client: HttpClient,
     client2: HttpClient,
     drain_timer_completion: SimIo.Completion,
@@ -649,6 +880,12 @@ const Http1Bed = struct {
         origin_tls: bool = false,
         origin_tls_name: []const u8 = "origin.zoxy.test",
         origin_tls_alpn: []const []const u8 = &.{"h2"},
+        /// The bed's origin speaks HTTP/1.1 over TLS (#296): the cluster
+        /// is `http1` with `tls`, verified as `origin_tls_name`, and
+        /// `https_origin` answers, selecting from `origin_https_alpn`.
+        origin_https: bool = false,
+        origin_https_alpn: []const []const u8 = &.{"http/1.1"},
+        upstream_tls_sessions: u32 = 2,
         h2_origin_connections: u32 = 2,
         h2_origin_streams: u32 = 2,
         /// The #181 dial-retry budget on the bed's one cluster.
@@ -829,7 +1066,7 @@ const Http1Bed = struct {
             .retries = options.retries,
             .protocol = if (options.origin_tls) .h2 else if (options.origin_h2) .h2c else .http1,
         }};
-        if (!options.origin_tls) return;
+        if (!options.origin_tls and !options.origin_https) return;
         bed.clusters[0].tls = .{
             .server_name = options.origin_tls_name,
             .anchors = try trust.parseAnchors(arena, @embedFile("tls/testdata/origin-ca.pem")),
@@ -933,6 +1170,7 @@ const Http1Bed = struct {
             .stream_slots = options.stream_slots,
             .h2_origin_connections = if (options.origin_h2) options.h2_origin_connections else 0,
             .h2_origin_streams = if (options.origin_h2) options.h2_origin_streams else 0,
+            .upstream_tls_sessions = if (options.origin_https) options.upstream_tls_sessions else 0,
         });
         try bed.loadTlsCredentials(arena, options.tls);
         try bed.server.start();
@@ -944,21 +1182,35 @@ const Http1Bed = struct {
             .interim_then_close_after_served = options.origin_interim_then_close_after_served,
             .close_second_at_accept = options.close_second_at_accept,
         };
-        bed.h2_origin = .{ .tls = options.origin_tls, .tls_alpn = options.origin_tls_alpn };
-        if (options.origin_h2) {
-            assert(!options.unix_origin);
-            if (options.origin_listens) try bed.h2_origin.start(arena, &bed.sim_io, originAddress());
-        } else if (options.origin_listens) {
-            if (options.unix_origin) {
-                try bed.origin.startUnix(&bed.sim_io, origin_socket_path);
-            } else {
-                try bed.origin.start(&bed.sim_io, originAddress());
-            }
-        }
+        try bed.startOrigins(arena, options);
         bed.client = .{ .send_delay_ms = options.send_delay_ms };
         bed.client2 = .{};
         bed.drain_timer_completion = .{};
         bed.origin_stop_completion = .{};
+    }
+
+    /// The origin this scenario answers from: HTTP/1.1, HTTP/2 or HTTPS,
+    /// on an address or a socket path — or none, for one that dials
+    /// nothing listening. Split from `setUp` for the length limit.
+    fn startOrigins(bed: *Http1Bed, arena: std.mem.Allocator, options: Options) !void {
+        bed.h2_origin = .{ .tls = options.origin_tls, .tls_alpn = options.origin_tls_alpn };
+        bed.https_origin = .{
+            .response = options.origin_response,
+            .close_after_response = options.origin_closes,
+            .mute = options.origin_mute,
+            .alpn = options.origin_https_alpn,
+        };
+        if (!options.origin_listens) return;
+        if (options.origin_h2) {
+            assert(!options.unix_origin);
+            return bed.h2_origin.start(arena, &bed.sim_io, originAddress());
+        }
+        if (options.origin_https) {
+            assert(!options.unix_origin);
+            return bed.https_origin.start(arena, &bed.sim_io, originAddress());
+        }
+        if (options.unix_origin) return bed.origin.startUnix(&bed.sim_io, origin_socket_path);
+        try bed.origin.start(&bed.sim_io, originAddress());
     }
 
     /// A sweep-observation scenario cannot let the client drive the drain
@@ -1031,11 +1283,13 @@ const Http1Bed = struct {
         try bed.sim_io.run();
         bed.origin.stopListening();
         bed.h2_origin.stopListening();
+        bed.https_origin.stopListening();
     }
 
     fn expectDrained(bed: *Http1Bed) !void {
         bed.origin.closeRemaining();
         bed.h2_origin.closeRemaining();
+        bed.https_origin.closeRemaining();
         try std.testing.expect(bed.server.isIdle());
         try std.testing.expect(bed.server.reconcile());
         try std.testing.expect(bed.sim_io.sockets.isFullyReleased());
@@ -1300,6 +1554,7 @@ test "h2c: an HTTP/1.1 request on an h2c listener is still HTTP/1.1, and a prefa
 
 const ResponseReader = @import("http/h2/ResponseReader.zig");
 const H2TestOrigin = @import("http/h2/TestOrigin.zig").TestOrigin(SimIo);
+const TestTlsServer = @import("tls/TestTlsServer.zig");
 const trust = @import("tls/trust.zig");
 const H2Session = @import("http/h2/Session.zig");
 const H2Slot = @import("http/h2/Connection.zig").Slot;
@@ -2044,6 +2299,175 @@ fn h2TlsOriginOptions(seed: u64) Http1Bed.Options {
     var options = h2OriginOptions(seed);
     options.origin_tls = true;
     return options;
+}
+
+// ---------------------------------------------------------------------------
+// HTTPS origins (#296): an `http1` cluster with `tls`, its connections
+// verified, sealed, parked and reused like any other.
+// ---------------------------------------------------------------------------
+
+fn httpsOriginOptions(seed: u64) Http1Bed.Options {
+    return .{
+        .seed = seed,
+        .origin_https = true,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsealed",
+    };
+}
+
+test "https origin: a verified origin is reached by its name, and a parked connection serves again unhandshaken" {
+    for ([_]bool{ false, true }) |partial_io| {
+        var options = httpsOriginOptions(400 + @as(u64, @intFromBool(partial_io)));
+        options.partial_io = partial_io;
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, options);
+        defer bed.tearDown();
+
+        bed.client.second_request = "GET /two HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
+        try bed.exchange("GET /one HTTP/1.1\r\nHost: a\r\n\r\n");
+
+        const response = bed.client.response();
+        try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, response, "\r\n\r\nsealed"));
+        // One connection, one handshake, two requests: the second rode the
+        // parked connection and its session as they were.
+        try std.testing.expectEqual(@as(u32, 1), bed.https_origin.accepted_count);
+        try std.testing.expectEqual(@as(u32, 2), bed.https_origin.requests_served);
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_tls_handshakes"));
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_reused"));
+        try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("upstream_tls_failed"));
+        try std.testing.expectEqual(@as(u32, 0), bed.https_origin.tls_failures);
+        try std.testing.expect(std.mem.startsWith(u8, bed.https_origin.lastHead(), "GET /two HTTP/1.1\r\n"));
+        try bed.expectDrained();
+    }
+}
+
+const https_answer_body: [40_000]u8 = @splat('s');
+comptime {
+    // Three records' worth, and whole in the test client's buffer.
+    assert(https_answer_body.len > 2 * constants.tls_record_plaintext_bytes_max);
+    assert(https_answer_body.len + 64 <= @as(HttpClient, .{}).receive_buffer.len);
+}
+const https_answer = "HTTP/1.1 200 OK\r\nContent-Length: 40000\r\n\r\n" ++ https_answer_body;
+
+test "https origin: bodies past a record go whole both ways, sealed and opened a record at a time" {
+    for ([_]bool{ false, true }) |partial_io| {
+        var options = httpsOriginOptions(402 + @as(u64, @intFromBool(partial_io)));
+        options.partial_io = partial_io;
+        options.origin_response = https_answer;
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, options);
+        defer bed.tearDown();
+
+        try bed.exchange(h2_origin_upload);
+
+        const response = bed.client.response();
+        try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expect(std.mem.endsWith(u8, response, &https_answer_body));
+        try std.testing.expectEqual(@as(u64, h2_origin_upload_body.len), bed.https_origin.last_body_len);
+        try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("upstream_tls_failed"));
+        try bed.expectDrained();
+    }
+}
+
+test "https origin: a chain for another name, or a refusal to speak HTTP/1.1, fails the dial as a 502, counted" {
+    {
+        var options = httpsOriginOptions(404);
+        options.origin_tls_name = "elsewhere.zoxy.test";
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, options);
+        defer bed.tearDown();
+        try bed.exchange("GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+        try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 502 "));
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_tls_failed"));
+        try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("upstream_tls_handshakes"));
+        // Nothing of the request reached an origin that could not prove
+        // whose it was.
+        try std.testing.expectEqual(@as(u32, 0), bed.https_origin.requests);
+        try bed.expectDrained();
+    }
+    {
+        // An origin that will speak only HTTP/2 to a client that offered
+        // only HTTP/1.1 refuses the handshake.
+        var options = httpsOriginOptions(405);
+        options.origin_https_alpn = &.{"h2"};
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, options);
+        defer bed.tearDown();
+        try bed.exchange("GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+        try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 502 "));
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_tls_failed"));
+        try std.testing.expectEqual(@as(u32, 0), bed.https_origin.requests);
+        try bed.expectDrained();
+    }
+}
+
+test "https origin: an origin that selects no protocol is spoken to as HTTP/1.1" {
+    var options = httpsOriginOptions(406);
+    options.origin_https_alpn = &.{};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+    try bed.exchange("GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+    try std.testing.expect(std.mem.endsWith(u8, bed.client.response(), "\r\n\r\nsealed"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_tls_handshakes"));
+    try bed.expectDrained();
+}
+
+test "https origin: an origin that closed a parked connection costs the next request its free replay" {
+    var options = httpsOriginOptions(407);
+    options.origin_closes = true;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    bed.client.second_request = "GET /two HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
+    try bed.exchange("GET /one HTTP/1.1\r\nHost: a\r\n\r\n");
+
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, bed.client.response(), "\r\n\r\nsealed"));
+    // The parked connection was found closed by the request it carried,
+    // and the replay dialed — and handshook — a fresh one.
+    try std.testing.expectEqual(@as(u32, 2), bed.https_origin.accepted_count);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_replayed"));
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("upstream_tls_handshakes"));
+    try bed.expectDrained();
+}
+
+test "https origin: an origin that never answers is a 504, its session given back" {
+    var options = httpsOriginOptions(408);
+    options.origin_mute = true;
+    options.request_timeout_ms = 30;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+    try bed.exchange("GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+    try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 504 "));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_gateway_timeout"));
+    try std.testing.expectEqual(@as(u32, 1), bed.https_origin.requests);
+    try bed.expectDrained();
+}
+
+test "https origin: a fresh connection with no session free is answered 503, counted" {
+    var options = h2BedOptions(409);
+    options.origin_https = true;
+    options.origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsealed";
+    options.upstream_tls_sessions = 1;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    var wire: H2Wire = .{};
+    wire.preface(&.{});
+    wire.get(1, "GET", "/a");
+    wire.get(3, "GET", "/b");
+    try bed.exchange(wire.written());
+
+    var storage: [2]H2Answer = undefined;
+    const answers = try h2Answers(bed.client.response(), &storage);
+    try std.testing.expectEqual(@as(usize, 2), answers.len);
+    try std.testing.expectEqual(@as(u16, 200), (try h2AnswerFor(answers, 1)).status);
+    try std.testing.expectEqual(@as(u16, 503), (try h2AnswerFor(answers, 3)).status);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_shed_upstream_tls"));
+    try bed.expectDrained();
 }
 
 test "h2 origin over TLS: a verified origin is reached by its name, h2 selected, and its trailers come back" {
