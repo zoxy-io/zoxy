@@ -470,7 +470,7 @@ pub const Step = union(enum) {
     };
     pub const Response = struct {
         stream: u31,
-        /// Three digits, 100 to 999, and never 101 (§8.6).
+        /// Three digits, 100 to 599 (RFC 9110 §15), and never 101 (§8.6).
         status: u16,
         /// `:status` among them, as decoded.
         fields: []const hpack.Field,
@@ -1851,14 +1851,15 @@ fn takeResponseHead(session: *Session, slot: *StreamTable.Slot, end_stream: bool
     } };
 }
 
-/// Three digits, 100 to 999: what an HTTP/1.1 status line can carry.
+/// Three digits, 100 to 599: the statuses RFC 9110 §15 defines a range
+/// for, and what the HTTP/1.1 parser on the far side of the proxy reads.
 fn statusOf(fields: []const hpack.Field) ?u16 {
     for (fields) |*field| {
         if (!std.mem.eql(u8, field.name, ":status")) continue;
         if (field.value.len != 3) return null;
-        if (field.value[0] < '1' or field.value[0] > '9') return null;
+        if (field.value[0] < '1' or field.value[0] > '5') return null;
         const status = std.fmt.parseUnsigned(u16, field.value, 10) catch return null;
-        assert(status >= 100 and status <= 999);
+        assert(status >= 100 and status <= 599);
         return status;
     }
     return null;

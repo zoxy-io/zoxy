@@ -106,7 +106,7 @@ pub fn responseHead(
     if (out.fields.len == 0) return error.TooLarge;
     if (out.bytes.len < 3) return error.TooLarge;
     var digits: [3]u8 = undefined;
-    _ = std.fmt.bufPrint(&digits, "{d}", .{parsed.status}) catch unreachable; // 100..999.
+    _ = std.fmt.bufPrint(&digits, "{d}", .{parsed.status}) catch unreachable; // 100..599, as parsed.
     @memcpy(out.bytes[0..3], &digits);
     out.fields[0] = .{ .name = ":status", .value = out.bytes[0..3] };
     var count: u32 = 1;
