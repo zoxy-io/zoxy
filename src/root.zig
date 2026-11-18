@@ -25,6 +25,7 @@ pub const http = struct {
     pub const router = @import("http/router.zig");
     pub const filter = @import("http/filter.zig");
     pub const proxy = @import("http/proxy.zig");
+    pub const grpc = @import("http/grpc.zig");
     /// What a client outside `src/http/h2/` needs to read a server's
     /// HTTP/2 field sections (#275), and the per-connection budgets a
     /// client can overrun (#276): the simulator's h2c client, which sends
@@ -94,6 +95,7 @@ test {
     _ = http.router;
     _ = http.filter;
     _ = http.proxy;
+    _ = http.grpc;
     _ = @import("http/h2/Session.zig");
     _ = @import("http/h2/StreamTable.zig");
     _ = @import("http/h2/downgrade.zig");

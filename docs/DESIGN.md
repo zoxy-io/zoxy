@@ -2385,6 +2385,32 @@ never cut short the delivery of the verdict it caused. `0` (the default)
 disables it: what counts as too slow is a property of the operator's
 origin, not one this proxy can pick for them.
 
+A gRPC call (`content-type: application/grpc`, with or without a
+`+format` suffix or parameters) brings a deadline of its own:
+`grpc-timeout`, the client's limit for the whole call. `http/grpc.zig`
+reads it at routing time: one to eight digits and a unit, clamped to
+`[1 ms, timeout_ms_max]`. A malformed value is ignored and the call
+still goes through. The call's deadline arms this same rung, either in
+place of `request_ms` when that is earlier or off, or not at all when
+`request_ms` comes first. This proxy then stops spending its relay
+buffer, upstream slot and origin stream on a call the client has
+already given up on.
+
+When the client's deadline is the one that fires, the answer is gRPC's
+Trailers-Only `200` with `grpc-status: 4` (DEADLINE_EXCEEDED), counted
+in `l7_grpc_deadline_exceeded`. It is not a `504`, because a gRPC client
+reads a `504` as UNAVAILABLE and may retry a call whose time is already
+spent. It is not witnessed against the endpoint either: the client's
+limit expired, which says nothing about the origin's time, so a client
+with tight deadlines cannot eject a healthy origin through passive
+ejection (#230). A deadline that fires after the answer has begun ends
+the exchange the same way the cap's does.
+
+The field is forwarded to the origin as sent. Nothing deducts the time
+the call has already spent at this hop, which is at most the dial, so
+the origin's copy of the deadline can run a little past the client's.
+The deadline this proxy enforces is the client's own.
+
 - **Static error responses.** `400`/`404`/`414`/`431`/`501`/`503`/`504`
   are comptime-rendered byte arrays sent directly from server memory —
   never staged through

@@ -267,6 +267,31 @@ const options_templates: [2]Template = .{
     optionsTemplate(.close),
 };
 
+/// The answer a gRPC call gets when its own `grpc-timeout` ran out here
+/// (§8): gRPC's Trailers-Only form, `200` with `grpc-status: 4`
+/// (DEADLINE_EXCEEDED) and no message — what a gRPC client reads as the
+/// deadline it set, where a `504` would read as UNAVAILABLE and invite a
+/// retry of a call whose time is already spent. Bodiless, so on an HTTP/2
+/// stream it is one HEADERS that ends it.
+fn grpcDeadlineTemplate(comptime persistence: Persistence) Template {
+    const prefix = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n" ++
+        "Content-Type: application/grpc\r\nGrpc-Status: 4\r\n" ++
+        "Grpc-Message: Deadline Exceeded\r\nDate: ";
+    const suffix = "\r\n" ++ server_line ++ switch (persistence) {
+        .keep => "",
+        .close => "Connection: close\r\n",
+    } ++ "\r\n";
+    return .{
+        .bytes = prefix ++ date_placeholder ++ suffix,
+        .date_offset = prefix.len,
+    };
+}
+
+const grpc_deadline_templates: [2]Template = .{
+    grpcDeadlineTemplate(.keep),
+    grpcDeadlineTemplate(.close),
+};
+
 /// The widest static response any status and persistence can render to,
 /// which is what one table slot must hold. Comptime, so the table is
 /// sized by the responses themselves rather than by a guess that a new
@@ -295,6 +320,11 @@ pub const static_response_bytes_max: u32 = blk: {
     // The OPTIONS answer shares the table's slot width, and being the one
     // response carrying an `Allow` it is the one that sets it.
     for (options_templates) |template| {
+        if (template.bytes.len > widest) {
+            widest = @intCast(template.bytes.len);
+        }
+    }
+    for (grpc_deadline_templates) |template| {
         if (template.bytes.len > widest) {
             widest = @intCast(template.bytes.len);
         }
@@ -372,6 +402,9 @@ pub const StaticTable = struct {
     /// it is the one static this proxy sends that is not a refusal, so it
     /// has no place in a table keyed by `static_statuses`.
     options: [2][static_response_bytes_max]u8,
+    /// The gRPC deadline answer, on the same terms as `options`: a static
+    /// that is not a refusal of the closed set's kind.
+    grpc_deadline: [2][static_response_bytes_max]u8,
     /// The #300 variants: the same pages carrying an RFC 9209 error
     /// token, for the three statuses that have one. Separate storage
     /// rather than a dimension on `storage`, because nine of twelve
@@ -398,6 +431,23 @@ pub const StaticTable = struct {
             assert(template.bytes.len <= slot.len);
             @memcpy(slot[0..template.bytes.len], template.bytes);
         }
+        for (&table.grpc_deadline, 0..) |*slot, persistence| {
+            const template = grpc_deadline_templates[persistence];
+            assert(template.bytes.len <= slot.len);
+            @memcpy(slot[0..template.bytes.len], template.bytes);
+        }
+    }
+
+    /// The gRPC deadline answer for one persistence choice.
+    pub fn getGrpcDeadline(table: *StaticTable, persistence: Persistence) StaticResponse {
+        const template = grpc_deadline_templates[@backingInt(persistence)];
+        const slot = &table.grpc_deadline[@backingInt(persistence)];
+        assert(template.date_offset + date_bytes <= template.bytes.len);
+        assert(template.bytes.len <= slot.len);
+        return .{
+            .bytes = slot[0..template.bytes.len],
+            .date = slot[template.date_offset..][0..date_bytes],
+        };
     }
 
     /// The #240 answer for one persistence choice.
@@ -433,6 +483,7 @@ pub const StaticTable = struct {
         }
         for ([_]Persistence{ .keep, .close }) |persistence| {
             @memcpy(table.getOptions(persistence).date, date);
+            @memcpy(table.getGrpcDeadline(persistence).date, date);
         }
     }
 

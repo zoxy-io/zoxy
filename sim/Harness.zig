@@ -3175,6 +3175,9 @@ fn l7OutcomeTotal(counters: *const zoxy.counters.Counters) u64 {
         "l7_shed_endpoint_inflight",
         "l7_bad_gateway",
         "l7_gateway_timeout",
+        // A gRPC call's own deadline: the same verdict, answered as gRPC
+        // reads one, and owing a line the same way.
+        "l7_grpc_deadline_exceeded",
         // The #247 head-read verdict. It answers `408` and so owes a
         // line, exactly like the `504` above it — the difference between
         // them is which side ran out of time, which the status says and
