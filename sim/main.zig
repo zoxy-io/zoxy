@@ -209,6 +209,11 @@ const uncovered = [_]Uncovered{
         .reason = "no h2c cluster in the sweep; origin.zig's tests and fuzz cover the refused answers",
     },
     .{
+        .name = "h2_origin_tls_failed",
+        .why = .unreached,
+        .reason = "no h2 cluster in the sweep; OriginClient's tests and the h2 origin TLS scenarios refuse chains",
+    },
+    .{
         .name = "l7_shed_h2_origin_connections",
         .why = .unreached,
         .reason = "no h2c cluster in the sweep, so neither origin pool exists to run dry",

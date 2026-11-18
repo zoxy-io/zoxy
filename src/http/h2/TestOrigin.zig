@@ -12,6 +12,7 @@ const h2 = @import("h2");
 const Session = @import("Session.zig");
 const StreamTable = @import("StreamTable.zig");
 const Io = @import("../../io/io.zig");
+const TestTlsServer = @import("../../tls/TestTlsServer.zig");
 
 const hpack = h2.hpack;
 const assert = std.debug.assert;
@@ -41,6 +42,13 @@ pub fn TestOrigin(comptime IoType: type) type {
         /// request is still arriving — and end only once it has: a
         /// bidirectional call's shape.
         answer_at_head: bool = false,
+        /// Terminate TLS in front of the session, serving the origin trust
+        /// fixtures' leaf, and select from `tls_alpn` — `h2`, or nothing.
+        tls: bool = false,
+        tls_alpn: []const []const u8 = &.{"h2"},
+        tls_servers: []TestTlsServer = &.{},
+        /// Handshakes that failed on this side.
+        tls_failures: u32 = 0,
         /// Refuse every stream past the first with GOAWAY naming it, the
         /// shape of an origin draining under a client.
         goaway_after_first: bool = false,
@@ -102,14 +110,37 @@ pub fn TestOrigin(comptime IoType: type) type {
             sending: u32 = 0,
             closed: bool = false,
             jobs: [streams_max]Job = @splat(.{}),
+            tls: ?*TestTlsServer = null,
 
             fn drive(conn: *Conn) void {
                 if (conn.closed) return;
+                var rounds: u32 = 0;
+                while (rounds < 64) : (rounds += 1) {
+                    const waiting = conn.stepAll();
+                    const tls = conn.tls orelse break;
+                    if (!waiting or tls.plaintext_len == 0) break;
+                    const taken = tls.takePlaintext(conn.session.recvBuffer());
+                    conn.session.received(taken);
+                    tls.process() catch return conn.tlsFailed();
+                }
+                conn.flush();
+                if (conn.session.state == .closed and conn.sending == 0) return conn.close();
+                if (!conn.receiving and conn.session.state != .closed) conn.armRecv();
+            }
+
+            fn tlsFailed(conn: *Conn) void {
+                conn.origin.tls_failures += 1;
+                conn.close();
+            }
+
+            /// Step until the session waits; true when it waits for input.
+            fn stepAll(conn: *Conn) bool {
                 var passes: u32 = 0;
                 while (passes < 1 << 16) : (passes += 1) {
                     const step = conn.session.step();
                     switch (step) {
-                        .need_input, .flush_first, .closed => break,
+                        .need_input => return true,
+                        .flush_first, .closed => return false,
                         .request => |request| conn.onRequest(&request),
                         .data => |data| {
                             if (data.bytes.len >= 1) conn.session.consume(data.stream, @intCast(data.bytes.len));
@@ -125,9 +156,7 @@ pub fn TestOrigin(comptime IoType: type) type {
                         .response => unreachable, // A server session raises none.
                     }
                 }
-                conn.flush();
-                if (conn.session.state == .closed and conn.sending == 0) return conn.close();
-                if (!conn.receiving and conn.session.state != .closed) conn.armRecv();
+                return false;
             }
 
             fn onRequest(conn: *Conn, request: *const Session.Step.Request) void {
@@ -221,6 +250,17 @@ pub fn TestOrigin(comptime IoType: type) type {
 
             fn flush(conn: *Conn) void {
                 if (conn.sending != 0 or conn.closed) return;
+                if (conn.tls) |tls| {
+                    if (!tls.owes() and tls.connected) {
+                        const staged = conn.session.outbound();
+                        if (staged.len >= 1) _ = tls.seal(staged) catch return conn.tlsFailed();
+                    }
+                    if (!tls.owes()) return;
+                    const wire = tls.wire();
+                    conn.sending = @intCast(wire.len);
+                    conn.origin.io.send(conn.socket, wire, &conn.send_completion, Conn, conn, onSend);
+                    return;
+                }
                 const staged = conn.session.outbound();
                 if (staged.len == 0) return;
                 conn.sending = @intCast(staged.len);
@@ -231,26 +271,39 @@ pub fn TestOrigin(comptime IoType: type) type {
                 conn.sending = 0;
                 if (conn.closed) return;
                 const sent = result catch return conn.close();
-                conn.session.outboundSent(sent);
+                if (conn.tls) |tls| {
+                    const plain = tls.sent(sent);
+                    if (plain >= 1) conn.session.outboundSent(plain);
+                    tls.process() catch return conn.tlsFailed();
+                } else {
+                    conn.session.outboundSent(sent);
+                }
                 conn.drive();
             }
 
             fn armRecv(conn: *Conn) void {
+                const buffer = if (conn.tls) |tls| tls.recvBuffer() else conn.session.recvBuffer();
+                if (buffer.len == 0) return; // Records wait for the session.
                 conn.receiving = true;
-                conn.origin.io.recv(conn.socket, conn.session.recvBuffer(), &conn.recv_completion, Conn, conn, onRecv);
+                conn.origin.io.recv(conn.socket, buffer, &conn.recv_completion, Conn, conn, onRecv);
             }
 
             fn onRecv(conn: *Conn, result: Io.RecvError!u32) void {
                 conn.receiving = false;
                 if (conn.closed) return;
                 const received = result catch return conn.close();
-                conn.session.received(received);
+                if (conn.tls) |tls| {
+                    tls.received(received) catch return conn.tlsFailed();
+                } else {
+                    conn.session.received(received);
+                }
                 conn.drive();
             }
 
             fn close(conn: *Conn) void {
                 if (conn.closed) return;
                 conn.closed = true;
+                if (conn.tls) |tls| tls.finish();
                 // An op still out holds the socket; it delivers into a
                 // closed conn and is dropped.
                 if (conn.receiving or conn.sending != 0) {
@@ -264,6 +317,10 @@ pub fn TestOrigin(comptime IoType: type) type {
         /// Listen on `address`, the sessions' buffers carved from `arena`.
         pub fn start(origin: *Self, arena: std.mem.Allocator, io: *IoType, address: std.Io.net.IpAddress) !void {
             origin.io = io;
+            if (origin.tls) {
+                origin.tls_servers = try arena.alloc(TestTlsServer, conns_max);
+                for (origin.tls_servers) |*server| server.started = false;
+            }
             const unit: usize = @intCast(layout.bytes());
             const slab = try arena.alignedAlloc(u8, .fromByteUnits(Session.Layout.unit_align), conns_max * unit);
             for (&origin.conns, 0..) |*conn, index| {
@@ -289,6 +346,18 @@ pub fn TestOrigin(comptime IoType: type) type {
             const session = conn.session;
             const buffers = conn.buffers;
             conn.* = .{ .origin = origin, .socket = socket, .session = session, .buffers = buffers };
+            if (origin.tls) {
+                const tls = &origin.tls_servers[origin.accepted_count - 1];
+                var key_share: [48]u8 = @splat(0x93);
+                key_share[47] = @intCast(origin.accepted_count);
+                tls.start(origin.tls_alpn, key_share) catch {
+                    origin.tls_failures += 1;
+                    conn.closed = true;
+                    origin.io.closeNow(socket);
+                    return origin.armAccept();
+                };
+                conn.tls = tls;
+            }
             conn.session.init(.{
                 .concurrent_streams_max = streams_max,
                 .header_list_size_max = layout.header_list_size_max,
@@ -307,6 +376,7 @@ pub fn TestOrigin(comptime IoType: type) type {
         /// exact.
         pub fn closeRemaining(origin: *Self) void {
             for (origin.conns[0..origin.accepted_count]) |*conn| {
+                if (conn.tls) |tls| tls.finish();
                 if (conn.closed) continue;
                 conn.closed = true;
                 origin.io.closeNow(conn.socket);

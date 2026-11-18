@@ -44,6 +44,8 @@ const parser = @import("../parser.zig");
 const render = @import("../render.zig");
 const constants = @import("../../constants.zig");
 const Io = @import("../../io/io.zig");
+const OriginClient = @import("../../tls/OriginClient.zig");
+const config_module = @import("../../config.zig");
 
 const hpack = h2.hpack;
 const assert = std.debug.assert;
@@ -64,9 +66,19 @@ const end_text_bytes_max: u32 = constants.chunked_trailer_bytes_max + "0\r\n".le
 /// hands over an event, or returns, so the input is the real bound.
 const drive_steps_max: u32 = 1 << 20;
 
-/// The most rounds one drive runs: a round is asked for again only by a
-/// kick from inside the last one, which at most ends the connection.
-const drive_rounds_max: u32 = 8;
+/// The most rounds one drive runs. A round is asked for again by a kick
+/// from inside the last one, which at most ends the connection, or — over
+/// TLS — by decrypted octets fed to the session. Those are at most the
+/// client's backlog and its two buffered records, 64 KiB, and a round
+/// either fills the session's frame buffer, which then holds a whole
+/// frame it consumes, or empties the backlog: two rounds per 16 KiB frame
+/// at worst, with room to spare.
+const drive_rounds_max: u32 = 64;
+
+comptime {
+    const plaintext_max = OriginClient.plaintext_bytes + 2 * OriginClient.record_plaintext_bytes_max;
+    assert(drive_rounds_max > 2 * (plaintext_max / Session.frame_payload_bytes_max) + 2);
+}
 
 /// What one leg's buffer holds at most: a response head, a window of
 /// payload, and the end of a chunked body.
@@ -176,6 +188,10 @@ pub fn Mux(comptime IoType: type) type {
             server: *ServerType,
             session: *Session,
             buffers: Session.Buffers,
+            /// This slot's TLS client, wired once where some cluster speaks
+            /// `h2` (null otherwise), and whether this connection uses it.
+            tls: ?*OriginClient,
+            tls_active: bool,
             socket: IoType.Socket,
             state: State,
             cluster_index: u16,
@@ -198,7 +214,7 @@ pub fn Mux(comptime IoType: type) type {
             op_cancel: IoType.Completion,
             armed: Armed,
 
-            pub const State = enum(u8) { free, connecting, open, closing };
+            pub const State = enum(u8) { free, connecting, handshaking, open, closing };
 
             pub const Armed = packed struct(u8) {
                 connect: bool = false,
@@ -222,6 +238,7 @@ pub fn Mux(comptime IoType: type) type {
                 slot.driving = false;
                 slot.drive_again = false;
                 slot.socket_open = false;
+                slot.tls_active = false;
                 slot.deadline_ns = 0;
                 slot.armed = .{};
                 assert(slot.buffers.inbound.len >= Session.frame_bytes_max);
@@ -337,7 +354,7 @@ pub fn Mux(comptime IoType: type) type {
             for (server.h2_origins.slots) |*slot| {
                 if (!server.h2_origins.isAcquired(slot)) continue;
                 if (slot.cluster_index != cluster_index or slot.endpoint_index != endpoint_index) continue;
-                if (slot.state != .connecting and slot.state != .open) continue;
+                if (slot.state != .connecting and slot.state != .handshaking and slot.state != .open) continue;
                 if (slot.state == .open and slot.session.goingAway()) continue;
                 if (slot.legs_count >= server.h2OriginSessionConfig().concurrent_streams_max) continue;
                 if (best == null or slot.legs_count < best.?.legs_count) best = slot;
@@ -826,10 +843,72 @@ pub fn Mux(comptime IoType: type) type {
             slot.socket = socket;
             slot.socket_open = true;
             server.io.setNodelay(socket) catch |err| server.witnessKernelPressure(.set_option, err);
+            if (server.config.clusters[slot.cluster_index].tls) |*tls| return startTls(server, slot, tls);
+            openSession(server, slot);
+        }
+
+        /// The connection speaks HTTP/2 from here: the session's preface
+        /// and SETTINGS are staged, and the idle window starts.
+        fn openSession(server: *ServerType, slot: *Slot) void {
+            assert(slot.state == .connecting or slot.state == .handshaking);
+            assert(slot.socket_open);
             slot.state = .open;
             slot.session.init(server.h2OriginSessionConfig(), &slot.buffers);
             slot.deadline_ns = server.io.nowNs() + @as(u64, server.idleTimeoutMs()) * std.time.ns_per_ms;
             drive(server, slot);
+        }
+
+        /// TLS first (RFC 9113 §3.2): the ClientHello goes out, offering
+        /// `h2` and naming the cluster's server, and the session waits for
+        /// the handshake — under the dial's budget still.
+        fn startTls(server: *ServerType, slot: *Slot, tls: *const config_module.Config.Cluster.Tls) void {
+            assert(slot.state == .connecting);
+            const client = slot.tls.?;
+            var entropy: [64]u8 = undefined;
+            server.io.fillRandom(&entropy);
+            // A scalar of zeros is the one x25519 refuses; the stream is
+            // random, so this never moves anything a peer could see.
+            entropy[32] |= 1;
+            client.start(&.{
+                .server_name = tls.server_name,
+                .anchors = tls.anchors,
+                .client_random = entropy[0..32].*,
+                .x25519_private = entropy[32..64].*,
+                .now_sec = nowSec(server),
+            });
+            slot.tls_active = true;
+            slot.state = .handshaking;
+            flush(server, slot);
+            armRecv(server, slot);
+        }
+
+        fn nowSec(server: *const ServerType) i64 {
+            return @intCast(server.io.nowWallNs() / std.time.ns_per_s);
+        }
+
+        /// The handshake moved: once it is done, the origin must have
+        /// selected `h2` — the session opens; until then, owed flights go
+        /// out and the next records are read.
+        fn handshakeProgress(server: *ServerType, slot: *Slot) void {
+            assert(slot.state == .handshaking);
+            const client = slot.tls.?;
+            if (client.closed) return tlsFailed(server, slot);
+            if (client.connected) {
+                if (!client.alpnIsH2()) return tlsFailed(server, slot);
+                return openSession(server, slot);
+            }
+            flush(server, slot);
+            if (!slot.receiving and client.canReceive()) armRecv(server, slot);
+        }
+
+        /// The handshake or a record failed — a chain that did not verify,
+        /// no `h2`, a record that did not open: the connection is over, and
+        /// counted against its endpoint as a refused dial would be.
+        fn tlsFailed(server: *ServerType, slot: *Slot) void {
+            assert(slot.tls_active);
+            server.counters.increment("h2_origin_tls_failed");
+            server.health.witnessPassiveFailure(slot.cluster_index, slot.endpoint_index);
+            close(server, slot);
         }
 
         fn serverOf(slot: *Slot) *ServerType {
@@ -858,16 +937,27 @@ pub fn Mux(comptime IoType: type) type {
             assert(!slot.driving);
             slot.driving = true;
             var rounds: u32 = 0;
+            var tls_failed = false;
             while (rounds < drive_rounds_max) : (rounds += 1) {
                 slot.drive_again = false;
-                stepEvents(server, slot);
+                const waiting = stepEvents(server, slot);
                 if (slot.session.state == .closed) break;
+                // Decrypted octets waiting for room the session just made.
+                if (waiting and slot.tls_active) {
+                    const fed = feedPlaintext(slot) catch blk: {
+                        tls_failed = true;
+                        break :blk false;
+                    };
+                    if (tls_failed) break;
+                    if (fed) slot.drive_again = true;
+                }
                 openWaiting(server, slot);
                 if (!slot.drive_again) break;
             }
             assert(rounds < drive_rounds_max);
             slot.driving = false;
             assert(slot.state == .open);
+            if (tls_failed) return tlsFailed(server, slot);
             if (slot.session.state == .closed) {
                 failLegs(server, slot);
                 flush(server, slot);
@@ -875,19 +965,51 @@ pub fn Mux(comptime IoType: type) type {
                 return;
             }
             flush(server, slot);
-            if (!slot.receiving) armRecv(server, slot);
+            if (slot.tls_active and slot.tls.?.closed and slot.tls.?.plaintext_len == 0) {
+                // The origin's close_notify: what it said is all read.
+                return close(server, slot);
+            }
+            if (!slot.receiving and recvRoom(slot)) armRecv(server, slot);
         }
 
-        /// Step the session until it waits, each event to its leg.
-        fn stepEvents(server: *ServerType, slot: *Slot) void {
+        /// Hand the session decrypted octets, as many as its buffer takes,
+        /// and decrypt what records are buffered behind them. True when it
+        /// took some, so the drive steps again.
+        fn feedPlaintext(slot: *Slot) OriginClient.Error!bool {
+            assert(slot.tls_active);
+            const client = slot.tls.?;
+            try client.process();
+            if (client.plaintext_len == 0) return false;
+            const taken = client.takePlaintext(slot.session.recvBuffer());
+            assert(taken >= 1);
+            slot.session.received(taken);
+            try client.process();
+            return true;
+        }
+
+        /// Whether a read has somewhere to land: over TLS, the record buffer
+        /// may be full of records waiting for the session to take their
+        /// plaintext, and a read then waits for that.
+        fn recvRoom(slot: *Slot) bool {
+            if (!slot.tls_active) return true;
+            return slot.tls.?.canReceive();
+        }
+
+        /// Step the session until it waits, each event to its leg. True when
+        /// it waits for input — the one state in which more may be fed it.
+        fn stepEvents(server: *ServerType, slot: *Slot) bool {
             assert(slot.driving);
             var steps: u32 = 0;
             while (steps < drive_steps_max) : (steps += 1) {
                 const step = slot.session.step();
                 switch (step) {
                     // Only a completed send makes room; this waits for it.
-                    .flush_first => return flush(server, slot),
-                    .need_input, .closed => return,
+                    .flush_first => {
+                        flush(server, slot);
+                        return false;
+                    },
+                    .need_input => return true,
+                    .closed => return false,
                     .response => |*response| onResponse(server, slot, response),
                     .data => |*data| onData(server, slot, data),
                     .trailers => |*trailers| onTrailers(server, slot, trailers),
@@ -934,12 +1056,32 @@ pub fn Mux(comptime IoType: type) type {
             assert(slot.state != .free);
             if (slot.sending != 0) return;
             if (!slot.socket_open or slot.state == .closing) return;
+            if (slot.tls_active) return flushTls(server, slot);
             const staged = slot.session.outbound();
             if (staged.len == 0) return;
             assert(!slot.armed.send);
             slot.sending = @intCast(staged.len);
             slot.armed.send = true;
             server.io.send(slot.socket, staged, &slot.op_send, Slot, slot, onSend);
+        }
+
+        /// Over TLS: what the client owes first — a handshake flight, or a
+        /// record already sealed — else a record of the session's staged
+        /// octets, sealed now.
+        fn flushTls(server: *ServerType, slot: *Slot) void {
+            assert(slot.tls_active);
+            assert(slot.sending == 0);
+            const client = slot.tls.?;
+            if (!client.owes() and slot.state == .open) {
+                const staged = slot.session.outbound();
+                if (staged.len >= 1) _ = client.seal(staged) catch return tlsFailed(server, slot);
+            }
+            if (!client.owes()) return;
+            const wire = client.wire();
+            assert(!slot.armed.send);
+            slot.sending = @intCast(wire.len);
+            slot.armed.send = true;
+            server.io.send(slot.socket, wire, &slot.op_send, Slot, slot, onSend);
         }
 
         fn onSend(slot: *Slot, result: Io.SendError!u32) void {
@@ -953,17 +1095,38 @@ pub fn Mux(comptime IoType: type) type {
                 return close(server, slot);
             };
             assert(sent >= 1);
+            if (slot.tls_active) return onTlsSent(server, slot, sent);
             slot.session.outboundSent(sent);
             if (slot.session.state == .closed and slot.session.outbound().len == 0) return close(server, slot);
+            drive(server, slot);
+        }
+
+        /// Wire octets out over TLS: a whole sealed record credits the
+        /// session with the plaintext it carried. A handshake's flight out,
+        /// records held behind it are read now.
+        fn onTlsSent(server: *ServerType, slot: *Slot, sent: u32) void {
+            const client = slot.tls.?;
+            const plain = client.sent(sent);
+            if (plain >= 1) slot.session.outboundSent(plain);
+            if (slot.state == .handshaking) {
+                client.process() catch return tlsFailed(server, slot);
+                return handshakeProgress(server, slot);
+            }
+            assert(slot.state == .open);
+            if (slot.session.state == .closed and slot.session.outbound().len == 0 and !client.owes()) {
+                return close(server, slot);
+            }
             drive(server, slot);
         }
 
         fn armRecv(server: *ServerType, slot: *Slot) void {
             assert(!slot.receiving);
             assert(slot.socket_open);
+            assert(recvRoom(slot));
+            const buffer = if (slot.tls_active) slot.tls.?.recvBuffer() else slot.session.recvBuffer();
             slot.receiving = true;
             slot.armed.recv = true;
-            server.io.recv(slot.socket, slot.session.recvBuffer(), &slot.op_io, Slot, slot, onRecv);
+            server.io.recv(slot.socket, buffer, &slot.op_io, Slot, slot, onRecv);
         }
 
         fn onRecv(slot: *Slot, result: Io.RecvError!u32) void {
@@ -977,13 +1140,19 @@ pub fn Mux(comptime IoType: type) type {
                 return close(server, slot);
             };
             assert(received >= 1);
+            if (slot.tls_active) {
+                slot.tls.?.received(received, nowSec(server)) catch return tlsFailed(server, slot);
+                if (slot.state == .handshaking) return handshakeProgress(server, slot);
+            }
             // Closed while this read was out: what arrived is past its last
             // word, and its GOAWAY's send closes it, or this does.
             if (slot.session.state == .closed) {
                 if (slot.sending == 0) close(server, slot);
                 return;
             }
-            slot.session.received(received);
+            // Over TLS the octets went to the client; the drive feeds the
+            // session what they decrypted to.
+            if (!slot.tls_active) slot.session.received(received);
             drive(server, slot);
         }
 
@@ -1007,7 +1176,7 @@ pub fn Mux(comptime IoType: type) type {
             if (slot.state == .closing) return continueClose(server, slot);
             result catch unreachable; // Only a close cancels it, handled above.
             const now = server.io.nowNs();
-            if (slot.state == .connecting) {
+            if (slot.state == .connecting or slot.state == .handshaking) {
                 server.counters.increment("h2_origin_connect_failed");
                 server.health.witnessPassiveFailure(slot.cluster_index, slot.endpoint_index);
                 return close(server, slot);
@@ -1086,6 +1255,8 @@ pub fn Mux(comptime IoType: type) type {
             }
             if (slot.socket_open) server.io.closeNow(slot.socket);
             slot.socket_open = false;
+            // The handshake's libcrypto state goes back to the fixed heap.
+            if (slot.tls_active) slot.tls.?.finish();
             assert(slot.legs_count == 0);
             slot.reset();
             server.h2_origins.release(slot);
@@ -1102,7 +1273,7 @@ pub fn Mux(comptime IoType: type) type {
                 if (slot.legs_count >= 1) continue;
                 switch (slot.state) {
                     .open => goAway(server, slot),
-                    .connecting => close(server, slot),
+                    .connecting, .handshaking => close(server, slot),
                     .closing, .free => {},
                 }
             }

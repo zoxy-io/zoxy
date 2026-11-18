@@ -2564,8 +2564,22 @@ Open, and not settled here:
   `SETTINGS_MAX_CONCURRENT_STREAMS` wait for a stream to free rather than
   spilling to a new connection; nothing counts that wait yet.
 - No gRPC health probe: an h2c cluster is checked by `tcp` probes only.
-- HTTP/2 to an origin over TLS waits on upstream TLS (#296), and needs
-  ALPN on the upstream handshake when it lands.
+- HTTP/2 to an origin over TLS landed after this run (`"protocol": "h2"`),
+  and was hand-run the same way against Node's `http2.createSecureServer`
+  serving the trust fixtures' leaf:
+  - 8 × 200 KB multiplexed and 4 × 200 KB over HTTP/1.1, all whole;
+  - 1 MB uploads, both client protocols;
+  - a cluster naming another `server_name` answered 502, with
+    `h2_origin_tls_failed 1`;
+  - a clean drain.
+
+  The first run of it crashed on zssl's `RecordBuffer.writable` assert.
+  Records are read only while their plaintext has room, so under load
+  whole records wait in the buffer and fill it, which zssl assumes never
+  happens. The client now asks `canReceive` before reading, and holds two
+  records of wire. No simulator seed reached that state; the live run did,
+  on its first large body. The live gate still has no TLS origin leg.
+  TLS to an HTTP/1.1 origin is the rest of #296.
 
 ## Reached is not covered — the `@panic` probe (2026-07-28, #106)
 

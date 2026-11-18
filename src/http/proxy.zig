@@ -1343,7 +1343,7 @@ pub fn Proxy(comptime IoType: type) type {
             // An h2c cluster's exchanges share connections as streams (§7):
             // there is no socket to check out or dial, only a connection to
             // join — so the render follows at once, as on the reuse path.
-            if (clusterSpeaksH2c(server, stream)) {
+            if (clusterSpeaksHttp2(server, stream)) {
                 if (!attachOrigin(server, stream, pick)) return;
                 renderRequestAndStartLegs(server, stream, request, views, scratch);
                 return;
@@ -1377,9 +1377,11 @@ pub fn Proxy(comptime IoType: type) type {
             dialUpstream(server, stream, pick, .fresh);
         }
 
-        fn clusterSpeaksH2c(server: *const ServerType, stream: *const StreamType) bool {
+        /// The cluster's origins speak HTTP/2 — `h2c`, or `h2` over TLS —
+        /// and so are reached on a shared connection's stream (§7).
+        fn clusterSpeaksHttp2(server: *const ServerType, stream: *const StreamType) bool {
             assert(stream.cluster_index < server.config.clusters.len);
-            return server.config.clusters[stream.cluster_index].protocol == .h2c;
+            return server.config.clusters[stream.cluster_index].protocol.http2();
         }
 
         /// An h2c cluster's try (§7): an upstream slot and its head, as a
@@ -1474,7 +1476,7 @@ pub fn Proxy(comptime IoType: type) type {
             // A replay's try on an h2c cluster joins a connection again
             // rather than dialing one (§7); a retry never reaches here for
             // one, having no dial of its own to have failed.
-            if (clusterSpeaksH2c(server, stream)) {
+            if (clusterSpeaksHttp2(server, stream)) {
                 assert(budget == .fresh);
                 if (!attachOrigin(server, stream, pick)) return;
                 return renderAndStartLegs(server, stream);

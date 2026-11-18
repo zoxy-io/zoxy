@@ -171,7 +171,7 @@ pub fn Budget(comptime IoType: type) type {
                 // `main.zig`'s `libcrypto_heap_storage`), so that is what
                 // the process holds for its life whatever `tls_engines`
                 // says, and §5 prices what is held.
-                .libcrypto_heap_bytes = if (limits.tls_engines == 0)
+                .libcrypto_heap_bytes = if (limits.tls_engines == 0 and !config_module.originTls(config.clusters))
                     0
                 else
                     constants.libcrypto_heap_bytes,
@@ -186,7 +186,7 @@ pub fn Budget(comptime IoType: type) type {
                     @sizeOf(upstream_module.HeadBuffer) + limits.head_buffer_bytes,
                 // Zero unless a cluster speaks h2c (§7).
                 .h2_origin_connections = limits.h2_origin_connections,
-                .h2_origin_bytes = ServerType.h2OriginBytes(&limits),
+                .h2_origin_bytes = ServerType.h2OriginBytes(config),
                 .h2_origin_streams = limits.h2_origin_streams,
                 .h2_origin_stream_bytes = ServerType.h2OriginStreamBytes(&limits),
             };

@@ -217,6 +217,11 @@ pub const Counters = struct {
     /// A request head HTTP/2 could not carry, or an answer HTTP/1.1 could
     /// not: the exchange fails, as on an unparseable origin head.
     h2_origin_refused_heads: Value = Value.init(0),
+    /// TLS to an origin that failed (§7): a chain that did not verify for
+    /// the cluster's `server_name` against its anchors, an origin that did
+    /// not select `h2`, or a record that did not open. The connection, and
+    /// every exchange on it, fails.
+    h2_origin_tls_failed: Value = Value.init(0),
     h2_origin_refused_answers: Value = Value.init(0),
     /// §8 requests answered 503 because every endpoint of their cluster
     /// was already carrying its configured `max_inflight`. Distinct from

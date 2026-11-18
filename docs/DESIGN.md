@@ -52,8 +52,9 @@ Non-goals (deliberate, recorded so they are decisions rather than drift):
   `h2c` cluster's origins, on a pool with its own lease model — a
   connection shared by streams rather than leased to one exchange. gRPC
   rides on both, with the response trailers it ends every call with
-  carried end to end. HTTP/2 to an origin over TLS waits on upstream TLS
-  (#296). WebSocket was
+  carried end to end. An `h2` cluster reaches its origins over TLS, every
+  chain verified (§7); TLS to an HTTP/1.1 origin is the rest of #296.
+  WebSocket was
   deferred too and is not any more (#180, §7): carrying it needs no new
   I/O machinery, because a tunnel is the L4 relay this proxy already
   runs, entered from an L7 exchange. What it does need is its own
@@ -2191,9 +2192,38 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   is a reused upstream's try, so the GOAWAY race earns §7's free replay.
   Connections (`h2_origin_connections`) are picked least-loaded per
   endpoint, dialed when none has room, told GOAWAY after an idle window,
-  and closed by the drain once their last leg leaves. An `h2c` cluster is
+  and closed by the drain once their last leg leaves. An HTTP/2 cluster is
   reachable only from `http` listeners without upgrades, and checked only
   by `tcp` probes, which the loader enforces.
+
+  An `h2` cluster puts TLS under the session (RFC 9113 §3.2), in the
+  connection's own two ops: `tls/OriginClient.zig` is sans-I/O like the
+  server's engine — records in, decrypted octets out for the session, one
+  sealed record or handshake flight owed at a time — and the session never
+  learns its octets were encrypted. The origin must select `h2` in ALPN.
+  Its chain is judged by `tls/trust.zig` and is never skipped:
+  - every entry is framed soundly (`der_bounds`) before std reads it, since
+    a peer chooses the bytes;
+  - the leaf carries the cluster's `server_name` in a subjectAltName (RFC
+    9525, no common-name fallback);
+  - each certificate is signed by, and inside the validity of, the next;
+  - every signer is a CA (basicConstraints `cA`, which std does not
+    check);
+  - the chain ends at an anchor from the cluster's `ca` bundle, parsed
+    once at load.
+
+  What it does not check is stated rather than implied: `pathLenConstraint`,
+  keyUsage and extendedKeyUsage. The anchors are the operator's own CAs,
+  not a public store, so the constraints a public CA's hierarchy leans on
+  are the operator's to keep in what they issue.
+
+  A failure is the connection's, as a refused dial is: every leg on it
+  fails, and its endpoint is witnessed. Each such connection holds a
+  libcrypto session, so the fixed heap (§4) is installed for it with no
+  terminating listener, and the loader holds listener engines and origin
+  connections together to the heap's `tls_engines_max` sessions. Records
+  are read only while their plaintext has room, so a session that cannot
+  take more stops the reads rather than growing a buffer.
 
 - **An HTTP/2 connection is told before it is closed.** It gets
   `GOAWAY(NO_ERROR)` before the close when it is drained, when it sits
@@ -3168,6 +3198,9 @@ src/
       TestOrigin.zig  // test support: an h2c origin on the server role
   tls/
     Engine.zig        // zssl wrapper: sans-I/O TLS 1.3 seam, pooled (§4, §5)
+    OriginClient.zig  // TLS client to an `h2` cluster's origins, sans-I/O (§7)
+    trust.zig         // an origin's chain judged: anchors, CA flags, RFC 9525
+    TestTlsServer.zig // test support: TLS in front of the test origin
     Credentials.zig   // per-listener PEM chain + signing key, parsed once (§4)
     libcrypto_heap.zig // libcrypto's mallocs into one fixed startup buffer (§4, §5)
   balancer.zig        // upstream endpoint pick: rr | p2c | hash (§7)
@@ -3243,8 +3276,10 @@ TLS (§7). Two BCPs are
 prescriptive rather than definitional and are treated as binding anyway:
 **9325** (secure use) and **8996** (TLS 1.0/1.1 deprecated). **9525** —
 service identity in certificates, which obsoleted 6125 in 2023 — binds
-only an implementation that *originates* TLS to its upstreams, which
-this one does not; it becomes load-bearing the day it does.
+an implementation that *originates* TLS to its upstreams, which this one
+now does for an `h2` cluster (§7): a DNS-ID in the subjectAltName is the
+only identity matched (§6.3's no-CN-fallback), against the configured
+`server_name`.
 
 **Per feature.** RFC **6455** §4 is the opening handshake #180
 recognises — tunnelling means never implementing the protocol, but

@@ -40,6 +40,7 @@ const H2Connection = @import("http/h2/Connection.zig");
 const H2Slot = H2Connection.Slot;
 const H2Exchange = @import("http/h2/exchange.zig");
 const H2Origin = @import("http/h2/Origin.zig");
+const OriginClient = @import("tls/OriginClient.zig");
 const h2_origin_fields = @import("http/h2/origin.zig");
 const upstream_module = @import("net/upstream.zig");
 
@@ -130,6 +131,9 @@ pub fn Server(comptime IoType: type) type {
         h2_origins: Pool(OriginMux.Slot),
         h2_origin_staging: Pool(H2Origin.Staging),
         h2_origin_layout: ?H2Session.Layout,
+        /// One TLS client per origin connection, wired to its slot, where
+        /// some cluster speaks `h2`; empty otherwise.
+        h2_origin_tls: []OriginClient,
         /// The window an origin stream advertises and the head an answer is
         /// held to, as the pools were sized (`initOriginPools`).
         h2_origin_window: u31,
@@ -900,11 +904,13 @@ pub fn Server(comptime IoType: type) type {
             };
         }
 
-        /// What one origin connection costs (§5): its pool element and its
-        /// unit of the slab.
-        pub fn h2OriginBytes(limits: *const config_module.Config.Limits) u64 {
+        /// What one origin connection costs (§5): its pool element, its
+        /// unit of the slab, and its TLS client where a cluster speaks `h2`.
+        pub fn h2OriginBytes(config: *const config_module.Config) u64 {
+            const limits = &config.limits;
             if (limits.h2_origin_connections == 0) return 0;
-            return @sizeOf(OriginMux.Slot) + h2OriginLayout(limits).bytes();
+            const tls: u64 = if (config_module.originTls(config.clusters)) @sizeOf(OriginClient) else 0;
+            return @sizeOf(OriginMux.Slot) + h2OriginLayout(limits).bytes() + tls;
         }
 
         /// What one origin stream's staging costs: its pool element and its
@@ -942,6 +948,7 @@ pub fn Server(comptime IoType: type) type {
             try server.h2_origins.init(arena, options.h2_origin_connections);
             try server.h2_origin_staging.init(arena, options.h2_origin_streams);
             server.h2_origin_layout = null;
+            server.h2_origin_tls = &.{};
             server.h2_origin_slab = &.{};
             server.h2_origin_scratch = OriginScratch.empty;
             server.h2_origin_window = H2Origin.streamWindow(options.relay_buffer_bytes);
@@ -964,6 +971,7 @@ pub fn Server(comptime IoType: type) type {
                 const carved = layout.carve(piece);
                 slot.session = carved.session;
                 slot.buffers = carved.buffers;
+                slot.tls = null;
                 // Dead until a dial arms them, as every pooled op starts.
                 slot.op_io = .{};
                 slot.op_send = .{};
@@ -971,6 +979,7 @@ pub fn Server(comptime IoType: type) type {
                 slot.op_cancel = .{};
                 slot.reset();
             }
+            try server.initOriginTls(arena, options);
             const window = H2Origin.streamWindow(options.relay_buffer_bytes);
             const staging_bytes = H2Origin.stagingBytes(options.head_buffer_bytes, window);
             const staging_slab = try arena.alloc(u8, @as(usize, options.h2_origin_streams) * staging_bytes);
@@ -984,6 +993,19 @@ pub fn Server(comptime IoType: type) type {
             };
             assert(server.h2_origins.slots.len == options.h2_origin_connections);
             assert(server.h2_origin_staging.slots.len == options.h2_origin_streams);
+        }
+
+        /// A TLS client per origin connection, where some cluster speaks
+        /// `h2` (§7): each wired to its slot once, its buffers inline.
+        fn initOriginTls(server: *Self, arena: std.mem.Allocator, options: *const InitOptions) error{OutOfMemory}!void {
+            assert(options.h2_origin_connections >= 1);
+            if (!config_module.originTls(server.config.clusters)) return;
+            server.h2_origin_tls = try arena.alloc(OriginClient, options.h2_origin_connections);
+            for (server.h2_origins.slots, server.h2_origin_tls) |*slot, *client| {
+                client.started = false;
+                slot.tls = client;
+            }
+            assert(server.h2_origin_tls.len == server.h2_origins.slots.len);
         }
 
         // -- the upstream half's dispatch (§7) --

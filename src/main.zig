@@ -493,16 +493,20 @@ fn loadTlsCredentials(
     config: *const zoxy.config.Config,
 ) ![]const ?zoxy.tls.Credentials {
     assert(config.listeners.len >= 1);
-    if (config.limits.tls_engines == 0) {
-        // No listener terminates TLS: nothing to load, and — the point of
-        // checking here — no libcrypto heap to reserve either.
+    const origin_tls = zoxy.config.originTls(config.clusters);
+    if (config.limits.tls_engines == 0 and !origin_tls) {
+        // No listener terminates TLS and no origin is reached over it:
+        // nothing to load, and — the point of checking here — no libcrypto
+        // heap to reserve either.
         return &.{};
     }
 
     // Before any credential, because `Credentials.load` calls libcrypto
     // and the allocator swap is refused once anything has allocated. If
     // it fails the zero-allocation promise (§5) is unbacked, and a proxy
-    // that cannot keep its own invariants should not start.
+    // that cannot keep its own invariants should not start. An origin
+    // reached over TLS (§7) holds libcrypto sessions too, so it needs the
+    // heap with no listener of its own terminating.
     if (!zoxy.tls.libcrypto_heap.install(&libcrypto_heap_storage)) {
         std.debug.print(
             "zoxy: libcrypto refused the fixed-heap install; " ++
