@@ -2002,7 +2002,7 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   in sequence, dial then send then recv, which is why the op budget is
   the same for both kinds. A **`grpc`** check, on an HTTP/2 cluster only,
   calls `grpc.health.v1.Health/Check` (with the configured `service`, or
-  none) as a stream on the cluster's own origin pool (`Origin.zig`), and
+  none) as a stream on the cluster's own origin pool (`origin_pool.zig`), and
   passes on `:status` 200, a `HealthCheckResponse` saying SERVING and
   `grpc-status: 0`. It proves what the cluster's exchanges need: an
   HTTP/2 connection, verified TLS for `h2`, and an application that says
@@ -2179,7 +2179,7 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   exchanges share, each on a stream of its own — and the exchange does
   not learn it. Its upstream half is the HTTP/1.1 one, ops and all; what
   it arms them on is a socket or, for such a cluster, a *leg*
-  (`Origin.zig`), and every upstream op goes through `Server`'s
+  (`origin_pool.zig`), and every upstream op goes through `Server`'s
   `upstream*` dispatch to one or the other. So §7 is stated once:
   - the rendered request head is read back by `parseRequestHead` and said
     as HTTP/2 fields (`origin.zig`) — Host as `:authority`, the
@@ -3234,7 +3234,7 @@ src/
       downgrade.zig   // h2 → h1: write the head, parse it back (§7)
       response.zig    // h1 → h2: the rendered head, read back as fields
       StreamTable.zig // one connection's open streams, a bounded scan
-      Origin.zig      // HTTP/2 to the origin: the pooled connection, its
+      origin_pool.zig // HTTP/2 to the origin: the pooled connection, its
                       // driver, and the leg an exchange's upstream ops use
       origin.zig      // h1 ↔ h2 at the origin: request head → fields,
                       // answer → HTTP/1.1 head, trailers → last chunk

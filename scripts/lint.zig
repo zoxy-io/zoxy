@@ -9,6 +9,11 @@
 //! everywhere: the codebase's one C surface is inside zssl, behind its Zig
 //! protocol layer, and a second one opened here would not be (§4). Runs as
 //! `zig build lint` with the source root as its single argument.
+//!
+//! It also refuses two paths that differ only in letter case: on a
+//! case-insensitive filesystem — macOS's default — they are one file, a
+//! checkout keeps one of the two, and the build breaks there alone, where
+//! no Linux gate can see it.
 
 const std = @import("std");
 
@@ -132,6 +137,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     var violation_count: u32 = 0;
     var file_count: u32 = 0;
+    var paths: [files_max][]const u8 = undefined;
     var walker = try root.walk(arena);
     while (try walker.next(io)) |entry| {
         if (entry.kind != .file) {
@@ -140,17 +146,45 @@ pub fn main(init: std.process.Init) !u8 {
         if (!std.mem.endsWith(u8, entry.path, ".zig")) {
             continue;
         }
+        assert(file_count < files_max);
+        // The walker reuses its path buffer: the collision check needs its own.
+        paths[file_count] = try arena.dupe(u8, entry.path);
         file_count += 1;
-        assert(file_count <= files_max);
         violation_count += try lintFile(arena, io, root, entry.path);
     }
     assert(file_count >= 1);
+    violation_count += reportCaseCollisions(paths[0..file_count]);
 
     if (violation_count > 0) {
         std.debug.print("lint: {d} violation(s)\n", .{violation_count});
         return 1;
     }
     return 0;
+}
+
+/// Every pair of paths one case-insensitive filesystem would merge.
+fn reportCaseCollisions(paths: []const []const u8) u32 {
+    assert(paths.len <= files_max);
+    var count: u32 = 0;
+    for (paths, 0..) |path, index| {
+        for (paths[index + 1 ..]) |other| {
+            if (!caseCollide(path, other)) continue;
+            std.debug.print(
+                "lint: {s} and {s} differ only in case — one file on a case-insensitive filesystem\n",
+                .{ path, other },
+            );
+            count += 1;
+        }
+    }
+    assert(count <= paths.len * paths.len);
+    return count;
+}
+
+/// Two different paths that one case-insensitive filesystem holds as one.
+fn caseCollide(a: []const u8, b: []const u8) bool {
+    assert(a.len >= 1);
+    assert(b.len >= 1);
+    return !std.mem.eql(u8, a, b) and std.ascii.eqlIgnoreCase(a, b);
 }
 
 fn lintFile(
@@ -394,6 +428,13 @@ fn startsWithAllowedMember(member: []const u8) bool {
         }
     }
     return false;
+}
+
+test "caseCollide: paths that differ only in case are one file on macOS" {
+    try std.testing.expect(caseCollide("http/h2/origin.zig", "http/h2/Origin.zig"));
+    try std.testing.expect(caseCollide("Tls/a.zig", "tls/A.zig"));
+    try std.testing.expect(!caseCollide("http/h2/origin.zig", "http/h2/origin.zig"));
+    try std.testing.expect(!caseCollide("http/h2/origin.zig", "http/h2/origin_pool.zig"));
 }
 
 test "lintLine: raw syscalls flagged outside io, allowed inside" {

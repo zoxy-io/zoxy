@@ -1,6 +1,6 @@
 //! The client end of TLS to an HTTP/2 origin (§7; #296, for the origins an
 //! `h2` cluster names): sans-I/O, like the server's `Engine`, so the origin
-//! connection that drives it (`http/h2/Origin.zig`) keeps its one recv and
+//! connection that drives it (`http/h2/origin_pool.zig`) keeps its one recv and
 //! one send and never learns its octets were encrypted.
 //!
 //! It owns the zssl client handshake and every buffer the connection's TLS

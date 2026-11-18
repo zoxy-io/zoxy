@@ -7,7 +7,7 @@
 //! knowing the port accepts and knowing the application answered. A
 //! `grpc` check, on an HTTP/2 cluster, asks the standard health service
 //! (`grpc.health.v1.Health/Check`) for SERVING over the cluster's own
-//! pooled connections (`Origin.zig`), TLS and all: it holds no socket of
+//! pooled connections (`origin_pool.zig`), TLS and all: it holds no socket of
 //! its own, only a stream, and its verdict comes back on one completion.
 //! Anything else (refused, unreachable, timed out, a wrong status, a
 //! head that will not parse, kernel pressure) is a fail — except a
@@ -62,7 +62,7 @@ const config_module = @import("../config.zig");
 const constants = @import("../constants.zig");
 const Io = @import("../io/io.zig");
 const parser = @import("../http/parser.zig");
-const Origin = @import("../http/h2/Origin.zig");
+const Origin = @import("../http/h2/origin_pool.zig");
 const upstream = @import("upstream.zig");
 
 const assert = std.debug.assert;
