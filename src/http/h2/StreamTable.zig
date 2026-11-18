@@ -31,8 +31,16 @@ pub const Slot = struct {
     /// send on the stream. SETTINGS can push it below zero (§6.9.2).
     send_window: i64,
     /// Whether the final (non-informational) response head is staged:
-    /// body and trailers may follow it, and nothing may precede it.
+    /// body and trailers may follow it, and nothing may precede it. On a
+    /// client, the request head that opened the stream.
     head_sent: bool,
+    /// Whether the head that lets a body follow has arrived: the request
+    /// that opened the stream, on a server; the final response head, on a
+    /// client. DATA before it is malformed (§8.1).
+    head_received: bool,
+    /// The request was a HEAD, on a client: its answer's declared length
+    /// binds no DATA (§8.1.1).
+    bodiless: bool,
     /// What a send cut short is waiting for, and the outbox room it needs
     /// — the scheduler's state for this stream.
     send_wait: SendWait,
@@ -76,6 +84,8 @@ pub const Slot = struct {
         .recv_delivered = 0,
         .send_window = 0,
         .head_sent = false,
+        .head_received = false,
+        .bodiless = false,
         .send_wait = .none,
         .send_room_needed = 0,
         .content_length = null,

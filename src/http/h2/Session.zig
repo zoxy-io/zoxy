@@ -38,6 +38,20 @@
 //! to the `content-length` its head declared (§8.1.1 — a HEAD response
 //! declares one it never sends), and whether a head is past the client's
 //! advisory SETTINGS_MAX_HEADER_LIST_SIZE.
+//!
+//! The same machinery speaks the other end of a connection too
+//! (`Config.role = .client`), for an origin reached over HTTP/2: the
+//! preface and SETTINGS go out first, with push disabled; this side opens
+//! the streams (`openRequest`), odd and rising, never more at once than the
+//! origin's SETTINGS_MAX_CONCURRENT_STREAMS; and what comes back on them is
+//! a response — `.response`, interim ones first, then `.data` and
+//! `.trailers` — under the same flow control, the same field rules read
+//! for a response, and the same budgets, since an origin that floods is no
+//! cheaper than a client that does. An origin's GOAWAY names the last
+//! stream it will act on, and every stream past it is reset to the caller
+//! as REFUSED_STREAM: unprocessed, so safe to try again (§8.7). Only the
+//! budget for streams reset by the peer is the server's alone — a server
+//! that resets this side's streams spends no stream of its own on it.
 
 const std = @import("std");
 const h2 = @import("h2");
@@ -110,6 +124,9 @@ const settings_bytes_max: u32 = frame.Header.octets + settings_entry_bytes * set
 /// the first `step` can find it in.
 pub const outbox_bytes_min: u32 = settings_bytes_max + reply_bytes_max;
 
+/// A client's opening is the preface's magic ahead of the same SETTINGS.
+pub const client_outbox_bytes_min: u32 = preface.len + outbox_bytes_min;
+
 /// RFC 9113 §6.9.2: every window starts here, and the connection's can
 /// never be lowered by SETTINGS — only raised, by WINDOW_UPDATE.
 pub const window_default: u31 = 65_535;
@@ -121,6 +138,7 @@ comptime {
     assert(frame_bytes_max == 9 + 16_384);
     assert(reply_bytes_max == 17);
     assert(control_bytes == 13);
+    assert(client_outbox_bytes_min == preface.len + outbox_bytes_min);
     assert(control_bytes <= reply_bytes_max);
     const index_max = hpack.static_table.entries.len + hpack.DynamicTable.entriesRequired(header_table_size);
     assert(Integer.encodedLength(index_max, 4) <= index_bytes_max);
@@ -133,10 +151,20 @@ comptime {
     assert(window_default <= window_max);
 }
 
+/// Which end of the connection this session speaks.
+pub const Role = enum {
+    /// Accepts streams: a client's connection to this proxy (#275).
+    server,
+    /// Opens streams: this proxy's connection to an HTTP/2 origin.
+    client,
+};
+
 pub const Config = struct {
+    role: Role = .server,
     /// SETTINGS_MAX_CONCURRENT_STREAMS as advertised: derived from the
     /// stream pool, never configured (#173's open question 3). The stream
-    /// table holds exactly this many.
+    /// table holds exactly this many. A client advertises none — it takes
+    /// no streams — and opens at most this many at once.
     concurrent_streams_max: u32,
     /// SETTINGS_MAX_HEADER_LIST_SIZE as advertised, and the HPACK
     /// decoder's own bound: the head budget, in RFC 7541's units.
@@ -412,11 +440,15 @@ pub const Step = union(enum) {
     /// be sent or asked on any of them. Send what `outbound` holds — the
     /// GOAWAY, if this side ended it — and close.
     closed,
-    /// A stream opened with a well-formed request head.
+    /// A stream opened with a well-formed request head. Server only.
     request: Request,
-    /// A request body's octets.
+    /// A well-formed response head on a stream this side opened: interim
+    /// ones first, as many as there are, then the final one. Client only.
+    response: Response,
+    /// A request body's octets — a response body's, on a client.
     data: Data,
-    /// A request's trailer section; it ends the client's half.
+    /// A request's trailer section; it ends the client's half. On a
+    /// client, the response's, which ends the origin's.
     trailers: Trailers,
     /// A stream ended without finishing: the client reset it, or this side
     /// did for a stream error. Either way it is gone from the table. Never
@@ -434,6 +466,21 @@ pub const Step = union(enum) {
         fields: []const hpack.Field,
         content_length: ?u64,
         /// The head was the whole request: no body, no trailers follow.
+        end_stream: bool,
+    };
+    pub const Response = struct {
+        stream: u31,
+        /// Three digits, 100 to 999, and never 101 (§8.6).
+        status: u16,
+        /// `:status` among them, as decoded.
+        fields: []const hpack.Field,
+        /// The declared length a body is held to — null when none was
+        /// declared, and on an answer that carries no body whatever it
+        /// declares: an interim one, a 204 or 304, or a HEAD's.
+        content_length: ?u64,
+        /// A 1xx: the final head is still to come (§8.1).
+        interim: bool,
+        /// The head was the whole response: no body, no trailers follow.
         end_stream: bool,
     };
     pub const Data = struct {
@@ -464,6 +511,18 @@ pub const Sent = enum {
     /// Never: fields HTTP/2 cannot carry (§8.2, §8.3.2, §8.6), or a block
     /// past what the outbox could hold empty. Nothing was staged, and the
     /// stream is the caller's to reset.
+    refused,
+};
+
+/// What opening a stream came to (`openRequest`).
+pub const Opened = union(enum) {
+    /// Its head is staged on this stream.
+    stream: u31,
+    /// Not now: the outbox lacks room for the head. Nothing was staged and
+    /// no identifier spent; offer it again once `outbound` has been sent.
+    blocked,
+    /// Never: fields HTTP/2 cannot carry, or a block past what the outbox
+    /// could hold empty. Nothing was staged.
     refused,
 };
 
@@ -534,8 +593,19 @@ recv_delivered: u32,
 send_window: i64,
 /// §5.1.1: the highest stream the client has opened. Identifiers only go
 /// up, so every one at or below this is open or closed and every one above
-/// is idle.
+/// is idle. A client's peer opens none, and it stays zero.
 last_peer_stream: u31,
+/// The highest stream this side opened: a client's `last_peer_stream`.
+/// Zero on a server, which opens none.
+last_local_stream: u31,
+/// The origin's SETTINGS_MAX_CONCURRENT_STREAMS, on a client: how many
+/// streams it may have open at once. Unbounded until said (§6.5.2).
+peer_concurrent_streams_max: u32,
+/// The last stream a server's GOAWAY said it may act on, on a client;
+/// null until one arrives. Streams past it are refused to the caller,
+/// one per `step`, while `refusing` says some may remain.
+peer_last_stream: ?u31,
+refusing: bool,
 /// The streams this side reset most recently: the one case in which a
 /// frame on a closed stream is a client's frame in flight rather than a
 /// protocol error (§5.1 — "MUST ignore frames that it receives on closed
@@ -575,6 +645,7 @@ pub fn init(session: *Session, config: Config, buffers: *const Buffers) void {
     assert(config.header_list_size_max >= 1);
     assert(buffers.inbound.len >= frame_bytes_max);
     assert(buffers.outbox.len >= outbox_bytes_min);
+    if (config.role == .client) assert(buffers.outbox.len >= client_outbox_bytes_min);
     assert(buffers.decoded.len >= config.header_list_size_max);
     assert(buffers.fields.len >= fieldsFor(config.header_list_size_max));
     assert(buffers.streams.len == config.concurrent_streams_max);
@@ -582,7 +653,9 @@ pub fn init(session: *Session, config: Config, buffers: *const Buffers) void {
     buffers.table.* = .{};
     buffers.encoder.* = .{};
     session.* = .{
-        .state = .awaiting_preface,
+        // A server reads the client's magic first; a client reads none,
+        // and the server's preface is its SETTINGS (§3.4).
+        .state = if (config.role == .server) .awaiting_preface else .awaiting_settings,
         .config = config,
         .inbound = buffers.inbound,
         .inbound_len = 0,
@@ -611,6 +684,10 @@ pub fn init(session: *Session, config: Config, buffers: *const Buffers) void {
         .recv_delivered = 0,
         .send_window = window_default,
         .last_peer_stream = 0,
+        .last_local_stream = 0,
+        .peer_concurrent_streams_max = std.math.maxInt(u32),
+        .peer_last_stream = null,
+        .refusing = false,
         .reset_ring = @splat(0),
         .reset_ring_next = 0,
         .last_accepted_stream = 0,
@@ -625,9 +702,16 @@ pub fn init(session: *Session, config: Config, buffers: *const Buffers) void {
         .send_cursor = 0,
     };
     // §3.4: the server's preface is a SETTINGS frame, and it may go out
-    // before the client's arrives — so it is staged now, first.
+    // before the client's arrives — so it is staged now, first. A client's
+    // is the magic, then its SETTINGS, and it may open streams behind them
+    // without waiting for the server's; this side waits, for the limit
+    // those carry (`openable`).
+    if (config.role == .client) {
+        @memcpy(session.outbox[0..preface.len], preface);
+        session.outbox_len = preface.len;
+    }
     session.stageSettings();
-    assert(session.outbox_len <= settings_bytes_max);
+    assert(session.outbox_len <= preface.len + settings_bytes_max);
 }
 
 /// Where the next read lands. Valid only after `step` answered
@@ -656,6 +740,11 @@ pub fn step(session: *Session) Step {
     session.compact(session.inbound_held);
     session.inbound_held = 0;
     if (session.state == .closed) return .closed;
+    // Streams a server's GOAWAY left unprocessed, one per step, before
+    // anything more is read.
+    if (session.refusing) {
+        if (session.refuseNext()) |event| return event;
+    }
     if (session.pending) session.flushPending();
     // A caller reset can be the last stream after the client's GOAWAY.
     if (session.state == .closed) return .closed;
@@ -795,11 +884,54 @@ pub fn goAway(session: *Session) void {
     assert(session.goingAway());
 }
 
+/// Whether a client may open a stream now: the origin's SETTINGS are in,
+/// with the limit they carry; neither side has said GOAWAY; the streams
+/// open are under both that limit and this side's own table; and an odd
+/// identifier is left to open it on (§5.1.1 — once they run out, only a
+/// new connection has more).
+pub fn openable(session: *const Session) bool {
+    assert(session.config.role == .client);
+    assert(session.last_local_stream % 2 == 1 or session.last_local_stream == 0);
+    if (session.state != .open) return false;
+    if (session.goingAway()) return false;
+    const limit = @min(session.peer_concurrent_streams_max, session.config.concurrent_streams_max);
+    if (session.streams.used >= limit) return false;
+    return session.last_local_stream <= std.math.maxInt(u31) - 2;
+}
+
+/// Open a stream with a request head, on a client — END_STREAM with it when
+/// no body follows. Only when `openable`. `bodiless` is a HEAD: its answer
+/// declares a length it never sends (§8.1.1). The next odd identifier is
+/// spent only once the head is staged, so the identifiers go out in order.
+pub fn openRequest(session: *Session, fields: []const hpack.Field, end_stream: bool, bodiless: bool) Opened {
+    assert(session.openable());
+    if (!fieldsValid(fields, .request)) return .refused;
+    const block_max = blockBound(fields);
+    const needed = block_max + frame.Header.octets * framesFor(block_max, session.peer_frame_size_max);
+    if (needed > session.outbox.len - send_reserve) return .refused;
+    if (needed > session.sendRoom()) return .blocked;
+    const id: u31 = if (session.last_local_stream == 0) 1 else session.last_local_stream + 2;
+    // `openable` held the streams under this side's table.
+    assert(session.streams.used < session.streams.slots.len);
+    const slot = session.streams.acquire(id).?;
+    slot.state = if (end_stream) .half_closed_local else .open;
+    slot.recv_window = session.streamWindow();
+    slot.send_window = session.peer_initial_window_size;
+    slot.head_sent = true;
+    slot.bodiless = bodiless;
+    session.last_local_stream = id;
+    session.stageBlock(id, fields, @intCast(block_max), end_stream);
+    session.paid();
+    assert(session.streams.find(id) == slot);
+    return .{ .stream = id };
+}
+
 /// Stage a response head on `stream`: interim ones (1xx) first, as many as
 /// there are, then the final one — with END_STREAM when no body follows.
 /// The fields borrow nothing past the call. After the client's half and
 /// this one have both ended, the stream is gone.
 pub fn sendHead(session: *Session, stream: u31, fields: []const hpack.Field, end_stream: bool) Sent {
+    assert(session.config.role == .server);
     const slot = session.sendable(stream);
     assert(!slot.head_sent);
     const status = responseStatus(fields) orelse return .refused;
@@ -911,7 +1043,7 @@ fn responseStatus(fields: []const hpack.Field) ?u16 {
 /// at all, when it waits for room or can never be sent.
 fn sendFields(session: *Session, slot: *StreamTable.Slot, fields: []const hpack.Field, kind: MessageValidator.Kind, end_stream: bool) Sent {
     assert(slot.state == .open or slot.state == .half_closed_remote);
-    assert(kind != .request);
+    assert(kind != .request); // A request opens its stream: `openRequest`.
     if (!fieldsValid(fields, kind)) return .refused;
     const block_max = blockBound(fields);
     const needed = block_max + frame.Header.octets * framesFor(block_max, session.peer_frame_size_max);
@@ -928,10 +1060,11 @@ fn sendFields(session: *Session, slot: *StreamTable.Slot, fields: []const hpack.
 
 /// The same `.strict` rules a request is read under: these fields are an
 /// HTTP/1.1 origin's, and nothing it says reaches the client that the
-/// client's own HTTP/2 stack would call malformed.
+/// client's own HTTP/2 stack would call malformed. A client's request is
+/// held to them too, for the origin's stack.
 fn fieldsValid(fields: []const hpack.Field, kind: MessageValidator.Kind) bool {
-    assert(kind != .request);
     assert(fields.len <= std.math.maxInt(u32));
+    assert(fields.len >= 1 or kind == .trailer);
     var validator = MessageValidator.init(.{ .kind = kind, .rules = .strict });
     for (fields) |*field| validator.field(field) catch return false;
     validator.finish() catch return false;
@@ -1262,7 +1395,9 @@ fn handleFrame(session: *Session, header: frame.Header, bytes: []const u8) void 
         };
     };
     // §8.4: a client cannot push, so a PUSH_PROMISE from one is a
-    // connection error before its field block is ever assembled.
+    // connection error before its field block is ever assembled — and a
+    // server may not push to a client that disabled it (§6.5.2), which
+    // this side's SETTINGS always do.
     if (payload == .push_promise) return session.fail(.protocol_error);
     // Every frame goes through the assembler, not only fragments: an open
     // field block forbids all of them (§4.3), which is the rule enforced.
@@ -1291,7 +1426,7 @@ fn handleControl(session: *Session, header: frame.Header, payload: *const frame.
             if (header.has(.ack)) return; // An answer to a PING we never sent.
             session.stage(&.{ .ping = .{ .opaque_data = ping.opaque_data } }, 0, frame.Flag.ack.bit());
         },
-        .goaway => session.handleGoaway(),
+        .goaway => |goaway| session.handleGoaway(goaway.last_stream_identifier),
         .window_update => |update| {
             if (!session.spend(.window_update)) return;
             session.handleWindowUpdate(header.stream_identifier, update.increment);
@@ -1344,8 +1479,11 @@ fn handleSettings(session: *Session, header: frame.Header, settings: frame.paylo
         switch (entry.identifier) {
             // §6.5.2: 0 or 1. Its value is moot — a client cannot be
             // pushed to by a server that never pushes — but its range is
-            // still the rule.
-            .enable_push => if (entry.value > 1) return session.fail(.protocol_error),
+            // still the rule. A server may only ever say 0.
+            .enable_push => {
+                const allowed: u32 = if (session.config.role == .client) 0 else 1;
+                if (entry.value > allowed) return session.fail(.protocol_error);
+            },
             .initial_window_size => {
                 if (entry.value > window_max) return session.fail(.flow_control_error);
                 const size: u31 = @intCast(entry.value);
@@ -1359,9 +1497,9 @@ fn handleSettings(session: *Session, header: frame.Header, settings: frame.paylo
             },
             .header_table_size => session.retuneEncoder(entry.value),
             .max_header_list_size => session.peer_header_list_size_max = entry.value,
-            // It bounds the streams *this* side may open, and a server
-            // that never pushes opens none.
-            .max_concurrent_streams => {},
+            // It bounds the streams *this* side may open: a server that
+            // never pushes opens none, and a client opens up to it.
+            .max_concurrent_streams => session.peer_concurrent_streams_max = entry.value,
             // §6.5.2: an identifier this side does not know is ignored.
             _ => {},
         }
@@ -1424,11 +1562,42 @@ fn takeSettingsAck(session: *Session) void {
 }
 
 /// The client opens nothing more; once what it did open is done, so is the
-/// connection.
-fn handleGoaway(session: *Session) void {
+/// connection. A server's GOAWAY names the last stream it may act on, and
+/// on a client every stream past it is refused to the caller (§6.8) — at
+/// most lowered by a later one, never raised.
+fn handleGoaway(session: *Session, last_stream: u31) void {
     assert(session.state == .open);
     session.peer_going_away = true;
+    if (session.config.role == .client) {
+        const last = @min(last_stream, session.peer_last_stream orelse last_stream);
+        session.peer_last_stream = last;
+        session.refusing = true;
+        if (session.refuseNext()) |event| session.event = event;
+        return;
+    }
     if (session.streams.used == 0) session.closeIfGoneAway();
+}
+
+/// One stream past a server's GOAWAY, released and raised as REFUSED_STREAM
+/// — nothing of it was processed (§8.7) — or null once none is left. One
+/// the caller already reset is let go without an event, as a peer's reset
+/// lets one go.
+fn refuseNext(session: *Session) ?Step {
+    assert(session.config.role == .client);
+    assert(session.refusing);
+    const last = session.peer_last_stream.?;
+    for (session.streams.slots) |*slot| {
+        if (slot.id == 0 or slot.id <= last) continue;
+        const stream = slot.id;
+        const caller_reset = slot.state == .reset_pending;
+        session.releaseStream(slot);
+        if (caller_reset) continue;
+        return .{ .reset = .{ .stream = stream, .code = .refused_stream } };
+    }
+    session.refusing = false;
+    // A release above may have been the last, and closed it already.
+    if (session.state != .closed and session.streams.used == 0) session.closeIfGoneAway();
+    return null;
 }
 
 fn handleWindowUpdate(session: *Session, stream: u31, increment: u31) void {
@@ -1460,7 +1629,7 @@ fn handlePeerReset(session: *Session, stream: u31, code: frame.ErrorCode) void {
     // still be going on, and the stream it held is the client's again.
     // Charged before the release, which may close a connection that is
     // going away — the overrun is the verdict, not that close.
-    if (!caller_reset and slot.state != .half_closed_local) {
+    if (session.config.role == .server and !caller_reset and slot.state != .half_closed_local) {
         assert(session.resets_unpaid <= resets_unpaid_max);
         session.resets_unpaid += 1;
         if (session.resets_unpaid > resets_unpaid_max) return session.failCalm(.rapid_reset);
@@ -1499,6 +1668,13 @@ fn handleData(session: *Session, header: frame.Header, data: frame.payload.Data)
         session.recv_unacked += header.length;
         slot.recv_unacked += header.length; // The slot's split stays whole to its release.
         return session.resetAccepted(slot, .flow_control_error);
+    }
+    // §8.1: a response's body follows its final head. A request's head
+    // opened its stream, so on a server this always holds.
+    if (!slot.head_received) {
+        session.recv_unacked += header.length;
+        slot.recv_unacked += header.length;
+        return session.resetAccepted(slot, .protocol_error);
     }
     const padding: u32 = header.length - @as(u32, @intCast(data.data.len));
     session.recv_unacked += padding;
@@ -1557,6 +1733,7 @@ fn deliverData(session: *Session, slot: *StreamTable.Slot, bytes: []const u8, en
 fn handleBlock(session: *Session, block: *const frame.BlockAssembler.Block) void {
     assert(block.frame_type == .headers); // PUSH_PROMISE never got here.
     assert(block.stream_identifier != 0); // The codec refused stream 0.
+    if (session.config.role == .client) return session.handleResponseBlock(block);
     // §5.1.1: a client's streams are odd. An even one is a stream only a
     // server may open, and this server never does.
     if (block.stream_identifier % 2 == 0) return session.fail(.protocol_error);
@@ -1594,6 +1771,113 @@ fn handleBlock(session: *Session, block: *const frame.BlockAssembler.Block) void
     }
 }
 
+/// A complete field block on a client: a response head on a stream this
+/// side opened — interim, then final — or, after the final one, its
+/// trailers. A server opens nothing here, so an even stream or one never
+/// opened is the connection's PROTOCOL_ERROR (§5.1.1, §8.4); one closed,
+/// unless this side reset it and its answer was in flight, is §5.1's
+/// STREAM_CLOSED.
+fn handleResponseBlock(session: *Session, block: *const frame.BlockAssembler.Block) void {
+    assert(session.config.role == .client);
+    assert(block.stream_identifier != 0);
+    if (isIdle(session, block.stream_identifier)) return session.fail(.protocol_error);
+    const slot_found = session.streams.find(block.stream_identifier);
+    const head = if (slot_found) |slot| !slot.head_received else false;
+    // Decoded whatever becomes of the stream: the HPACK context is the
+    // connection's, so a block skipped is every later block misread.
+    const decoded = session.decodeBlock(block.fragment, if (head) .response else .trailer);
+    switch (decoded) {
+        .connection => |err| return session.failDecode(err),
+        .malformed, .ok => {},
+    }
+    const slot = slot_found orelse {
+        if (session.resetByUs(block.stream_identifier)) return;
+        return session.fail(.stream_closed);
+    };
+    switch (slot.state) {
+        .open, .half_closed_local => {},
+        .half_closed_remote => return session.resetAccepted(slot, .stream_closed), // §5.1.
+        .reset_pending => return, // Its reset is already owed.
+    }
+    if (selfDependent(block)) return session.resetAccepted(slot, .protocol_error);
+    const count = switch (decoded) {
+        .connection => unreachable, // Failed above.
+        .malformed => return session.resetAccepted(slot, .protocol_error),
+        .ok => |ok| ok.count,
+    };
+    if (!head) return session.endWithTrailers(slot, block.end_stream, count);
+    const content_length = switch (decoded) {
+        .ok => |ok| ok.content_length,
+        else => unreachable,
+    };
+    session.takeResponseHead(slot, block.end_stream, count, content_length);
+}
+
+/// A response head that decoded well-formed: its status read and held to
+/// what HTTP/2 can say, then handed over — final, or interim with the
+/// final still owed.
+fn takeResponseHead(session: *Session, slot: *StreamTable.Slot, end_stream: bool, count: u32, content_length: ?u64) void {
+    assert(!slot.head_received);
+    assert(count <= session.fields.len);
+    const fields = session.fields[0..count];
+    // §8.3.2: the validator saw `:status` present; its value is ours to read.
+    const status = statusOf(fields) orelse return session.resetAccepted(slot, .protocol_error);
+    // §8.6: no 101; §8.1: an interim head ends nothing, and says no body.
+    if (status == 101) return session.resetAccepted(slot, .protocol_error);
+    const interim = status < 200;
+    if (interim and end_stream) return session.resetAccepted(slot, .protocol_error);
+    // A body this answer can never have: its declared length binds nothing.
+    const bodiless = interim or slot.bodiless or status == 204 or status == 304;
+    const binding = if (bodiless) null else content_length;
+    if (end_stream) {
+        if (binding) |declared| {
+            if (declared != 0) return session.resetAccepted(slot, .protocol_error);
+        }
+    }
+    const stream = slot.id;
+    if (!interim) {
+        slot.head_received = true;
+        slot.content_length = binding;
+    }
+    session.paid();
+    if (end_stream) session.endRemote(slot);
+    session.event = .{ .response = .{
+        .stream = stream,
+        .status = status,
+        .fields = fields,
+        .content_length = binding,
+        .interim = interim,
+        .end_stream = end_stream,
+    } };
+}
+
+/// Three digits, 100 to 999: what an HTTP/1.1 status line can carry.
+fn statusOf(fields: []const hpack.Field) ?u16 {
+    for (fields) |*field| {
+        if (!std.mem.eql(u8, field.name, ":status")) continue;
+        if (field.value.len != 3) return null;
+        if (field.value[0] < '1' or field.value[0] > '9') return null;
+        const status = std.fmt.parseUnsigned(u16, field.value, 10) catch return null;
+        assert(status >= 100 and status <= 999);
+        return status;
+    }
+    return null;
+}
+
+/// A trailer section that decoded well-formed on an open stream: it must
+/// end the stream (§8.1) and the body its head declared.
+fn endWithTrailers(session: *Session, slot: *StreamTable.Slot, end_stream: bool, count: u32) void {
+    assert(slot.head_received);
+    assert(count <= session.fields.len);
+    if (!end_stream) return session.resetAccepted(slot, .protocol_error);
+    if (slot.content_length) |declared| {
+        if (slot.data_received != declared) return session.resetAccepted(slot, .protocol_error);
+    }
+    const stream = slot.id;
+    session.endRemote(slot);
+    session.event = .{ .trailers = .{ .stream = stream, .fields = session.fields[0..count] } };
+}
+
 /// Whether the opening HEADERS named its own stream as the one it
 /// depends on — the PRIORITY flag's one rule HTTP/2 still states.
 fn selfDependent(block: *const frame.BlockAssembler.Block) bool {
@@ -1621,6 +1905,7 @@ fn openStream(session: *Session, block: *const frame.BlockAssembler.Block, count
     slot.state = if (block.end_stream) .half_closed_remote else .open;
     slot.recv_window = session.streamWindow();
     slot.send_window = session.peer_initial_window_size;
+    slot.head_received = true;
     slot.content_length = content_length;
     session.last_accepted_stream = block.stream_identifier;
     session.paid();
@@ -1723,11 +2008,25 @@ fn failDecode(session: *Session, err: hpack.Decoder.Error) void {
     };
 }
 
+/// Whether `stream` was never opened. Only odd identifiers ever are: a
+/// client's, which is the peer on a server and this side on a client — a
+/// server that never pushes opens no even one, and one never promised is
+/// idle either way.
 fn isIdle(session: *const Session, stream: u31) bool {
     assert(stream != 0);
-    assert(session.last_peer_stream % 2 == 1 or session.last_peer_stream == 0);
+    const highest = session.highestOpened();
+    assert(highest % 2 == 1 or highest == 0);
     if (stream % 2 == 0) return true;
-    return stream > session.last_peer_stream;
+    return stream > highest;
+}
+
+/// The highest stream identifier opened on this connection, by whichever
+/// side opens them.
+fn highestOpened(session: *const Session) u31 {
+    return switch (session.config.role) {
+        .server => session.last_peer_stream,
+        .client => session.last_local_stream,
+    };
 }
 
 /// A stream error (§5.4.2) from a frame's header or payload, once the rules
@@ -1893,7 +2192,7 @@ fn stageReset(session: *Session, stream: u31, code: frame.ErrorCode) void {
 /// Whether this side reset `stream` recently enough to remember it.
 fn resetByUs(session: *const Session, stream: u31) bool {
     assert(stream != 0); // The ring's empty entries never match.
-    assert(stream <= session.last_peer_stream);
+    assert(stream <= session.highestOpened());
     for (session.reset_ring) |id| {
         if (id == stream) return true;
     }
@@ -1955,14 +2254,19 @@ fn stageGoaway(session: *Session, code: frame.ErrorCode) void {
     } }, 0, 0);
 }
 
-/// The server preface. Only what differs from RFC 9113's defaults goes
-/// out: the frame size and table size are the defaults on purpose, and the
-/// window is sent only when the caller chose another.
+/// The server preface, or the SETTINGS ending a client's. Only what differs
+/// from RFC 9113's defaults goes out: the frame size and table size are the
+/// defaults on purpose, and the window is sent only when the caller chose
+/// another. A server says how many streams it takes; a client takes none,
+/// and says instead that it takes no push.
 fn stageSettings(session: *Session) void {
-    assert(session.outbox_len == 0);
+    assert(session.outbox_len == if (session.config.role == .client) preface.len else 0);
     var bytes: [settings_entry_bytes * settings_entries_max]u8 = undefined;
     var used: u32 = 0;
-    used = putSetting(&bytes, used, .max_concurrent_streams, session.config.concurrent_streams_max);
+    used = switch (session.config.role) {
+        .server => putSetting(&bytes, used, .max_concurrent_streams, session.config.concurrent_streams_max),
+        .client => putSetting(&bytes, used, .enable_push, 0),
+    };
     used = putSetting(&bytes, used, .max_header_list_size, session.config.header_list_size_max);
     if (session.config.initial_window_size != window_default) {
         used = putSetting(&bytes, used, .initial_window_size, session.config.initial_window_size);

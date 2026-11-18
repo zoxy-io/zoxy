@@ -235,6 +235,7 @@ const Fixture = struct {
                 if (fixture.jobOf(writable.stream)) |job| fixture.push(job);
             },
             .need_input, .flush_first, .closed => unreachable,
+            .response => unreachable, // A server session raises none.
         }
         // The fuzz target can raise more events than a test inspects; the
         // record keeps the first ones and the answers go on regardless.
