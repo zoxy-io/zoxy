@@ -2216,6 +2216,19 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   redundant, and why a deployment wants both without either being a
   workaround for the other.
 
+  **A flapping endpoint can be made to wait longer** (#394). With
+  `recovery_ms_max`, each passive ejection doubles the endpoint's last
+  cooldown, up to that ceiling, so an origin that fails again the moment
+  it is let back costs `fall` requests at a shrinking rate rather than
+  every `recovery_ms` forever. The penalty decays without a timer of its
+  own: at the next ejection, an endpoint that stayed in rotation for the
+  whole ceiling since it last came back starts over at `recovery_ms`. A
+  probe's `rise` still restores early, as above, but does not reset the
+  level — it proves the probe path, not the traffic. Absent, every
+  cooldown is `recovery_ms`, the 1.0-era rule (§5). The level and the
+  restore stamp are two more per-endpoint tables, priced in the banner's
+  endpoint term with the two #230 already added.
+
   Both verdicts write one mask through one ejection path, so an endpoint
   is out or it is not and `health_endpoint_down` counts either, with a
   cause partition saying which. A **drained** endpoint (weight `0`)

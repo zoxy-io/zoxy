@@ -570,7 +570,11 @@ pub fn Server(comptime IoType: type) type {
                 @sizeOf(u16) + // Server.l4_inflight
                 @sizeOf(bool) + // Checker.healthy
                 @sizeOf(u8) + // Checker.fail_streaks
-                @sizeOf(u8); // Checker.ok_streaks
+                @sizeOf(u8) + // Checker.ok_streaks
+                @sizeOf(u8) + // Checker.passive_streaks (#230)
+                @sizeOf(u64) + // Checker.eject_deadline_ns (#230)
+                @sizeOf(u8) + // Checker.passive_levels (#394)
+                @sizeOf(u64); // Checker.restored_at_ns (#394)
             const scratch = @as(u64, keys.stride) * @sizeOf(u16);
             const total = count * per_key + scratch;
             assert(total > 0);

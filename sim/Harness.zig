@@ -1252,15 +1252,21 @@ fn derivePanicThreshold(random: std.Random, ejects: bool) ?u8 {
 fn derivePassiveEjection(clean: bool, random: std.Random) ?PassiveEjection {
     if (clean) return null;
     if (random.uintLessThan(u8, 3) != 0) return null;
+    const recovery_ms = 1 + random.uintAtMost(u32, 20);
     const draw: PassiveEjection = .{
         .fall = 1 + random.uintAtMost(u8, 2),
-        .recovery_ms = 1 + random.uintAtMost(u32, 20),
+        .recovery_ms = recovery_ms,
+        // #394's backoff on half of these: a ceiling a few doublings
+        // above the base, so repeat ejections inside one scenario walk
+        // the levels and an endpoint that recovers long enough resets.
+        .recovery_ms_max = if (random.boolean()) recovery_ms * (1 + random.uintAtMost(u32, 7)) else null,
     };
     // The bounds the reachability argument above depends on, stated
     // where they are drawn rather than only in prose.
     assert(draw.fall >= 1 and draw.fall <= 3);
     assert(draw.recovery_ms >= 1);
     assert(draw.recovery_ms < health_interval_floor_ms);
+    assert(draw.recovery_ms_max == null or draw.recovery_ms_max.? >= draw.recovery_ms);
     return draw;
 }
 

@@ -798,6 +798,10 @@ pub const Config = struct {
             /// none, so recovery cannot be passive too — this cooldown
             /// is what makes it observable at all.
             recovery_ms: u32 = constants.passive_ejection_recovery_ms_default,
+            /// #394: the ceiling a repeatedly ejected endpoint's cooldown
+            /// doubles toward, or null to keep every cooldown at
+            /// `recovery_ms` — the rule before the key (§5, #400).
+            recovery_ms_max: ?u32 = null,
         };
     };
 };
@@ -860,6 +864,7 @@ pub const ValidationError = error{
     ClusterCheckGrpcOnHttp1,
     ClusterPassiveEjectionFallOutOfRange,
     ClusterPassiveEjectionRecoveryOutOfRange,
+    ClusterPassiveEjectionRecoveryMaxBelowBase,
     ClusterMaxInflightOutOfRange,
     ClusterPanicThresholdOutOfRange,
     ClusterPanicThresholdWithoutHealth,
@@ -3808,6 +3813,8 @@ pub const CheckJson = struct {
 pub const PassiveEjectionJson = struct {
     fall: u8 = constants.passive_ejection_fall_default,
     recovery_ms: u32 = constants.passive_ejection_recovery_ms_default,
+    /// Optional #394 cooldown ceiling; absent keeps the cooldown fixed.
+    recovery_ms_max: ?u32 = null,
 
     pub const schema_doc =
         "Eject an endpoint that real traffic shows is dead: a failed dial, " ++
@@ -3822,6 +3829,15 @@ pub const PassiveEjectionJson = struct {
         },
         .recovery_ms = .{
             .desc = "How long an ejected endpoint stays out before real traffic tests it again.",
+            .minimum = 1,
+            .maximum = constants.timeout_ms_max,
+        },
+        .recovery_ms_max = .{
+            .desc = "Double the cooldown on each passive ejection of the same endpoint, " ++
+                "up to this many milliseconds, so a flapping origin stays out longer " ++
+                "each time. An endpoint that then stays in rotation this long starts " ++
+                "over at recovery_ms. Absent keeps every cooldown at recovery_ms; " ++
+                "must be at least recovery_ms.",
             .minimum = 1,
             .maximum = constants.timeout_ms_max,
         },
@@ -5820,7 +5836,19 @@ fn resolvePassiveEjection(passive_ejection_json: ?PassiveEjectionJson) ParseErro
     if (passive_ejection.recovery_ms < 1 or passive_ejection.recovery_ms > constants.timeout_ms_max) {
         return error.ClusterPassiveEjectionRecoveryOutOfRange;
     }
-    return .{ .fall = passive_ejection.fall, .recovery_ms = passive_ejection.recovery_ms };
+    if (passive_ejection.recovery_ms_max) |max_ms| {
+        if (max_ms < 1 or max_ms > constants.timeout_ms_max) {
+            return error.ClusterPassiveEjectionRecoveryOutOfRange;
+        }
+        // A ceiling below the base would shorten the first cooldown, which
+        // is the opposite of what the key is for (#394).
+        if (max_ms < passive_ejection.recovery_ms) return error.ClusterPassiveEjectionRecoveryMaxBelowBase;
+    }
+    return .{
+        .fall = passive_ejection.fall,
+        .recovery_ms = passive_ejection.recovery_ms,
+        .recovery_ms_max = passive_ejection.recovery_ms_max,
+    };
 }
 
 fn resolveCheck(
@@ -7938,6 +7966,18 @@ test "config: a passive_ejection block rejects the thresholds it cannot act on" 
     // A zero cooldown re-admits in the tick that ejected — not a fast
     // recovery but an ejection that never happened.
     try expectParseError(error.ClusterPassiveEjectionRecoveryOutOfRange, head ++ "{\"recovery_ms\":0}" ++ tail);
+    // #394's ceiling: never below the cooldown it grows from, and
+    // absent unless named — a fixed cooldown, as every config had.
+    try expectParseError(
+        error.ClusterPassiveEjectionRecoveryMaxBelowBase,
+        head ++ "{\"recovery_ms\":5000,\"recovery_ms_max\":4999}" ++ tail,
+    );
+    {
+        var backoff_arena: std.heap.ArenaAllocator = undefined;
+        defer backoff_arena.deinit();
+        const backoff = try expectParseOk(&backoff_arena, head ++ "{\"recovery_ms\":1000,\"recovery_ms_max\":60000}" ++ tail);
+        try std.testing.expectEqual(@as(?u32, 60_000), backoff.clusters[0].passive_ejection.?.recovery_ms_max);
+    }
 
     // The defaults are what an operator who writes `"passive_ejection":{}` gets,
     // and they are the whole point of the block being two optional
@@ -8564,6 +8604,7 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "RoutePrefixNotCanonical", .gap = .literal_syntax },
     .{ .name = "RouteSniIsAddress", .gap = .literal_syntax },
     .{ .name = "TimeoutOrderInvalid", .gap = .budget },
+    .{ .name = "ClusterPassiveEjectionRecoveryMaxBelowBase", .gap = .budget },
 };
 
 comptime {
