@@ -585,6 +585,13 @@ pub const Config = struct {
         /// exhausted thread pool, a GC stall. That is precisely what a
         /// `tcp` probe cannot see, because the backlog accepts for it.
         passive_ejection: ?PassiveEjection = null,
+        /// #390's panic threshold, in percent of the cluster's routable
+        /// weight. While the healthy share of that weight is at or
+        /// above it, health verdicts steer picks; below it, the balancer
+        /// picks over every routable endpoint as if none were ejected.
+        /// Null keeps the 1.0-era rule (§5, #400): fail open only when
+        /// nothing is healthy — which is this same threshold at zero.
+        panic_threshold_percent: ?u8 = null,
         /// The §8 concurrency cap protecting each of this cluster's
         /// endpoints, or null for uncapped. **Per endpoint, not per
         /// cluster**: it is a statement about what one origin can carry,
@@ -836,6 +843,8 @@ pub const ValidationError = error{
     ClusterPassiveEjectionFallOutOfRange,
     ClusterPassiveEjectionRecoveryOutOfRange,
     ClusterMaxInflightOutOfRange,
+    ClusterPanicThresholdOutOfRange,
+    ClusterPanicThresholdWithoutHealth,
     ClusterRetriesOutOfRange,
     ClusterPickKeyMissing,
     ClusterPickKeyUnknown,
@@ -3200,6 +3209,9 @@ pub const ClusterJson = struct {
     check: ?CheckJson = null,
     /// Optional §7 passive ejection (#230); absent leaves it off.
     passive_ejection: ?PassiveEjectionJson = null,
+    /// Optional #390 panic threshold; absent fails open only at zero
+    /// healthy, as every config before the key did.
+    panic_threshold_percent: ?u8 = null,
     /// Optional §8 per-endpoint concurrency cap; absent means uncapped.
     max_inflight: ?u32 = null,
     /// Optional #181 dial retries across this cluster's endpoints;
@@ -3234,6 +3246,16 @@ pub const ClusterJson = struct {
         },
         .passive_ejection = .{
             .desc = "Eject endpoints that real traffic reports dead; absent leaves passive ejection off.",
+        },
+        .panic_threshold_percent = .{
+            .desc = "Percent of the cluster's routable weight that must be healthy " ++
+                "for health checks to steer traffic. Below it, zoxy picks over " ++
+                "every routable endpoint as if none were ejected, so a cluster " ++
+                "that has lost most of its capacity spreads load rather than " ++
+                "piling it onto the few survivors. Absent fails open only when " ++
+                "no endpoint is healthy. Requires check or passive_ejection.",
+            .minimum = constants.panic_threshold_percent_min,
+            .maximum = constants.panic_threshold_percent_max,
         },
         .max_inflight = .{
             .desc = "Cap on concurrent in-flight work per endpoint; absent leaves the cluster uncapped.",
@@ -4234,6 +4256,7 @@ fn resolveClusters(
             .pick = picked.pick,
             .check = try resolveCheck(entry.cluster.check, connect_timeout_ms),
             .passive_ejection = try resolvePassiveEjection(entry.cluster.passive_ejection),
+            .panic_threshold_percent = try resolvePanicThreshold(&entry.cluster),
             .hash_key = picked.hash_key,
             .max_inflight = try resolveMaxInflight(entry.cluster.max_inflight),
             .retries = try resolveRetries(entry.cluster.retries),
@@ -5842,6 +5865,28 @@ fn resolveHttpCheck(check: *const CheckJson) ParseError!Config.Cluster.Check.Htt
         .host = check.host,
         .expect_status = expect_status,
     };
+}
+
+/// Resolve #390's panic threshold. Absent keeps the default rule — fail
+/// open only at zero healthy — which needs no value to say.
+fn resolvePanicThreshold(cluster: *const ClusterJson) ValidationError!?u8 {
+    const threshold = cluster.panic_threshold_percent orelse return null;
+    // Zero is the absent rule under a second spelling, and 100 would put
+    // the cluster in panic at its first ejection — health checks that
+    // never steer, which is turning them off without saying so.
+    if (threshold < constants.panic_threshold_percent_min or
+        threshold > constants.panic_threshold_percent_max)
+    {
+        return error.ClusterPanicThresholdOutOfRange;
+    }
+    // A threshold reads the health mask; a cluster nothing ejects from
+    // keeps every endpoint healthy, so the key could never act (#390).
+    if (cluster.check == null and cluster.passive_ejection == null) {
+        return error.ClusterPanicThresholdWithoutHealth;
+    }
+    assert(threshold >= constants.panic_threshold_percent_min);
+    assert(threshold <= constants.panic_threshold_percent_max);
+    return threshold;
 }
 
 /// Resolve the §8 per-endpoint concurrency cap. Absent leaves the
@@ -8399,6 +8444,7 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "ClusterH2cWithUpgrades", .gap = .cross_block },
     .{ .name = "ClusterTlsOnH2c", .gap = .cross_block },
     .{ .name = "ClusterRetriesOnHttp2", .gap = .cross_block },
+    .{ .name = "ClusterPanicThresholdWithoutHealth", .gap = .cross_block },
     .{ .name = "ClusterTlsOnL4Listener", .gap = .cross_block },
     .{ .name = "ClusterTlsWithUpgrades", .gap = .cross_block },
     .{ .name = "ClusterTlsHttpCheck", .gap = .cross_block },
@@ -8898,7 +8944,8 @@ const fuzz_seed_json =
     \\ "clusters":{"o":{"endpoints":["127.0.0.1:9000",
     \\ {"address":"127.0.0.1:9001","weight":3}],
     \\ "pick":{"policy":"hash","key":"cookie","name":"zoxy-srv"},"max_inflight":8,
-    \\ "check":{"type":"http","path":"/health","expect_status":200,"timeout_ms":250}},
+    \\ "check":{"type":"http","path":"/health","expect_status":200,"timeout_ms":250},
+    \\ "panic_threshold_percent":50},
     \\ "t":{"endpoints":["127.0.0.1:9100"]}},
     \\ "timeouts":{"connect_ms":5000,"idle_ms":60000,"drain_deadline_ms":10000,
     \\ "max_lifetime_ms":300000,"request_ms":30000,"health_interval_ms":2000},
@@ -9855,6 +9902,42 @@ test "config: the keep-alive cap is the http listener's, and reaches it (#399)" 
             "\"keepalive_requests\":5}}]," ++
             "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
             "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}",
+    );
+}
+
+test "config: a panic threshold resolves where health can eject, and nowhere else (#390)" {
+    const head =
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2","127.0.0.1:3"],
+    ;
+    const tail =
+        \\}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    ;
+    // Either detector is enough: both write the one mask it reads.
+    inline for (.{ "\"check\":{\"type\":\"tcp\"},", "\"passive_ejection\":{}," }) |detector| {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ detector ++ "\"panic_threshold_percent\":50" ++ tail);
+        try std.testing.expectEqual(@as(?u8, 50), parsed.clusters[0].panic_threshold_percent);
+    }
+    // Absent is the default rule, fail open at zero healthy, and needs
+    // no value to say it.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ "\"check\":{\"type\":\"tcp\"}" ++ tail);
+        try std.testing.expectEqual(@as(?u8, null), parsed.clusters[0].panic_threshold_percent);
+    }
+    // Zero is that default spelled twice; 100 panics at the first
+    // ejection, which is health checks that never steer.
+    const checked = head ++ "\"check\":{\"type\":\"tcp\"},\"panic_threshold_percent\":";
+    try expectParseError(error.ClusterPanicThresholdOutOfRange, checked ++ "0" ++ tail);
+    try expectParseError(error.ClusterPanicThresholdOutOfRange, checked ++ "100" ++ tail);
+    // Nothing ejects from an unchecked cluster, so the key could never act.
+    try expectParseError(
+        error.ClusterPanicThresholdWithoutHealth,
+        head ++ "\"panic_threshold_percent\":50" ++ tail,
     );
 }
 
