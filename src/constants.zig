@@ -904,6 +904,24 @@ pub const health_check_path_bytes_max: u16 = 256;
 /// as a routing host, and for the same reason — it is a DNS name.
 pub const health_check_host_bytes_max: u16 = host_bytes_max;
 
+/// Upper bound on a `grpc` check's `service` (§7): the name a
+/// `HealthCheckRequest` carries, encoded with a one-octet length — which
+/// is what keeps the probe's request message a fixed few octets.
+pub const health_check_grpc_service_bytes_max: u8 = 127;
+
+/// The longest IP endpoint literal `Address.format` writes: a bracketed
+/// IPv6 address at its longest spelling — eight groups of four hex digits
+/// and seven colons; std writes no scope there — and a five-digit port.
+pub const ip_literal_bytes_max: u32 = "[".len + 8 * 4 + 7 + "]:".len + "65535".len;
+
+/// A `grpc` probe's `:authority` storage (§7): the endpoint's literal,
+/// when the cluster has no TLS name to send instead.
+pub const health_check_grpc_authority_bytes_max: u32 = ip_literal_bytes_max;
+
+/// The octets of a `grpc` probe's answer it keeps (§7): a SERVING answer's
+/// whole message, and more, so a longer one is seen to be longer.
+pub const health_check_grpc_response_bytes_max: u32 = 16;
+
 /// The probe's rendered request buffer (§7): request line + Host +
 /// the two fixed headers, all bounded by the two limits above.
 pub const health_check_request_bytes_max: u32 =
@@ -1768,6 +1786,16 @@ comptime {
     // configure — its response buffer follows `limits.head_buffer_bytes`
     // at init, so only the request side needs a comptime floor.
     assert(health_check_request_bytes_max <= head_buffer_bytes_min);
+    // A protobuf length below 128 is one varint octet (§7's gRPC probe).
+    assert(health_check_grpc_service_bytes_max >= 1);
+    assert(health_check_grpc_service_bytes_max < 128);
+    // Every endpoint literal fits the probe's authority: an IPv4 one is
+    // shorter than any IPv6 one's longest spelling.
+    assert(health_check_grpc_authority_bytes_max >= ip_literal_bytes_max);
+    assert(ip_literal_bytes_max >= "255.255.255.255:65535".len);
+    // A SERVING answer is a frame prefix and a two-octet message; the
+    // probe keeps strictly more, so a longer message is not mistaken for it.
+    assert(health_check_grpc_response_bytes_max > 5 + 2);
 }
 
 /// Total pool memory as a closed-form function of the *effective* pool

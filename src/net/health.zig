@@ -4,9 +4,15 @@
 //! proves is the cluster's choice: a `tcp` check dials and takes the
 //! SYN/ACK as its answer, while an `http` check goes on to send a
 //! request and require the configured status — the difference between
-//! knowing the port accepts and knowing the application answered.
+//! knowing the port accepts and knowing the application answered. A
+//! `grpc` check, on an HTTP/2 cluster, asks the standard health service
+//! (`grpc.health.v1.Health/Check`) for SERVING over the cluster's own
+//! pooled connections (`Origin.zig`), TLS and all: it holds no socket of
+//! its own, only a stream, and its verdict comes back on one completion.
 //! Anything else (refused, unreachable, timed out, a wrong status, a
-//! head that will not parse, kernel pressure) is a fail. `fall`
+//! head that will not parse, kernel pressure) is a fail — except a
+//! `grpc` probe the origin pool had no room for, which has no verdict:
+//! that limit is this proxy's, and says nothing of the endpoint. `fall`
 //! consecutive fails eject an endpoint from balancing and close its
 //! parked pooled connections (the §5 obligation: a parked socket to a
 //! dead origin is a stale replay waiting to be spent); `rise`
@@ -56,6 +62,7 @@ const config_module = @import("../config.zig");
 const constants = @import("../constants.zig");
 const Io = @import("../io/io.zig");
 const parser = @import("../http/parser.zig");
+const Origin = @import("../http/h2/Origin.zig");
 const upstream = @import("upstream.zig");
 
 const assert = std.debug.assert;
@@ -153,6 +160,9 @@ pub fn Checker(comptime IoType: type) type {
             none,
             pass,
             fail,
+            /// A `grpc` probe the origin pool could not carry: neither
+            /// streak moves (`health_probes_skipped`).
+            skipped,
         };
 
         /// One probe: the endpoint it was handed, the verdict it has
@@ -204,6 +214,10 @@ pub fn Checker(comptime IoType: type) type {
             op_send: IoType.Completion,
             op_recv: IoType.Completion,
             op_deadline: IoType.Completion,
+            /// The `grpc` probe's stream, on a connection of the cluster's
+            /// pool, and the completion its verdict is delivered on.
+            origin: Origin.ProbeLeg,
+            op_call: IoType.Completion,
             /// The one cancel completion, reused across this probe's
             /// targets — legal because a probe's cancels are serialized
             /// (`armed.cancel` gates every submission).
@@ -221,7 +235,10 @@ pub fn Checker(comptime IoType: type) type {
                 recv: bool = false,
                 deadline: bool = false,
                 cancel: bool = false,
-                _pad: u3 = 0,
+                /// A `grpc` probe's call: the one leg it has, in place of
+                /// the other three.
+                call: bool = false,
+                _pad: u2 = 0,
             };
 
             fn init(
@@ -249,6 +266,8 @@ pub fn Checker(comptime IoType: type) type {
                 probe.op_send = .{};
                 probe.op_recv = .{};
                 probe.op_deadline = .{};
+                probe.origin = .{};
+                probe.op_call = .{};
                 probe.op_cancel = .{};
                 assert(probe.armedCount() == 0);
             }
@@ -303,6 +322,7 @@ pub fn Checker(comptime IoType: type) type {
                     probe,
                     onProbeDeadline,
                 );
+                if (check.kind == .grpc) return probe.beginCall(check);
                 probe.armed.connect = true;
                 server.io.connect(
                     &cluster.endpoints[endpoint_index],
@@ -312,6 +332,49 @@ pub fn Checker(comptime IoType: type) type {
                     onProbeConnect,
                 );
                 assert(probe.armedCount() <= constants.health_probe_ops_max);
+            }
+
+            /// A `grpc` probe's one leg: the health call, on a connection
+            /// of the cluster's pool. Its delivery is a ring op of this
+            /// probe's (a zero-delay timer); the dial and stream it rides
+            /// are the pool's, priced there (§5).
+            fn beginCall(probe: *Probe, check: *const config_module.Config.Cluster.Check) void {
+                assert(check.kind == .grpc);
+                assert(!probe.armed.call);
+                probe.armed.call = true;
+                ServerType.OriginMux.probe(
+                    probe.checker.server,
+                    &probe.origin,
+                    probe.target_cluster,
+                    probe.target_endpoint,
+                    check.grpc_service,
+                    &probe.op_call,
+                    probe,
+                    onCallVerdict,
+                );
+                assert(probe.armedCount() <= constants.health_probe_ops_max);
+            }
+
+            fn onCallVerdict(context: *anyopaque, verdict: Origin.ProbeLeg.Verdict) void {
+                const probe: *Probe = @ptrCast(@alignCast(context));
+                const checker = probe.checker;
+                assert(probe.armed.call);
+                probe.armed.call = false;
+                if (checker.state == .stopping) {
+                    checker.continueStop();
+                    return;
+                }
+                assert(checker.state == .probing);
+                // First outcome wins, as for a dial: a call that answers
+                // after its deadline failed the probe keeps the fail.
+                if (probe.pending_verdict == .none) {
+                    probe.pending_verdict = switch (verdict) {
+                        .pass => .pass,
+                        .fail => .fail,
+                        .skipped => .skipped,
+                    };
+                }
+                probe.settle();
             }
 
             fn onProbeConnect(probe: *Probe, result: Io.ConnectError!IoType.Socket) void {
@@ -592,8 +655,15 @@ pub fn Checker(comptime IoType: type) type {
                 // Only ever called with a leg outstanding: a deadline fires
                 // against the leg it was armed beside, and the drain ladder
                 // reaches here only under its own armed guard.
-                assert(probe.armed.connect or probe.armed.send or probe.armed.recv);
+                assert(probe.armed.connect or probe.armed.send or probe.armed.recv or probe.armed.call);
                 assert(probe.checker.state == .probing or probe.checker.state == .stopping);
+                if (probe.armed.call and !probe.canceled.call) {
+                    // The stream is reset and the verdict delivered — a
+                    // fail — on the call's own completion.
+                    probe.canceled.call = true;
+                    ServerType.OriginMux.cancelProbe(probe.checker.server, &probe.origin);
+                    return;
+                }
                 if (probe.armed.connect and !probe.armed.cancel and !probe.canceled.connect) {
                     probe.armCancelConnect();
                     return;
@@ -646,10 +716,11 @@ pub fn Checker(comptime IoType: type) type {
                 probe.closeSocket();
                 const verdict = probe.pending_verdict;
                 probe.pending_verdict = .none;
-                if (verdict == .pass) {
-                    checker.witnessPass(probe.target_cluster, probe.target_endpoint);
-                } else {
-                    checker.witnessFail(probe.target_cluster, probe.target_endpoint);
+                switch (verdict) {
+                    .none => unreachable,
+                    .pass => checker.witnessPass(probe.target_cluster, probe.target_endpoint),
+                    .fail => checker.witnessFail(probe.target_cluster, probe.target_endpoint),
+                    .skipped => checker.server.counters.increment("health_probes_skipped"),
                 }
                 checker.dispatchNext();
             }
@@ -707,7 +778,7 @@ pub fn Checker(comptime IoType: type) type {
                 // what decides whether anything is still outstanding. The
                 // guard lives inside `endArmedLeg`, which is idempotent, so
                 // this states only that a leg is what it is being called for.
-                if (probe.armed.send or probe.armed.recv) {
+                if (probe.armed.send or probe.armed.recv or probe.armed.call) {
                     probe.endArmedLeg();
                 }
                 return false;

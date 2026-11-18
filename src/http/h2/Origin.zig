@@ -168,6 +168,106 @@ pub const Leg = struct {
     }
 };
 
+/// A gRPC health probe's stream on an origin connection (§7): the
+/// `grpc.health.v1.Health/Check` call a `grpc` check makes, riding the
+/// same pool the cluster's exchanges do — so it proves what they need, an
+/// HTTP/2 connection (over TLS for `h2`, verified) and an application that
+/// answers SERVING. Lives in the prober's probe slot; the verdict comes
+/// back on the probe's own completion, through a zero-delay timer, as a
+/// leg's does.
+pub const ProbeLeg = struct {
+    phase: Phase = .idle,
+    slot: ?*anyopaque = null,
+    next: ?*ProbeLeg = null,
+    id: u31 = 0,
+    /// `:authority`: the cluster's TLS name, or the endpoint's literal —
+    /// what an `http` probe's `Host` defaults to — rendered into
+    /// `authority_storage`. A slice into the leg itself, so a `ProbeLeg`
+    /// stays where the prober put it: it is never copied while it is busy.
+    authority: []const u8 = "",
+    authority_storage: [constants.health_check_grpc_authority_bytes_max]u8 = undefined,
+    /// The request message: the five-octet gRPC frame prefix and a
+    /// `HealthCheckRequest` naming the service, when one is named.
+    body: [5 + 2 + service_bytes_max]u8 = undefined,
+    body_len: u32 = 0,
+    /// Octets of `body` staged; the last carried END_STREAM.
+    body_offset: u32 = 0,
+    status_ok: bool = false,
+    /// The response message's first octets: enough for the status field.
+    payload: [constants.health_check_grpc_response_bytes_max]u8 = undefined,
+    payload_len: u32 = 0,
+    verdict: Verdict = .fail,
+    completion: ?*anyopaque = null,
+    callback: ?*const fn (*anyopaque, Verdict) void = null,
+    context: ?*anyopaque = null,
+
+    pub const Phase = enum(u8) { idle, waiting, open, delivering };
+
+    pub const Verdict = enum(u8) {
+        /// SERVING, said whole: `:status` 200, the message, `grpc-status` 0.
+        pass,
+        /// Anything else: no connection, a reset, another status, another
+        /// message, no trailers.
+        fail,
+        /// No verdict: the pool had no connection to the endpoint and no
+        /// room for one — this proxy's limit, which says nothing of the
+        /// origin, and so must not eject it.
+        skipped,
+    };
+
+    pub const service_bytes_max: u32 = constants.health_check_grpc_service_bytes_max;
+
+    /// The cluster's TLS name — the one its certificate is verified
+    /// against — or the endpoint's own literal; a socket path names no
+    /// host, so `localhost` stands in for it.
+    fn authorize(leg: *ProbeLeg, cluster: *const config_module.Config.Cluster, endpoint_index: u16) void {
+        assert(endpoint_index < cluster.endpoints.len);
+        if (cluster.tls) |*tls| {
+            leg.authority = tls.server_name;
+            return;
+        }
+        leg.authority = switch (cluster.endpoints[endpoint_index]) {
+            // `ip_literal_bytes_max` is the longest literal; the test
+            // below holds it to std's own spelling.
+            .ip => |*ip| std.fmt.bufPrint(&leg.authority_storage, "{f}", .{ip.*}) catch unreachable,
+            .unix => "localhost",
+        };
+        assert(leg.authority.len >= 1);
+        assert(leg.authority.len <= constants.health_check_grpc_authority_bytes_max);
+    }
+
+    /// The request message: a `HealthCheckRequest` with field 1 (`service`)
+    /// when one is named, empty otherwise, behind its frame prefix.
+    fn compose(leg: *ProbeLeg, service: []const u8) void {
+        assert(service.len <= service_bytes_max);
+        const message_len: u32 = if (service.len == 0) 0 else @intCast(2 + service.len);
+        leg.body[0] = 0; // Not compressed.
+        std.mem.writeInt(u32, leg.body[1..5], message_len, .big);
+        if (service.len >= 1) {
+            leg.body[5] = 0x0a; // Field 1, length-delimited.
+            leg.body[6] = @intCast(service.len);
+            @memcpy(leg.body[7..][0..service.len], service);
+        }
+        leg.body_len = 5 + message_len;
+        assert(leg.body_len <= leg.body.len);
+        leg.body_offset = 0;
+    }
+
+    /// The response said SERVING: a frame holding a `HealthCheckResponse`
+    /// whose field 1 (`status`) is 1, and nothing else.
+    fn serving(leg: *const ProbeLeg) bool {
+        assert(leg.payload_len <= leg.payload.len);
+        // Strictly more is kept than a SERVING message is, so a longer
+        // message cannot be cut down to look like one.
+        comptime assert(constants.health_check_grpc_response_bytes_max > 7);
+        const payload = leg.payload[0..leg.payload_len];
+        if (payload.len != 7) return false;
+        if (payload[0] != 0) return false;
+        if (std.mem.readInt(u32, payload[1..5], .big) != 2) return false;
+        return payload[5] == 0x08 and payload[6] == 1;
+    }
+};
+
 pub fn Mux(comptime IoType: type) type {
     const ServerType = @import("../../Server.zig").Server(IoType);
     const ConnType = @import("../../net/Conn.zig").Conn(IoType);
@@ -200,6 +300,9 @@ pub fn Mux(comptime IoType: type) type {
             /// heads become streams in.
             legs: ?*StreamType,
             legs_count: u32,
+            /// The health probes riding it.
+            probes: ?*ProbeLeg,
+            probes_count: u32,
             sending: u32,
             receiving: bool,
             driving: bool,
@@ -233,6 +336,8 @@ pub fn Mux(comptime IoType: type) type {
                 slot.state = .free;
                 slot.legs = null;
                 slot.legs_count = 0;
+                slot.probes = null;
+                slot.probes_count = 0;
                 slot.sending = 0;
                 slot.receiving = false;
                 slot.driving = false;
@@ -267,7 +372,7 @@ pub fn Mux(comptime IoType: type) type {
             assert(!leg.attached());
             assert(stream.upstream != null);
             const staging = server.h2_origin_staging.acquire() orelse return .shed_streams;
-            const found = pickSlot(server, cluster_index, endpoint_index);
+            const found = pickSlot(server, cluster_index, endpoint_index, .free);
             const slot = found orelse dial(server, cluster_index, endpoint_index) orelse {
                 server.h2_origin_staging.release(staging);
                 return .shed_connections;
@@ -345,9 +450,13 @@ pub fn Mux(comptime IoType: type) type {
             leg.* = .{};
         }
 
+        /// Whether a connection must have a stream free (`.free`), or may be
+        /// full (`.any`) — a probe waits there for a stream to end.
+        const Room = enum { free, any };
+
         /// The least loaded connection to the endpoint that can take one
-        /// more stream, if any.
-        fn pickSlot(server: *ServerType, cluster_index: u16, endpoint_index: u16) ?*Slot {
+        /// more stream, if any — or, for `.any`, that will.
+        fn pickSlot(server: *ServerType, cluster_index: u16, endpoint_index: u16, room: Room) ?*Slot {
             assert(cluster_index < server.config.clusters.len);
             assert(endpoint_index < server.config.clusters[cluster_index].endpoints.len);
             var best: ?*Slot = null;
@@ -356,8 +465,9 @@ pub fn Mux(comptime IoType: type) type {
                 if (slot.cluster_index != cluster_index or slot.endpoint_index != endpoint_index) continue;
                 if (slot.state != .connecting and slot.state != .handshaking and slot.state != .open) continue;
                 if (slot.state == .open and slot.session.goingAway()) continue;
-                if (slot.legs_count >= server.h2OriginSessionConfig().concurrent_streams_max) continue;
-                if (best == null or slot.legs_count < best.?.legs_count) best = slot;
+                const carried = slot.legs_count + slot.probes_count;
+                if (room == .free and carried >= server.h2OriginSessionConfig().concurrent_streams_max) continue;
+                if (best == null or carried < best.?.legs_count + best.?.probes_count) best = slot;
             }
             return best;
         }
@@ -426,12 +536,224 @@ pub fn Mux(comptime IoType: type) type {
             return null;
         }
 
+        // -- health probes (§7) ----------------------------------------------
+
+        /// Ask the endpoint's application whether it is SERVING, on a
+        /// connection to it — the least loaded with room, or a new one.
+        /// The verdict comes back through `callback` on `completion`.
+        pub fn probe(
+            server: *ServerType,
+            leg: *ProbeLeg,
+            cluster_index: u16,
+            endpoint_index: u16,
+            service: []const u8,
+            completion: *IoType.Completion,
+            context: *anyopaque,
+            callback: *const fn (*anyopaque, ProbeLeg.Verdict) void,
+        ) void {
+            assert(leg.phase == .idle);
+            assert(service.len <= ProbeLeg.service_bytes_max);
+            const cluster = &server.config.clusters[cluster_index];
+            assert(cluster.protocol.http2());
+            leg.* = .{
+                .phase = .waiting,
+                .completion = completion,
+                .callback = callback,
+                .context = context,
+            };
+            leg.authorize(cluster, endpoint_index);
+            leg.compose(service);
+            // The pool full, a probe waits on a full connection to its
+            // endpoint for a stream, rather than failing for a limit of
+            // this proxy's; with none at all, it has no verdict.
+            const slot = pickSlot(server, cluster_index, endpoint_index, .free) orelse
+                dial(server, cluster_index, endpoint_index) orelse
+                pickSlot(server, cluster_index, endpoint_index, .any) orelse
+                return deliverProbe(server, leg, .skipped);
+            leg.slot = slot;
+            leg.next = slot.probes;
+            slot.probes = leg;
+            slot.probes_count += 1;
+            kick(server, slot);
+        }
+
+        /// The prober's budget ran out, or it is stopping: the probe fails
+        /// now, its stream reset if it has one.
+        pub fn cancelProbe(server: *ServerType, leg: *ProbeLeg) void {
+            // Delivered already, or on its way: the verdict stands.
+            if (leg.phase != .waiting and leg.phase != .open) return;
+            assert(leg.slot != null);
+            const slot: *Slot = @ptrCast(@alignCast(leg.slot.?));
+            assert(slot.probes_count >= 1);
+            finishProbe(server, slot, leg, .fail);
+            assert(leg.phase == .delivering);
+            kick(server, slot);
+        }
+
+        fn findProbe(slot: *Slot, id: u31) ?*ProbeLeg {
+            assert(id != 0);
+            var cursor = slot.probes;
+            var visited: u32 = 0;
+            while (cursor) |leg| : (cursor = leg.next) {
+                assert(visited < slot.probes_count);
+                visited += 1;
+                if (leg.phase == .open and leg.id == id) return leg;
+            }
+            return null;
+        }
+
+        fn openWaitingProbes(server: *ServerType, slot: *Slot) void {
+            var cursor = slot.probes;
+            var visited: u32 = 0;
+            while (cursor) |leg| {
+                assert(visited < slot.probes_count);
+                visited += 1;
+                cursor = leg.next;
+                if (leg.phase != .waiting) continue;
+                if (!slot.session.openable()) return;
+                const cluster = &server.config.clusters[slot.cluster_index];
+                const fields = [_]hpack.Field{
+                    .{ .name = ":method", .value = "POST" },
+                    .{ .name = ":scheme", .value = if (cluster.tls != null) "https" else "http" },
+                    .{ .name = ":authority", .value = leg.authority },
+                    .{ .name = ":path", .value = "/grpc.health.v1.Health/Check" },
+                    .{ .name = "content-type", .value = "application/grpc" },
+                    .{ .name = "te", .value = "trailers" },
+                };
+                switch (slot.session.openRequest(&fields, false, false)) {
+                    .stream => |id| {
+                        leg.id = id;
+                        leg.phase = .open;
+                        sendProbeBody(slot, leg);
+                    },
+                    .blocked => return,
+                    .refused => finishProbe(server, slot, leg, .fail),
+                }
+            }
+        }
+
+        /// The request message, as far as the windows and the outbox
+        /// allow; the rest waits for `.writable`.
+        fn sendProbeBody(slot: *Slot, leg: *ProbeLeg) void {
+            assert(leg.phase == .open);
+            assert(leg.body_offset <= leg.body_len);
+            if (leg.body_offset == leg.body_len) return;
+            const sent = slot.session.sendData(leg.id, leg.body[leg.body_offset..leg.body_len], true);
+            leg.body_offset += sent.taken;
+            // END_STREAM goes with the last octet, so all of it is sent once
+            // the stream's half has ended.
+            assert(sent.ended == (leg.body_offset == leg.body_len));
+        }
+
+        fn onProbeResponse(server: *ServerType, slot: *Slot, leg: *ProbeLeg, response: *const Session.Step.Response) void {
+            assert(leg.phase == .open);
+            if (response.interim) return;
+            leg.status_ok = response.status == 200;
+            // A trailers-only answer carries its `grpc-status` here, and no
+            // message: whatever it says, it did not say SERVING.
+            if (response.end_stream or !leg.status_ok) finishProbe(server, slot, leg, .fail);
+        }
+
+        /// The response message's octets, as far as `payload` holds them:
+        /// a longer one is not the one a SERVING answer is, and the rest is
+        /// credited back unread.
+        fn onProbeData(server: *ServerType, slot: *Slot, leg: *ProbeLeg, data: *const Session.Step.Data) void {
+            assert(leg.phase == .open);
+            assert(leg.payload_len <= leg.payload.len);
+            const length: u32 = @intCast(data.bytes.len);
+            if (length >= 1) {
+                const take: u32 = @min(length, @as(u32, leg.payload.len) - leg.payload_len);
+                @memcpy(leg.payload[leg.payload_len..][0..take], data.bytes[0..take]);
+                leg.payload_len += take;
+                slot.session.consume(data.stream, length);
+            }
+            // A gRPC answer ends on its trailers; one that ends on DATA did
+            // not carry a status.
+            if (data.end_stream) finishProbe(server, slot, leg, .fail);
+        }
+
+        fn onProbeTrailers(server: *ServerType, slot: *Slot, leg: *ProbeLeg, trailers: *const Session.Step.Trailers) void {
+            assert(leg.phase == .open);
+            var ok = false;
+            for (trailers.fields) |*field| {
+                if (std.mem.eql(u8, field.name, "grpc-status")) ok = std.mem.eql(u8, field.value, "0");
+            }
+            const passed = ok and leg.status_ok and leg.serving();
+            finishProbe(server, slot, leg, if (passed) .pass else .fail);
+        }
+
+        /// The probe is decided: off its connection, its stream reset if
+        /// the origin still holds it, and the verdict on its way.
+        fn finishProbe(server: *ServerType, slot: *Slot, leg: *ProbeLeg, verdict: ProbeLeg.Verdict) void {
+            assert(leg.phase == .waiting or leg.phase == .open);
+            assert(leg.slot == @as(?*anyopaque, slot));
+            if (leg.phase == .open and slot.session.state != .closed and slot.session.resettable(leg.id)) {
+                slot.session.resetStream(leg.id, .cancel);
+            }
+            unlinkProbe(slot, leg);
+            assert(leg.slot == null);
+            deliverProbe(server, leg, verdict);
+            settleIdle(server, slot);
+        }
+
+        fn unlinkProbe(slot: *Slot, leg: *ProbeLeg) void {
+            assert(slot.probes_count >= 1);
+            if (slot.probes == leg) {
+                slot.probes = leg.next;
+            } else {
+                var cursor = slot.probes.?;
+                var visited: u32 = 0;
+                while (cursor.next) |next| : (cursor = next) {
+                    assert(visited < slot.probes_count);
+                    visited += 1;
+                    if (next == leg) {
+                        cursor.next = leg.next;
+                        break;
+                    }
+                }
+            }
+            leg.next = null;
+            leg.slot = null;
+            slot.probes_count -= 1;
+        }
+
+        fn deliverProbe(server: *ServerType, leg: *ProbeLeg, verdict: ProbeLeg.Verdict) void {
+            assert(leg.phase != .idle and leg.phase != .delivering);
+            assert(leg.slot == null);
+            leg.phase = .delivering;
+            leg.verdict = verdict;
+            const completion: *IoType.Completion = @ptrCast(@alignCast(leg.completion.?));
+            server.io.timerStart(completion, 0, ProbeLeg, leg, onProbeDelivered);
+            assert(leg.phase == .delivering);
+        }
+
+        fn onProbeDelivered(leg: *ProbeLeg, result: Io.TimerError!void) void {
+            result catch unreachable; // Nothing cancels a delivery.
+            assert(leg.phase == .delivering);
+            assert(leg.slot == null);
+            leg.phase = .idle;
+            leg.callback.?(leg.context.?, leg.verdict);
+        }
+
+        /// The connection is over: every probe on it fails.
+        fn failProbes(server: *ServerType, slot: *Slot) void {
+            const count = slot.probes_count;
+            var passes: u32 = 0;
+            while (slot.probes) |leg| : (passes += 1) {
+                assert(passes < count);
+                unlinkProbe(slot, leg);
+                deliverProbe(server, leg, .fail);
+            }
+            assert(slot.probes_count == 0);
+        }
+
         // -- the request -------------------------------------------------
 
         /// Open the waiting legs whose heads have arrived, in order, while
         /// the session can open a stream.
         fn openWaiting(server: *ServerType, slot: *Slot) void {
             assert(slot.state == .open);
+            openWaitingProbes(server, slot);
             var cursor = slot.legs;
             var visited: u32 = 0;
             while (cursor) |stream| {
@@ -1010,11 +1332,23 @@ pub fn Mux(comptime IoType: type) type {
                     },
                     .need_input => return true,
                     .closed => return false,
-                    .response => |*response| onResponse(server, slot, response),
-                    .data => |*data| onData(server, slot, data),
-                    .trailers => |*trailers| onTrailers(server, slot, trailers),
-                    .reset => |reset| onReset(server, slot, reset.stream),
-                    .writable => |writable| if (find(slot, writable.stream)) |stream| pushBody(server, slot, stream),
+                    .response => |*response| if (findProbe(slot, response.stream)) |leg| {
+                        onProbeResponse(server, slot, leg, response);
+                    } else onResponse(server, slot, response),
+                    .data => |*data| if (findProbe(slot, data.stream)) |leg| {
+                        onProbeData(server, slot, leg, data);
+                    } else onData(server, slot, data),
+                    .trailers => |*trailers| if (findProbe(slot, trailers.stream)) |leg| {
+                        onProbeTrailers(server, slot, leg, trailers);
+                    } else onTrailers(server, slot, trailers),
+                    .reset => |reset| if (findProbe(slot, reset.stream)) |leg| {
+                        finishProbe(server, slot, leg, .fail);
+                    } else onReset(server, slot, reset.stream),
+                    .writable => |writable| if (find(slot, writable.stream)) |stream| {
+                        pushBody(server, slot, stream);
+                    } else if (findProbe(slot, writable.stream)) |leg| {
+                        sendProbeBody(slot, leg);
+                    },
                     .request => unreachable, // A client session raises none.
                 }
             }
@@ -1050,6 +1384,7 @@ pub fn Mux(comptime IoType: type) type {
                 forcePending(server, stream);
             }
             assert(slot.legs_count == 0);
+            failProbes(server, slot);
         }
 
         fn flush(server: *ServerType, slot: *Slot) void {
@@ -1182,11 +1517,11 @@ pub fn Mux(comptime IoType: type) type {
                 return close(server, slot);
             }
             assert(slot.state == .open);
-            if (slot.legs_count == 0 and now >= slot.deadline_ns) {
+            if (slot.legs_count == 0 and slot.probes_count == 0 and now >= slot.deadline_ns) {
                 server.counters.increment("h2_origin_idle_closed");
                 return goAway(server, slot);
             }
-            if (slot.legs_count >= 1) {
+            if (slot.legs_count >= 1 or slot.probes_count >= 1) {
                 slot.deadline_ns = now + @as(u64, server.idleTimeoutMs()) * std.time.ns_per_ms;
             }
             const delay_ns = slot.deadline_ns -| now;
@@ -1199,7 +1534,7 @@ pub fn Mux(comptime IoType: type) type {
         fn settleIdle(server: *ServerType, slot: *Slot) void {
             assert(slot.state != .free);
             assert(slot.legs_count == 0 or slot.legs != null);
-            if (slot.legs_count >= 1) return;
+            if (slot.legs_count >= 1 or slot.probes_count >= 1) return;
             if (slot.state != .open) return;
             slot.deadline_ns = server.io.nowNs() + @as(u64, server.idleTimeoutMs()) * std.time.ns_per_ms;
             if (server.draining) goAway(server, slot);
@@ -1211,6 +1546,7 @@ pub fn Mux(comptime IoType: type) type {
         fn goAway(server: *ServerType, slot: *Slot) void {
             assert(slot.state == .open);
             assert(slot.legs_count == 0);
+            assert(slot.probes_count == 0);
             if (slot.session.state == .closed) return;
             slot.session.goAway();
             kick(server, slot);
@@ -1258,6 +1594,7 @@ pub fn Mux(comptime IoType: type) type {
             // The handshake's libcrypto state goes back to the fixed heap.
             if (slot.tls_active) slot.tls.?.finish();
             assert(slot.legs_count == 0);
+            assert(slot.probes_count == 0);
             slot.reset();
             server.h2_origins.release(slot);
             // A drain may have been waiting on this connection alone.
@@ -1270,7 +1607,7 @@ pub fn Mux(comptime IoType: type) type {
             assert(server.draining);
             for (server.h2_origins.slots) |*slot| {
                 if (!server.h2_origins.isAcquired(slot)) continue;
-                if (slot.legs_count >= 1) continue;
+                if (slot.legs_count >= 1 or slot.probes_count >= 1) continue;
                 switch (slot.state) {
                     .open => goAway(server, slot),
                     .connecting, .handshaking => close(server, slot),
@@ -1279,4 +1616,36 @@ pub fn Mux(comptime IoType: type) type {
             }
         }
     };
+}
+
+test "probe leg: the longest endpoint literal std spells is the bound the authority holds" {
+    const longest = try std.Io.net.IpAddress.parseLiteral("[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535");
+    var storage: [constants.health_check_grpc_authority_bytes_max + 1]u8 = undefined;
+    const text = try std.fmt.bufPrint(&storage, "{f}", .{longest});
+    try std.testing.expectEqual(@as(usize, constants.ip_literal_bytes_max), text.len);
+    // A scope never reaches an endpoint: the literal parser refuses one.
+    try std.testing.expectError(error.InvalidAddress, std.Io.net.IpAddress.parseLiteral("[fe80::1%1]:65535"));
+}
+
+test "probe leg: the request names the service, and only SERVING said whole passes" {
+    var leg: ProbeLeg = .{};
+    leg.compose("");
+    try std.testing.expectEqualStrings("\x00\x00\x00\x00\x00", leg.body[0..leg.body_len]);
+    leg.compose("a.B");
+    try std.testing.expectEqualStrings("\x00\x00\x00\x00\x05\x0a\x03a.B", leg.body[0..leg.body_len]);
+
+    const cases = [_]struct { payload: []const u8, serving: bool }{
+        .{ .payload = "\x00\x00\x00\x00\x02\x08\x01", .serving = true },
+        // NOT_SERVING, UNKNOWN, a compressed frame, a longer message.
+        .{ .payload = "\x00\x00\x00\x00\x02\x08\x02", .serving = false },
+        .{ .payload = "\x00\x00\x00\x00\x00", .serving = false },
+        .{ .payload = "\x01\x00\x00\x00\x02\x08\x01", .serving = false },
+        .{ .payload = "\x00\x00\x00\x00\x04\x08\x01\x10\x01", .serving = false },
+        .{ .payload = "", .serving = false },
+    };
+    for (cases) |case| {
+        leg.payload_len = @intCast(case.payload.len);
+        @memcpy(leg.payload[0..case.payload.len], case.payload);
+        try std.testing.expectEqual(case.serving, leg.serving());
+    }
 }
