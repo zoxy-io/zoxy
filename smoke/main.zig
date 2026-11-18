@@ -2578,7 +2578,7 @@ const config_template =
     \\        "relay_buffers": {d},
     \\        "upstream_slots": {d},
     \\        "tls_engines": {d},
-    \\        "stream_slots": {d},
+    \\        "h2_streams": {d},
     \\        "upstream_tls_sessions": 2
     \\    }}
     \\}}

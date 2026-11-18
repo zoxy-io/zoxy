@@ -368,10 +368,10 @@ and a body with no length is sent to an HTTP/1.1 origin chunked.
                "alpn": ["h2", "http/1.1"] } },
     { "bind": "10.0.0.1:8080", "http": { "cluster": "web", "h2c": true } }
 ],
-"limits": { "stream_slots": 4096 }
+"limits": { "h2_streams": 4096 }
 ```
 
-`limits.stream_slots` is required and has no default. It bounds the
+`limits.h2_streams` is required and has no default. It bounds the
 requests in flight across all HTTP/2 connections, each holding its own head
 buffer, and how many to carry is a capacity decision. A stream beyond the
 pool is refused with `REFUSED_STREAM`, which a client retries, and counted
@@ -692,10 +692,10 @@ requests waiting on it, counted in `zoxy_h2_origin_tls_failed`. The same
 [HTTPS origins](#https-origins).
 
 Two pools carry it, both zero unless some cluster speaks `h2c` or `h2`.
-`limits.h2_origin_connections` bounds the origin connections, two per
-`h2c` endpoint by default. `limits.h2_origin_streams` bounds the requests
-on them at once, one per upstream slot by default and never more; each
-holds a buffer for its answer. A request that finds neither is answered
+`limits.upstream_h2_connections` bounds the origin connections, two per
+`h2c` or `h2` endpoint by default. `limits.upstream_h2_streams` bounds
+the requests on them at once, one per upstream slot by default and never
+more; each holds a buffer for its answer. A request that finds neither is answered
 `503` and counted in `zoxy_l7_shed_h2_origin_connections` or
 `zoxy_l7_shed_h2_origin_streams`. An origin connection that carries
 nothing for an idle window is told `GOAWAY` and closed.
@@ -1013,7 +1013,7 @@ holds no connection to the endpoint, the probe is skipped instead of
 failed, since that limit is zoxy's and says nothing about the origin.
 Skipped probes are counted in `zoxy_health_probes_skipped`. If that
 counter keeps rising,
-`limits.h2_origin_connections` is smaller than the cluster's endpoints
+`limits.upstream_h2_connections` is smaller than the cluster's endpoints
 need.
 
 If *every* endpoint in a cluster is ejected, zoxy fails open and uses them
@@ -1530,7 +1530,7 @@ platform does.
 The block is optional. The compiled constants are hard ceilings; this block
 sizes the actual pools anywhere from 1 up to them, so a small deployment
 neither reserves nor demands the ceiling's resources. The conditional keys
-(`tls_engines`, `tunnels`, `h2_connections` and `stream_slots`) are left
+(`tls_engines`, `tunnels`, `h2_connections` and `h2_streams`) are left
 out of the example below, because each is refused unless the feature it
 sizes is configured. They are described further down.
 
@@ -1575,11 +1575,11 @@ since no default can be derived for it. Each tunnel holds one relay-buffer
 pair (8200 bytes) for its whole life, which is why tunnels are reserved
 apart from `relay_buffers`.
 
-`h2_connections` and `stream_slots` size [HTTP/2](#http2) and are zero
-unless a listener speaks it, in which case `stream_slots` is **required**.
+`h2_connections` and `h2_streams` size [HTTP/2](#http2) and are zero
+unless a listener speaks it, in which case `h2_streams` is **required**.
 Each HTTP/2 connection holds a session of about 100 KiB and each stream
 slot a head buffer; the banner prints both.
-`h2_origin_connections` and `h2_origin_streams` size
+`upstream_h2_connections` and `upstream_h2_streams` size
 [HTTP/2 to the origin](#http2-to-the-origin-and-grpc) and are zero unless
 a cluster speaks `h2c` or `h2`. Both have defaults, and the banner prints
 them. Over TLS, each origin connection also holds a TLS session on the

@@ -8,7 +8,7 @@
 //!   slots' capacity and occupancy. An HTTP/1.1 connection runs its
 //!   exchanges on it one at a time. An HTTP/2 connection's carries the
 //!   socket's one recv and one send, and runs no exchange of its own.
-//! - **Shared streams** (#275), `limits.stream_slots`: each multiplexed
+//! - **Shared streams** (#275), `limits.h2_streams`: each multiplexed
 //!   HTTP/2 exchange takes one for the life of one request.
 //!
 //! §5's release rule and its generation discipline hold one layer down,
@@ -22,7 +22,7 @@
 //! move, an equality sharp enough that a changed banner means the split
 //! took something with it that it should not have. A shared stream is
 //! charged its own ops beside that divisor (§5), which is why
-//! `stream_slots` is required rather than guessed.
+//! `h2_streams` is required rather than guessed.
 
 const std = @import("std");
 

@@ -935,7 +935,7 @@ fn spawnZoxy(
         \\    "clusters": {{
         \\        "origin": {{ "endpoints": ["{s}"] }}
         \\    }},
-        \\    "limits": {{ "stream_slots": {d}, "h2_connections": {d} }},
+        \\    "limits": {{ "h2_streams": {d}, "h2_connections": {d} }},
         \\    "timeouts": {{
         \\        "connect_ms": 5000,
         \\        "idle_ms": 60000,

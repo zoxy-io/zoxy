@@ -108,7 +108,7 @@ pub fn Server(comptime IoType: type) type {
         /// (`h2RequestWindow`).
         h2_request_window: u31,
         /// The shared stream pool (#275): the exchanges HTTP/2 multiplexes,
-        /// `limits.stream_slots` of them. A pool of its own beside
+        /// `limits.h2_streams` of them. A pool of its own beside
         /// `streams`, not a tail on it, so admission's one stream per
         /// connection stays a reservation nothing else can draw down — and
         /// `admitStream`'s acquire stays one that cannot fail.

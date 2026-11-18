@@ -639,7 +639,7 @@ comptime {
 /// One stream per connection — what an HTTP/1.1 exchange model *is*: a
 /// connection carries one request at a time, and an HTTP/2 connection
 /// runs its own I/O on the one it was admitted with — plus the shared
-/// pool `limits.stream_slots` sizes for the exchanges HTTP/2 multiplexes
+/// pool `limits.h2_streams` sizes for the exchanges HTTP/2 multiplexes
 /// (#275), which is zero on a deployment that speaks no HTTP/2.
 ///
 /// The per-connection share keeps the ring budget's divisor where it was
@@ -655,7 +655,7 @@ pub fn streamSlotsFor(conn_slots: u32, stream_slots: u32) u32 {
     return conn_slots + stream_slots;
 }
 
-/// The ceiling on `limits.stream_slots` (#275): a pool past the conn-slot
+/// The ceiling on `limits.h2_streams` (#275): a pool past the conn-slot
 /// ceiling would hold more multiplexed exchanges than the upstream pool —
 /// pinned to that same ceiling — has slots to give them.
 pub const stream_slots_max: u32 = conn_slots_max;
@@ -1306,7 +1306,7 @@ comptime {
     assert(upstream_tls_sessions_per_endpoint <= upstream_tls_sessions_max);
 }
 
-/// The ceiling on `limits.h2_origin_connections` (§7): each is an fd and
+/// The ceiling on `limits.upstream_h2_connections` (§7): each is an fd and
 /// a session unit, and a deployment needs about one per origin endpoint.
 pub const h2_origin_connections_max: u32 = 4096;
 
@@ -1950,8 +1950,8 @@ pub const PoolSizes = struct {
     /// one per shared stream slot, app-side like the upstream heads.
     stream_head_buffers: u32 = 0,
     stream_head_buffer_bytes: u64 = 0,
-    /// The §7 HTTP/2 origin pools (`limits.h2_origin_connections` and
-    /// `limits.h2_origin_streams`; zero unless a cluster speaks h2c): a
+    /// The §7 HTTP/2 origin pools (`limits.upstream_h2_connections` and
+    /// `limits.upstream_h2_streams`; zero unless a cluster speaks h2c): a
     /// client session unit per connection, and per stream the buffer its
     /// answer is staged in — a head, a window, and a trailer section.
     h2_origin_connections: u32 = 0,
