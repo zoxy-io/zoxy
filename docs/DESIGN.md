@@ -41,18 +41,19 @@ Goals, in priority order:
    moving parts than the previous iteration, not more.
 5. **L4 (TCP relay) and L7 (HTTP/1.1 reverse proxy)** serving, with
    keep-alive and shared upstream connection reuse. HTTP/2 reaches the
-   same L7 exchange from the client side (§7, #173).
+   same L7 exchange from the client side (§7, #173), and leaves it for an
+   `h2c` cluster's origins (§7) — which, with trailers carried, is gRPC.
 
 Non-goals (deliberate, recorded so they are decisions rather than drift):
 
-- HTTP/3, HTTP/2 to the origin, gRPC — deferred. HTTP/2 to the client
-  was deferred on this line until the L4/L7 core was proven, and it is
-  not any more (#173, §7). It was let in only in front of the HTTP/1.1
-  exchange, and that is why its two neighbours here stay out. An h2
-  connection to an origin is shared by concurrent requests rather than
-  leased to one, so it would need a pool with a different lease model.
-  gRPC needs that upstream leg; the response trailers it ends every
-  call with already reach an HTTP/2 client (§7). HTTP/3 is #197. WebSocket was
+- HTTP/3 — deferred (#197). HTTP/2 was deferred on this line until the
+  L4/L7 core was proven, and it is not any more, at either end (§7): in
+  front of the HTTP/1.1 exchange for clients (#173), and behind it for an
+  `h2c` cluster's origins, on a pool with its own lease model — a
+  connection shared by streams rather than leased to one exchange. gRPC
+  rides on both, with the response trailers it ends every call with
+  carried end to end. HTTP/2 to an origin over TLS waits on upstream TLS
+  (#296). WebSocket was
   deferred too and is not any more (#180, §7): carrying it needs no new
   I/O machinery, because a tunnel is the L4 relay this proxy already
   runs, entered from an L7 exchange. What it does need is its own
@@ -562,7 +563,14 @@ per-connection divisor, which is why `limits.stream_slots` is required
 rather than guessed. Both read zero, and are refused, unless a listener
 speaks HTTP/2 — `h2` in `tls.alpn`, or `http.h2c`; a listener offering
 `h2` alone has no HTTP/1.1 to fall back to, and sheds at accept instead
-(`shed_h2_sessions`). A deployment that does configure tunnels at the
+(`shed_h2_sessions`). The two HTTP/2 *origin* pools (§7) are off unless a
+cluster speaks `h2c`: connections, each a client session unit, an fd and
+`h2_origin_ops_max` ring ops — priced in `fdsRequired` and `inFlightOps`
+as their own term — and the per-stream staging buffers an answer is held
+in, which never outnumber the upstream slots every such exchange also
+holds. Both default rather than being required: a connection per
+endpoint is the common case, and the stream ceiling is one the upstream
+pool already set. A deployment that does configure tunnels at the
 ceiling pays the same `relay_buffer_bytes` term twice. Both figures track
 that knob: measured at the ceiling with tunnels and TLS off, the banner
 prints 290 MiB at 4 KiB against 559 MiB at the 16 KiB default, the
@@ -2151,6 +2159,42 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   no field is no HEADERS. A request's trailers still end the client's
   half and go no further: the chunked body goes upstream with none.
 
+- **HTTP/2 to the origin is a leg, not a second exchange** (§1). A
+  cluster with `"protocol": "h2c"` is reached over connections many
+  exchanges share, each on a stream of its own — and the exchange does
+  not learn it. Its upstream half is the HTTP/1.1 one, ops and all; what
+  it arms them on is a socket or, for such a cluster, a *leg*
+  (`Origin.zig`), and every upstream op goes through `Server`'s
+  `upstream*` dispatch to one or the other. So §7 is stated once:
+  - the rendered request head is read back by `parseRequestHead` and said
+    as HTTP/2 fields (`origin.zig`) — Host as `:authority`, the
+    connection-specific fields gone, `te: trailers` said — and opened as
+    a stream; the body's octets are unframed into DATA;
+  - the answer is written out as the HTTP/1.1 head it stands for and
+    parsed like any origin's, its body framed with the origin's declared
+    length or chunked when there is none, so a trailer section has
+    somewhere to go — the last chunk's, which the slice above carries on
+    to an HTTP/2 client and an HTTP/1.1 client reads as it is;
+  - a leg's op completes on the exchange's own completion, through a
+    zero-delay timer, never inside the call that armed it, so the ring
+    charge per exchange is unchanged; the connection's own ops are a new
+    term (`h2_origin_ops_max` each).
+
+  What arrives for a stream is staged in a buffer of the leg's own (§5's
+  `h2_origin_streams`): a head, a window of payload, a trailer section.
+  The stream's window is what that buffer holds, so DATA is copied out of
+  the session at once and a slow client never holds a connection its
+  siblings share; octets are credited back as the exchange reads them.
+  An origin that resets a stream, refuses it past its GOAWAY, or loses
+  its connection fails the leg as a socket error would, and the exchange
+  decides what that means: a leg on a connection that was already open
+  is a reused upstream's try, so the GOAWAY race earns §7's free replay.
+  Connections (`h2_origin_connections`) are picked least-loaded per
+  endpoint, dialed when none has room, told GOAWAY after an idle window,
+  and closed by the drain once their last leg leaves. An `h2c` cluster is
+  reachable only from `http` listeners without upgrades, and checked only
+  by `tcp` probes, which the loader enforces.
+
 - **An HTTP/2 connection is told before it is closed.** It gets
   `GOAWAY(NO_ERROR)` before the close when it is drained, when it sits
   idle with no stream open, and when its stream count reaches
@@ -3107,7 +3151,8 @@ src/
     render.zig        // §7 head rendering: hop-by-hop strip + close injection
     router.zig        // §7 path routing: canonical-path longest-prefix table
     proxy.zig         // L7 state machine over phases
-    h2/               // HTTP/2 to the client (§7); the only `h2` importer
+    h2/               // HTTP/2 to the client and to the origin (§7);
+                      // the only `h2` importer
       Session.zig     // one connection, sans-I/O: frames in, events out;
                       // either end — a client's to this proxy, or this
                       // proxy's to an HTTP/2 origin (`Config.role`)
@@ -3116,6 +3161,11 @@ src/
       downgrade.zig   // h2 → h1: write the head, parse it back (§7)
       response.zig    // h1 → h2: the rendered head, read back as fields
       StreamTable.zig // one connection's open streams, a bounded scan
+      Origin.zig      // HTTP/2 to the origin: the pooled connection, its
+                      // driver, and the leg an exchange's upstream ops use
+      origin.zig      // h1 ↔ h2 at the origin: request head → fields,
+                      // answer → HTTP/1.1 head, trailers → last chunk
+      TestOrigin.zig  // test support: an h2c origin on the server role
   tls/
     Engine.zig        // zssl wrapper: sans-I/O TLS 1.3 seam, pooled (§4, §5)
     Credentials.zig   // per-listener PEM chain + signing key, parsed once (§4)

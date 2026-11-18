@@ -197,6 +197,27 @@ pub const Counters = struct {
     /// knobs (`upstream_slots` vs `upstream_head_buffers`), and an
     /// operator widening the wrong one fixes nothing.
     l7_shed_upstream_head_buffers: Value = Value.init(0),
+    /// §8 rungs for an `h2c` cluster (§7): no connection to the endpoint
+    /// had room for another stream and none was free to dial
+    /// (`limits.h2_origin_connections`), or no stream could hold an answer
+    /// (`limits.h2_origin_streams`). Answered 503, as the slot rung is.
+    l7_shed_h2_origin_connections: Value = Value.init(0),
+    l7_shed_h2_origin_streams: Value = Value.init(0),
+    /// HTTP/2 origin connections dialed (§7), and the dials refused,
+    /// unreachable or past their budget — each of which fails every
+    /// exchange that was waiting on it.
+    h2_origin_connections: Value = Value.init(0),
+    h2_origin_connect_failed: Value = Value.init(0),
+    /// Origin connections ended for having carried nothing for an idle
+    /// window: told GOAWAY, then closed.
+    h2_origin_idle_closed: Value = Value.init(0),
+    /// Streams to an origin it reset, or refused past its GOAWAY — the
+    /// exchange fails as on a reset socket, and may be replayed (§7).
+    h2_origin_streams_reset: Value = Value.init(0),
+    /// A request head HTTP/2 could not carry, or an answer HTTP/1.1 could
+    /// not: the exchange fails, as on an unparseable origin head.
+    h2_origin_refused_heads: Value = Value.init(0),
+    h2_origin_refused_answers: Value = Value.init(0),
     /// §8 requests answered 503 because every endpoint of their cluster
     /// was already carrying its configured `max_inflight`. Distinct from
     /// `l7_shed_upstream_slots` on purpose: that one says this proxy ran

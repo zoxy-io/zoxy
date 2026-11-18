@@ -39,6 +39,8 @@ const H2Session = @import("http/h2/Session.zig");
 const H2Connection = @import("http/h2/Connection.zig");
 const H2Slot = H2Connection.Slot;
 const H2Exchange = @import("http/h2/exchange.zig");
+const H2Origin = @import("http/h2/Origin.zig");
+const h2_origin_fields = @import("http/h2/origin.zig");
 const upstream_module = @import("net/upstream.zig");
 
 const assert = std.debug.assert;
@@ -120,6 +122,21 @@ pub fn Server(comptime IoType: type) type {
         /// for one mapping at a time — the session copies the section out
         /// before the mapping returns. Empty where no HTTP/2 is spoken.
         h2_scratch: H2Exchange.Scratch,
+        /// The §7 HTTP/2 origin pools: connections to `h2c` endpoints, each
+        /// a carved client session unit from `h2_origin_slab`, and the
+        /// staging buffers the exchanges on them hold their answers in.
+        /// Empty unless a cluster speaks h2c.
+        h2_origin_slab: []align(H2Session.Layout.unit_align) u8,
+        h2_origins: Pool(OriginMux.Slot),
+        h2_origin_staging: Pool(H2Origin.Staging),
+        h2_origin_layout: ?H2Session.Layout,
+        /// The window an origin stream advertises and the head an answer is
+        /// held to, as the pools were sized (`initOriginPools`).
+        h2_origin_window: u31,
+        h2_origin_head_bytes: u32,
+        /// Where a leg's request head is mapped to an origin's fields: one
+        /// per process, used inside one call and never across one.
+        h2_origin_scratch: OriginScratch,
         /// Live L4 relayed connections per endpoint (§7), the other half
         /// of `upstream_module.Load`. The pool cannot hold this: an L4
         /// connection leases no upstream slot, so it is the server —
@@ -402,6 +419,23 @@ pub fn Server(comptime IoType: type) type {
         pub const Proxy = proxy.Proxy(IoType);
         const H2Driver = H2Connection.Driver(IoType);
         const H2ExchangeType = H2Exchange.Exchange(IoType);
+        pub const OriginMux = H2Origin.Mux(IoType);
+
+        /// `h2_origin_scratch`'s shape: a parse's headers, the fields an
+        /// origin is sent, and the octets of the names they lowercase.
+        pub const OriginScratch = struct {
+            headers: parser.HeaderStorage,
+            fields: []h2_origin_fields.Field,
+            bytes: []u8,
+
+            pub const empty: OriginScratch = .{ .headers = undefined, .fields = &.{}, .bytes = &.{} };
+
+            /// What `initOriginPools` reserves at `head_buffer_bytes`.
+            pub fn bytesFor(head_buffer_bytes: u32) u64 {
+                return @as(u64, h2_origin_fields.request_fields_max) * @sizeOf(h2_origin_fields.Field) +
+                    head_buffer_bytes;
+            }
+        };
 
         /// Pool sizes are injectable so tests and the simulator can force
         /// every exhaustion rung; production passes the config's resolved
@@ -632,6 +666,7 @@ pub fn Server(comptime IoType: type) type {
             try server.initHeadBuffers(arena, &options);
             try server.initTlsEngines(arena, &options);
             try server.initH2Pools(arena, &options);
+            try server.initOriginPools(arena, &options);
             server.l4_inflight = try arena.alloc(u16, keys.count);
             @memset(server.l4_inflight, 0);
             server.listeners = try arena.alloc(ListenerState, config.listeners.len);
@@ -793,10 +828,7 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.tunnel_buffer == null);
             // An exchange ended mid-flight still holds its upstream half:
             // nothing is armed on it any more, so it closes synchronously.
-            if (stream.upstream_socket) |socket| {
-                server.io.closeNow(socket);
-                stream.upstream_socket = null;
-            }
+            server.upstreamClose(stream);
             if (stream.upstream) |leased| {
                 server.releaseUpstream(leased);
                 stream.upstream = null;
@@ -853,6 +885,156 @@ pub fn Server(comptime IoType: type) type {
                 server.releaseSharedStream(stream);
             }
             assert(conn.h2_streams == null);
+        }
+
+        /// One HTTP/2 origin connection's session shape (§7): an answer's
+        /// head up to a head buffer — what the exchange reads it back into
+        /// — and as many streams as the staging pool could ever fill, up to
+        /// what one connection sensibly carries.
+        pub fn h2OriginLayout(limits: *const config_module.Config.Limits) H2Session.Layout {
+            assert(limits.h2_origin_connections >= 1);
+            assert(limits.h2_origin_streams >= 1);
+            return .{
+                .header_list_size_max = limits.head_buffer_bytes,
+                .concurrent_streams_max = @min(H2Session.concurrent_streams_advertised_max, limits.h2_origin_streams),
+            };
+        }
+
+        /// What one origin connection costs (§5): its pool element and its
+        /// unit of the slab.
+        pub fn h2OriginBytes(limits: *const config_module.Config.Limits) u64 {
+            if (limits.h2_origin_connections == 0) return 0;
+            return @sizeOf(OriginMux.Slot) + h2OriginLayout(limits).bytes();
+        }
+
+        /// What one origin stream's staging costs: its pool element and its
+        /// buffer.
+        pub fn h2OriginStreamBytes(limits: *const config_module.Config.Limits) u64 {
+            if (limits.h2_origin_streams == 0) return 0;
+            const window = H2Origin.streamWindow(limits.relay_buffer_bytes);
+            return @sizeOf(H2Origin.Staging) + H2Origin.stagingBytes(limits.head_buffer_bytes, window);
+        }
+
+        /// What an origin connection's `Session.init` is given: the client
+        /// role on the carved layout, its window the relay buffer's read.
+        pub fn h2OriginSessionConfig(server: *const Self) H2Session.Config {
+            const layout = server.h2_origin_layout.?;
+            return .{
+                .role = .client,
+                .concurrent_streams_max = layout.concurrent_streams_max,
+                .header_list_size_max = layout.header_list_size_max,
+                .initial_window_size = server.h2_origin_window,
+            };
+        }
+
+        /// The §7 origin pools, reserved as §5 prices them: the session
+        /// slab carved once, the staging slab wired once, and the scratch
+        /// a request head is mapped in.
+        fn initOriginPools(
+            server: *Self,
+            arena: std.mem.Allocator,
+            options: *const InitOptions,
+        ) error{OutOfMemory}!void {
+            assert(options.h2_origin_streams <= options.upstream_slots);
+            if (@hasDecl(IoType, "h2_origin_connections_max")) {
+                assert(options.h2_origin_connections <= IoType.h2_origin_connections_max);
+            }
+            try server.h2_origins.init(arena, options.h2_origin_connections);
+            try server.h2_origin_staging.init(arena, options.h2_origin_streams);
+            server.h2_origin_layout = null;
+            server.h2_origin_slab = &.{};
+            server.h2_origin_scratch = OriginScratch.empty;
+            server.h2_origin_window = H2Origin.streamWindow(options.relay_buffer_bytes);
+            server.h2_origin_head_bytes = options.head_buffer_bytes;
+            if (options.h2_origin_connections == 0) {
+                assert(options.h2_origin_streams == 0);
+                return;
+            }
+            const layout = h2OriginLayout(options);
+            server.h2_origin_layout = layout;
+            const unit: usize = @intCast(layout.bytes());
+            server.h2_origin_slab = try arena.alignedAlloc(
+                u8,
+                .fromByteUnits(H2Session.Layout.unit_align),
+                @as(usize, options.h2_origin_connections) * unit,
+            );
+            for (server.h2_origins.slots, 0..) |*slot, index| {
+                const piece: []align(H2Session.Layout.unit_align) u8 =
+                    @alignCast(server.h2_origin_slab[index * unit ..][0..unit]);
+                const carved = layout.carve(piece);
+                slot.session = carved.session;
+                slot.buffers = carved.buffers;
+                // Dead until a dial arms them, as every pooled op starts.
+                slot.op_io = .{};
+                slot.op_send = .{};
+                slot.op_timer = .{};
+                slot.op_cancel = .{};
+                slot.reset();
+            }
+            const window = H2Origin.streamWindow(options.relay_buffer_bytes);
+            const staging_bytes = H2Origin.stagingBytes(options.head_buffer_bytes, window);
+            const staging_slab = try arena.alloc(u8, @as(usize, options.h2_origin_streams) * staging_bytes);
+            for (server.h2_origin_staging.slots, 0..) |*staging, index| {
+                staging.data = staging_slab[index * staging_bytes ..][0..staging_bytes];
+            }
+            server.h2_origin_scratch = .{
+                .headers = undefined,
+                .fields = try arena.alloc(h2_origin_fields.Field, h2_origin_fields.request_fields_max),
+                .bytes = try arena.alloc(u8, options.head_buffer_bytes),
+            };
+            assert(server.h2_origins.slots.len == options.h2_origin_connections);
+            assert(server.h2_origin_staging.slots.len == options.h2_origin_streams);
+        }
+
+        // -- the upstream half's dispatch (§7) --
+        //
+        // An exchange's upstream is a leased socket or, for an h2c cluster,
+        // a leg on a shared connection. Every op the exchange arms on it
+        // goes through these four, so neither half of the proxy has to ask
+        // which it has.
+
+        /// Whether the exchange has an upstream to arm ops on.
+        pub fn upstreamAttached(stream: *const StreamType) bool {
+            return stream.upstream_socket != null or stream.h2_origin.attached();
+        }
+
+        pub fn upstreamSend(
+            server: *Self,
+            stream: *StreamType,
+            bytes: []const u8,
+            completion: *IoType.Completion,
+            comptime callback: fn (*StreamType, Io.SendError!u32) void,
+        ) void {
+            if (stream.h2_origin.attached()) return OriginMux.send(server, stream, bytes, completion, callback);
+            server.io.send(stream.upstream_socket.?, bytes, completion, StreamType, stream, callback);
+        }
+
+        pub fn upstreamRecv(
+            server: *Self,
+            stream: *StreamType,
+            buffer: []u8,
+            completion: *IoType.Completion,
+            comptime callback: fn (*StreamType, Io.RecvError!u32) void,
+        ) void {
+            if (stream.h2_origin.attached()) return OriginMux.recv(server, stream, buffer, completion, callback);
+            server.io.recv(stream.upstream_socket.?, buffer, completion, StreamType, stream, callback);
+        }
+
+        /// Force what the exchange has armed on its upstream to deliver.
+        pub fn upstreamShutdown(server: *Self, stream: *StreamType) void {
+            if (stream.h2_origin.attached()) return OriginMux.shutdown(server, stream);
+            if (stream.upstream_socket) |socket| server.io.shutdown(socket, .both);
+        }
+
+        /// Let go of the upstream with nothing armed on it: a socket closes,
+        /// a leg leaves its connection.
+        pub fn upstreamClose(server: *Self, stream: *StreamType) void {
+            if (stream.h2_origin.attached()) {
+                assert(stream.upstream_socket == null);
+                return OriginMux.detach(server, stream);
+            }
+            if (stream.upstream_socket) |socket| server.io.closeNow(socket);
+            stream.upstream_socket = null;
         }
 
         /// A session for a connection about to speak HTTP/2, or null when
@@ -1542,6 +1724,7 @@ pub fn Server(comptime IoType: type) type {
             // first (§8). Synchronous closes: no armed op to wait for.
             server.reapParked(true);
             server.drainH2Connections();
+            OriginMux.beginDrain(server);
             // A zero deadline is "no cap" (§5): the drain waits for the
             // last connection however long that takes, which is what
             // nginx, HAProxy and Caddy all do by default. Whoever sent
@@ -1903,6 +2086,9 @@ pub fn Server(comptime IoType: type) type {
             if (!server.access_log.isQuiescent()) return;
             // Same rule for the prober's armed ops (§8).
             if (!server.health.isQuiescent()) return;
+            // And for the HTTP/2 origin connections (§7): each ends once its
+            // last exchange has, and its GOAWAY and close take ops of their own.
+            if (!server.h2_origins.isFullyReleased()) return;
             // Every stream released ahead of the conn that owned it
             // (#274, `continueTeardown`), and the check above says every
             // conn is gone — so an outstanding stream here is the split's
@@ -1928,6 +2114,7 @@ pub fn Server(comptime IoType: type) type {
             assert(server.h2_sessions.isFullyReleased());
             assert(server.shared_streams.isFullyReleased());
             assert(server.stream_head_buffers.isFullyReleased());
+            assert(server.h2_origin_staging.isFullyReleased());
             // The drain finished, so the watchdog has nothing left to
             // watch. Unconditional: `alarmCancel` on an unarmed alarm is
             // a no-op on both sides of the seam, and the alternative is
@@ -2022,6 +2209,8 @@ pub fn Server(comptime IoType: type) type {
                 server.h2_sessions.isFullyReleased() and
                 server.shared_streams.isFullyReleased() and
                 server.stream_head_buffers.isFullyReleased() and
+                server.h2_origins.isFullyReleased() and
+                server.h2_origin_staging.isFullyReleased() and
                 server.head_buffers_in_use == 0 and
                 server.admin.isQuiescent() and
                 server.access_log.isQuiescent() and
@@ -3795,9 +3984,9 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.isLive());
             conn.enter(.tearing_down);
             server.io.shutdown(conn.client_socket, .both);
-            if (conn.stream.upstream_socket) |socket| {
-                server.io.shutdown(socket, .both);
-            }
+            // A socket, or an HTTP/2 origin leg (§7): either way, what is
+            // armed on it is forced.
+            server.upstreamShutdown(conn.stream);
             // A dial-timeout verdict (§8) may already have a cancel in
             // flight; submitting a second would double-arm the op.
             if (conn.stream.armed.connect and !conn.stream.armed.connect_cancel) {
@@ -3932,10 +4121,7 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.armedCount() == 0);
             assert(conn.stream.armedCount() == 0);
             server.io.closeNow(conn.client_socket);
-            if (conn.stream.upstream_socket) |socket| {
-                server.io.closeNow(socket);
-                conn.stream.upstream_socket = null;
-            }
+            server.upstreamClose(conn.stream);
             server.releasePooledResources(conn);
             // The last chance to say anything about this connection (§8).
             // An exchange that reached a verdict already spoke and is
@@ -4506,7 +4692,7 @@ pub fn Server(comptime IoType: type) type {
             stream.ending = true;
             // Its deadline no longer applies: the forced ops end it.
             stream.deadline_ns = 0;
-            if (stream.upstream_socket) |socket| server.io.shutdown(socket, .both);
+            server.upstreamShutdown(stream);
             // A dial-timeout verdict may already have its cancel in flight.
             if (stream.armed.connect and !stream.armed.connect_cancel) {
                 server.armConnectCancel(stream);

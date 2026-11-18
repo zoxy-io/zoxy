@@ -227,6 +227,11 @@ pub fn Pump(
             assert(stream.relay_buffer != null);
             if (@hasDecl(Policy, "beforeRecv")) Policy.beforeRecv(stream);
             stream.arm(op(stream), bit);
+            // The upstream side is a socket or an HTTP/2 origin leg (§7),
+            // which the server's dispatch tells apart.
+            if (direction == .upstream_to_client) {
+                return server.upstreamRecv(stream, recvBuffer(stream), &op(stream).completion, onRecv);
+            }
             server.io.recv(
                 source(stream),
                 recvBuffer(stream),
@@ -308,6 +313,9 @@ pub fn Pump(
             // caller asked to write with nothing staged.
             assert(wire.len >= 1);
             stream.arm(op(stream), bit);
+            if (direction == .client_to_upstream) {
+                return server.upstreamSend(stream, wire, &op(stream).completion, onSend);
+            }
             server.io.send(
                 target(stream),
                 wire,

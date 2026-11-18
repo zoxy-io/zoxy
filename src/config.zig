@@ -334,6 +334,15 @@ pub const Config = struct {
         /// count implies.
         h2_connections: u32 = 0,
         stream_slots: u32 = 0,
+        /// The §5 pools an HTTP/2 origin draws on (§7): connections to
+        /// `h2c` clusters' endpoints, each a client session many exchanges
+        /// share, and the staging buffers those exchanges' streams hold
+        /// their answers in. Zero exactly when no cluster speaks `h2c`.
+        /// Where one does, the connections default to two per `h2c`
+        /// endpoint and the streams to the upstream slots — every such
+        /// exchange holds one of those too, so more could never be used.
+        h2_origin_connections: u32 = 0,
+        h2_origin_streams: u32 = 0,
         /// How many eighths of the io_uring completion queue the worst-case
         /// in-flight ops may fill (§8). Unlike the pool sizes this is not a
         /// shrink: ⅞ (the compiled default, the fill the ceiling is derived
@@ -612,6 +621,17 @@ pub const Config = struct {
         /// across clients (§3), and a per-connection header cannot name
         /// one client — rejected at load, not silently ignored.
         proxy_protocol_send: ?ProxyProtocolSend = null,
+        /// What the origins speak (§7): HTTP/1.1, each exchange leasing a
+        /// pooled socket, or HTTP/2 by prior knowledge (`h2c`, RFC 9113
+        /// §3.3), many exchanges sharing a connection as streams. Only
+        /// `http` listeners route to an `h2c` cluster, and none that
+        /// carries an upgrade: HTTP/2 has no `101`.
+        protocol: Protocol = .http1,
+
+        pub const Protocol = enum(u1) {
+            http1,
+            h2c,
+        };
 
         pub const Pick = enum(u2) {
             rr,
@@ -833,6 +853,7 @@ pub const ValidationError = error{
     ListenerTlsAlpnDuplicate,
     ListenerTlsAlpnOnL4,
     ClusterProxyProtocolSendUnknown,
+    ClusterProtocolUnknown,
     ClusterProxyProtocolOnHttpListener,
     ClusterProxyProtocolOnTlsListener,
     FilterMethodEmpty,
@@ -907,6 +928,20 @@ pub const ValidationError = error{
     LimitH2ConnectionsOverConnSlots,
     LimitH2ConnectionsWithoutHttp2,
     ListenerH2cOnTls,
+    LimitH2OriginConnectionsOutOfRange,
+    LimitH2OriginConnectionsWithoutH2c,
+    LimitH2OriginStreamsOutOfRange,
+    LimitH2OriginStreamsOverUpstreamSlots,
+    LimitH2OriginStreamsWithoutH2c,
+    /// An `h2c` cluster probed by HTTP/1.1, which its origins may not
+    /// speak at all: every probe would fail, and eject every endpoint.
+    ClusterH2cHttpCheck,
+    /// An `l4` listener routing to an `h2c` cluster: what it relays is
+    /// whatever the client sent, not HTTP/2 this proxy speaks.
+    ClusterH2cOnL4Listener,
+    /// An `http` listener carrying an upgrade to an `h2c` cluster: the
+    /// tunnel would need a `101`, which HTTP/2 does not have.
+    ClusterH2cWithUpgrades,
     LimitCqFillOutOfRange,
     LimitConnSlotsOverCqFill,
     LimitAccessLogBufferOutOfRange,
@@ -1002,6 +1037,9 @@ pub fn parseWithFiles(
         // because clusters resolve before limits do — the `check` blocks
         // are already settled by the time the budget is priced.
         constants.healthProbeConcurrency(checkedEndpointsOf(clusters)),
+        // The h2c endpoints the origin pools are sized for (§7), known for
+        // the same reason.
+        h2cEndpointsOf(clusters),
     );
     // Bodies before listeners (#159): a `respond` action names one, and
     // both consumers render through the same load-time cache — so the
@@ -1546,37 +1584,10 @@ fn assertPoolsFitConnSlots(
     assert(tunnels <= conn_slots);
 }
 
-/// Resolve the effective pool sizes (§5, §8): the comptime constants are
-/// the hard, budget-asserted ceilings — config may only shrink below
-/// them, never grow past them, and never to zero. An unspecified
-/// relay-buffer count derives from the effective conn slots (a buffer
-/// beyond the slot count could never be acquired); a *specified* count
-/// above them is a contradiction and fails loudly.
-fn resolveLimits(
-    limits_json: *const LimitsJson,
-    listeners_count: u32,
-    features: ListenerFeatures,
-    access_log_on: bool,
-    log_header_count: u32,
-    health_probes: u32,
-) ValidationError!Config.Limits {
-    assert(listeners_count >= 1);
-    assert(health_probes >= 1);
-    assert(health_probes <= constants.health_probe_concurrency_max);
-    // Bounds are `countListenerFeatures`'s postcondition, not re-checked
-    // here — restating them would be two places to keep in step.
-    const slots = try resolveSlotCounts(limits_json);
-    const conn_slots = slots.conn_slots;
-    const relay_buffers = slots.relay_buffers;
-    const upstream_slots = slots.upstream_slots;
-    const head_pools = try resolveHeadPools(
-        limits_json,
-        conn_slots,
-        upstream_slots,
-        features.http,
-    );
-    const head_buffer_bytes = try resolveHeadBufferBytes(limits_json.head_buffer_bytes);
-    const relay_buffer_bytes = try resolveRelayBufferBytes(limits_json.relay_buffer_bytes);
+/// The relay buffer's width against what the listeners ask of it — split
+/// from `resolveLimits` for the length limit.
+fn rejectRelayBufferShape(features: ListenerFeatures, relay_buffer_bytes: u32) ValidationError!void {
+    assert(relay_buffer_bytes >= constants.relay_buffer_bytes_min);
     // The §6 peek stages a whole ClientHello in the relay buffer's
     // client->upstream half (#298), so a listener that routes by name
     // needs a half wide enough to hold one. Refused at load, which is
@@ -1599,7 +1610,43 @@ fn resolveLimits(
     if (features.tls >= 1 and relay_buffer_bytes > constants.tls_app_chunk_bytes) {
         return error.LimitRelayBufferOverTlsRecord;
     }
+}
+
+/// Resolve the effective pool sizes (§5, §8): the comptime constants are
+/// the hard, budget-asserted ceilings — config may only shrink below
+/// them, never grow past them, and never to zero. An unspecified
+/// relay-buffer count derives from the effective conn slots (a buffer
+/// beyond the slot count could never be acquired); a *specified* count
+/// above them is a contradiction and fails loudly.
+fn resolveLimits(
+    limits_json: *const LimitsJson,
+    listeners_count: u32,
+    features: ListenerFeatures,
+    access_log_on: bool,
+    log_header_count: u32,
+    health_probes: u32,
+    h2c_endpoints: u32,
+) ValidationError!Config.Limits {
+    assert(listeners_count >= 1);
+    assert(health_probes >= 1);
+    assert(health_probes <= constants.health_probe_concurrency_max);
+    // Bounds are `countListenerFeatures`'s postcondition, not re-checked
+    // here — restating them would be two places to keep in step.
+    const slots = try resolveSlotCounts(limits_json);
+    const conn_slots = slots.conn_slots;
+    const relay_buffers = slots.relay_buffers;
+    const upstream_slots = slots.upstream_slots;
+    const head_pools = try resolveHeadPools(
+        limits_json,
+        conn_slots,
+        upstream_slots,
+        features.http,
+    );
+    const head_buffer_bytes = try resolveHeadBufferBytes(limits_json.head_buffer_bytes);
+    const relay_buffer_bytes = try resolveRelayBufferBytes(limits_json.relay_buffer_bytes);
+    try rejectRelayBufferShape(features, relay_buffer_bytes);
     const feature_pools = try resolveFeaturePools(limits_json, conn_slots, features);
+    const origin_pools = try resolveOriginPools(limits_json, upstream_slots, h2c_endpoints);
     const cq_fill_eighths = try resolveCqFill(
         limits_json.cq_fill_eighths,
         conn_slots,
@@ -1607,6 +1654,7 @@ fn resolveLimits(
         upstream_slots,
         listeners_count,
         health_probes,
+        origin_pools.connections,
     );
     // Zero exactly when the log is off, so the one number says both how
     // big the staging buffers are and whether there are any (§8). A
@@ -1637,6 +1685,8 @@ fn resolveLimits(
         .tunnels = feature_pools.tunnels,
         .h2_connections = feature_pools.h2_connections,
         .stream_slots = feature_pools.stream_slots,
+        .h2_origin_connections = origin_pools.connections,
+        .h2_origin_streams = origin_pools.streams,
         .keepalive_requests = limits_json.keepalive_requests orelse
             constants.keepalive_requests_default,
         .cq_fill_eighths = cq_fill_eighths,
@@ -1684,6 +1734,42 @@ fn resolveSlotCounts(limits_json: *const LimitsJson) ValidationError!SlotCounts 
     };
 }
 
+/// The HTTP/2 origin pools (§7), which exist exactly when some cluster
+/// speaks `h2c`: connections, two per such endpoint unless sized, and the
+/// streams that may hold an answer at once — one per upstream slot unless
+/// sized, and never more, since every one of those exchanges holds a slot.
+fn resolveOriginPools(
+    limits_json: *const LimitsJson,
+    upstream_slots: u32,
+    h2c_endpoints: u32,
+) ValidationError!struct { connections: u32, streams: u32 } {
+    assert(upstream_slots >= 1);
+    if (h2c_endpoints == 0) {
+        if (limits_json.h2_origin_connections != null) return error.LimitH2OriginConnectionsWithoutH2c;
+        if (limits_json.h2_origin_streams != null) return error.LimitH2OriginStreamsWithoutH2c;
+        return .{ .connections = 0, .streams = 0 };
+    }
+    const connections = limits_json.h2_origin_connections orelse
+        @min(2 * @as(u64, h2c_endpoints), constants.h2_origin_connections_max);
+    if (connections < 1 or connections > constants.h2_origin_connections_max) {
+        return error.LimitH2OriginConnectionsOutOfRange;
+    }
+    const streams = limits_json.h2_origin_streams orelse upstream_slots;
+    if (streams < 1 or streams > constants.upstream_slots_max) return error.LimitH2OriginStreamsOutOfRange;
+    if (streams > upstream_slots) return error.LimitH2OriginStreamsOverUpstreamSlots;
+    assert(streams <= upstream_slots);
+    return .{ .connections = @intCast(connections), .streams = streams };
+}
+
+/// How many endpoints the `h2c` clusters name between them.
+fn h2cEndpointsOf(clusters: []const Config.Cluster) u32 {
+    var count: u32 = 0;
+    for (clusters) |*cluster| {
+        if (cluster.protocol == .h2c) count += @intCast(cluster.endpoints.len);
+    }
+    return count;
+}
+
 /// The CQ fill is the one limit an operator tightens for headroom, not a
 /// pool shrink (§8): a smaller fill demands a deeper ring for the same
 /// conn slots. Range-check first, then reject a fill that — with these
@@ -1696,6 +1782,7 @@ fn resolveCqFill(
     upstream_slots: u32,
     listeners_count: u32,
     health_probes: u32,
+    origin_connections: u32,
 ) ValidationError!u32 {
     assert(conn_slots >= 1);
     assert(listeners_count >= 1);
@@ -1712,6 +1799,7 @@ fn resolveCqFill(
         upstream_slots,
         listeners_count,
         health_probes,
+        origin_connections,
         cq_fill_eighths,
     )) {
         return error.LimitConnSlotsOverCqFill;
@@ -2074,6 +2162,11 @@ pub const LimitsJson = struct {
     /// and the shared streams they multiplex (required there).
     h2_connections: ?u32 = null,
     stream_slots: ?u32 = null,
+    /// The §7 HTTP/2 origin pools: connections to `h2c` clusters and the
+    /// streams on them that can hold an answer. Both defaulted, and only
+    /// legal where some cluster speaks `h2c`.
+    h2_origin_connections: ?u32 = null,
+    h2_origin_streams: ?u32 = null,
     /// Optional #237 keep-alive request cap; absent means nginx's 1000,
     /// `0` is unlimited.
     keepalive_requests: ?u32 = null,
@@ -2176,6 +2269,22 @@ pub const LimitsJson = struct {
                 "connection advertises at most 100.",
             .minimum = 1,
             .maximum = constants.stream_slots_max,
+        },
+        .h2_origin_connections = .{
+            .desc = "Connections to the endpoints of h2c clusters (§7), each " ++
+                "carrying many exchanges as HTTP/2 streams. Only legal when some " ++
+                "cluster speaks h2c; defaults to two per h2c endpoint. A request " ++
+                "with no connection to carry it is answered 503.",
+            .minimum = 1,
+            .maximum = constants.h2_origin_connections_max,
+        },
+        .h2_origin_streams = .{
+            .desc = "Exchanges on h2c connections at once (§7), each holding a " ++
+                "buffer for its answer: a head, a relay buffer's window, and a " ++
+                "trailer section. Only legal when some cluster speaks h2c; " ++
+                "defaults to upstream_slots, and may not exceed it.",
+            .minimum = 1,
+            .maximum = constants.upstream_slots_max,
         },
         .cq_fill_eighths = .{
             .desc = "How many eighths of the io_uring completion queue the " ++
@@ -2899,6 +3008,8 @@ pub const ClusterJson = struct {
     /// (#142); absent sends none. Only valid on clusters no http
     /// listener routes to.
     proxy_protocol: ?ClusterProxyProtocolJson = null,
+    /// Optional §7 origin protocol; absent is HTTP/1.1.
+    protocol: []const u8 = "http1",
 
     pub const schema_doc = "One upstream cluster: its endpoints, pick policy and health checks.";
     pub const schema_fields = .{
@@ -2934,6 +3045,14 @@ pub const ClusterJson = struct {
             .desc = "Announce each client to this cluster's origins with a PROXY " ++
                 "protocol header on the upstream connection (only on clusters " ++
                 "no http listener routes to); absent sends none.",
+        },
+        .protocol = .{
+            .desc = "What the origins speak: http1 (the default; each exchange " ++
+                "leases a pooled connection) or h2c (HTTP/2 by prior knowledge; " ++
+                "exchanges share connections as streams, and an answer's " ++
+                "trailers reach the client — what gRPC needs). Only http " ++
+                "listeners without upgrades may route to an h2c cluster.",
+            .enum_type = Config.Cluster.Protocol,
         },
     };
 };
@@ -3857,7 +3976,14 @@ fn resolveClusters(
             .max_inflight = try resolveMaxInflight(entry.cluster.max_inflight),
             .retries = try resolveRetries(entry.cluster.retries),
             .proxy_protocol_send = try resolveClusterProxyProtocol(entry.cluster.proxy_protocol),
+            .protocol = try resolveClusterProtocol(entry.cluster.protocol),
         };
+        // The prober speaks HTTP/1.1, which an h2c origin need not.
+        if (clusters[index].protocol == .h2c) {
+            if (clusters[index].check) |check| {
+                if (check.kind == .http) return error.ClusterH2cHttpCheck;
+            }
+        }
     }
     assert(clusters.len == count);
     return clusters;
@@ -4228,6 +4354,7 @@ fn resolveListener(
     if (listener.tls != null) {
         try rejectTlsClusterSend(listener.routes, clusters);
     }
+    try rejectH2cRoutes(&listener, clusters);
     assert(listener.routes.len >= 1);
     return listener;
 }
@@ -5679,6 +5806,29 @@ fn rejectTlsClusterSend(
         if (clusters[route.cluster_index].proxy_protocol_send != null) {
             return error.ClusterProxyProtocolOnTlsListener;
         }
+    }
+}
+
+/// A cluster's origin protocol (§7): the closed vocabulary, which the
+/// schema states too.
+fn resolveClusterProtocol(protocol: []const u8) ValidationError!Config.Cluster.Protocol {
+    return std.meta.stringToEnum(Config.Cluster.Protocol, protocol) orelse error.ClusterProtocolUnknown;
+}
+
+/// Where an `h2c` cluster may be routed from (§7): only an `http`
+/// listener, and only one that carries no upgrade — an `l4` listener
+/// relays bytes, not HTTP/2 this proxy speaks, and an upgrade's tunnel
+/// begins with a `101` HTTP/2 does not have.
+fn rejectH2cRoutes(
+    listener: *const Config.Listener,
+    clusters: []const Config.Cluster,
+) ValidationError!void {
+    assert(listener.routes.len >= 1);
+    for (listener.routes) |route| {
+        assert(route.cluster_index < clusters.len);
+        if (clusters[route.cluster_index].protocol != .h2c) continue;
+        if (listener.protocol == .l4) return error.ClusterH2cOnL4Listener;
+        if (listener.upgrades.any()) return error.ClusterH2cWithUpgrades;
     }
 }
 
@@ -7807,6 +7957,12 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "ListenerBindUnixPathInvalid", .gap = .literal_syntax },
     .{ .name = "ListenerBindUnixPathRelative", .gap = .literal_syntax },
     .{ .name = "ListenerH2cOnTls", .gap = .cross_block },
+    .{ .name = "LimitH2OriginConnectionsWithoutH2c", .gap = .budget },
+    .{ .name = "LimitH2OriginStreamsWithoutH2c", .gap = .budget },
+    .{ .name = "LimitH2OriginStreamsOverUpstreamSlots", .gap = .budget },
+    .{ .name = "ClusterH2cHttpCheck", .gap = .cross_block },
+    .{ .name = "ClusterH2cOnL4Listener", .gap = .cross_block },
+    .{ .name = "ClusterH2cWithUpgrades", .gap = .cross_block },
     .{ .name = "ListenerL4RequestKeyedHash", .gap = .cross_block },
     .{ .name = "ListenerModeInvalid", .gap = .literal_syntax },
     .{ .name = "ListenerModeWithoutUnixBind", .gap = .cross_block },
@@ -9791,6 +9947,55 @@ test "config: tls.alpn offers what the listener speaks, and only that (#271)" {
         error.ListenerTlsAlpnOnL4,
         l4 ++ tls_head ++ ",\"alpn\":[\"http/1.1\"]}" ++ tail,
     );
+}
+
+test "config: an h2c cluster is reached over HTTP/2, sizes the origin pools, and only http listeners route to it (§7)" {
+    const http = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"}}],";
+    const timeouts = "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}";
+    const h2c = "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\",\"127.0.0.1:3\"],\"protocol\":\"h2c\"}},";
+    const plain = "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}},";
+    // Defaults: two connections per h2c endpoint, a stream per upstream slot.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, http ++ h2c ++ timeouts ++ "}");
+        try std.testing.expectEqual(Config.Cluster.Protocol.h2c, parsed.clusters[0].protocol);
+        try std.testing.expectEqual(@as(u32, 4), parsed.limits.h2_origin_connections);
+        try std.testing.expectEqual(parsed.limits.upstream_slots, parsed.limits.h2_origin_streams);
+    }
+    // Sized, and absent where nothing speaks h2c — the default protocol.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const sized = try expectParseOk(&arena_state, http ++ h2c ++ timeouts ++
+            ",\"limits\":{\"h2_origin_connections\":1,\"h2_origin_streams\":8}}");
+        try std.testing.expectEqual(@as(u32, 1), sized.limits.h2_origin_connections);
+        try std.testing.expectEqual(@as(u32, 8), sized.limits.h2_origin_streams);
+    }
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const none = try expectParseOk(&arena_state, http ++ plain ++ timeouts ++ "}");
+        try std.testing.expectEqual(Config.Cluster.Protocol.http1, none.clusters[0].protocol);
+        try std.testing.expectEqual(@as(u32, 0), none.limits.h2_origin_connections);
+        try std.testing.expectEqual(@as(u32, 0), none.limits.h2_origin_streams);
+    }
+    try expectParseError(error.LimitH2OriginConnectionsWithoutH2c, http ++ plain ++ timeouts ++
+        ",\"limits\":{\"h2_origin_connections\":2}}");
+    try expectParseError(error.LimitH2OriginStreamsWithoutH2c, http ++ plain ++ timeouts ++
+        ",\"limits\":{\"h2_origin_streams\":2}}");
+    try expectParseError(error.LimitH2OriginStreamsOverUpstreamSlots, http ++ h2c ++ timeouts ++
+        ",\"limits\":{\"upstream_slots\":4,\"h2_origin_streams\":5}}");
+    try expectParseError(error.ClusterProtocolUnknown, http ++
+        "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"],\"protocol\":\"h3\"}}," ++ timeouts ++ "}");
+    // The prober speaks HTTP/1.1, which an h2c origin need not.
+    try expectParseError(error.ClusterH2cHttpCheck, http ++
+        "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"],\"protocol\":\"h2c\"," ++
+        "\"check\":{\"type\":\"http\",\"path\":\"/health\"}}}," ++ timeouts ++ "}");
+    // An l4 listener relays bytes; an upgrade's tunnel needs a 101.
+    try expectParseError(error.ClusterH2cOnL4Listener, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"}}]," ++ h2c ++ timeouts ++ "}");
+    try expectParseError(error.ClusterH2cWithUpgrades, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"," ++
+        "\"upgrades\":{\"websocket\":true}}}]," ++ h2c ++ timeouts ++ ",\"limits\":{\"tunnels\":4}}");
 }
 
 test "config: a listener speaking HTTP/2 sizes its pools, and only one does (#275)" {

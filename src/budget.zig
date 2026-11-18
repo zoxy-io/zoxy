@@ -83,6 +83,7 @@ pub fn Budget(comptime IoType: type) type {
                     listeners_count,
                     access_log_files,
                     health_probes,
+                    config.limits.h2_origin_connections,
                 ),
                 .cq_entries = constants.completionQueueDepthFor(
                     config.limits.conn_slots,
@@ -90,6 +91,7 @@ pub fn Budget(comptime IoType: type) type {
                     config.limits.upstream_slots,
                     listeners_count,
                     health_probes,
+                    config.limits.h2_origin_connections,
                     config.limits.cq_fill_eighths,
                 ),
             };
@@ -182,6 +184,11 @@ pub fn Budget(comptime IoType: type) type {
                     0
                 else
                     @sizeOf(upstream_module.HeadBuffer) + limits.head_buffer_bytes,
+                // Zero unless a cluster speaks h2c (§7).
+                .h2_origin_connections = limits.h2_origin_connections,
+                .h2_origin_bytes = ServerType.h2OriginBytes(&limits),
+                .h2_origin_streams = limits.h2_origin_streams,
+                .h2_origin_stream_bytes = ServerType.h2OriginStreamBytes(&limits),
             };
         }
 
@@ -307,6 +314,7 @@ pub fn Budget(comptime IoType: type) type {
                 limits.upstream_slots,
                 @intCast(config.listeners.len),
                 config.healthProbes(),
+                limits.h2_origin_connections,
             );
             const access_log_bytes = constants.accessLogBytes(limits.access_log_buffer_bytes);
             const sizes = poolSizesFor(config);
@@ -456,13 +464,24 @@ pub fn Budget(comptime IoType: type) type {
                 sizes.tls_plaintext_bytes,
                 sizes.libcrypto_heap_bytes / 1024,
             });
-            // Apart from the block above only because one format call takes
-            // at most 32 arguments. The HTTP/2 terms read zero unless a
-            // listener speaks HTTP/2 (#275) — printed rather than omitted,
-            // like the tunnel and TLS lines — and the arena stays last, the
-            // one term measured rather than derived.
+            try emitH2Banner(sink, sizes, config_arena_bytes);
+        }
+
+        /// Apart from the memory block only because one format call takes
+        /// at most 32 arguments. The HTTP/2 terms read zero unless a
+        /// listener speaks HTTP/2 (#275), or a cluster does (§7) — printed
+        /// rather than omitted, like the tunnel and TLS lines — and the
+        /// arena stays last, the one term measured rather than derived.
+        fn emitH2Banner(
+            sink: Sink,
+            sizes: *const constants.PoolSizes,
+            config_arena_bytes: u64,
+        ) std.Io.Writer.Error!void {
+            assert(sizes.h2_connections == 0 or sizes.h2_session_bytes > 0);
+            assert(sizes.h2_origin_connections == 0 or sizes.h2_origin_bytes > 0);
             try emit(sink,
                 \\          + h2 sessions {d} x {d} B + stream heads {d} x {d} B
+                \\          + h2 origins {d} x {d} B + origin streams {d} x {d} B
                 \\          + config arena {d} KiB (measured, not closed-form)
                 \\
             , .{
@@ -470,6 +489,10 @@ pub fn Budget(comptime IoType: type) type {
                 sizes.h2_session_bytes,
                 sizes.stream_head_buffers,
                 sizes.stream_head_buffer_bytes,
+                sizes.h2_origin_connections,
+                sizes.h2_origin_bytes,
+                sizes.h2_origin_streams,
+                sizes.h2_origin_stream_bytes,
                 config_arena_bytes / 1024,
             });
         }

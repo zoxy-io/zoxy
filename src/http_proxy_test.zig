@@ -587,6 +587,8 @@ const Http1Bed = struct {
     config: config_module.Config,
     server: ServerSim,
     origin: HttpOrigin,
+    /// The HTTP/2 origin an `origin_h2` scenario answers from (§7).
+    h2_origin: H2TestOrigin,
     client: HttpClient,
     client2: HttpClient,
     drain_timer_completion: SimIo.Completion,
@@ -638,6 +640,11 @@ const Http1Bed = struct {
         /// ring was willing to carry.
         inbox_bytes: ?u32 = null,
         origin_response: []const u8 = "",
+        /// The bed's origin speaks HTTP/2 by prior knowledge (§7): the
+        /// cluster is `h2c`, and `h2_origin` answers in place of `origin`.
+        origin_h2: bool = false,
+        h2_origin_connections: u32 = 2,
+        h2_origin_streams: u32 = 2,
         /// The #181 dial-retry budget on the bed's one cluster.
         retries: u16 = 0,
         /// The #180 upgrade allowlist and tunnel pool. Both off by
@@ -875,7 +882,7 @@ const Http1Bed = struct {
             .buffer_group_bytes = options.head_buffer_bytes,
         });
         bed.installEndpoints(options);
-        bed.clusters = .{.{ .name = "origin", .endpoints = bed.endpoints[0..bed.endpoints_count], .check = options.check, .passive_ejection = options.passive_ejection, .max_inflight = options.max_inflight, .pick = options.pick, .hash_key = options.hash_key, .retries = options.retries }};
+        bed.clusters = .{.{ .name = "origin", .endpoints = bed.endpoints[0..bed.endpoints_count], .check = options.check, .passive_ejection = options.passive_ejection, .max_inflight = options.max_inflight, .pick = options.pick, .hash_key = options.hash_key, .retries = options.retries, .protocol = if (options.origin_h2) .h2c else .http1 }};
         bed.routes = .{.{ .host = options.route_host, .prefix = options.route_prefix, .cluster_index = 0 }};
         bed.installListener(options);
         bed.buildConfig(options);
@@ -895,6 +902,8 @@ const Http1Bed = struct {
             .tunnels = options.tunnels,
             .h2_connections = options.h2_connections,
             .stream_slots = options.stream_slots,
+            .h2_origin_connections = if (options.origin_h2) options.h2_origin_connections else 0,
+            .h2_origin_streams = if (options.origin_h2) options.h2_origin_streams else 0,
         });
         try bed.loadTlsCredentials(arena, options.tls);
         try bed.server.start();
@@ -906,7 +915,11 @@ const Http1Bed = struct {
             .interim_then_close_after_served = options.origin_interim_then_close_after_served,
             .close_second_at_accept = options.close_second_at_accept,
         };
-        if (options.origin_listens) {
+        bed.h2_origin = .{};
+        if (options.origin_h2) {
+            assert(!options.unix_origin);
+            if (options.origin_listens) try bed.h2_origin.start(arena, &bed.sim_io, originAddress());
+        } else if (options.origin_listens) {
             if (options.unix_origin) {
                 try bed.origin.startUnix(&bed.sim_io, origin_socket_path);
             } else {
@@ -988,10 +1001,12 @@ const Http1Bed = struct {
         bed.client.startAt(&bed.sim_io, &bed.server, bed.listeners[0].bind_address);
         try bed.sim_io.run();
         bed.origin.stopListening();
+        bed.h2_origin.stopListening();
     }
 
     fn expectDrained(bed: *Http1Bed) !void {
         bed.origin.closeRemaining();
+        bed.h2_origin.closeRemaining();
         try std.testing.expect(bed.server.isIdle());
         try std.testing.expect(bed.server.reconcile());
         try std.testing.expect(bed.sim_io.sockets.isFullyReleased());
@@ -1255,6 +1270,7 @@ test "h2c: an HTTP/1.1 request on an h2c listener is still HTTP/1.1, and a prefa
 // ---------------------------------------------------------------------------
 
 const ResponseReader = @import("http/h2/ResponseReader.zig");
+const H2TestOrigin = @import("http/h2/TestOrigin.zig").TestOrigin(SimIo);
 const H2Session = @import("http/h2/Session.zig");
 const H2Slot = @import("http/h2/Connection.zig").Slot;
 
@@ -1765,6 +1781,212 @@ fn expectTrailers(options: Http1Bed.Options, body: []const u8, trailers: []const
     try std.testing.expect(answers[0].ended);
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_responses"));
     try bed.expectDrained();
+}
+
+// ---------------------------------------------------------------------------
+// HTTP/2 to the origin (§7): an `h2c` cluster's exchanges share connections
+// as streams. The client side is either protocol; the origin is
+// `H2TestOrigin`, a `Session` on the server role.
+// ---------------------------------------------------------------------------
+
+fn h2OriginOptions(seed: u64) Http1Bed.Options {
+    return .{ .seed = seed, .origin_h2 = true };
+}
+
+test "h2 origin: an HTTP/1.1 request reaches an h2c origin as HTTP/2, and its answer comes back chunked" {
+    for ([_]bool{ false, true }) |partial_io| {
+        var options = h2OriginOptions(70 + @as(u64, @intFromBool(partial_io)));
+        options.partial_io = partial_io;
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, options);
+        defer bed.tearDown();
+        bed.h2_origin.headers = &.{.{ "content-type", "text/plain" }};
+        bed.h2_origin.body = "hello";
+
+        try bed.exchange("GET /greet?x=1 HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+
+        const response = bed.client.response();
+        try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expect(std.mem.indexOf(u8, response, "content-type: text/plain\r\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response, "transfer-encoding: chunked\r\n") != null);
+        try std.testing.expect(std.mem.endsWith(u8, response, "\r\n\r\n5\r\nhello\r\n0\r\n\r\n"));
+        // What the origin heard: the request line and Host as pseudo-headers,
+        // and the one TE HTTP/2 allows.
+        try std.testing.expectEqualStrings("GET", bed.h2_origin.last_method.slice());
+        try std.testing.expectEqualStrings("/greet?x=1", bed.h2_origin.last_path.slice());
+        try std.testing.expectEqualStrings("a", bed.h2_origin.last_authority.slice());
+        try std.testing.expectEqualStrings("trailers", bed.h2_origin.last_te.slice());
+        try std.testing.expectEqual(@as(u32, 1), bed.h2_origin.accepted_count);
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_responses"));
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("h2_origin_connections"));
+        try bed.expectDrained();
+    }
+}
+
+test "h2 origin: a declared length goes both ways as itself, and an origin's trailers reach an HTTP/1.1 client" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, h2OriginOptions(72));
+    defer bed.tearDown();
+    bed.h2_origin.headers = &.{.{ "content-length", "2" }};
+    bed.h2_origin.body = "ok";
+
+    try bed.exchange("POST /upload HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello");
+
+    const response = bed.client.response();
+    try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, response, "content-length: 2\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, response, "\r\n\r\nok"));
+    try std.testing.expectEqualStrings("hello", bed.h2_origin.last_body.slice());
+    try std.testing.expectEqualStrings("POST", bed.h2_origin.last_method.slice());
+    try bed.expectDrained();
+
+    var trailed: Http1Bed = undefined;
+    try trailed.setUp(std.testing.allocator, h2OriginOptions(73));
+    defer trailed.tearDown();
+    trailed.h2_origin.body = "abc";
+    trailed.h2_origin.trailers = &.{ .{ "grpc-status", "0" }, .{ "content-length", "9" } };
+    try trailed.exchange("GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+    // The managed name in the trailer section is not said (#244); the rest is.
+    try std.testing.expect(std.mem.endsWith(u8, trailed.client.response(), "3\r\nabc\r\n0\r\ngrpc-status: 0\r\n\r\n"));
+    try trailed.expectDrained();
+}
+
+test "h2 origin: a gRPC call from an HTTP/2 client reaches the origin and its trailers come back" {
+    for ([_]bool{ false, true }) |partial_io| {
+        var options = h2BedOptions(74 + @as(u64, @intFromBool(partial_io)));
+        options.origin_h2 = true;
+        options.partial_io = partial_io;
+        options.origin_response = "";
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, options);
+        defer bed.tearDown();
+        bed.h2_origin.headers = &.{.{ "content-type", "application/grpc" }};
+        bed.h2_origin.body = "\x00\x00\x00\x00\x03abc";
+        bed.h2_origin.trailers = &.{ .{ "grpc-status", "0" }, .{ "grpc-message", "OK" } };
+
+        var wire: H2Wire = .{};
+        wire.preface(&.{});
+        wire.headers(1, &.{
+            .{ ":method", "POST" },
+            .{ ":scheme", "http" },
+            .{ ":path", "/helloworld.Greeter/SayHello" },
+            .{ ":authority", "a" },
+            .{ "content-type", "application/grpc" },
+            .{ "te", "trailers" },
+        }, false);
+        wire.data(1, "\x00\x00\x00\x00\x02hi", true);
+        try bed.exchange(wire.written());
+
+        var storage: [2]H2Answer = undefined;
+        const answers = try h2Answers(bed.client.response(), &storage);
+        try std.testing.expectEqual(@as(usize, 1), answers.len);
+        try std.testing.expectEqual(@as(u16, 200), answers[0].status);
+        try std.testing.expectEqualStrings("\x00\x00\x00\x00\x03abc", answers[0].dataSlice());
+        try std.testing.expectEqualStrings("grpc-status=0;grpc-message=OK;", answers[0].trailersSlice());
+        try std.testing.expect(answers[0].ended);
+        try std.testing.expectEqualStrings("/helloworld.Greeter/SayHello", bed.h2_origin.last_path.slice());
+        try std.testing.expectEqualStrings("application/grpc", bed.h2_origin.last_content_type.slice());
+        try std.testing.expectEqualStrings("trailers", bed.h2_origin.last_te.slice());
+        try std.testing.expectEqualStrings("\x00\x00\x00\x00\x02hi", bed.h2_origin.last_body.slice());
+        try bed.expectDrained();
+    }
+}
+
+test "h2 origin: two client streams share one origin connection, each on a stream of its own" {
+    var options = h2BedOptions(76);
+    options.origin_h2 = true;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+    bed.h2_origin.body = "ok";
+
+    var wire: H2Wire = .{};
+    wire.preface(&.{});
+    wire.get(1, "GET", "/a");
+    wire.get(3, "GET", "/b");
+    try bed.exchange(wire.written());
+
+    var storage: [2]H2Answer = undefined;
+    const answers = try h2Answers(bed.client.response(), &storage);
+    try std.testing.expectEqual(@as(usize, 2), answers.len);
+    for (answers) |answer| {
+        try std.testing.expectEqual(@as(u16, 200), answer.status);
+        try std.testing.expectEqualStrings("ok", answer.dataSlice());
+        try std.testing.expect(answer.ended);
+    }
+    try std.testing.expectEqual(@as(u32, 1), bed.h2_origin.accepted_count);
+    try std.testing.expectEqual(@as(u32, 2), bed.h2_origin.answered);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("h2_origin_connections"));
+    try bed.expectDrained();
+}
+
+const h2_origin_answer: [8000]u8 = @splat('a');
+const h2_origin_upload_body: [100_000]u8 = @splat('q');
+const h2_origin_upload = "POST /up HTTP/1.1\r\nHost: a\r\nContent-Length: 100000\r\nConnection: close\r\n\r\n" ++ h2_origin_upload_body;
+
+test "h2 origin: bodies past every window go whole, both ways, a window at a time" {
+    for ([_]bool{ false, true }) |partial_io| {
+        var options = h2OriginOptions(80 + @as(u64, @intFromBool(partial_io)));
+        options.partial_io = partial_io;
+        // A kilobyte of window per stream: the answer crosses it eight times.
+        options.relay_buffer_bytes = constants.relay_buffer_bytes_min;
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, options);
+        defer bed.tearDown();
+        bed.h2_origin.body = &h2_origin_answer;
+
+        try bed.exchange(h2_origin_upload);
+
+        // The upload overran the origin's own windows, and went whole.
+        try std.testing.expectEqual(@as(u64, h2_origin_upload_body.len), bed.h2_origin.last_body_len);
+        const response = bed.client.response();
+        try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 OK\r\n"));
+        const body_start = std.mem.indexOf(u8, response, "\r\n\r\n").? + 4;
+        var scanner: parser.ChunkedScanner = .{};
+        var copy: [2 * constants.head_buffer_bytes_default]u8 = undefined;
+        const wire = copy[0 .. response.len - body_start];
+        @memcpy(wire, response[body_start..]);
+        const dechunked = try scanner.dechunk(wire);
+        try std.testing.expect(dechunked.done);
+        try std.testing.expectEqualSlices(u8, &h2_origin_answer, wire[0..dechunked.payload_len]);
+        try bed.expectDrained();
+    }
+}
+
+test "h2 origin: an answer the origin never finishes ends the exchange at its deadline, and the drain still ends" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, h2OriginOptions(79));
+    defer bed.tearDown();
+    bed.h2_origin.body = "part";
+    bed.h2_origin.stall_after_body = true;
+    try bed.exchange("GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+    // The answer began, so the deadline cannot be a 504: the exchange ends.
+    try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.endsWith(u8, bed.client.response(), "4\r\npart\r\n"));
+    try bed.expectDrained();
+}
+
+test "h2 origin: an origin nobody answers for is a 502, and a mute one a 504" {
+    {
+        var options = h2OriginOptions(77);
+        options.origin_listens = false;
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, options);
+        defer bed.tearDown();
+        try bed.exchange("GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+        try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 502 "));
+        try bed.expectDrained();
+    }
+    {
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, h2OriginOptions(78));
+        defer bed.tearDown();
+        bed.h2_origin.mute = true;
+        try bed.exchange("GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+        try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 504 "));
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_gateway_timeout"));
+        try bed.expectDrained();
+    }
 }
 
 test "h2: two streams on one connection reach the origin side by side, each with its own line" {

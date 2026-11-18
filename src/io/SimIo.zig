@@ -60,6 +60,7 @@ const pending_ops_max: u32 = constants.inFlightOps(
     constants.upstream_slots_max,
     listeners_max,
     constants.health_probe_concurrency_max,
+    h2_origin_connections_max,
 );
 const pending_signals_max: u8 = 8;
 
@@ -68,6 +69,10 @@ const pending_signals_max: u8 = 8;
 /// asserts every pool it is handed under SimIo against it, so a bed or a
 /// harness past it fails there rather than overflowing the pending list.
 pub const stream_slots_max: u32 = 64;
+
+/// The most HTTP/2 origin connections a scenario may configure (§7), on
+/// `stream_slots_max`'s terms: it sizes `pending_ops_max`.
+pub const h2_origin_connections_max: u32 = 16;
 
 comptime {
     assert(stream_slots_max >= 1);
