@@ -22,6 +22,7 @@ const shed = @import("shed.zig");
 const io_module = @import("io/io.zig");
 const json_schema = @import("json_schema.zig");
 const Options = @import("Options.zig");
+const defaults = @import("defaults.zig");
 /// The ALPN vocabulary (#271). Public so the schema emitter states the
 /// same closed set the loader enforces.
 pub const alpn = @import("tls/alpn.zig");
@@ -2446,7 +2447,7 @@ fn checkOf(check_json: ?CheckJson, connect_ms: u32) ParseError!?Options.Cluster.
         .http => .{ .http = .{
             .path = check.path orelse return error.ClusterCheckPathMissing,
             .host = check.host,
-            .expect_status = check.expect_status orelse 200,
+            .expect_status = check.expect_status orelse defaults.check.expect_status,
         } },
         // The health protocol fixes the path and the verdict (a SERVING
         // answer, not a status), and the authority is the cluster's.
@@ -3562,11 +3563,11 @@ pub const HttpListenerJson = struct {
     /// is three states for a two-state idea, and every other cap in this
     /// config — `drain_deadline_ms`, `max_lifetime_ms`, `request_ms` —
     /// already spells "no cap" as `0` with no third state to explain.
-    max_body_bytes: u64 = constants.request_body_bytes_default,
+    max_body_bytes: u64 = defaults.max_body_bytes,
     /// The #237 keep-alive request cap, `0` serving any number. Beside
     /// `max_body_bytes` on §5's placement rule: it reserves nothing, so
     /// it is policy on the thing it governs, not a `limits` entry (#399).
-    keepalive_requests: u32 = constants.keepalive_requests_default,
+    keepalive_requests: u32 = defaults.keepalive_requests,
     /// Whether this listener names *why* it refused, in an RFC 9209
     /// `Proxy-Status` field (#300). Absent is off.
     proxy_status: bool = false,
@@ -3811,7 +3812,7 @@ pub const CertificateJson = struct {
 /// whether a client must present a certificate at all.
 pub const ClientCaJson = struct {
     path: []const u8,
-    verify: []const u8 = "required",
+    verify: []const u8 = @tagName(defaults.client_verify),
 
     pub const schema_doc =
         "Mutual TLS: the CA bundle a client's certificate must chain to. " ++
@@ -4058,7 +4059,7 @@ pub const ActionJson = struct {
 /// policy page that wants a body without a matching `error_pages`
 /// entry.
 pub const RespondJson = struct {
-    status: u16 = 200,
+    status: u16 = defaults.respond_status,
     body: []const u8,
 
     pub const schema_doc =
@@ -4082,7 +4083,7 @@ pub const RespondJson = struct {
 /// replaced, the request's own canonical path and query carried through
 /// so the config never restates them. Exactly one form.
 pub const RedirectJson = struct {
-    status: u16 = 301,
+    status: u16 = defaults.redirect_status,
     location: ?[]const u8 = null,
     scheme: ?[]const u8 = null,
     host: ?[]const u8 = null,
@@ -4250,7 +4251,7 @@ pub const ClusterJson = struct {
     /// form names a `hash` policy's key (#178) — a bare `"hash"` string
     /// is rejected, because what the cluster is sticky on is the
     /// operator's decision, not a default.
-    pick: PickJson = .{ .policy = "p2c" },
+    pick: PickJson = .{ .policy = @tagName(defaults.pick) },
     /// Optional §7 active health checks; absent means off, so an
     /// unprobed cluster reserves nothing and is never skipped.
     check: ?CheckJson = null,
@@ -4817,10 +4818,10 @@ pub const ClusterProxyProtocolJson = struct {
 /// `service` under all but `grpc`, rather than ignored, so a config
 /// cannot quietly describe a check it is not running.
 pub const CheckJson = struct {
-    type: []const u8 = "tcp",
+    type: []const u8 = @tagName(defaults.check.kind),
     /// Thresholds, HAProxy's `fall`/`rise`.
-    fall: u8 = constants.health_probe_fall_default,
-    rise: u8 = constants.health_probe_rise_default,
+    fall: u8 = defaults.check.fall,
+    rise: u8 = defaults.check.rise,
     /// Budget for one whole probe; absent means `timeouts.connect_ms`.
     timeout_ms: ?u32 = null,
     /// Required for `http`, rejected for `tcp` and `grpc`.
@@ -4902,8 +4903,8 @@ pub const CheckJson = struct {
 /// the operator, because the choice worth making is *whether* to remove
 /// capacity by inference — not which inference to draw.
 pub const PassiveEjectionJson = struct {
-    fall: u8 = constants.passive_ejection_fall_default,
-    recovery_ms: u32 = constants.passive_ejection_recovery_ms_default,
+    fall: u8 = defaults.passive_ejection.fall,
+    recovery_ms: u32 = defaults.passive_ejection.recovery_ms,
     /// Optional #394 cooldown ceiling; absent keeps the cooldown fixed.
     recovery_ms_max: ?u32 = null,
 
@@ -4940,12 +4941,12 @@ pub const TimeoutsJson = struct {
     /// `timeout connect` is conventionally single-digit seconds, so a
     /// value zoxy can pick without guessing at anyone's policy. Zero
     /// stays rejected — it would fail every dial before it left.
-    connect_ms: u32 = constants.connect_ms_default,
+    connect_ms: u32 = defaults.timeouts.connect_ms,
     /// Optional, same argument: nginx's `keepalive_timeout` is 75 s and
     /// its `client_header_timeout` 60 s. Zero would reap on arrival, and a
     /// value at or below `connect_ms` is rejected — the dial's handoff
     /// cannot shorten a timer that is already counting down (§4/§5).
-    idle_ms: u32 = constants.idle_ms_default,
+    idle_ms: u32 = defaults.timeouts.idle_ms,
     /// Optional, and `0` means "no cap" — the drain waits for the last
     /// connection however long that takes (§8).
     ///
@@ -4979,17 +4980,17 @@ pub const TimeoutsJson = struct {
     /// nobody named is a restart this proxy chose on their behalf.
     loop_watchdog_ms: ?u32 = null,
     /// Optional #235 head-read budget. Absent is *derived* rather than
-    /// fixed — see `derivedHeadMs`, which is what keeps every config
+    /// fixed — see `defaults.headMs`, which is what keeps every config
     /// written before this field behaving exactly as it did.
     head_ms: ?u32 = null,
     /// Optional #180 tunnel lifetime; absent means an hour. Unlike the
     /// two caps above, zero is rejected — a tunnel pins a dedicated pool
     /// slot, so "no cap" is the one answer §5 cannot carry.
-    tunnel_ms: u32 = constants.tunnel_ms_default,
+    tunnel_ms: u32 = defaults.timeouts.tunnel_ms,
     /// Optional §7 health-probe pacing; absent means HAProxy's `inter`
     /// default. Unlike the two caps above, zero is rejected: probing is
     /// switched per cluster (`check`), never by zeroing its interval.
-    health_interval_ms: u32 = constants.health_interval_ms_default,
+    health_interval_ms: u32 = defaults.timeouts.health_interval_ms,
 
     pub const schema_doc = "Connection lifecycle deadlines, in milliseconds.";
     pub const schema_fields = .{
@@ -5238,9 +5239,9 @@ fn assertVariantsMatch(comptime T: type) void {
             @compileError(@typeName(T) ++ " schema_variants on '" ++ set.on ++
                 "' needs at least two branches");
         }
-        var defaults = 0;
+        var default_branches = 0;
         for (set.branches) |branch| {
-            if (branch.default) defaults += 1;
+            if (branch.default) default_branches += 1;
             if (branch.value.len == 0) {
                 @compileError(@typeName(T) ++ " schema_variants on '" ++ set.on ++
                     "' has an empty branch value");
@@ -5281,11 +5282,11 @@ fn assertVariantsMatch(comptime T: type) void {
         // accepts by default.
         const optional = @typeInfo(@FieldType(T, set.on)) == .optional or
             defaultOf(T, set.on) != null;
-        if (optional and defaults != 1) {
+        if (optional and default_branches != 1) {
             @compileError(@typeName(T) ++ " schema_variants on '" ++ set.on ++
                 "' may be absent, so exactly one branch must be .default");
         }
-        if (!optional and defaults != 0) {
+        if (!optional and default_branches != 0) {
             @compileError(@typeName(T) ++ " schema_variants on '" ++ set.on ++
                 "' is required, so no branch may be .default");
         }
@@ -7522,32 +7523,6 @@ fn validateTunnelTimeout(tunnel_ms: u32) ValidationError!void {
     assert(tunnel_ms <= constants.tunnel_ms_max);
 }
 
-/// The #235 head-read budget when the config names none.
-///
-/// Derived rather than fixed, and that is what keeps every config written
-/// before this field existed behaving exactly as it did. A flat ten
-/// seconds would break two shapes: a config whose whole `idle_ms` is
-/// smaller than the default (the head budget must never exceed the idle
-/// window it tightens), and — the one that would have been a silent
-/// regression rather than a load error — a config with a `connect_ms`
-/// *above* ten seconds, whose dial budget would quietly have been cut to
-/// the head budget, since the lazy timer cannot move later at the
-/// re-base. So the default is the ten seconds clamped into the band the
-/// two neighbours leave: strictly above the dial, at or below the idle.
-///
-/// Total, because it runs before anything is validated: the JSON
-/// front-end fills an absent key before the options are judged (#417).
-/// Where the band is empty — `connect_ms` at or above `idle_ms` — what
-/// it returns is moot, since `validateTimeouts` refuses that pair before
-/// it looks at the head budget.
-fn derivedHeadMs(connect_ms: u32, idle_ms: u32) u32 {
-    const floored = @max(constants.head_ms_default, connect_ms +| 1);
-    const derived = @min(floored, idle_ms);
-    assert(derived <= idle_ms);
-    if (connect_ms < idle_ms) assert(derived > connect_ms);
-    return derived;
-}
-
 /// The JSON front-end's timeouts (#417): the stock values where a key
 /// is absent, the derived head budget among them, and nothing judged —
 /// every refusal is `validateTimeouts`', made of the options alone.
@@ -7556,7 +7531,7 @@ fn timeoutsOf(timeouts_json: *const TimeoutsJson) Options.Timeouts {
         .connect_ms = timeouts_json.connect_ms,
         .idle_ms = timeouts_json.idle_ms,
         .head_ms = timeouts_json.head_ms orelse
-            derivedHeadMs(timeouts_json.connect_ms, timeouts_json.idle_ms),
+            defaults.headMs(timeouts_json.connect_ms, timeouts_json.idle_ms),
         .tunnel_ms = timeouts_json.tunnel_ms,
         .health_interval_ms = timeouts_json.health_interval_ms,
         .request_ms = timeouts_json.request_ms,
@@ -7699,27 +7674,6 @@ fn assertTimeoutsBounded(
     assert(timeouts.head_ms <= timeouts.idle_ms);
     assert(timeouts.tunnel_ms >= constants.tunnel_ms_min);
     assert(timeouts.tunnel_ms <= constants.tunnel_ms_max);
-}
-
-test "config: the derived head budget is total over every timeout pair (#417)" {
-    // It runs before validation now, so it meets pairs validation would
-    // refuse; none of them may trap, and every pair validation accepts
-    // must land strictly above the dial and at or below the idle window.
-    const max = std.math.maxInt(u32);
-    const pairs = [_][2]u32{
-        .{ 0, 0 },          .{ max, 0 },         .{ max, max }, .{ 0, max },
-        .{ 5_000, 60_000 }, .{ 20_000, 60_000 }, .{ 1, 2 },     .{ 60_000, 5_000 },
-    };
-    for (pairs) |pair| {
-        const head_ms = derivedHeadMs(pair[0], pair[1]);
-        try std.testing.expect(head_ms <= pair[1]);
-        if (pair[0] < pair[1]) try std.testing.expect(head_ms > pair[0]);
-    }
-    // The stock pair keeps the flat default; a slow dial lifts it; a
-    // tight idle window caps it.
-    try std.testing.expectEqual(constants.head_ms_default, derivedHeadMs(5_000, 60_000));
-    try std.testing.expectEqual(@as(u32, 20_001), derivedHeadMs(20_000, 60_000));
-    try std.testing.expectEqual(@as(u32, 2), derivedHeadMs(1, 2));
 }
 
 test "config: clusters written as options meet the loader's rules (#417)" {

@@ -10,7 +10,7 @@
 //! deadlines, policies, caps a listener promises its clients. Optional
 //! features default to off. The stock binary's JSON applies zoxy's stock
 //! values where its keys are absent; a build writing options in code
-//! states its own.
+//! states its own, or names the stock ones (`zoxy.defaults`).
 //!
 //! **Bytes, not paths.** Certificates, CA bundles and bodies arrive as
 //! bytes, so validating options reads no file: whoever builds them does,
@@ -97,13 +97,14 @@ pub const Listener = struct {
     };
 
     pub const Alpn = alpn.Protocol;
+    pub const ClientVerify = config.Config.Listener.ClientVerify;
     pub const Certificate = config.Config.Listener.Certificate;
 
     pub const ClientCa = struct {
         /// The PEM bundle a client's chain must reach.
         ca_pem: []const u8,
         /// Whether a client without a certificate is refused or let on.
-        verify: config.Config.Listener.ClientVerify,
+        verify: ClientVerify,
     };
 
     pub const Http = struct {

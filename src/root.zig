@@ -21,6 +21,9 @@ pub const config = @import("config.zig");
 /// input, validated and compiled by `config.resolve` — by `App.serve`
 /// and `App.check` for a build that runs through them.
 pub const Options = @import("Options.zig");
+/// zoxy's stock values (#417): what the stock binary's JSON applies where
+/// a key is absent, named for a build that wants the same choice.
+pub const defaults = @import("defaults.zig");
 /// The extension seam (#417): `Runtime` is what every part of the serving
 /// path is generic over — the Io backend and the build's extensions —
 /// and `Extensions` lists the extension types one build carries.
@@ -114,6 +117,7 @@ test {
     _ = @import("budget.zig");
     _ = config;
     _ = Options;
+    _ = defaults;
     _ = extension;
     _ = config_schema;
     _ = json_schema;
