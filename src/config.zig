@@ -282,8 +282,8 @@ pub const Config = struct {
         /// TLS records a terminating listener emits.
         ///
         /// Lower it when concurrency matters more than bulk: the c10k
-        /// ceiling multiplies this by 11457 pairs, so 4 KiB is ~90 MiB of
-        /// relay pool where the default is ~358. Raising it past one TLS
+        /// ceiling multiplies this by 14321 pairs, so 4 KiB is ~112 MiB of
+        /// relay pool where the default is ~448. Raising it past one TLS
         /// record is refused; see `relay_buffer_bytes_max` for why that
         /// bound is the transform's and not the RFC's.
         relay_buffer_bytes: u32 = constants.relay_buffer_bytes_default,
@@ -1786,7 +1786,6 @@ fn resolveLimits(
         limits_json.cq_fill_eighths,
         conn_slots,
         feature_pools.stream_slots,
-        upstream_slots,
         listeners_count,
         health_probes,
         origin_pools.connections,
@@ -2020,13 +2019,13 @@ pub fn originTls(clusters: []const Config.Cluster) bool {
 /// The CQ fill is the one limit an operator tightens for headroom, not a
 /// pool shrink (§8): a smaller fill demands a deeper ring for the same
 /// conn slots. Range-check first, then reject a fill that — with these
-/// conn/upstream slots and listeners — would need a completion queue past
-/// the compiled ring, so main.zig's `completionQueueDepthFor` never clamps.
+/// conn and stream slots and listeners — would need a completion queue
+/// past the compiled ring, so main.zig's `completionQueueDepthFor` never
+/// clamps.
 fn resolveCqFill(
     requested: ?u32,
     conn_slots: u32,
     stream_slots: u32,
-    upstream_slots: u32,
     listeners_count: u32,
     health_probes: u32,
     origin_connections: u32,
@@ -2043,7 +2042,6 @@ fn resolveCqFill(
     if (!constants.cqFillFits(
         conn_slots,
         stream_slots,
-        upstream_slots,
         listeners_count,
         health_probes,
         origin_connections,

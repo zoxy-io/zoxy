@@ -367,11 +367,11 @@ whose feature no config names has count 0 and costs nothing.**
 
 | pool | held | count: default → ceiling | unit |
 |---|---|---|---|
-| conn slots | the connection's life | `conn_slots`: 1386 → 11457 | deadline timer and its cancel |
+| conn slots | the connection's life | `conn_slots`: 1386 → 14321 | deadline timer and its cancel |
 | admission streams | the connection's life | one per conn slot | one exchange's state, its op completions, its log capture |
 | relay buffers | L4: the connection's life. L7: one body relay | `relay_buffers`: = conn slots | 2 × `relay_buffer_bytes` (16 KiB; 1–32 KiB) |
 | head ring (kernel-provided buffers) | first byte of a request → keep-alive turnaround | `head_buffers`: = conn slots, if any `http` listener | `head_buffer_bytes` (8 KiB; 1 KiB–1 MiB) |
-| upstream slots | one exchange or a parked origin connection | `upstream_slots`: 1311 → 11457 | scalars |
+| upstream slots | one exchange or a parked origin connection | `upstream_slots`: 1311 → 14321 | scalars |
 | upstream heads | request render → response head parsed | `upstream_head_buffers`: = upstream slots | `head_buffer_bytes` |
 | tunnels | an upgraded connection's life | `tunnels`: required with upgrades, ≤ conn slots | as a relay buffer |
 | TLS engines | a TLS connection's life | `tls_engines`: min(conn slots, 1024) → 1024, if a listener terminates | ~92 KiB + plaintext |
@@ -437,18 +437,19 @@ Fixed reservations beside the pools:
 
 - per conn slot, `conn_ops_max` (2);
 - per stream slot, `stream_ops_max` (2);
-- one per upstream slot;
 - listeners;
 - fixed reservations for the admin plane, access log, probes, signal,
-  drain and watchdog;
+  drain, the parked-upstream sweep and the watchdog;
 - per HTTP/2 origin connection, `h2_origin_ops_max` (4).
 
-The upstream ceiling matches the conn ceiling so the budget allows one
-upstream slot per admitted connection. With both pools at their ceiling,
-each connection accounts for five ops. At a ⅞ fill of 65536 CQ entries,
-the 57 fixed ops include the maximum probe concurrency. This yields
-11457 slots before charging configured listeners, shared HTTP/2 streams
-or HTTP/2 origin connections.
+Upstream slots cost nothing here. A leased one's socket ops are its
+exchange's, charged to the stream, and a parked one holds no op: one
+sweep timer reaps them all. So each admitted connection costs 4 ops. At a
+⅞ fill of 65536 CQ entries, the 58 fixed ops include the maximum probe
+concurrency, which yields (57344 − 58) / 4 = 14321 conn slots before
+charging configured listeners, shared HTTP/2 streams or HTTP/2 origin
+connections. The upstream ceiling matches it, because every admitted L7
+connection can be mid-exchange at once.
 
 **fds.** `fdsRequired` adds up:
 
