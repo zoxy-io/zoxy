@@ -102,33 +102,40 @@ fn serve(init: std.process.Init, arena: std.mem.Allocator, config_path: []const 
     assert(config_path.len >= 1);
     // Measured across the read, not assumed from the file size: the
     // parse allocates its own structures beside the text it parses, and
-    // both live in the arena for the process's life (§5).
+    // both live in the arena for the process's life (§5). The banner adds
+    // what resolving the options takes, which `App.serve` measures.
     const arena_before = init.arena.queryCapacity();
-    const config = try readConfig(init.io, arena, config_path);
-    const config_arena_bytes = init.arena.queryCapacity() - arena_before;
-    try App.serve(init, &config, .{
+    const options = try readConfig(init.io, arena, config_path);
+    const options_arena_bytes = init.arena.queryCapacity() - arena_before;
+    try App.serve(init, &options, &.{
         .build = .{ .version = build_options.version, .id_suffix = build_id_suffix },
-        .config_arena_bytes = config_arena_bytes,
+        .source = config_path,
+        .options_arena_bytes = options_arena_bytes,
     });
 }
 
-/// `--check` (#301): load the config, then let the library run the start
-/// up to the banner. A config that never loads earns its verdict here,
-/// with no budget to report — nothing was loaded to price.
+/// `--check` (#301): read the config into options, then let the library
+/// resolve them and run the start up to the banner. A config whose JSON
+/// never translates earns its verdict here, with no budget to report —
+/// nothing was loaded to price; options the library refuses earn theirs
+/// in `App.check`, the same way.
 fn checkConfig(init: std.process.Init, arena: std.mem.Allocator, config_path: []const u8) !u8 {
     assert(config_path.len >= 1);
     const arena_before = init.arena.queryCapacity();
-    const config = readConfig(init.io, arena, config_path) catch |err|
+    const options = readConfig(init.io, arena, config_path) catch |err|
         return @backingInt(zoxy.app.checkExitFor(err));
-    const config_arena_bytes = init.arena.queryCapacity() - arena_before;
-    const verdict = try App.check(init, &config, .{
+    const options_arena_bytes = init.arena.queryCapacity() - arena_before;
+    const verdict = try App.check(init, &options, &.{
         .build = .{ .version = build_options.version, .id_suffix = build_id_suffix },
-        .config_arena_bytes = config_arena_bytes,
-    }, config_path);
+        .source = config_path,
+        .options_arena_bytes = options_arena_bytes,
+    });
     return @backingInt(verdict);
 }
 
-/// Read and parse the config file, or say on stderr why it cannot be.
+/// Read the config file and translate it into options, or say on stderr
+/// why it cannot be. What the options must satisfy is judged by the
+/// library, in `App.serve` and `App.check`, under the same words.
 ///
 /// The read is deliberately unlimited. The config is operator-provided
 /// at startup rather than attacker-controlled input, and its size is now
@@ -143,13 +150,14 @@ fn checkConfig(init: std.process.Init, arena: std.mem.Allocator, config_path: []
 /// read faults pages in — where the kernel's OOM killer, not a returned
 /// `OutOfMemory`, is what intervenes. The guarantee is therefore "the
 /// operator is told what their config cost" (the caller measures the
-/// arena across this call and the startup banner prints it), not "an
-/// oversized config is refused cleanly".
+/// arena across this call, `App` adds what resolving took, and the
+/// startup banner prints the sum), not "an oversized config is refused
+/// cleanly".
 fn readConfig(
     io: std.Io,
     arena: std.mem.Allocator,
     config_path: []const u8,
-) !zoxy.config.Config {
+) !zoxy.Options {
     assert(config_path.len >= 1);
     const config_bytes = std.Io.Dir.cwd().readFileAlloc(
         io,
@@ -164,7 +172,7 @@ fn readConfig(
     // startup-time reader the config file itself used — the one moment
     // this process touches the filesystem for content (parse-once, §1).
     var file_context: BodyFileContext = .{ .io = io };
-    return zoxy.config.parseWithFiles(arena, config_bytes, .{
+    return zoxy.config.optionsFromJson(arena, config_bytes, .{
         .context = &file_context,
         .read = readBodyFile,
     }) catch |err| {

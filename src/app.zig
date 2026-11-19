@@ -1,9 +1,12 @@
 //! zoxy as a process (#417): what a binary built on the library runs
-//! between "here is a config" and "the drain finished". The stock binary
-//! and every custom build call the same sequence, so the order its steps
-//! run in — which is itself a verdict `--check` reports (#301) — is
+//! between "here are the options" and "the drain finished". The stock
+//! binary and every custom build call the same sequence, so the order its
+//! steps run in — which is itself a verdict `--check` reports (#301) — is
 //! written once:
 //!
+//! 0. resolve the options (`config.resolve`) and refuse a selection the
+//!    build does not list, so a custom build is held to every rule the
+//!    stock loader holds a file to;
 //! 1. price the config and print the banner (§5), before the box is
 //!    asked for anything, so a start the box refuses still leaves the
 //!    numbers that refused it;
@@ -14,7 +17,7 @@
 //! 4. start, run until a drain completes, print the final tally.
 //!
 //! What is left to an application is what only it knows: its command
-//! line, and where its config comes from — the stock binary's JSON, or a
+//! line, and where its options come from — the stock binary's JSON, or a
 //! custom build's own code. Everything that touches the process itself —
 //! the descriptor limit, signals — sits behind the Io seam, so nothing
 //! here makes a syscall.
@@ -33,6 +36,7 @@ const libcrypto_heap = @import("tls/libcrypto_heap.zig");
 const trust = @import("tls/trust.zig");
 
 const Config = config_module.Config;
+const Options = @import("Options.zig");
 
 const assert = std.debug.assert;
 
@@ -43,19 +47,51 @@ pub fn App(comptime extensions: extension.Extensions) type {
         pub const ServerType = Server(runtime);
         pub const BudgetType = Budget(runtime);
 
-        /// What a start states about itself beside its config.
+        /// What a start states about itself beside its options.
         pub const Startup = struct {
             /// What the banner's first line stamps.
             build: BudgetType.Build,
-            /// What the config took from the startup arena, measured by
-            /// whoever built it (§5): the banner prints it beside the
-            /// closed form, because it is the one term not derived.
-            config_arena_bytes: u64,
+            /// What messages about the options call them: the file a JSON
+            /// config came from, or whatever a custom build calls its own.
+            source: []const u8,
+            /// What building the options took from the startup arena,
+            /// measured by whoever built them (§5); zero for options that
+            /// are constants. The banner prints it, with what resolving
+            /// them took, beside the closed form — the one term not
+            /// derived.
+            options_arena_bytes: u64,
         };
+
+        /// Options resolved for a start, and what the startup arena holds
+        /// for them.
+        const Loaded = struct {
+            config: Config,
+            arena_bytes: u64,
+        };
+
+        /// Step zero: resolve `options` into the startup arena, measuring
+        /// what that took, or say on stderr why they are refused — in the
+        /// words the stock binary has always used, so a file's verdict
+        /// reads the same whichever half of the loader reached it.
+        fn load(init: std.process.Init, options: *const Options, startup: *const Startup) !Loaded {
+            assert(startup.source.len >= 1);
+            const arena_before = init.arena.queryCapacity();
+            const config = resolveServed(init.arena.allocator(), options) catch |err| {
+                std.debug.print("zoxy: invalid config '{s}': {t}\n", .{ startup.source, err });
+                return err;
+            };
+            const arena_after = init.arena.queryCapacity();
+            assert(arena_after >= arena_before);
+            assert(config.listeners.len == options.listeners.len);
+            return .{
+                .config = config,
+                .arena_bytes = startup.options_arena_bytes + (arena_after - arena_before),
+            };
+        }
 
         /// A cluster's pick: `instance`, which must point at a picker type
         /// this build lists — a compile error otherwise.
-        pub fn picker(instance: anytype) Config.Cluster.Pick {
+        pub fn picker(instance: anytype) Options.Cluster.Pick {
             const selection = extension.select(extensions.pickers, instance);
             assert(selection.index < extensions.pickers.len);
             return .{ .extension = selection };
@@ -69,15 +105,63 @@ pub fn App(comptime extensions: extension.Extensions) type {
             return selection;
         }
 
-        /// Start serving `config` and hand the process to the loop until a
-        /// drain completes. Once per process: the loop owns the process's
-        /// signals for its whole life (§3).
-        pub fn serve(init: std.process.Init, config: *const Config, startup: Startup) !void {
+        /// The options as this build can serve them: resolved, and every
+        /// selection one of the build's own lists reaches.
+        fn resolveServed(arena: std.mem.Allocator, options: *const Options) !Config {
+            const config = try config_module.resolve(arena, options);
+            try refuseUnservedSelections(&config);
+            assert(config.clusters.len == options.clusters.len);
+            assert(config.listeners.len >= 1);
+            return config;
+        }
+
+        /// A selection this build's lists do not reach: made by hand rather
+        /// than by `picker` or `policy`, which make one only for a listed
+        /// type. Refused at startup rather than left to the server's
+        /// asserts, because it is the build author's input, not this
+        /// proxy's invariant. The instance's type cannot be checked at
+        /// runtime — selections are built with `picker` and `policy` so
+        /// that it never has to be.
+        fn refuseUnservedSelections(config: *const Config) error{ExtensionUnserved}!void {
+            assert(config.clusters.len >= 1);
+            for (config.clusters) |*cluster| {
+                switch (cluster.pick) {
+                    .extension => |selection| try refuseUnserved(selection, extensions.pickers.len),
+                    .rr, .p2c, .hash => {},
+                }
+            }
+            for (config.listeners) |*listener| {
+                for (listener.request_policies) |selection| {
+                    try refuseUnserved(selection, extensions.request_policies.len);
+                }
+                for (listener.routes) |*route| {
+                    for (route.request_policies) |selection| {
+                        try refuseUnserved(selection, extensions.request_policies.len);
+                    }
+                }
+            }
+        }
+
+        fn refuseUnserved(selection: extension.Selection, listed_count: usize) error{ExtensionUnserved}!void {
+            assert(listed_count <= extension.list_types_max);
+            if (selection.index >= listed_count) return error.ExtensionUnserved;
+            assert(selection.index < listed_count);
+        }
+
+        /// Resolve `options`, start serving them, and hand the process to
+        /// the loop until a drain completes. Once per process: the loop
+        /// owns the process's signals for its whole life (§3). The options'
+        /// own memory is referenced for that whole life too.
+        pub fn serve(init: std.process.Init, options: *const Options, startup: *const Startup) !void {
             assert(!serving);
+            // Claimed only once the options resolve, so options refused
+            // here leave nothing claimed and may be corrected and served.
+            const loaded = try load(init, options, startup);
             serving = true;
+            const config = &loaded.config;
             const arena = init.arena.allocator();
             const demands = BudgetType.demandsFor(config);
-            BudgetType.print(config, demands, startup.config_arena_bytes, startup.build);
+            BudgetType.print(config, demands, loaded.arena_bytes, startup.build);
             const resources = try openStartupResources(arena, config, demands);
             try global_io.init(
                 arena,
@@ -107,10 +191,10 @@ pub fn App(comptime extensions: extension.Extensions) type {
             server.dumpMetrics();
         }
 
-        /// `--check` (#301): the gauntlet `serve` runs after its banner,
+        /// `--check` (#301): the resolution and the gauntlet `serve` runs,
         /// and nothing that takes a port. The report goes to stdout, naming
-        /// `subject` — the file a JSON config came from, or whatever a
-        /// custom build calls its options — and the verdict comes back.
+        /// the options' source, and the verdict comes back; options that
+        /// do not resolve earn theirs with no budget to report.
         ///
         /// The gauntlet is `openStartupResources`, unchanged and
         /// unbranched: a check that ran its own sequence could reach a
@@ -118,11 +202,11 @@ pub fn App(comptime extensions: extension.Extensions) type {
         /// #301 warns a pre-flight can be worse than none.
         pub fn check(
             init: std.process.Init,
-            config: *const Config,
-            startup: Startup,
-            subject: []const u8,
+            options: *const Options,
+            startup: *const Startup,
         ) !CheckExit {
-            assert(subject.len >= 1);
+            const loaded = load(init, options, startup) catch |err| return checkExitFor(err);
+            const config = &loaded.config;
             const demands = BudgetType.demandsFor(config);
             assert(demands.fds > 0);
             // Read before the gauntlet: `ensureFdBudget` raises the soft
@@ -130,8 +214,8 @@ pub fn App(comptime extensions: extension.Extensions) type {
             // what this check just did rather than what it found.
             const limit = try XevIo.fdLimit();
             const verdict = startFits(init.arena.allocator(), config, demands);
-            try writeCheckReport(init.io, config, demands, startup, &.{
-                .subject = subject,
+            try writeCheckReport(init.io, config, demands, loaded.arena_bytes, startup.build, &.{
+                .subject = startup.source,
                 .limit = limit,
                 .verdict = verdict,
             });
@@ -166,7 +250,8 @@ pub fn App(comptime extensions: extension.Extensions) type {
             io: std.Io,
             config: *const Config,
             demands: BudgetType.Demands,
-            startup: Startup,
+            arena_bytes: u64,
+            build: BudgetType.Build,
             report: *const CheckReport,
         ) !void {
             assert(report.subject.len >= 1);
@@ -176,7 +261,7 @@ pub fn App(comptime extensions: extension.Extensions) type {
             var buffer: [1024]u8 = undefined;
             var file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
             const writer = &file_writer.interface;
-            try BudgetType.printTo(writer, config, demands, startup.config_arena_bytes, startup.build);
+            try BudgetType.printTo(writer, config, demands, arena_bytes, build);
             var soft_buffer: [limit_text_bytes]u8 = undefined;
             var hard_buffer: [limit_text_bytes]u8 = undefined;
             try writer.print(
@@ -496,6 +581,55 @@ test "limitText: no limit reads as a word, not as the largest number" {
     // The buffer is wide enough for the widest value, which is what the
     // `catch unreachable` inside rests on.
     try std.testing.expectEqual(limit_text_bytes, limitText(std.math.maxInt(u64), &buffer).len);
+}
+
+test "App: a selection the build does not list is refused at startup (#417)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var instance: u8 = 0;
+    const origin = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:9000");
+    const bind = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:8080");
+    // Index 0 of a list the stock build leaves empty: a selection made by
+    // hand, since `picker` cannot make one for a type nobody listed.
+    const options: Options = .{
+        .listeners = &.{.{ .bind = .{ .ip = bind }, .protocol = .{ .l4 = .{ .target = .{ .cluster = "origin" } } } }},
+        .clusters = &.{.{
+            .name = "origin",
+            .endpoints = &.{.{ .address = .{ .ip = origin } }},
+            .pick = .{ .extension = .{ .index = 0, .instance = &instance } },
+        }},
+        .timeouts = .{ .connect_ms = 1_000, .idle_ms = 5_000, .head_ms = 2_000, .tunnel_ms = 60_000, .health_interval_ms = 2_000 },
+        .limits = .{},
+    };
+    const config = try config_module.resolve(arena, &options);
+    try std.testing.expectError(error.ExtensionUnserved, App(.{}).refuseUnservedSelections(&config));
+    // The same options, in a build that lists a picker, are served.
+    const Picker = struct {
+        pub fn pick(_: *@This(), _: *const extension.Candidates, _: *const extension.PickInput) u16 {
+            return 0;
+        }
+    };
+    try App(.{ .pickers = &.{Picker} }).refuseUnservedSelections(&config);
+
+    // A route's policy is held to the policies list the same way.
+    var routed = options;
+    routed.clusters = &.{.{
+        .name = "origin",
+        .endpoints = &.{.{ .address = .{ .ip = origin } }},
+        .pick = .p2c,
+    }};
+    routed.listeners = &.{.{ .bind = .{ .ip = bind }, .protocol = .{ .http = .{
+        .target = .{ .routes = &.{.{
+            .prefix = "/",
+            .cluster = "origin",
+            .request_policies = &.{.{ .index = 0, .instance = &instance }},
+        }} },
+        .max_body_bytes = 0,
+        .keepalive_requests = 0,
+    } } }};
+    const routed_config = try config_module.resolve(arena, &routed);
+    try std.testing.expectError(error.ExtensionUnserved, App(.{ .pickers = &.{Picker} }).refuseUnservedSelections(&routed_config));
 }
 
 test "App: a selection names the build's own type" {
