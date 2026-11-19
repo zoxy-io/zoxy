@@ -201,11 +201,11 @@ pub fn build(b: *std.Build) void {
     linkLibcrypto(zoxy_module, libcrypto);
     // `src/io/XevIo.zig` reads the backend choice from here.
     zoxy_module.addOptions("io_options", io_options);
-    // The shipped example config is embedded so tests and the fuzz corpus
-    // stay in sync with the file users actually copy.
-    zoxy_module.addAnonymousImport("example_config", .{
-        .root_source_file = b.path("config/example.json"),
-    });
+    // The stock binary's JSON front-end (#417): the config file's DTOs,
+    // their translation into options, the schema emitter and validator.
+    // Created rather than added, so a package depending on zoxy cannot
+    // import it — a custom build is configured in code.
+    const json_module = jsonModule(b, zoxy_module, target, optimize);
 
     const exe = b.addExecutable(.{
         .name = "zoxy",
@@ -215,6 +215,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "zoxy", .module = zoxy_module },
+                .{ .name = "zoxy_json", .module = json_module },
             },
         }),
         // A release binary is handed to strangers, so it needs nothing on
@@ -253,10 +254,12 @@ pub fn build(b: *std.Build) void {
     });
 
     const module_tests = b.addRunArtifact(b.addTest(.{ .root_module = zoxy_module }));
+    const json_tests = b.addRunArtifact(b.addTest(.{ .root_module = json_module }));
     const exe_tests = b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module }));
     const lint_tests = b.addRunArtifact(b.addTest(.{ .root_module = lint_exe.root_module }));
     const test_step = b.step("test", "Run unit tests (--fuzz adds the fuzz gate)");
     test_step.dependOn(&module_tests.step);
+    test_step.dependOn(&json_tests.step);
     test_step.dependOn(&exe_tests.step);
     test_step.dependOn(&lint_tests.step);
 
@@ -313,7 +316,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "zoxy", .module = zoxy_module },
+                .{ .name = "zoxy_json", .module = json_module },
             },
         }),
     });
@@ -344,8 +347,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
     // The TLS fixture, handed in rather than embedded: `@embedFile` cannot
-    // escape its module root and the harness is its own module. The
-    // `example_config` import above is the same shape. It stays a
+    // escape its module root and the harness is its own module — the
+    // shape `jsonModule`'s `example_config` import has too. It stays a
     // *config* input — the harness writes both files into its work
     // directory and points the proxy at them, exactly as an operator
     // would — so nothing here links zssl or libcrypto (§4, §9).
@@ -431,6 +434,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .safe,
             .imports = &.{
                 .{ .name = "zoxy", .module = zoxy_fast_module },
+                .{ .name = "zoxy_json", .module = jsonModule(b, zoxy_fast_module, target, .safe) },
             },
         }),
     });
@@ -592,6 +596,11 @@ pub fn build(b: *std.Build) void {
         .root_module = zoxy_module,
         .use_llvm = true,
     });
+    const cov_json_tests = b.addTest(.{
+        .name = "coverage-json-tests",
+        .root_module = json_module,
+        .use_llvm = true,
+    });
     const cov_sim = b.addExecutable(.{
         .name = "coverage-sim",
         .use_llvm = true,
@@ -621,6 +630,11 @@ pub fn build(b: *std.Build) void {
     const tests_cov = kcov_tests.addOutputDirectoryArg("cov-tests");
     kcov_tests.addArtifactArg(cov_tests);
 
+    const kcov_json_tests = b.addSystemCommand(&.{"kcov"});
+    kcov_json_tests.addDirectoryArg2(src_root, include_arg);
+    const json_tests_cov = kcov_json_tests.addOutputDirectoryArg("cov-json-tests");
+    kcov_json_tests.addArtifactArg(cov_json_tests);
+
     const kcov_sim = b.addSystemCommand(&.{"kcov"});
     kcov_sim.addDirectoryArg2(src_root, include_arg);
     const sim_cov = kcov_sim.addOutputDirectoryArg("cov-sim");
@@ -630,6 +644,7 @@ pub fn build(b: *std.Build) void {
     const kcov_merge = b.addSystemCommand(&.{ "kcov", "--merge" });
     const merged_cov = kcov_merge.addOutputDirectoryArg("cov-merged");
     kcov_merge.addDirectoryArg(tests_cov);
+    kcov_merge.addDirectoryArg(json_tests_cov);
     kcov_merge.addDirectoryArg(sim_cov);
 
     // kcov writes an absolute <source> root; Coveralls resolves each file by
@@ -927,3 +942,30 @@ var static_link: bool = false;
 /// readiness model on Linux — see the option's own comment for why that
 /// is worth being able to ask for.
 const IoBackend = enum { default, epoll };
+
+/// The JSON front-end module over one build of the library (#417). One
+/// per library build, because the ReleaseSafe twin's front-end must reach
+/// the ReleaseSafe library rather than the default one. The shipped
+/// example config is embedded so the front-end's tests and the fuzz
+/// corpus stay in sync with the file users actually copy.
+fn jsonModule(
+    b: *std.Build,
+    zoxy_module: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.lang.Optimize,
+) *std.Build.Module {
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/json/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zoxy", .module = zoxy_module },
+        },
+    });
+    // Lazy, which is what lets a dependent's build carry this call: the
+    // package ships no `config/`, and only this module's tests read it.
+    module.addAnonymousImport("example_config", .{
+        .root_source_file = b.path("config/example.json"),
+    });
+    return module;
+}

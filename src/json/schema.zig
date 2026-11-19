@@ -1,5 +1,5 @@
 //! JSON Schema (draft 2020-12) for the startup config, emitted by reflecting
-//! over the very `*Json` DTOs the loader parses (see `config.zig`). Structure
+//! over the very `*Json` DTOs the loader parses (see `loader.zig`). Structure
 //! comes from `@typeInfo`; the un-reflectable parts — prose, numeric bounds,
 //! and the closed vocabularies (`protocol`, `pick`, filter `method` tokens,
 //! filter `reject` statuses) — come from the DTOs' co-located `schema_doc`/
@@ -21,17 +21,19 @@
 
 const std = @import("std");
 
-const config = @import("config.zig");
-const json_schema = @import("json_schema.zig");
-const constants = @import("constants.zig");
-const filter = @import("http/filter.zig");
-const parser = @import("http/parser.zig");
+const zoxy = @import("zoxy");
+
+const config = @import("loader.zig");
+const json_schema = @import("validator.zig");
+const constants = zoxy.constants;
+const filter = zoxy.http.filter;
+const parser = zoxy.http.parser;
 
 const assert = std.debug.assert;
 
 const Writer = std.Io.Writer;
 const Stringify = std.json.Stringify;
-const Pick = config.Config.Cluster.Pick.Builtin;
+const Pick = zoxy.config.Config.Cluster.Pick.Builtin;
 
 /// Emit the whole schema document, pretty-printed (it is a shipped,
 /// human-read artifact). `std.json.Stringify` owns all punctuation, quoting,
@@ -504,7 +506,7 @@ fn writeEnum(out: *Stringify, comptime Enum: type) Writer.Error!void {
 /// variants; the closedness it publishes is the same, and it is the
 /// point: a token absent from here is one no rule could catch after 101.
 fn writeUpgradeEnum(out: *Stringify) Writer.Error!void {
-    const names = @typeInfo(config.Config.Listener.Upgrades).@"struct".field_names;
+    const names = @typeInfo(zoxy.config.Config.Listener.Upgrades).@"struct".field_names;
     comptime assert(names.len >= 1);
     try out.objectField("enum");
     try out.beginArray();
@@ -616,7 +618,7 @@ fn renderInto(buffer: []u8) Writer.Error![]const u8 {
     return w.buffered();
 }
 
-test "config_schema: the emitted document is valid, documented JSON" {
+test "json schema: the emitted document is valid, documented JSON" {
     var buffer: [128 * 1024]u8 = undefined;
     const text = try renderInto(&buffer);
 
@@ -634,7 +636,7 @@ test "config_schema: the emitted document is valid, documented JSON" {
     try std.testing.expectEqual(false, root.object.get("additionalProperties").?.bool);
 }
 
-test "config_schema: the `$schema` editor hint is a declared root property" {
+test "json schema: the `$schema` editor hint is a declared root property" {
     // `additionalProperties: false` is what makes the schema mirror the
     // strict loader, so the key an editor writes to *find* this schema has
     // to be declared here too — otherwise pointing at it flags the pointer.
@@ -653,7 +655,7 @@ test "config_schema: the `$schema` editor hint is a declared root property" {
     }
 }
 
-test "config_schema: emission is deterministic" {
+test "json schema: emission is deterministic" {
     var buffer_a: [128 * 1024]u8 = undefined;
     var buffer_b: [128 * 1024]u8 = undefined;
     // Same inputs, twice: field/enum order is declaration order, so the two
@@ -661,7 +663,7 @@ test "config_schema: emission is deterministic" {
     try std.testing.expectEqualStrings(try renderInto(&buffer_a), try renderInto(&buffer_b));
 }
 
-test "config_schema: the shipped example's top-level keys are all declared" {
+test "json schema: the shipped example's top-level keys are all declared" {
     var buffer: [128 * 1024]u8 = undefined;
     const text = try renderInto(&buffer);
     var schema = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
@@ -677,7 +679,7 @@ test "config_schema: the shipped example's top-level keys are all declared" {
     }
 }
 
-test "config_schema: endpoint items accept both spellings" {
+test "json schema: endpoint items accept both spellings" {
     var buffer: [128 * 1024]u8 = undefined;
     const text = try renderInto(&buffer);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
@@ -707,7 +709,7 @@ test "config_schema: endpoint items accept both spellings" {
     try std.testing.expectEqual(@as(i64, 0), weight.get("minimum").?.integer);
 }
 
-test "config_schema: pick accepts both spellings, and only the object names hash" {
+test "json schema: pick accepts both spellings, and only the object names hash" {
     var buffer: [128 * 1024]u8 = undefined;
     const text = try renderInto(&buffer);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
@@ -739,17 +741,17 @@ test "config_schema: pick accepts both spellings, and only the object names hash
     const properties = object_arm.get("properties").?.object;
     const policies = properties.get("policy").?.object.get("enum").?.array;
     try std.testing.expectEqual(
-        @typeInfo(config.Config.Cluster.Pick.Builtin).@"enum".field_names.len,
+        @typeInfo(zoxy.config.Config.Cluster.Pick.Builtin).@"enum".field_names.len,
         policies.items.len,
     );
     const keys = properties.get("key").?.object.get("enum").?.array;
     try std.testing.expectEqual(
-        @typeInfo(std.meta.Tag(config.Config.Cluster.HashKey)).@"enum".field_names.len,
+        @typeInfo(std.meta.Tag(zoxy.config.Config.Cluster.HashKey)).@"enum".field_names.len,
         keys.items.len,
     );
 }
 
-test "config_schema: response filter status bounds and class vocabulary" {
+test "json schema: response filter status bounds and class vocabulary" {
     var buffer: [128 * 1024]u8 = undefined;
     const text = try renderInto(&buffer);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
@@ -777,7 +779,7 @@ test "config_schema: response filter status bounds and class vocabulary" {
     try std.testing.expectEqualStrings("5xx", class_values.items[4].string);
 }
 
-test "config_schema: every exactly-one-of fork is emitted, and names real properties" {
+test "json schema: every exactly-one-of fork is emitted, and names real properties" {
     var buffer: [128 * 1024]u8 = undefined;
     const text = try renderInto(&buffer);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
@@ -827,7 +829,7 @@ fn expectOneOf(object: *const std.json.ObjectMap, arms_expected: usize) !void {
     }
 }
 
-test "config_schema: the emitted dialect is one the validator implements" {
+test "json schema: the emitted dialect is one the validator implements" {
     // The two halves of #305's gate held together. `json_schema.zig`
     // validates only the keywords it knows and would otherwise report
     // "valid" for a constraint it never read — so the emitter is not
@@ -848,7 +850,7 @@ test "config_schema: the emitted dialect is one the validator implements" {
     }
 }
 
-test "config_schema: no DTO concedes a rule the schema now expresses" {
+test "json schema: no DTO concedes a rule the schema now expresses" {
     // #305's measurable definition of done, held at the count it is
     // actually at. Every "enforced by the loader" sentence in the emitted
     // document is a cross-field rule a shape could have carried instead —
@@ -877,7 +879,7 @@ fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
     return count;
 }
 
-test "config_schema: the method enum matches what the parser accepts" {
+test "json schema: the method enum matches what the parser accepts" {
     // Every token the schema emits must be one the loader resolves, and no
     // more than the registered methods (extension names no token).
     var accepted: u32 = 0;

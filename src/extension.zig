@@ -63,8 +63,8 @@ pub const Runtime = struct {
 pub const list_types_max = std.math.maxInt(u8) + 1;
 
 /// One extension instance selected in code: which of the build's listed
-/// types it is, and the instance itself, type-erased the way
-/// `config.FileSource` carries its context. Built by `select`, which
+/// types it is, and the instance itself, type-erased the way a context
+/// pointer beside a function pointer is. Built by `select`, which
 /// checks the type against the build's list at compile time, so `index`
 /// always names the type `instance` points at.
 pub const Selection = struct {
