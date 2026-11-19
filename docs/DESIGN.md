@@ -15,8 +15,6 @@ and why it has that shape. Code cites sections as a bare `§N`, and each
 number keeps its topic. Other documents cover the rest:
 
 - coding rules: [TIGER_STYLE.md](TIGER_STYLE.md);
-- measurements, rejected experiments and open questions:
-  [IMPLEMENTATION_NOTES.md](IMPLEMENTATION_NOTES.md);
 - the operator's manual: [README.md](README.md);
 - planned work: GitHub issues.
 
@@ -133,22 +131,12 @@ stickiness still agree across processes because both are stateless
 (§7). A `unix:` listener binds its path once, so it does not spread
 across processes.
 
-**CPU on the loop.** The one CPU-heavy step is a TLS handshake's
-signature:
-
-- **ECDSA.** A P-256 sign takes ~15 µs on libcrypto. The loop absorbs
-  it between completions.
-- **RSA.** RSA keys of 2048–4096 bits are the operator's opt-in. A sign
-  costs ~0.5–2.4 ms, which makes it the longest uninterruptible step the
-  loop takes. A listener holding both kinds signs with ECDSA for every
-  client that can verify it, and `tls_rsa_signed` counts what RSA cost
-  (§4).
-- **Where handshake CPU binds.** Session resumption is the first lever;
-  more processes are the second.
-
-Re-adding threads would be a fresh decision gated on a measurement, not
-a dormant seam reopened. The measurements are in IMPLEMENTATION_NOTES,
-"TLS on the loop".
+**Handshake CPU.** Signing occupies the loop until the signature is
+ready. An RSA signature can take milliseconds, so certificate selection
+prefers ECDSA among compatible keys within the same name tier (§4).
+`tls_rsa_signed` counts completed handshakes that used RSA. Session
+resumption reduces how often signatures are needed. Additional
+processes provide more capacity for full handshakes.
 
 ## 4. I/O and TLS — the seams
 
@@ -205,8 +193,6 @@ live, stays auditable Zig.
   is never resubmitted.
 - **Plain ops.** Single-shot accept, recv, send and connect, plus
   single-shot buffer-select (`recvGroup`) for request heads (§5).
-  Multishot, `send_zc` and `splice` were measured and shelved; see the
-  notes.
 - **Run to completion.** A callback never suspends and never runs
   another callback inline. Completions drain in bounded batches per
   tick.
@@ -289,8 +275,9 @@ listener parses it.
   - Rotation is driven by sealing, not by a timer.
   - Keys never reach disk, so a restart costs each returning client one
     full handshake.
-  - Two tickets are sent per handshake, after the client's Finished.
-    Sending them earlier stalled on delayed ACK.
+  - The server sends up to two tickets after processing the client's
+    Finished. The ticket flight can carry the TCP ACK for Finished,
+    releasing a client's first request if Nagle is holding that write.
 - **Choosing a certificate.** `cert`/`key` is the listener's default
   pair, and `certificates` lists further pairs.
   - *Names* come from each leaf's subjectAltName DNS entries, read at
@@ -361,15 +348,15 @@ anchors are the operator's own CAs, not a public store.
 ### The promise
 
 Everything is reserved at startup from the config arena, plus libcrypto's
-heap in BSS, and the banner prints each term. The total is a ceiling that
-resident memory approaches under load, since pages fault in lazily.
-Three things sit outside it:
+heap in BSS, and the banner prints each term. The buffer slabs become
+resident as traffic touches their pages. The benchmark checks RSS
+against the banner total plus a fixed allowance (§9). The banner
+excludes three costs.
 
-- the kernel's socket buffers. Linux's default is 144 KiB per socket,
-  and an L7 connection holds two (IMPLEMENTATION_NOTES, "Kernel socket
-  buffers are outside the §5 budget");
-- the ring's kernel memory;
-- small fixed-size scratch held inline in `Server`.
+- Kernel socket buffers. Their memory use depends on the kernel's
+  TCP settings, autotuning and traffic.
+- The ring's kernel memory.
+- Small fixed-size scratch held inline in `Server`.
 
 ### Pools
 
@@ -384,7 +371,7 @@ whose feature no config names has count 0 and costs nothing.**
 | admission streams | the connection's life | one per conn slot | one exchange's state, its op completions, its log capture |
 | relay buffers | L4: the connection's life. L7: one body relay | `relay_buffers`: = conn slots | 2 × `relay_buffer_bytes` (16 KiB; 1–32 KiB) |
 | head ring (kernel-provided buffers) | first byte of a request → keep-alive turnaround | `head_buffers`: = conn slots, if any `http` listener | `head_buffer_bytes` (8 KiB; 1 KiB–1 MiB) |
-| upstream slots | one exchange; while parked, a socket only | `upstream_slots`: 1311 → 11457 | scalars |
+| upstream slots | one exchange or a parked origin connection | `upstream_slots`: 1311 → 11457 | scalars |
 | upstream heads | request render → response head parsed | `upstream_head_buffers`: = upstream slots | `head_buffer_bytes` |
 | tunnels | an upgraded connection's life | `tunnels`: required with upgrades, ≤ conn slots | as a relay buffer |
 | TLS engines | a TLS connection's life | `tls_engines`: min(conn slots, 1024) → 1024, if a listener terminates | ~92 KiB + plaintext |
@@ -401,9 +388,15 @@ Why pools have these shapes:
   buffer, no upstream slot. A TLS connection also keeps its engine, and
   an HTTP/2 connection its session. The head ring makes that possible. A head recv is armed with
   *no* buffer, and the kernel binds one only when the client speaks.
-- **A parked upstream holds only its socket.** One server-wide sweep
-  timer reaps parked connections while any exist. An endpoint's
-  ejection closes its parked connections (§7).
+- **Parked upstreams keep their slots.** A parked HTTP/1.1 origin
+  connection releases its head buffer and keeps its socket and any TLS
+  session. A request can shed when the pool is full of slots parked for
+  other endpoints. One server-wide sweep timer reaps parked connections,
+  and an endpoint's ejection closes its parked connections (§7).
+- **Relay buffer sizing.** The slab uses two buffers per relay slot.
+  Larger buffers can move a body in fewer recv/send cycles (§6).
+  A configuration that terminates TLS caps `relay_buffer_bytes` at
+  16 KiB so each relay chunk fits in one record.
 - **Tunnels have a pool of their own.** A tunnel pins its buffers for
   its whole life, the opposite of every other pool's shape. Drawn from
   the shared pool, tunnels would starve HTTP.
@@ -419,12 +412,17 @@ Fixed reservations beside the pools:
 - **The libcrypto heap.** A static BSS array of 13 MiB: 2 MiB, plus
   8 KiB × 1024 sessions, plus 12 KiB × 256 certificates (priced at
   RSA-4096's cost).
+  - Static storage keeps the heap alive through libcrypto's exit
+    cleanup, which can free blocks after `main` returns.
+  - Sequential handshakes reuse freed blocks after warmup. Concurrent
+    sessions hold their own blocks, which is why the reservation grows
+    with the session count it can fit.
   - It is priced in full whenever any TLS is configured.
   - Its 1024 sessions are shared by listener engines, `h2` origin
     connections and HTTPS sessions, and a config summing past 1024 is
     refused.
-  - `zig build tls-heap-proof` measures and asserts the per-session and
-    per-certificate figures.
+  - `zig build tls-heap-proof` checks the per-certificate cost and that
+    sequential handshakes reuse the same heap space after warmup.
 - **The access log,** when a sink is configured. Two staging buffers
   (64 KiB together by default), plus a per-stream table that captures
   named headers.
@@ -445,10 +443,12 @@ Fixed reservations beside the pools:
   drain and watchdog;
 - per HTTP/2 origin connection, `h2_origin_ops_max` (4).
 
-The upstream ceiling is pinned to the conn ceiling, because every
-admitted L7 connection can be mid-exchange at once. So each admitted
-connection costs 5 ops. At a ⅞ fill of 65536 CQ entries, that puts
-`conn_slots_max` at (57344 − 57) / 5 = 11457.
+The upstream ceiling matches the conn ceiling so the budget allows one
+upstream slot per admitted connection. With both pools at their ceiling,
+each connection accounts for five ops. At a ⅞ fill of 65536 CQ entries,
+the 57 fixed ops include the maximum probe concurrency. This yields
+11457 slots before charging configured listeners, shared HTTP/2 streams
+or HTTP/2 origin connections.
 
 **fds.** `fdsRequired` adds up:
 
@@ -990,8 +990,11 @@ gates startup.
   through a zero-delay timer, so an exchange costs the same ring ops as
   before. The connection's own ops are a separate budget term.
 - **Connections.**
-  - The least-loaded connection per endpoint is used; a new one is
-    dialed when none has room.
+  - Pool selection picks the eligible connection carrying the fewest
+    legs and probes. It tries a new dial when no eligible connection
+    for the endpoint has room under zoxy's own stream limit.
+    When an origin's advertised `SETTINGS_MAX_CONCURRENT_STREAMS`
+    limit is reached, attached legs wait on that connection.
   - An idle connection is told `GOAWAY`; a draining one closes when its
     last leg leaves.
   - A stream's data is staged in the leg's own buffer, so a slow client
@@ -1068,9 +1071,8 @@ Rules the table follows:
   - upstream pressure shortens how long a parked connection may wait;
   - the head and upstream-head flags only report.
 
-  Conn pressure never suppresses keep-alive. Closing busy connections
-  churns them into reconnect waves (IMPLEMENTATION_NOTES, "Occupancy is
-  not overload").
+  A steady keep-alive population can fill the connection pool. Closing
+  serving connections as the pool fills can create synchronized reconnects.
 - **fds and ring ops are budgeted, not shed** (§5).
 
 **Rungs that answer on time:**
@@ -1146,6 +1148,10 @@ Rules the table follows:
   - Partitions are reconciled too: kernel pressure by op and by cause;
     each labeled family against its total; the histogram's `_count`
     against the responses it measured.
+  - On io_uring, libxev supplies the raw errno for unexpected
+    completion errors. These count as kernel pressure even when the
+    errno reflects a network failure. `kernel_pressure_last_errno`
+    exposes the most recent raw errno recorded by that counter path.
 - **Metrics.** The admin listener serves Prometheus text from one
   reserved slot. It never parses the request, and a scrape gets 5 s.
   - Labeled families are per endpoint (dial failures, responses,
@@ -1166,6 +1172,9 @@ Rules the table follows:
     - `client_cert_sha256`;
     - any request or response headers the operator named: copied,
       truncated with a mark, names lowercased, first value only.
+  - **TLS byte counts.** For TLS-terminated HTTP/1.1, the response-head
+    write counts plaintext in `bytes_out`. Body chunks sent by the
+    response pump include TLS record overhead in that count.
   - **Outcome vs status.** `outcome` is not derivable from `status`. An
     origin's `503` and a shed `503` are opposite events.
   - **The sink.**
@@ -1227,7 +1236,7 @@ binary. h2spec and the speed gates run at merge.
 | gate | command | when | what it proves |
 |---|---|---|---|
 | unit + fuzz corpus | `zig build test` | every change | every unit test; each fuzz target's corpus |
-| libcrypto heap proof | `zig build tls-heap-proof` | every change | the per-session and per-certificate heap prices and their plateaus |
+| libcrypto heap proof | `zig build tls-heap-proof` | every change | fixed-heap hooks, the per-certificate cost and reuse across sequential handshakes |
 | lint | `zig build lint` | every change | the boundaries and Tiger Style rules a reader would miss |
 | simulation | `zig build sim` | every change (4096 seeds); nightly (4 × 1M) | the real data path under an adversary; every counter and op reached |
 | live gate | `zig build smoke`, `smoke-release` | every change | the shipped binary, on a real kernel, judged by equalities |
@@ -1251,13 +1260,18 @@ binary. h2spec and the speed gates run at merge.
   - **Replay.** Every seed runs twice, and the two trace hashes must
     match. A failure, or a panic, prints its seed, and
     `zig build sim -- <seed>` replays it.
-  - **Per-seed invariants:**
+  - **Per-seed invariants.** Each seed must drain or reach the expected
+    backstop after a deliberately withheld completion. After a normal
+    drain, the simulator checks the following.
     - every pool drains to zero;
-    - nothing deadlocks;
     - counters reconcile (§8);
     - no completion reaches a freed slot;
     - the access log equals the counted outcomes;
     - no origin receives a malformed byte.
+  - **Missing completions.** The adversary can withhold an armed op or
+    an op submitted during teardown. The drain may then exit through
+    its diagnostic or watchdog backstop (§8). The simulator checks that
+    sockets referenced by pending ops are still live at that exit.
   - **The census.** A sweep of at least 4096 seeds must fire every
     counter and every seam op kind.
     - Exemptions are named, each with its reason.
@@ -1282,9 +1296,9 @@ binary. h2spec and the speed gates run at merge.
   The oracle: never panic, never overrun, and parse or reject, with no
   third outcome.
 - **Zero allocation.** A failing allocator runs the L4 path with the
-  access log and a drain, plus directed L7 gates. libcrypto's heap is
-  proved by `tls-heap-proof`. From outside, the live gate and the bench
-  hold resident memory flat.
+  access log and a drain, plus directed L7 gates. The heap proof runs in
+  a separate process so it can install the hooks before libcrypto's
+  first allocation.
 - **The live gate** (`smoke/`) runs the shipped binary against a Zig
   origin and client.
   - **Every verdict is an equality on real output,** which a shared
@@ -1314,16 +1328,21 @@ binary. h2spec and the speed gates run at merge.
     direct and proxied paths: L4, L7 with and without keep-alive, and
     HTTP/2. An nginx origin answers, and HAProxy runs the same scenarios
     beside zoxy.
-  - **Bands are compared across runs,** never single numbers.
-  - **Hard gates:**
-    - resident memory under the banner total plus slack;
-    - flat resident memory under an overload scenario;
-    - a clean drain;
-    - under 1% errors.
-  - **Tools:** `bench/micro` with poop decides hot-path A/Bs on hardware
-    counters, and `zig build profile` draws flame graphs. The multi-host
-    comparison is [zoxy-io/benchmark](https://github.com/zoxy-io/benchmark),
-    run per release.
+  - Compare bands from repeated runs under the same conditions.
+  - **Hard gates**
+    - Resident memory under the banner total plus slack.
+    - At least 90% of the offered rate across the ordinary paths,
+      including the direct and HAProxy references.
+    - At most 1% socket errors on ordinary zoxy paths.
+    - Under overload, both 2xx and 5xx responses, under 1% timeouts,
+      and at most 1 MiB of RSS growth.
+    - A clean drain.
+  - `bench/micro` uses poop for hot-path A/Bs on hardware counters.
+    `zig build profile` samples userspace cycles by default. Pass
+    `--kernel` to include kernel samples and compare runs collected
+    with the same setting.
+  - The multi-host comparison runs per release.
+    [zoxy-io/benchmark](https://github.com/zoxy-io/benchmark)
 - **The lint** (`scripts/lint.zig`) enforces:
   - syscall surfaces only under `src/io/`, plus `main.zig`'s allowlist;
   - the `xev`, `hparse`, `h2` and `zssl` import boundaries;
@@ -1522,7 +1541,5 @@ is an embedder.
   `balancer.zig` (pick) or `http/proxy.zig` (settle).
   - There is no runtime hook. A hook could allocate, and the census and
     Tiger Style do not cross a seam.
-  - Specializing a `Config` at comptime for speed is a settled no; see
-    IMPLEMENTATION_NOTES, "Comptime config".
 - **Published, not frozen.** There is no external consumer yet, and
   HTTP/3 would move the exchange's internal shape again.

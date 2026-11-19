@@ -567,9 +567,8 @@ const BodyFileContext = struct {
 /// Tier-0.5 gate the first time it ran the real binary with TLS
 /// configured, which is the only place it could have been found.
 ///
-/// BSS, so the pages a plaintext deployment never touches never become
-/// resident; the §5 banner prices this only when a listener terminates,
-/// which is when it is actually used.
+/// BSS pages become resident as libcrypto uses them. The §5 banner
+/// includes the heap when a listener terminates TLS or an origin uses it.
 var libcrypto_heap_storage: [zoxy.constants.libcrypto_heap_bytes]u8 align(16) = undefined;
 
 /// Turn each listener's configured certificate paths into loaded

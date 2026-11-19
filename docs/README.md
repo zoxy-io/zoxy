@@ -2152,7 +2152,5 @@ does.
 - [TIGER_STYLE.md](TIGER_STYLE.md): the coding rules the tree is held to
   (static allocation only, bounded loops, assertion density,
   explicitly sized integers).
-- [IMPLEMENTATION_NOTES.md](IMPLEMENTATION_NOTES.md): measured findings,
-  shelved experiments and open technical questions.
 - [zoxy.io/config](https://zoxy.io/config/): every field, bound and default,
   rendered from the JSON Schema of the latest release.

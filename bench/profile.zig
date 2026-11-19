@@ -72,16 +72,9 @@ const Flags = struct {
     /// from the cycles event so samples landing inside syscalls, softirq
     /// and the TCP stack are recorded instead of discarded.
     ///
-    /// Off by default, and that default is load-bearing: every number in
-    /// IMPLEMENTATION_NOTES.md is a userspace share, and a run that
-    /// silently included kernel time would not be comparable to any of
-    /// them. It is a separate question, so it gets a separate flag.
-    ///
-    /// It answers the gap that file records as unmeasured — what the ~52
-    /// points of kernel time on zoxy's core are doing, against the ~5 the
-    /// profiler can see today. Needs `kernel.perf_event_paranoid <= 1`
-    /// and, to resolve the symbols, `kernel.kptr_restrict = 0`; both are
-    /// checked before a window opens rather than discovered in the output.
+    /// Userspace-only is the default (§9). The harness checks
+    /// `perf_event_paranoid` and `kptr_restrict` before recording kernel
+    /// samples so their addresses can resolve to symbols.
     ///
     /// KERNEL STACKS ARE NOT UNWOUND. The recording keeps `--call-graph
     /// lbr`, whose branch filter is user-only, so kernel frames arrive as
@@ -280,23 +273,10 @@ fn spawnNginx(arena: std.mem.Allocator, io: Io, environ: std.process.Environ) !s
     };
 }
 
-/// Conn slots for a run of `connections` connections, with headroom for the
-/// churn a reject or a reconnect leaves behind. Without this the config
-/// carried no `limits` block at all, so every run above the default
-/// silently spent its window shedding at the admission wall (§8) — the
-/// profile would have been of the shed path, not the serving path, and
-/// nothing in the output would have said so.
-///
-/// Both bounds come from `constants`, not from literals here: a ceiling
-/// that later moves has to move this with it, and a raised one would
-/// otherwise cap a run below the maximum it was aimed at without saying so.
-/// Effective pool size for a run of `connections` clients — used for both
-/// pools, because they are pinned to each other at the ceiling and for the
-/// same reason at the effective size: on the L7 path a busy client
-/// connection holds an upstream slot, so leaving `upstream_slots` at its
-/// lean default would profile the §8 shed path instead of the proxy. That
-/// is not hypothetical — it is what a cloud c10k run measured before the
-/// ceilings were pinned (IMPLEMENTATION_NOTES.md).
+/// Size both pools for the requested connections, with headroom for
+/// reconnects. A busy HTTP/1.1 client can hold an upstream slot, so
+/// profiling above either pool's default can otherwise measure sheds
+/// (§8).
 fn connSlotsFor(connections: u32) u32 {
     assert(connections >= 1);
     const wanted = @as(u64, connections) + connections / 8 + 64;
@@ -404,10 +384,8 @@ fn cpuListContains(list: []const u8, cpu: u16) bool {
 /// the chosen cpu keeps the pairing correct whichever core is picked,
 /// including a `--cpu` override onto an E-core.
 ///
-/// The modifier is the `--kernel` axis: `cpu_core/cycles/u` counts user
-/// mode only, `cpu_core/cycles/` (empty modifier) counts both. Every
-/// figure recorded in IMPLEMENTATION_NOTES.md came off the former, so the
-/// default stays there and the two are never silently mixed.
+/// `cpu_core/cycles/u` samples userspace cycles. `--kernel` selects
+/// `cpu_core/cycles/`, which includes kernel cycles.
 fn cyclesEventFor(io: Io, cpu: u16, kernel: bool) []const u8 {
     var buffer: [256]u8 = undefined;
     const event = event: {

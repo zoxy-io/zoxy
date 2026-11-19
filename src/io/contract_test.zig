@@ -24,9 +24,7 @@
 //!           a netns harness ever lands.
 //!   recv    EndOfStream        tested: the echo scenario's FIN path.
 //!   recv    Reset              tested on io_uring: the linger-RST recv
-//!           test. The kqueue backend cannot pass it — its data-op maps
-//!           name only CANCELED, so an RST lands as Unexpected there
-//!           (found by this test's first macOS CI run; fork queue).
+//!           test. On kqueue an RST lands as Unexpected.
 //!   send    Reset (EPIPE)      tested: the write-shutdown send test.
 //!   send    Reset (ECONNRESET) not tested directly: pinning the errno
 //!           needs a send already blocked when the RST lands — an
@@ -37,13 +35,9 @@
 //!   recv/send Canceled         unreachable through the seam today: no
 //!           caller cancels a data op (§5 cancels connects and timers
 //!           only); the arms stay mapped for a future drain that does.
-//!   *       else => Unexpected the honest fallback: witnessed as §8
-//!           pressure with the raw errno kept by the fork
-//!           (`result_errno`). Two known peer-gone errnos still land
-//!           there — ENETUNREACH on connect, ETIMEDOUT on the data ops —
-//!           because the fork leaves them unnamed; naming them is queued
-//!           in docs/IMPLEMENTATION_NOTES.md ("Open questions" — libxev
-//!           fork queue).
+//!   *       else => Unexpected counts as kernel pressure (§8). On
+//!           io_uring, `result_errno` preserves the raw errno, including
+//!           ENETUNREACH on connect and ETIMEDOUT on data ops.
 
 const std = @import("std");
 const xev = @import("xev");
@@ -1333,12 +1327,8 @@ test "xevio: a recv against a linger-RST close is Reset, with the errno pinned" 
     // submits the recv, so the op completes with ECONNRESET — the peer's
     // verdict (error.Reset), never EOF and never the §8 pressure rung.
     //
-    // io_uring only: the arm under test is the io_uring adapter's. The
-    // kqueue backend's data-op maps name only CANCELED, so on the macOS
-    // dev box the RST arrives as error.Unexpected — the same
-    // peer-gone-as-pressure gap the fork queue tracks
-    // (docs/IMPLEMENTATION_NOTES.md, "Open questions"), which this test
-    // would otherwise report as its own failure.
+    // This pins the io_uring adapter's mapping. On kqueue an RST
+    // arrives as error.Unexpected.
     if (comptime XevIo.backend != .io_uring) return error.SkipZigTest;
 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);

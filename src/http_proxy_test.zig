@@ -8371,12 +8371,8 @@ const TlsWindDown = struct {
 };
 
 test "l7: a completed handshake issues its session tickets" {
-    // The post-handshake flight, and the reason it exists: the ~45 ms
-    // stall (IMPLEMENTATION_NOTES) is a client's second small write held
-    // by its own Nagle, waiting for an ACK zoxy has no reason to send.
-    // Tickets are what give it one — and they are only worth anything if
-    // they go out *after* the client's Finished, which is what makes
-    // "issued once the session is up" the assertion rather than "issued".
+    // The ticket flight follows Finished so it can ACK the client's
+    // handshake and release a first request held by Nagle (§4).
     var bed: Http1Bed = undefined;
     try bed.setUp(std.testing.allocator, .{
         .seed = 53,

@@ -65,8 +65,6 @@ same listener with health checks and the access log turned on, and
   point here.
 - [docs/TIGER_STYLE.md](docs/TIGER_STYLE.md) — the coding rules the tree is
   held to.
-- [docs/IMPLEMENTATION_NOTES.md](docs/IMPLEMENTATION_NOTES.md) — measured
-  findings, shelved experiments and open technical questions.
 - [zoxy.io/config](https://zoxy.io/config/) — every configuration field,
   bound and default, rendered from the JSON Schema of the latest release.
 
