@@ -64,15 +64,16 @@ are read-only: never edit files; report findings.
   comptime asserts relating it to its neighbours; the memory/fd/ring
   budgets (§5, §8) are updated when a limit affects them.
 - **Single-writer stays structural** (§3): only the loop thread touches
-  pools; no new atomics, locks, or shared mutable state on the data
-  path (loop-written relaxed counters in counters.zig are the one
-  sanctioned pattern).
+  pools; no atomics, locks, or shared mutable state on the data path
+  (counters in counters.zig are plain `u64`, written and read only on
+  the loop).
 - **Slot lifecycle** (§5): a slot is released only when its armed-op set
   is empty; completions are never resubmitted while armed; straggler
   delivery is guarded by the generation counter.
 - **Exhaustion sheds, never blocks or grows** (§8): a new resource has a
   ladder rung, a static answer, and a counter; counters keep the
-  reconcile invariant (admitted = completed + shed + in-flight).
+  reconcile identities (accepted = admitted + Σ `shed_*`; admitted =
+  completed + active).
 - **Every feature ships with its §9 gate:** new parsing gets fuzz
   coverage, new data-path states get sim coverage, new pools get
   zero-alloc coverage. A feature without its gate is not done.
