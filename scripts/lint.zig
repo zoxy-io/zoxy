@@ -1,7 +1,8 @@
 //! Build-time lint for the fd boundary of DESIGN.md §4/§9: raw syscall
 //! surfaces (`std.posix`, `std.os`, `os.linux`) and the `xev` import may be
-//! named only under `src/io/`, with an explicit allowlist for `main.zig`
-//! startup work (rlimits, sigaction). The `hparse` import is likewise
+//! named only under `src/io/` — the process's own work included, the
+//! descriptor limit and the signal dispositions, which moved behind the
+//! seam with the startup sequence (#417). The `hparse` import is likewise
 //! confined to `src/http/parser.zig` — the wrapper that owns the trust
 //! boundary (§7) — `h2` to `src/http/h2/`, the HTTP/2 session that owns
 //! framing semantics over that codec (#275), and `zssl` to `src/tls/`, the
@@ -101,25 +102,6 @@ const unbounded_loop_message =
 /// assert, near enough that an unrelated `assert` deeper in the loop
 /// cannot satisfy it by accident.
 const loop_bound_lookahead_lines: u32 = 6;
-
-/// The only `std.posix.` members main.zig may name (rlimits + sigaction);
-/// everything else — sockets, files, pipes — stays behind the Io seam.
-/// These are matched as fully-qualified `std.posix.<name>` occurrences,
-/// not bare words, so a comment mentioning SIGTERM or a stray
-/// `std.posix.socket` cannot ride the exemption.
-const main_allowed_members = [_][]const u8{
-    "getrlimit",
-    "setrlimit",
-    // The two types `getrlimit` answers in, so a reported limit can be
-    // held and rendered without the value leaving the allowlist.
-    "rlimit",
-    "rlim_t",
-    "RLIM",
-    "sigaction",
-    "Sigaction",
-    "sigemptyset",
-    "SIG",
-};
 
 pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
@@ -379,55 +361,16 @@ fn lintLine(line: []const u8, path: []const u8) ?[]const u8 {
             return boundary.message;
         }
     }
-    // The syscall surfaces are not one needle with one home: they are a set,
-    // and main.zig carries a member-level allowlist rather than a path.
+    // The syscall surfaces are a set of needles with one home.
     if (in_io_directory) {
         return null;
     }
-    const is_main = std.mem.eql(u8, path, "main.zig");
     for (syscall_needles) |needle| {
-        if (std.mem.indexOf(u8, line, needle) == null) {
-            continue;
+        if (std.mem.indexOf(u8, line, needle) != null) {
+            return "raw syscall surfaces live under src/io/ only (DESIGN.md §4)";
         }
-        if (is_main) {
-            if (lineIsAllowlisted(line)) {
-                return null;
-            }
-            return "main.zig may only use std.posix for rlimits and sigaction";
-        }
-        return "raw syscall surfaces live under src/io/ only (DESIGN.md §4)";
     }
     return null;
-}
-
-/// True only if every `std.posix.` occurrence on the line names an
-/// allowed member — a forbidden call sharing the line with an allowed one
-/// is still flagged.
-fn lineIsAllowlisted(line: []const u8) bool {
-    assert(line.len > 0);
-    const qualifier = "std.posix.";
-    var offset: usize = 0;
-    var saw_qualifier = false;
-    while (std.mem.indexOfPos(u8, line, offset, qualifier)) |at| {
-        saw_qualifier = true;
-        const member = line[at + qualifier.len ..];
-        if (!startsWithAllowedMember(member)) {
-            return false;
-        }
-        offset = at + qualifier.len;
-    }
-    // A line matched a syscall needle but not via `std.posix.` (e.g.
-    // std.os.linux.*) — not allowlisted.
-    return saw_qualifier;
-}
-
-fn startsWithAllowedMember(member: []const u8) bool {
-    for (main_allowed_members) |allowed| {
-        if (std.mem.startsWith(u8, member, allowed)) {
-            return true;
-        }
-    }
-    return false;
 }
 
 test "caseCollide: paths that differ only in case are one file on macOS" {
@@ -444,16 +387,11 @@ test "lintLine: raw syscalls flagged outside io, allowed inside" {
     try std.testing.expect(lintLine("const clean = a + b;", "net/relay.zig") == null);
 }
 
-test "lintLine: main.zig allowlist admits rlimit and sigaction only" {
-    try std.testing.expect(lintLine("try std.posix.setrlimit(.NOFILE, limits);", "main.zig") == null);
-    try std.testing.expect(lintLine("std.posix.sigaction(.TERM, &action, null);", "main.zig") == null);
-    try std.testing.expect(lintLine("_ = std.posix.setsockopt(fd, 0, 0, &opt);", "main.zig") != null);
-    // A comment mentioning SIG must not exempt a real forbidden call.
-    try std.testing.expect(lintLine("const s = std.posix.socket(); // closed on SIGTERM", "main.zig") != null);
-    // A forbidden call sharing a line with an allowed one is still caught.
-    try std.testing.expect(lintLine("std.posix.sigaction(x); std.posix.socket();", "main.zig") != null);
-    // std.os.linux.* is never allowlisted in main.zig.
+test "lintLine: main.zig has no exemption — the process's syscalls live under io (#417)" {
+    try std.testing.expect(lintLine("try std.posix.setrlimit(.NOFILE, limits);", "main.zig") != null);
+    try std.testing.expect(lintLine("std.posix.sigaction(.TERM, &action, null);", "main.zig") != null);
     try std.testing.expect(lintLine("_ = std.os.linux.close(fd);", "main.zig") != null);
+    try std.testing.expect(lintLine("posix.sigaction(.TERM, &action, null);", "io/XevIo.zig") == null);
 }
 
 test "lintLine: xev import and cImport boundaries" {

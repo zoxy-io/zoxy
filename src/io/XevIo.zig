@@ -1383,10 +1383,11 @@ pub fn signalWait(
     io.notifier.wait(&io.loop, &io.notifier_completion, XevIo, io, onNotifierWake);
 }
 
-/// The exit code the alarm handler will use, and whether `main` has
-/// installed the handler that reads it. Module-level because a signal
-/// handler takes no arguments: the whole point of this watchdog is that
-/// nothing between the kernel and the exit is the loop's (#226).
+/// The exit code the alarm handler will use, and whether
+/// `installProcessSignals` has installed the handler that reads it.
+/// Module-level because a signal handler takes no arguments: the whole
+/// point of this watchdog is that nothing between the kernel and the exit
+/// is the loop's (#226).
 var alarm_exit_code = std.atomic.Value(u8).init(0);
 var alarm_handler_installed = std.atomic.Value(bool).init(false);
 /// Which watchdog is armed, so the handler's one line says which silence
@@ -1416,8 +1417,9 @@ pub fn alarmStart(io: *XevIo, after_ns: u64, exit_code: u8, reason: Io.AlarmReas
     assert(after_ns >= std.time.ns_per_s);
     // Without the handler, SIGALRM's default action terminates the
     // process silently — the hang would become a death with even less to
-    // say than before. `main` installs it before the loop ever runs; a
-    // caller arming this without one is a wiring bug, not a fallback.
+    // say than before. `installProcessSignals` puts it in place before
+    // the loop ever runs; a caller arming this without one is a wiring
+    // bug, not a fallback.
     assert(alarm_handler_installed.load(.acquire));
     const seconds = (after_ns + std.time.ns_per_s - 1) / std.time.ns_per_s;
     assert(seconds >= 1);
@@ -1440,8 +1442,8 @@ pub fn alarmCancel(io: *XevIo) void {
     _ = std.c.alarm(0);
 }
 
-/// Called by `main` once its SIGALRM handler is installed, so `alarmStart`
-/// can refuse to arm a signal nothing is listening for.
+/// Called by `installProcessSignals` once the SIGALRM handler is in
+/// place, so `alarmStart` can refuse to arm a signal nothing hears.
 pub fn alarmHandlerInstalled() void {
     alarm_handler_installed.store(true, .release);
 }
@@ -1454,8 +1456,8 @@ pub fn alarmHandlerInstalled() void {
 /// didn't.
 ///
 /// The body lives on this side of the seam because `write` and `_exit`
-/// are syscalls and those live here (§4); `main` owns only the sigaction
-/// that points at it.
+/// are syscalls and those live here (§4), as does the sigaction that
+/// points at it (`installProcessSignals`).
 pub fn onAlarmFromHandler() noreturn {
     const drain_message = "zoxy: drain watchdog fired, the event loop stopped " ++
         "delivering (DESIGN.md §8, #226)\n";
@@ -1491,6 +1493,151 @@ pub fn onAlarmFromHandler() noreturn {
 pub fn notifySignalFromHandler(io: *XevIo, signal: Io.Signal) void {
     _ = io.signal_mask.fetchOr(signalBit(signal), .release);
     io.notifier.notify() catch {};
+}
+
+// -- the process (#417) --
+//
+// What only a program owning a process may do: raise its descriptor
+// limit and install its signal dispositions. Here rather than in the
+// application, so the one place raw syscalls are written stays this
+// directory, and an embedder's binary inherits the sequence `zoxy.App`
+// runs instead of copying it.
+
+/// fds are pre-budgeted, not shed (§8): raise the soft limit up to the
+/// hard limit, and refuse to start if even that cannot cover the budget.
+///
+/// One error for every way this can fail, the kernel's included, because
+/// they all mean the same thing to whoever reads it — this box will not
+/// give this config the descriptors it needs — and because `--check`
+/// classifies on the error (#301): a distinct value here is what keeps
+/// "run it elsewhere" from ever being reported as "change the file". The
+/// specific reason is printed instead of returned, here where the numbers
+/// that produced it are still in hand.
+pub fn ensureFdBudget(fds_required: u32) error{FdBudgetUnsatisfiable}!void {
+    assert(fds_required > 0);
+    const required: u64 = fds_required;
+    var limits = posix.getrlimit(.NOFILE) catch |err| {
+        std.debug.print("zoxy: cannot read RLIMIT_NOFILE: {t}\n", .{err});
+        return error.FdBudgetUnsatisfiable;
+    };
+    assert(limits.max >= limits.cur);
+    if (limits.cur >= required) return;
+    if (limits.max < required) {
+        std.debug.print(
+            "zoxy: RLIMIT_NOFILE hard limit {d} is below the fd budget {d} (§8)\n",
+            .{ limits.max, required },
+        );
+        return error.FdBudgetUnsatisfiable;
+    }
+    limits.cur = required;
+    posix.setrlimit(.NOFILE, limits) catch |err| {
+        std.debug.print(
+            "zoxy: cannot raise RLIMIT_NOFILE to the fd budget {d}: {t}\n",
+            .{ required, err },
+        );
+        return error.FdBudgetUnsatisfiable;
+    };
+}
+
+/// `RLIMIT_NOFILE` as `--check` reports it (#301): each bound in
+/// descriptors, or null for `RLIM_INFINITY`.
+pub const FdLimit = struct {
+    soft: ?u64,
+    hard: ?u64,
+};
+
+/// The limit as this process found it. `--check` reads it before
+/// `ensureFdBudget`, which raises the soft limit: read afterwards, it would
+/// report what the check did rather than what the box had.
+pub fn fdLimit() error{FdLimitUnreadable}!FdLimit {
+    const limits = posix.getrlimit(.NOFILE) catch return error.FdLimitUnreadable;
+    assert(limits.max >= limits.cur);
+    const limit: FdLimit = .{
+        .soft = if (limits.cur == posix.RLIM.INFINITY) null else limits.cur,
+        .hard = if (limits.max == posix.RLIM.INFINITY) null else limits.max,
+    };
+    // The soft limit never exceeds the hard one, so a finite hard limit
+    // has a finite soft one beneath it.
+    if (limit.hard != null) assert(limit.soft != null);
+    return limit;
+}
+
+/// The loop a SIGTERM, SIGINT or SIGHUP is delivered to. Set once, by
+/// `installProcessSignals`, before any handler that reads it exists.
+var signal_target: ?*XevIo = null;
+
+/// Install the process's signal dispositions (§4, §8), aimed at `io`:
+///
+/// - SIGTERM and SIGINT start the drain, and SIGHUP reopens the access
+///   log, each through the loop's own eventfd;
+/// - SIGALRM is the watchdogs' (#226, #311): it never reaches the loop,
+///   because a loop that stopped delivering is what it exists to report;
+/// - SIGPIPE and SIGUSR1 are ignored.
+///
+/// Before `Server.start`, which arms the serving watchdog: the seam
+/// refuses to arm an alarm whose handler is not installed, since
+/// SIGALRM's default action is to terminate. Installing early also means
+/// a SIGTERM that arrives during startup is recorded and drained once the
+/// loop runs, rather than killing a process mid-bind.
+pub fn installProcessSignals(io: *XevIo) void {
+    assert(signal_target == null);
+    signal_target = io;
+    const action = posix.Sigaction{
+        .handler = .{ .handler = onRawSignal },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(.TERM, &action, null);
+    posix.sigaction(.INT, &action, null);
+    posix.sigaction(.HUP, &action, null);
+    const alarm_action = posix.Sigaction{
+        .handler = .{ .handler = onAlarm },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(.ALRM, &alarm_action, null);
+    // Only now may anything arm one.
+    alarmHandlerInstalled();
+    // A proxy must not die because something downstream of it went away.
+    // The access log writes to a pipe the operator owns (§8), and a
+    // `write` to a pipe with no reader raises SIGPIPE, whose default
+    // action is to terminate — an operator closing `zoxy config.json | jq`
+    // would take the data path with it. Ignoring it turns that into the
+    // EPIPE the sink already handles by declaring itself broken. Socket
+    // sends are covered too: io_uring sets MSG_NOSIGNAL for them, but a
+    // proxy relying on that for its liveness is relying on a detail of a
+    // dependency's submission path.
+    const ignore = posix.Sigaction{
+        .handler = .{ .handler = posix.SIG.IGN },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(.PIPE, &ignore, null);
+    // SIGUSR1 carried the counter dump until #310 removed it, and its
+    // default disposition is *terminate*: ignored, so an operator's muscle
+    // memory cannot become an outage.
+    posix.sigaction(.USR1, &ignore, null);
+    assert(signal_target == io);
+}
+
+/// Async-signal-safe by delegation: one `write` and one `_exit`. Nothing
+/// here reads process state or asserts — a panic locks stdio and captures
+/// a stack trace, none of which a signal handler may do.
+fn onAlarm(signal_number: posix.SIG) callconv(.c) void {
+    if (signal_number != .ALRM) return;
+    onAlarmFromHandler();
+}
+
+/// Async-signal-safe: the loop's atomic mask and eventfd wake (§4), and
+/// nothing else.
+fn onRawSignal(signal_number: posix.SIG) callconv(.c) void {
+    const signal: Io.Signal = switch (signal_number) {
+        .TERM, .INT => .terminate,
+        .HUP => .reopen_log,
+        else => return,
+    };
+    const io = signal_target orelse return;
+    io.notifySignalFromHandler(signal);
 }
 
 /// The classified cause of the op currently being delivered (§8). Valid

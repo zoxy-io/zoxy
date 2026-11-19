@@ -2051,7 +2051,7 @@ pub fn originTls(clusters: []const Config.Cluster) bool {
 /// pool shrink (§8): a smaller fill demands a deeper ring for the same
 /// conn slots. Range-check first, then reject a fill that — with these
 /// conn and stream slots and listeners — would need a completion queue
-/// past the compiled ring, so main.zig's `completionQueueDepthFor` never
+/// past the compiled ring, so the budget's `completionQueueDepthFor` never
 /// clamps.
 fn resolveCqFill(
     requested: ?u32,

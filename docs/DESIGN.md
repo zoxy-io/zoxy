@@ -185,8 +185,9 @@ live, stays auditable Zig.
   - Socket controls are seam methods: `setNodelay`, `setLingerRst`, and
     `shutdown` of read, write or both.
   - So a direct syscall from the data path cannot be written. The lint
-    confines `std.posix` and `os.linux` to `src/io/`, plus an allowlist
-    for `main.zig`'s startup work.
+    confines `std.posix` and `os.linux` to `src/io/`, and that includes
+    the process's own work: raising the descriptor limit and installing
+    signal dispositions are seam functions too.
 - **Completions are caller-owned.** Each op's completion is embedded in
   the slot that owns the op: a connection, stream, origin connection,
   probe, admin slot or listener. No op allocates, and an armed completion
@@ -1349,7 +1350,7 @@ binary. h2spec and the speed gates run at merge.
   - The multi-host comparison runs per release.
     [zoxy-io/benchmark](https://github.com/zoxy-io/benchmark)
 - **The lint** (`scripts/lint.zig`) enforces:
-  - syscall surfaces only under `src/io/`, plus `main.zig`'s allowlist;
+  - syscall surfaces only under `src/io/`, with no exception;
   - the `xev`, `hparse`, `h2` and `zssl` import boundaries;
   - no `@cImport`;
   - bounded loops;
@@ -1361,7 +1362,8 @@ binary. h2spec and the speed gates run at merge.
 
 ```
 src/
-  main.zig              the application: argv, files, rlimit, signals, libcrypto heap
+  main.zig              the stock binary: argv, reading the JSON config, then zoxy.App
+  app.zig               zoxy as a process: banner, fd budget, log sink, certificates, signals, run
   root.zig              the `zoxy` module's exports (§13)
   Server.zig            composition root: pools, listeners, admission, teardown; generic over Io
   budget.zig            §5's closed form: pool sizes, fd and ring demands, the banner

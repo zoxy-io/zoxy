@@ -872,7 +872,7 @@ const Http1Bed = struct {
         partial_io: bool = false,
         /// Terminate TLS on the one listener (#125). The bed loads the
         /// checked-in fixtures and hands them over before `start`,
-        /// standing in for what `main` does — this file runs under the Io
+        /// standing in for what `zoxy.App` does — this file runs under the Io
         /// seam, where a filesystem is what does not exist.
         tls: bool = false,
         /// #304: the TLS listener's client CA, when `tls` is set.
@@ -1298,7 +1298,7 @@ const Http1Bed = struct {
         bed.origin.stopListening();
     }
 
-    /// Stand in for what `main` does before `start` (§4): this file runs
+    /// Stand in for what `zoxy.App` does before `start` (§4): this file runs
     /// under the Io seam, so it embeds the fixtures rather than reading
     /// them. Its own function for `setUp`'s length limit.
     fn loadTlsCredentials(bed: *Http1Bed, arena: std.mem.Allocator, on: bool) !void {
