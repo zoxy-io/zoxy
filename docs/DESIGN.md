@@ -609,6 +609,10 @@ flowchart LR
       requires `relay_buffer_bytes ≥ 16 KiB`. SNI routes and `tls` on one
       listener are refused, since the handshake would consume the hello
       the peek reads.
+    - The peek stages at most `sni_peek_bytes_max`, 16 KiB less a sent
+      PROXY header. The cluster is chosen only after the peek, so the
+      room is kept whether or not the cluster sends one; a hello longer
+      than that is `l4_sni_invalid`.
     - Counters: `l4_sni_routed`, `l4_sni_absent`, `l4_sni_no_route`,
       `l4_sni_invalid`.
 - **PROXY protocol, send** (a cluster's `"proxy_protocol": {"send":

@@ -16,6 +16,7 @@ const io_module = @import("io/io.zig");
 const Credentials = @import("tls/Credentials.zig");
 const router = @import("http/router.zig");
 const sni_router = @import("net/sni_router.zig");
+const client_hello = @import("net/client_hello.zig");
 const Io = @import("io/io.zig");
 const Server = @import("Server.zig").Server;
 const SimIo = @import("io/SimIo.zig");
@@ -1302,6 +1303,30 @@ fn sniHello(out: []u8, name: ?[]const u8) []const u8 {
     return out[0..at];
 }
 
+/// `sniHello`, grown to exactly `record_len` bytes by an RFC 7685
+/// `padding` extension: how a peer reaches the peek's edge with a hello
+/// that is still one well-formed record, which is the shape the edge has
+/// to be tested with — a malformed one would be refused for being
+/// malformed, and the size would never be judged.
+fn sniHelloPadded(out: []u8, name: []const u8, record_len: u32) []const u8 {
+    const base = sniHello(out, name);
+    assert(record_len >= base.len + 4);
+    assert(record_len <= out.len);
+    const padding_len: u16 = @intCast(record_len - base.len - 4);
+    std.mem.writeInt(u16, out[base.len..][0..2], 21, .big);
+    std.mem.writeInt(u16, out[base.len + 2 ..][0..2], padding_len, .big);
+    @memset(out[base.len + 4 ..][0..padding_len], 0);
+    // The three lengths that enclose the extensions grow with them: the
+    // record's fragment, the handshake body, and the extensions vector,
+    // at the fixed offsets `sniHello` writes them.
+    std.mem.writeInt(u16, out[3..5], @intCast(record_len - 5), .big);
+    std.mem.writeInt(u24, out[6..9], @intCast(record_len - 9), .big);
+    std.mem.writeInt(u16, out[47..49], @intCast(record_len - 49), .big);
+    const hello = out[0..record_len];
+    assert(client_hello.parse(hello) == .ok);
+    return hello;
+}
+
 /// The one named route these scenarios share, plus a catch-all where the
 /// case wants one. Both point at cluster 0 — the bed has one, and what is
 /// under test is which *verdict* the table reaches, not which backend.
@@ -1488,6 +1513,79 @@ test "sni routing: opening bytes that are not a hello are refused" {
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l4_sni_invalid"));
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l4_sni_routed"));
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l4_sni_absent"));
+}
+
+test "sni routing: the longest hello the peek takes still leaves a sent header room" {
+    // #298 meets #142 send. The peek stages the hello in the buffer half
+    // a sending cluster's header is later prepended into, and it runs
+    // before the cluster — so before whether a header is owed — is
+    // known. The longest hello it admits is the case that has to leave
+    // the room: staged whole, with the header in front of it, and every
+    // byte of both reaching the origin. The origin is mute so it can
+    // count what arrived without echoing a hello the client never
+    // expects back.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 11, .adversary = .{ .partial_io = true } },
+        .sni_routes = &sni_named_only,
+        .proxy_protocol_send = .v2,
+    });
+    defer bed.tearDown();
+    bed.scenario.origin.mode = .mute;
+
+    var hello_buffer: [constants.client_hello_bytes_max]u8 = undefined;
+    const hello = sniHelloPadded(&hello_buffer, "api.example.com", constants.sni_peek_bytes_max);
+    bed.scenario.clients_count = 1;
+    const client = &bed.scenario.clients[0];
+    client.exchange = true;
+    client.prefix = hello;
+    client.start(&bed.scenario, TestBed.bindAddress());
+    try bed.sim_io.run();
+    try bed.expectDrained();
+
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l4_sni_routed"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l4_sni_invalid"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l4_proxy_header_sent"));
+    // A v2 header between two IPv4 addresses is 28 bytes; behind it, the
+    // hello and then the token, nothing dropped and nothing doubled.
+    try std.testing.expectEqual(
+        @as(u32, 28) + constants.sni_peek_bytes_max + echo_token.len,
+        bed.scenario.origin.conns[0].received_bytes,
+    );
+}
+
+test "sni routing: a hello past the peek is refused, not staged against a header" {
+    // The other side of that edge. The record layer's own ceiling is the
+    // case that once crashed: a 16 KiB hello staged whole in a 16 KiB
+    // half, then a sent header asserted into a buffer it no longer fit.
+    // One byte past the edge is the boundary. Both are refused while
+    // still peeking, before any cluster is chosen or header staged; the
+    // origin is mute so that, were one let through, the counters below
+    // would say so rather than the double's own echo bound.
+    for ([_]u32{ constants.client_hello_bytes_max, constants.sni_peek_bytes_max + 1 }) |record_len| {
+        var bed: TestBed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .sim = .{ .seed = 13, .adversary = .{ .partial_io = true } },
+            .sni_routes = &sni_named_only,
+            .proxy_protocol_send = .v2,
+        });
+        defer bed.tearDown();
+        bed.scenario.origin.mode = .mute;
+
+        var hello_buffer: [constants.client_hello_bytes_max]u8 = undefined;
+        const hello = sniHelloPadded(&hello_buffer, "api.example.com", record_len);
+        bed.scenario.clients_count = 1;
+        const client = &bed.scenario.clients[0];
+        client.exchange = true;
+        client.prefix = hello;
+        client.start(&bed.scenario, TestBed.bindAddress());
+        try bed.sim_io.run();
+        try bed.expectDrained();
+
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l4_sni_invalid"));
+        try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l4_sni_routed"));
+        try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l4_proxy_header_sent"));
+    }
 }
 
 test "proxy protocol: the header is consumed, the payload relays, the client is believed" {

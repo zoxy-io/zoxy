@@ -44,8 +44,10 @@ const fuzzSeed = @import("../testing/bytes.zig").fuzzSeed;
 const assert = std.debug.assert;
 
 /// The verdict on a byte prefix. `need_more` never asks past
-/// `constants.client_hello_bytes_max` (asserted in `parse`), so the
-/// accumulating caller needs no bound of its own.
+/// `constants.client_hello_bytes_max` (asserted in `parse`), so a caller
+/// that stages that much needs no bound of its own. One that stages less
+/// — the §6 peek stops at `constants.sni_peek_bytes_max` — judges a full
+/// window that still reads `need_more` itself.
 pub const Parsed = union(enum) {
     need_more,
     invalid,

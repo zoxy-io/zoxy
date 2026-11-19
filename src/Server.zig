@@ -3410,7 +3410,7 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.sni_routes.len >= 1);
             assert(conn.stream.relay_buffer != null);
             assert(conn.armed.deadline);
-            assert(conn.stream.head_len < constants.client_hello_bytes_max);
+            assert(conn.stream.head_len < constants.sni_peek_bytes_max);
             conn.enter(.l4_peeking_client_hello);
             // Judged before any recv is armed, because this phase can be
             // entered *holding* bytes: the PROXY-header phase reads past
@@ -3429,28 +3429,36 @@ pub fn Server(comptime IoType: type) type {
         fn judgeSniPeek(server: *Self, conn: *ConnType) void {
             assert(conn.state == .l4_peeking_client_hello);
             assert(conn.stream.relay_buffer != null);
+            assert(conn.stream.head_len <= constants.sni_peek_bytes_max);
             const staged = conn.stream.relay_buffer.?.client_to_upstream[0..conn.stream.head_len];
             switch (client_hello.parse(staged)) {
-                .need_more => server.armSniPeekRecv(conn),
-                .invalid => {
-                    server.counters.increment("l4_sni_invalid");
-                    server.beginTeardown(conn);
+                .ok => |hello| return server.finishSniPeek(conn, hello.server_name),
+                // The parser waits up to the record layer's ceiling; the
+                // peek stops a sent header's width short of it. A hello
+                // still incomplete at that edge is one this listener
+                // cannot stage, refused on the terms a malformed one is.
+                .need_more => if (conn.stream.head_len < constants.sni_peek_bytes_max) {
+                    return server.armSniPeekRecv(conn);
                 },
-                .ok => |hello| server.finishSniPeek(conn, hello.server_name),
+                .invalid => {},
             }
+            server.counters.increment("l4_sni_invalid");
+            server.beginTeardown(conn);
         }
 
         /// One recv into the staging window past what has accumulated.
-        /// The window ends at the cap, not the buffer, on
-        /// `armProxyHeaderRecv`'s rule — and the loader guarantees the
-        /// half is at least that wide (`LimitRelayBufferUnderSniRouting`),
-        /// so the cap is reachable rather than aspirational.
+        /// The window ends at the peek's edge, not the buffer, on
+        /// `armProxyHeaderRecv`'s rule: what lies past it is the room a
+        /// sending cluster's header is prepended into (§6, #142 send).
+        /// The loader guarantees the half is wide enough for both
+        /// (`LimitRelayBufferUnderSniRouting`), so the edge is reachable
+        /// rather than aspirational.
         fn armSniPeekRecv(server: *Self, conn: *ConnType) void {
             assert(conn.state == .l4_peeking_client_hello);
             assert(conn.stream.relay_buffer != null);
-            assert(conn.stream.head_len < constants.client_hello_bytes_max);
+            assert(conn.stream.head_len < constants.sni_peek_bytes_max);
             const staging = conn.stream.relay_buffer.?
-                .client_to_upstream[0..constants.client_hello_bytes_max];
+                .client_to_upstream[0..constants.sni_peek_bytes_max];
             conn.stream.arm(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.recv(
                 conn.client_socket,
@@ -3487,7 +3495,7 @@ pub fn Server(comptime IoType: type) type {
             };
             assert(received >= 1);
             conn.stream.head_len += received;
-            assert(conn.stream.head_len <= constants.client_hello_bytes_max);
+            assert(conn.stream.head_len <= constants.sni_peek_bytes_max);
             server.judgeSniPeek(conn);
         }
 
@@ -3981,8 +3989,11 @@ pub fn Server(comptime IoType: type) type {
             ];
             const staging = conn.stream.relay_buffer.?.client_to_upstream;
             const framed = direction.framed_len;
-            // Comptime-guaranteed in proxy_protocol: header + the largest
-            // receive leftover fit the buffer half together.
+            // Both receive phases that frame payload leave this header
+            // room, comptime-pinned in proxy_protocol: a PROXY header's
+            // leftover is under `proxy_header_bytes_max`, and the SNI
+            // peek stops at `sni_peek_bytes_max`, a header short of the
+            // floor the loader holds an SNI listener's half to.
             assert(header.len + framed <= staging.len);
             if (framed >= 1) {
                 // Receive-phase payload sits at the front; move it over.

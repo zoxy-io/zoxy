@@ -648,8 +648,8 @@ pub const Counters = struct {
     /// the wrong address.
     l4_sni_no_route: Value = Value.init(0),
     /// Connections closed because their opening bytes were not a
-    /// ClientHello — not TLS at all, malformed, over
-    /// `client_hello_bytes_max`, fragmented across records (which this
+    /// ClientHello — not TLS at all, malformed, longer than the peek
+    /// stages (`sni_peek_bytes_max`), fragmented across records (which this
     /// proxy does not reassemble, see `net/client_hello.zig`), or EOF
     /// mid-hello. A rising count on a listener fronting real TLS
     /// services is the signal that the fragmentation limit stopped being
