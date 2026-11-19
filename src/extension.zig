@@ -31,6 +31,7 @@
 const std = @import("std");
 
 const config_module = @import("config.zig");
+const filter = @import("http/filter.zig");
 const io_module = @import("io/io.zig");
 const parser = @import("http/parser.zig");
 const upstream = @import("net/upstream.zig");
@@ -237,6 +238,56 @@ pub const ClusterSite = struct {
     endpoints: []const io_module.Address,
 };
 
+/// The request-policy contract (§7). A policy type declares
+///
+///     pub fn evaluate(self: *P, request: *const Request) Verdict
+///
+/// and may declare
+///
+///     pub fn bind(self: *P, site: *const PolicySite, startup: *const Startup) !void
+///
+/// which zoxy calls once at startup for each listener and each route that
+/// selects the instance. A listener's policies run once per request, after
+/// its head parses and canonicalizes and before the request filters and
+/// routing; a route's run once the route is chosen, before the request
+/// takes any resource. Each list runs in order and the first reject wins.
+/// A retry or a replay re-picks without re-routing, so neither phase ever
+/// evaluates one request twice.
+pub const Verdict = union(enum) {
+    /// Hand the request on: to the filters and the route table at the
+    /// listener phase, to the dial at the route phase.
+    proceed,
+    /// Answer with this status from server memory, before any resource
+    /// is taken or origin dialed — the filter reject's answer (§8).
+    reject: RejectStatus,
+};
+
+/// The statuses a policy may refuse with: the static reject set a filter
+/// rule may use (§8), so every one is a page the proxy already serves.
+pub const RejectStatus = enum(u16) {
+    bad_request = 400,
+    forbidden = 403,
+    not_found = 404,
+    too_many_requests = 429,
+};
+
+comptime {
+    for (std.enums.values(RejectStatus)) |status| {
+        assert(filter.isRejectStatus(@backingInt(status)));
+    }
+    assert(std.enums.values(RejectStatus).len == filter.reject_statuses.len);
+}
+
+/// Where a policy is bound: a listener, or one of its routes.
+pub const PolicySite = struct {
+    listener_index: u16,
+    /// The route's index in its listener's table, or null for the
+    /// listener itself.
+    route_index: ?u16,
+    /// The cluster the route sends to; null for the listener.
+    cluster_index: ?u16,
+};
+
 /// Refuse, at compile time, a picker type that does not meet `pick`'s
 /// contract — with a message naming what is wrong, rather than an error
 /// deep inside the dispatch that calls it.
@@ -257,6 +308,27 @@ pub fn assertPicker(comptime Picker: type) void {
     }
     if (@hasDecl(Picker, "bind")) {
         assertBind(Picker, ClusterSite);
+    }
+}
+
+/// Refuse, at compile time, a request-policy type that does not meet
+/// `evaluate`'s contract.
+pub fn assertRequestPolicy(comptime Policy: type) void {
+    const name = @typeName(Policy);
+    if (!@hasDecl(Policy, "evaluate")) {
+        @compileError(name ++ " is listed as a request policy but declares no `pub fn evaluate`");
+    }
+    const evaluate_fn = @typeInfo(@TypeOf(Policy.evaluate)).@"fn";
+    const evaluate_ok = evaluate_fn.param_types.len == 2 and
+        evaluate_fn.param_types[0] == *Policy and
+        evaluate_fn.param_types[1] == *const Request and
+        evaluate_fn.return_type == Verdict;
+    if (!evaluate_ok) {
+        @compileError(name ++ ".evaluate must be `fn (*" ++ name ++
+            ", *const extension.Request) extension.Verdict`");
+    }
+    if (@hasDecl(Policy, "bind")) {
+        assertBind(Policy, PolicySite);
     }
 }
 
@@ -287,6 +359,12 @@ pub fn assertExtensions(comptime extensions: Extensions) void {
         assertPicker(Picker);
         inline for (extensions.pickers[index + 1 ..]) |Later| {
             if (Picker == Later) @compileError(@typeName(Picker) ++ " is listed twice as a picker");
+        }
+    }
+    inline for (extensions.request_policies, 0..) |Policy, index| {
+        assertRequestPolicy(Policy);
+        inline for (extensions.request_policies[index + 1 ..]) |Later| {
+            if (Policy == Later) @compileError(@typeName(Policy) ++ " is listed twice as a request policy");
         }
     }
 }

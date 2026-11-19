@@ -93,6 +93,9 @@ pub const testing = struct {
     /// A picker that records what it was offered and answers a scripted
     /// slot (#417): the gates' way through the extension seam.
     pub const ScriptedPicker = @import("testing/picker.zig").ScriptedPicker;
+    /// A request policy that refuses one path prefix and records what it
+    /// evaluated (#417).
+    pub const ScriptedPolicy = @import("testing/policy.zig").ScriptedPolicy;
 };
 
 test {
@@ -141,6 +144,7 @@ test {
     _ = @import("testing/origin.zig");
     _ = @import("testing/bytes.zig");
     _ = @import("testing/picker.zig");
+    _ = @import("testing/policy.zig");
     _ = @import("net/pump_transform_test.zig");
     _ = @import("io/contract_test.zig");
     _ = @import("io/sim_io_test.zig");

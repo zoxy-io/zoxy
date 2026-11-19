@@ -167,6 +167,8 @@ pub fn proxyStatusCauseFor(comptime rung: []const u8) ProxyStatusCause {
     if (std.mem.startsWith(u8, rung, "l7_shed_")) return .limit;
     if (std.mem.eql(u8, rung, "l7_no_route")) return .no_route;
     if (std.mem.eql(u8, rung, "l7_filtered")) return .denied;
+    // A #417 policy refuses for the reason a filter rule does.
+    if (std.mem.eql(u8, rung, "l7_policy_rejected")) return .denied;
     if (std.mem.eql(u8, rung, "l7_gateway_timeout")) return .timeout;
     return .none;
 }
@@ -781,6 +783,7 @@ test "shed: every token this proxy emits is one the registry defines" {
     try std.testing.expectEqual(ProxyStatusCause.limit, proxyStatusCauseFor("l7_shed_tunnels"));
     try std.testing.expectEqual(ProxyStatusCause.no_route, proxyStatusCauseFor("l7_no_route"));
     try std.testing.expectEqual(ProxyStatusCause.denied, proxyStatusCauseFor("l7_filtered"));
+    try std.testing.expectEqual(ProxyStatusCause.denied, proxyStatusCauseFor("l7_policy_rejected"));
     try std.testing.expectEqual(ProxyStatusCause.none, proxyStatusCauseFor("l7_bad_gateway"));
 }
 

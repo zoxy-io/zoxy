@@ -386,6 +386,11 @@ pub const Config = struct {
         /// Empty on the L4 path and whenever no `"request_filters"` were given.
         /// Compiled and interpreted by `http/filter.zig`.
         request_filters: []const filter.Rule = &.{},
+        /// #417's request policies on this listener, selected in code: run
+        /// in order on every request after its head canonicalizes, before
+        /// `request_filters` and routing. Http listeners only, and never
+        /// produced by the JSON loader.
+        request_policies: []const extension_module.Selection = &.{},
         /// The #175 response filter rules, same discipline on the way
         /// out: empty on the L4 path and whenever no `"response_filters"`
         /// were given. Compiled by this loader, matched by

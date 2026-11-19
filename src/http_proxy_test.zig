@@ -51,10 +51,15 @@ const fixture_host_name = "spike.zoxy.test";
 
 const extension = @import("extension.zig");
 const ScriptedPicker = @import("testing/picker.zig").ScriptedPicker;
+const ScriptedPolicy = @import("testing/policy.zig").ScriptedPolicy;
 
-/// The beds' runtime lists one picker (#417), so a scenario can select an
-/// instance of it; every scenario that selects none runs the stock path.
-const runtime: extension.Runtime = .{ .Io = SimIo, .extensions = .{ .pickers = &.{ScriptedPicker} } };
+/// The beds' runtime lists one picker and one request policy (#417), so a
+/// scenario can select an instance of either; every scenario that selects
+/// none runs the stock path.
+const runtime: extension.Runtime = .{ .Io = SimIo, .extensions = .{
+    .pickers = &.{ScriptedPicker},
+    .request_policies = &.{ScriptedPolicy},
+} };
 const ServerSim = Server(runtime);
 
 /// A scripted HTTP client: sends `request` (the adversary may split the
@@ -977,6 +982,9 @@ const Http1Bed = struct {
         /// existing scenarios are unfiltered. A test supplies compiled
         /// rules to drive the filter reject/edit paths.
         request_filters: []const filter.Rule = &.{},
+        /// #417's request policies on the listener, selected from the
+        /// beds' runtime; empty for every other scenario.
+        request_policies: []const extension.Selection = &.{},
         /// The listener's #175 response filter rules; empty by default
         /// on the same terms.
         response_filters: []const filter.ResponseRule = &.{},
@@ -1100,6 +1108,7 @@ const Http1Bed = struct {
             .bind_mode = null,
             .routes = &bed.routes,
             .request_filters = options.request_filters,
+            .request_policies = options.request_policies,
             .response_filters = options.response_filters,
             .protocol = .http,
             .upgrades = options.upgrades,
@@ -9880,5 +9889,108 @@ test "h2: an HTTP/2 stream's request reaches its cluster's extension picker (#41
     try std.testing.expect(picker.had_request);
     try std.testing.expect(!picker.retry);
     try std.testing.expectEqualStrings("/streams/one", picker.lastPath());
+    try bed.expectDrained();
+}
+
+test "l7: a listener's request policy rejects before any origin attempt, and proceeds into the filters (#417)" {
+    var policy: ScriptedPolicy = .{ .reject_prefix = "/tenants/9" };
+    const selected = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &policy)};
+    {
+        // A reject is the static page a filter's is, cause and all, and
+        // the origin never hears of the request.
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .seed = 4172,
+            .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+            .request_policies = &selected,
+            .proxy_status = true,
+        });
+        defer bed.tearDown();
+
+        try bed.exchange("POST /tenants/9/reports HTTP/1.1\r\nHost: o\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+
+        try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 403 "));
+        try std.testing.expect(std.mem.indexOf(u8, bed.client.response(), "Proxy-Status: zoxy; error=http_request_denied\r\n") != null);
+        try std.testing.expectEqual(@as(u32, 0), bed.origin.accepted_count);
+        try std.testing.expectEqual(@as(u32, 1), policy.binds);
+        try std.testing.expectEqual(@as(u32, 1), policy.rejected);
+        // The listener phase runs before routing: no cluster yet.
+        try std.testing.expect(!policy.routed);
+        try std.testing.expectEqualStrings("/tenants/9/reports", policy.lastPath());
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_policy_rejected"));
+        try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_filtered"));
+        try bed.expectDrained();
+    }
+    {
+        // `proceed` hands the request to the filters as configured: here
+        // a filter rejects what the policy let through.
+        policy = .{ .reject_prefix = "/tenants/9" };
+        const filters = [_]filter.Rule{.{ .match = .{ .path_prefix = "/blocked" }, .actions = &.{.{ .reject = 404 }} }};
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .seed = 4173,
+            .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+            .request_policies = &selected,
+            .request_filters = &filters,
+        });
+        defer bed.tearDown();
+
+        try bed.exchange("GET /blocked HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+        try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 404 "));
+        try std.testing.expectEqual(@as(u32, 1), policy.evaluated);
+        try std.testing.expectEqual(@as(u32, 0), policy.rejected);
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_filtered"));
+        try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_policy_rejected"));
+        try bed.expectDrained();
+    }
+}
+
+test "l7: a retry does not evaluate the listener's request policy again (#417)" {
+    var policy: ScriptedPolicy = .{};
+    const selected = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &policy)};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 4174,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .refusing_endpoint_first = true,
+        .retries = 1,
+        .pick = .rr,
+        .request_policies = &selected,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 200 "));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_retried"));
+    try std.testing.expectEqual(@as(u32, 1), policy.evaluated);
+    try bed.expectDrained();
+}
+
+test "h2: a listener's request policy rejects one stream and leaves its sibling (#417)" {
+    var policy: ScriptedPolicy = .{ .reject_prefix = "/denied", .status = .too_many_requests };
+    const selected = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &policy)};
+    var options = h2BedOptions(4175);
+    options.request_policies = &selected;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    var wire: H2Wire = .{};
+    wire.preface(&.{});
+    wire.get(1, "GET", "/denied/one");
+    wire.get(3, "GET", "/allowed");
+    try bed.exchange(wire.written());
+
+    var storage: [4]H2Answer = undefined;
+    const answers = try h2Answers(bed.client.response(), &storage);
+    try std.testing.expectEqual(@as(usize, 2), answers.len);
+    try std.testing.expectEqual(@as(u16, 429), (try h2AnswerFor(answers, 1)).status);
+    try std.testing.expectEqual(@as(u16, 200), (try h2AnswerFor(answers, 3)).status);
+    try std.testing.expectEqual(@as(u32, 2), policy.evaluated);
+    try std.testing.expectEqual(@as(u32, 1), policy.rejected);
+    try std.testing.expectEqual(@as(u32, 1), bed.origin.requests_served);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_policy_rejected"));
     try bed.expectDrained();
 }
