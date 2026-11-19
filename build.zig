@@ -687,6 +687,11 @@ fn resolveBuildId(b: *std.Build) []const u8 {
     if (b.option([]const u8, "build-id", "Build identifier, e.g. git describe output")) |given| {
         return given;
     }
+    // A dependency builds no zoxy binary of its own (#417), and its
+    // package directory has no `.git` to describe — while the shell-out
+    // would still poison the dependent's configuration cache on every
+    // `zig build` it runs.
+    if (!b.isRoot()) return "";
     // Zig's configuration cache keys on the command line, not on what a
     // spawned program answers, and `runAllowFail` does not poison it the
     // way `findProgram` does. Left pure, a build after a commit — or after
@@ -734,11 +739,14 @@ fn addLoadGenerator(
     target: std.Build.ResolvedTarget,
     release_zoxy: *std.Build.Step.Compile,
 ) LoadGenerator {
+    // On by default only where zoxy is the build being run. As a
+    // dependent's dependency (#417) its bench steps are unreachable, yet
+    // asking for zrk and zio would still make every dependent fetch them.
     const enabled = b.option(
         bool,
         "bench",
         "wire zrk and zio for bench, profile and ci (false: skip fetching them)",
-    ) orelse true;
+    ) orelse b.isRoot();
     if (enabled) {
         // Both harnesses embed zrk (pinned by hash) as their load
         // generator — that role stays ReleaseFast regardless of what

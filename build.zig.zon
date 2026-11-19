@@ -690,12 +690,16 @@
             .hash = "zssl-0.0.1-5ocyiFkHEQBi4TIgT1Yh7RnCsa3274ieVA9wZwd9gGQR",
         },
     },
+    // What a dependent receives (#417). `src` is the library and
+    // build.zig.zon's pins its dependencies; `LICENSE` travels because MIT
+    // requires the notice to ship with every copy, and a fetched package
+    // is a copy. Everything else — the simulator, smoke, bench, tools and
+    // the example — is this repository's own gates, and `build.zig` only
+    // reaches it from steps a dependent never runs.
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
-        // For example...
-        //"LICENSE",
-        //"README.md",
+        "LICENSE",
     },
 }

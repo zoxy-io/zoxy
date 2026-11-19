@@ -1,0 +1,16 @@
+.{
+    .name = .zoxy_edge,
+    .version = "0.0.0",
+    .fingerprint = 0x97e479d7c070c2a9, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        // The repository's own tree. CI swaps this for a `zig fetch` of a
+        // `git archive` of HEAD (#417), the package a dependent receives.
+        .zoxy = .{ .path = "../.." },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
