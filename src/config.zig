@@ -1135,8 +1135,9 @@ pub const ParseError = std.json.ParseError(std.json.Scanner) || ValidationError;
 pub const FileSource = struct {
     context: ?*anyopaque = null,
     /// Read the whole file, at most `limit` bytes, into the arena.
-    /// A file over the limit reports `FileTooLarge` — the loader turns
-    /// it into the same `BodyOverLimit` an oversized inline body earns.
+    /// A file over the limit reports `FileTooLarge` — the front-end
+    /// turns it into the same `BodyOverLimit` an oversized inline body
+    /// earns.
     read: *const fn (
         context: ?*anyopaque,
         arena: std.mem.Allocator,
@@ -1226,7 +1227,8 @@ pub fn parseWithFiles(
     // therefore outrank a listener's, which is the honest order anyway:
     // an unreadable file is a fact about the deployment, where a bad
     // filter is a fact about a rule that may never have loaded.
-    const bodies = try resolveBodies(arena, parsed.bodies, files);
+    const bodies_stated = try bodiesOf(arena, parsed.bodies, files);
+    const bodies = try resolveBodies(arena, bodies_stated);
     const listeners = try resolveListeners(
         arena,
         parsed.listeners,
@@ -1236,7 +1238,8 @@ pub fn parseWithFiles(
         files,
     );
     const admin_bind = try resolveAdminBind(parsed.admin);
-    const error_pages = try resolveErrorPages(arena, parsed.error_pages, bodies);
+    const error_pages_stated = try errorPagesOf(arena, parsed.error_pages);
+    const error_pages = try resolveErrorPages(arena, error_pages_stated, bodies);
 
     assert(listeners.len >= 1);
     assert(clusters.len >= 1);
@@ -1353,21 +1356,19 @@ const ResolvedBody = struct {
     rendered: [shed.page_statuses.len]?*const Config.StaticPage = @splat(null),
 };
 
-/// Resolve the #159 `bodies` map: names bounded and unique, exactly one
-/// source arm per body, bytes under `body_bytes_max` whichever arm they
-/// came through, content type a forwardable header value. Absent means
-/// an empty table, and every reference then fails as `BodyUnknown`.
+/// Resolve the #159 bodies: names bounded and unique, bytes under
+/// `body_bytes_max` wherever they came from, content type a forwardable
+/// header value. None is an empty table, and every reference then fails
+/// as `BodyUnknown`.
 fn resolveBodies(
     arena: std.mem.Allocator,
-    bodies_json: ?BodiesJson,
-    files: FileSource,
+    stated: []const Options.Body,
 ) ParseError![]ResolvedBody {
-    const parsed = bodies_json orelse return &.{};
-    if (parsed.entries.len > std.math.maxInt(u16)) {
+    if (stated.len > std.math.maxInt(u16)) {
         return error.BodiesOverLimit;
     }
-    const bodies = try arena.alloc(ResolvedBody, parsed.entries.len);
-    for (parsed.entries, 0..) |entry, index| {
+    const bodies = try arena.alloc(ResolvedBody, stated.len);
+    for (stated, 0..) |entry, index| {
         if (entry.name.len == 0) {
             return error.BodyNameEmpty;
         }
@@ -1375,67 +1376,28 @@ fn resolveBodies(
             return error.BodyNameTooLong;
         }
         // Nested rather than sorted (the cluster-names rationale does
-        // not carry): a config lists a handful of bodies, and each is
-        // already paying a file read next to this compare.
+        // not carry): a config lists a handful of bodies, and each has
+        // already paid a file read or a copy next to this compare.
         for (bodies[0..index]) |previous| {
             if (std.mem.eql(u8, previous.name, entry.name)) {
                 return error.BodyNameDuplicate;
             }
         }
+        // The cap holds whichever way the bytes arrived: where they came
+        // from is not what the memory statement is about.
+        if (entry.bytes.len > constants.body_bytes_max) {
+            return error.BodyOverLimit;
+        }
         bodies[index] = .{
             .name = entry.name,
-            .bytes = try resolveBodyBytes(arena, &entry.body, files),
-            .content_type = try resolveContentType(entry.body.content_type),
+            .bytes = entry.bytes,
+            .content_type = try resolveContentType(entry.content_type),
         };
         assert(bodies[index].name.len >= 1);
         assert(bodies[index].bytes.len <= constants.body_bytes_max);
     }
-    assert(bodies.len == parsed.entries.len);
+    assert(bodies.len == stated.len);
     return bodies;
-}
-
-/// One body's bytes through its one source arm (#159): `file` XOR
-/// `inline`, the redirect target's exactly-one-fork rule. The cap
-/// applies to both arms identically — where the bytes came from is not
-/// what the memory statement is about.
-fn resolveBodyBytes(
-    arena: std.mem.Allocator,
-    body_json: *const BodyJson,
-    files: FileSource,
-) ParseError![]const u8 {
-    const has_file = body_json.file != null;
-    const has_inline = body_json.@"inline" != null;
-    if (!has_file and !has_inline) {
-        return error.BodySourceMissing;
-    }
-    if (has_file and has_inline) {
-        return error.BodySourceAmbiguous;
-    }
-    if (body_json.file) |path| {
-        if (path.len == 0) {
-            return error.BodyFileUnreadable;
-        }
-        const bytes = files.read(
-            files.context,
-            arena,
-            path,
-            constants.body_bytes_max,
-        ) catch |err| switch (err) {
-            error.FileUnreadable => return error.BodyFileUnreadable,
-            error.FileTooLarge => return error.BodyOverLimit,
-            error.OutOfMemory => return error.OutOfMemory,
-        };
-        assert(bytes.len <= constants.body_bytes_max);
-        return bytes;
-    }
-    const inline_bytes = body_json.@"inline".?;
-    if (inline_bytes.len > constants.body_bytes_max) {
-        return error.BodyOverLimit;
-    }
-    // The same postcondition the file arm states: where the bytes came
-    // from is not what the memory statement is about.
-    assert(inline_bytes.len <= constants.body_bytes_max);
-    return inline_bytes;
 }
 
 /// A body's Content-Type: non-empty and injection-safe — the same
@@ -1456,44 +1418,41 @@ fn resolveContentType(content_type: []const u8) ParseError![]const u8 {
 /// comptime-static path unchanged: one send from immutable memory.
 fn resolveErrorPages(
     arena: std.mem.Allocator,
-    error_pages_json: ?ErrorPagesJson,
+    stated: []const Options.ErrorPage,
     bodies: []ResolvedBody,
 ) ParseError![]const *const Config.StaticPage {
-    const parsed = error_pages_json orelse return &.{};
     // The closed status set bounds what can survive validation, so a
-    // longer map always fails below — on an unknown status or on a
+    // longer list always fails below — on an unknown status or on a
     // duplicate, and which one is not knowable from the count alone,
     // which is why this has an error of its own rather than guessing at
     // either. Ahead of the allocation, so a rejected config's arena
-    // stays bounded by the vocabulary rather than by the file's length
+    // stays bounded by the vocabulary rather than by the list's length
     // (`BodiesOverLimit`'s reasoning, one resolver up).
-    if (parsed.entries.len > shed.static_statuses.len) {
+    if (stated.len > shed.static_statuses.len) {
         return error.ErrorPagesOverLimit;
     }
-    const pages = try arena.alloc(*const Config.StaticPage, parsed.entries.len);
-    for (parsed.entries, 0..) |entry, index| {
-        const status = std.fmt.parseUnsigned(u16, entry.status, 10) catch
-            return error.ErrorPageStatusInvalid;
+    const pages = try arena.alloc(*const Config.StaticPage, stated.len);
+    for (stated, 0..) |entry, index| {
         // The error set, not the wider page set: `200` is a `respond`
         // action's status, and no rung raises it — a page here for one
         // would never serve.
-        if (!shed.isStaticStatus(status)) {
+        if (!shed.isStaticStatus(entry.status)) {
             return error.ErrorPageStatusUnknown;
         }
         // The closed set is ten wide, so the duplicate scan is bounded
         // by it whatever the entry count claims.
         for (pages[0..index]) |previous| {
-            if (previous.status == status) {
+            if (previous.status == entry.status) {
                 return error.ErrorPageDuplicate;
             }
         }
-        pages[index] = try pageFor(arena, bodies, entry.body, status);
+        pages[index] = try pageFor(arena, bodies, entry.body, entry.status);
         // What the serve path reads back (`configuredPage`): a head
         // that is a prefix of its own response, on both variants.
         assert(pages[index].keep_head_len <= pages[index].keep.len);
         assert(pages[index].close_head_len <= pages[index].close.len);
     }
-    assert(pages.len == parsed.entries.len);
+    assert(pages.len == stated.len);
     assert(pages.len <= shed.static_statuses.len);
     return pages;
 }
@@ -2508,6 +2467,93 @@ fn clusterTlsOf(
     assert(pem.len <= constants.origin_ca_bytes_max);
     assert(tls.ca.path.len >= 1);
     return .{ .server_name = tls.server_name, .ca_pem = pem };
+}
+
+/// The JSON front-end's #159 bodies: exactly one source arm per body —
+/// `file` XOR `inline`, the redirect target's exactly-one-fork rule — and
+/// a file read through the seam under the same cap the library holds every
+/// body to, so an oversized file is refused before it is read whole.
+fn bodiesOf(
+    arena: std.mem.Allocator,
+    bodies_json: ?BodiesJson,
+    files: FileSource,
+) ParseError![]const Options.Body {
+    const parsed = bodies_json orelse return &.{};
+    // The library's bound, stated ahead of the reads too, so a table that
+    // will be refused is refused before it costs a file read per entry.
+    if (parsed.entries.len > std.math.maxInt(u16)) {
+        return error.BodiesOverLimit;
+    }
+    const bodies = try arena.alloc(Options.Body, parsed.entries.len);
+    for (parsed.entries, bodies) |*entry, *body| {
+        body.* = .{
+            .name = entry.name,
+            .bytes = try bodyBytesOf(arena, &entry.body, files),
+            .content_type = entry.body.content_type,
+        };
+    }
+    assert(bodies.len == parsed.entries.len);
+    return bodies;
+}
+
+/// One body's bytes through its one source arm. A file is read under the
+/// cap, so an oversized one is refused without being read whole; an inline
+/// body is passed through, and `resolveBodies` holds it to the same cap.
+fn bodyBytesOf(
+    arena: std.mem.Allocator,
+    body_json: *const BodyJson,
+    files: FileSource,
+) ParseError![]const u8 {
+    const has_file = body_json.file != null;
+    const has_inline = body_json.@"inline" != null;
+    if (!has_file and !has_inline) {
+        return error.BodySourceMissing;
+    }
+    if (has_file and has_inline) {
+        return error.BodySourceAmbiguous;
+    }
+    const path = body_json.file orelse return body_json.@"inline".?;
+    if (path.len == 0) {
+        return error.BodyFileUnreadable;
+    }
+    const bytes = files.read(
+        files.context,
+        arena,
+        path,
+        constants.body_bytes_max,
+    ) catch |err| switch (err) {
+        error.FileUnreadable => return error.BodyFileUnreadable,
+        error.FileTooLarge => return error.BodyOverLimit,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    assert(!has_inline);
+    assert(bytes.len <= constants.body_bytes_max);
+    return bytes;
+}
+
+/// The JSON front-end's `error_pages`: a map keyed by status, so the key
+/// is text that has to parse as one. Which statuses may carry a page is
+/// the library's rule.
+fn errorPagesOf(
+    arena: std.mem.Allocator,
+    error_pages_json: ?ErrorPagesJson,
+) ParseError![]const Options.ErrorPage {
+    const parsed = error_pages_json orelse return &.{};
+    // The library's bound, ahead of the key parse, so a map the closed
+    // status set cannot hold is told so by its size, as it always was.
+    if (parsed.entries.len > shed.static_statuses.len) {
+        return error.ErrorPagesOverLimit;
+    }
+    const pages = try arena.alloc(Options.ErrorPage, parsed.entries.len);
+    for (parsed.entries, pages) |entry, *page| {
+        page.* = .{
+            .status = std.fmt.parseUnsigned(u16, entry.status, 10) catch
+                return error.ErrorPageStatusInvalid,
+            .body = entry.body,
+        };
+    }
+    assert(pages.len == parsed.entries.len);
+    return pages;
 }
 
 // The strict parser binds JSON to these `*Json` DTOs. Each carries the
@@ -7293,6 +7339,44 @@ test "config: clusters written as options meet the loader's rules (#417)" {
     const with_picker = try resolveClusters(arena, &[_]Options.Cluster{picked});
     try std.testing.expect(with_picker[0].pick == .extension);
     try std.testing.expect(with_picker[0].hash_key == .source_ip);
+}
+
+test "config: bodies and error pages written as options (#417)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const bodies = try resolveBodies(arena, &[_]Options.Body{.{
+        .name = "busy",
+        .bytes = "try again shortly",
+        .content_type = "text/plain",
+    }});
+    const pages = try resolveErrorPages(arena, &[_]Options.ErrorPage{
+        .{ .status = 503, .body = "busy" },
+    }, bodies);
+    try std.testing.expectEqual(@as(usize, 1), pages.len);
+    try std.testing.expectEqual(@as(u16, 503), pages[0].status);
+    try std.testing.expect(std.mem.endsWith(u8, pages[0].keep, "try again shortly"));
+    // The rules a file meets, met from code: only a status zoxy answers
+    // itself takes a page, and a page names a body that exists.
+    try std.testing.expectError(error.ErrorPageStatusUnknown, resolveErrorPages(
+        arena,
+        &[_]Options.ErrorPage{.{ .status = 200, .body = "busy" }},
+        bodies,
+    ));
+    try std.testing.expectError(error.BodyUnknown, resolveErrorPages(
+        arena,
+        &[_]Options.ErrorPage{.{ .status = 503, .body = "missing" }},
+        bodies,
+    ));
+    // The cap moved from the inline arm to every body, whatever carried
+    // its bytes in.
+    const oversized = try arena.alloc(u8, constants.body_bytes_max + 1);
+    @memset(oversized, 'x');
+    try std.testing.expectError(error.BodyOverLimit, resolveBodies(arena, &[_]Options.Body{.{
+        .name = "huge",
+        .bytes = oversized,
+        .content_type = "text/plain",
+    }}));
 }
 
 const example_json = @embedFile("example_config");
