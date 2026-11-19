@@ -437,12 +437,12 @@ startup; there is nothing to list in the config, so the config cannot
 disagree with the certificate. The common name is not consulted (RFC 9525).
 A name is matched case-insensitively, in this order:
 
-1. An exact name, in any certificate, `cert` first and then the list in
-   order.
-2. A wildcard: `*.example.com` covers `api.example.com`, but neither
-   `example.com` nor `a.b.example.com`.
-3. Otherwise, and for a client that sends no server name, the default
-   pair in `cert` and `key`.
+- First, an exact name, in any certificate, `cert` first and then the list
+  in order.
+- Then a wildcard: `*.example.com` covers `api.example.com`, but neither
+  `example.com` nor `a.b.example.com`.
+- Otherwise, and for a client that sends no server name, the default pair
+  in `cert` and `key`.
 
 Within the first of those that has a match, a certificate is only
 considered if the client can verify its key, going by the
