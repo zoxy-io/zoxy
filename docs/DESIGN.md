@@ -67,8 +67,11 @@ Non-goals. Each is recorded so that it reads as a decision, not as drift:
   processes (§3).
 - **Config reload.** The config is parsed once, and a change means a
   restart. SIGHUP only reopens the access log's file (§8).
-- **DNS.** An endpoint is an IP literal or a `unix:` path. Nothing is
-  ever resolved.
+- **DNS, and discovery at runtime.** zoxy resolves no name: an
+  endpoint is an IP address or a `unix:` path in the options. A build
+  that finds its endpoints — in DNS, or in a registry — does so in its
+  own code before the options exist (§13), and the set is fixed for the
+  process's life.
 - **xDS, multi-process orchestration, hot restart.**
 - **Production off Linux.** Production means Linux with io_uring.
   macOS builds ship for development, and correctness claims are made
@@ -173,8 +176,8 @@ live, stays auditable Zig.
 
 ### The Io seam
 
-- **One contract, two backends.** `Server(Io)` and everything under it
-  are generic over an Io contract that `io.assertIoInterface` checks:
+- **One contract, two backends.** `Server(runtime)` and everything under
+  it are generic over an Io contract that `io.assertIoInterface` checks:
   - `XevIo` is the production backend;
   - `SimIo` is the simulator's (§9);
   - `io/contract_test.zig` runs the same suite against both.
@@ -501,12 +504,28 @@ banner, and exits:
 
 ### The config
 
-- **Parsed once.** Strict JSON goes into an arena: immutable, read-only
-  thereafter, never freed. That arena is the only allocating region.
-  Unknown fields are refused.
-- **A working config is one listener and one cluster.** Every other
-  block and field is optional.
-- **Defaults exist only where zoxy can answer honestly:**
+- **Options, then a config.** What a build states is `zoxy.Options`:
+  typed, carrying bytes rather than paths, and selecting extensions by
+  instance (§13). `config.resolve` holds them to every rule below and
+  compiles them into the `Config` the server runs, in an arena:
+  immutable, read-only thereafter, never freed. That arena is the only
+  allocating region. Resolving reads no file and looks up no name.
+- **JSON is the stock binary's front-end.** `src/json/` parses a config
+  file strictly — an unknown field is refused — reads the files it
+  names, applies the stock values where a key is absent, and hands the
+  library options. It is a module of its own that the package does not
+  export, so a custom build cannot be configured with JSON; it states
+  its options in code, naming the stock values (`zoxy.defaults`) where
+  it wants them. What only a spelling can get wrong — an unknown string,
+  a fork named twice, a literal that does not parse, an unreadable file —
+  is the front-end's refusal, and outranks every rule.
+- **Options state every choice.** No option has a default if it decides
+  where traffic goes, when work is refused, or what is reserved;
+  optional features default to off, and `limits` is stated even when
+  every pool is left to zoxy's sizing.
+- **A working config is one listener and one cluster.** In JSON every
+  other block and field is optional.
+- **The stock values exist only where zoxy can answer honestly:**
   - `connect_ms` 5 s, `idle_ms` 60 s, `health_interval_ms` 2 s,
     `tunnel_ms` 1 h;
   - `head_ms` 10 s, clamped between `connect_ms` and `idle_ms`;
@@ -514,7 +533,7 @@ banner, and exits:
     off. They are policy about the operator's origins or supervisor.
   - A zero that would break rather than disable (a dial, idle or probe
     interval) is refused.
-- **Orderings.** `connect_ms < head_ms ≤ idle_ms` is refused at load
+- **Orderings.** `connect_ms < head_ms ≤ idle_ms` is refused by `resolve`
   otherwise, because the lazy timer cannot move a deadline earlier for
   free (§4). `Server.init` asserts it again.
 - **Refuse, never clamp.** A config zoxy cannot honour does not start.
@@ -932,7 +951,9 @@ gates startup.
     path run (steering, or panic and fail-open), and its result narrows
     to the lowest tier too.
 - **Counters:** `upstream_ejected_picks`, `upstream_panic_picks` and
-  `upstream_standby_picks`, each also per cluster.
+  `upstream_standby_picks`, each also per cluster; and
+  `upstream_fallback_picks`, a build's picker answering out of range
+  (§13).
 - **Health is opt-in.** Passive ejection removes capacity by inference,
   which is the operator's call to make. The banner states how many
   clusters have no failure detection.
@@ -1129,7 +1150,7 @@ Rules the table follows:
 - **`Proxy-Status`** (RFC 9209) is a per-listener opt-in. Its token is
   keyed by the *rung*, not the status:
   - no route: `destination_not_found`;
-  - a filter reject: `http_request_denied`;
+  - a filter or request-policy reject: `http_request_denied`;
   - any shed: `connection_limit_reached`;
   - the request deadline: `http_response_timeout`.
 
@@ -1247,6 +1268,7 @@ binary. h2spec and the speed gates run at merge.
 | lint | `zig build lint` | every change | the boundaries and Tiger Style rules a reader would miss |
 | simulation | `zig build sim` | every change (4096 seeds); nightly (4 × 1M) | the real data path under an adversary; every counter and op reached |
 | live gate | `zig build smoke`, `smoke-release` | every change | the shipped binary, on a real kernel, judged by equalities |
+| a dependent's build | `zig build`, `test`, `smoke` in `examples/edge` | every change (CI's consumer job) | a build on the fetched package runs, its own extensions held to `zoxy.testing`'s gate (§13) |
 | HTTP/2 conformance | `zig build h2spec` | at merge | an independent RFC 9113 implementation agrees, except §12's deviations |
 | benchmark | `zig build bench` | at merge | bands compared across runs, plus hard RSS and drain gates |
 
@@ -1365,10 +1387,11 @@ binary. h2spec and the speed gates run at merge.
 src/
   main.zig              the stock binary: argv, reading the JSON config into options, then zoxy.App
   app.zig               zoxy as a process: resolve, banner, fd budget, log sink, certificates, signals, run
+  extension.zig         the extension seam: Runtime, Extensions, selections, the contracts (§13)
   root.zig              the `zoxy` module's exports (§13)
   Options.zig           what a build states: the library's one input (§5)
   defaults.zig          zoxy's stock values, named for a build that wants them
-  Server.zig            composition root: pools, listeners, admission, teardown; generic over Io
+  Server.zig            composition root: pools, listeners, admission, teardown; generic over the runtime (Io, extensions)
   budget.zig            §5's closed form: pool sizes, fd and ring demands, the banner
   constants.zig         every static limit and the comptime asserts relating them
   config.zig            Options → arena-owned immutable Config; every rule a config is held to
@@ -1426,7 +1449,8 @@ src/
     libcrypto_heap.zig  libcrypto's allocations into one fixed buffer
     TestClient.zig, TestTlsServer.zig   test support
   tls_heap_proof.zig    the libcrypto heap measurements (zig build tls-heap-proof)
-  testing/              shared test helpers: fuzz seeds, an origin
+  testing/              shared test helpers: fuzz seeds, an origin, the scripted extensions,
+                        and the embedder's bed and zero-allocation gate (zoxy.testing, §13)
   *_test.zig            directed suites, mostly over SimIo (13 files)
 sim/                    the simulator: Harness, L4 and L7 populations, oracles
 smoke/                  the live gate and the h2spec harness
@@ -1522,36 +1546,142 @@ agreeing with everyone else. Two external checks exist:
 ## 13. Embedding — the library seam
 
 zoxy is a Zig module before it is a binary. `build.zig` publishes
-`zoxy`, and the serving path takes a `Config` **struct**, never a file.
-JSON is one way to build that struct; `sim/Harness.zig` builds it field
-by field from a seed. The simulator runs the real data path *because* it
-is an embedder.
+`zoxy`; the stock binary is one build on it and a custom build is
+another (#417). Both run the same startup sequence and the same serving
+path. They differ in where their options come from and in which
+extensions they list.
 
-- **What the module offers** is what `src/root.zig` exports:
-  - `config.Config` and its loader;
-  - `Server(Io)`, and `Budget(Io)` (§5's closed form, fd and ring
-    demands, the banner);
-  - the `Io` seam and both backends;
-  - the pieces the phases are built from.
+- **Configured in code.** A build states `zoxy.Options` (§5). The JSON
+  loader is the stock binary's private front-end, so a custom build has
+  no config file. `zoxy.defaults` names the stock values a build may
+  choose by name. The simulator is a build too: `sim/Harness.zig`
+  states its configs from a seed.
+- **The entry points:**
+  - `zoxy.App(extensions)`, the application half of a build that lists
+    `extensions`;
+  - `App.serve(init, *const Options, *const App.Startup)` runs the whole
+    sequence below to the drain. `App.Startup` carries the banner's
+    build stamp, what messages call the options' source, and what
+    building the options took from the startup arena. Once per process:
+    the loop owns the process's signals;
+  - `App.check` runs step zero, the banner and the same resource
+    gauntlet a start runs, gives everything back, and binds no port. It
+    returns `--check`'s verdict (§8);
+  - `App.picker(&instance)` and `App.policy(&instance)` make
+    selections. A type the build does not list is a compile error;
+  - `config.resolve(arena, *const Options)` is step zero on its own, for
+    a build that wants the verdict alone;
+  - `zoxy.testing`, the bed and gate below.
 
-  The many other `pub` declarations are module visibility for
-  zoxy's own files, not surface.
-- **What stays in `main.zig` is the application:** argv, `--check`, the
-  filesystem, `RLIMIT_NOFILE`, signal dispositions, the SIGALRM handler,
-  installing the libcrypto heap, and loading certificates.
-  - `Budget` lives in the module because it must price exactly what
-    `Server.init` reserves. A second derivation would break §5's promise
-    while still looking right.
-- **An embedder's start-up order:**
-  1. install the libcrypto heap;
-  2. `Server.init`, then hand over TLS credentials and certificate sets;
-  3. install SIGALRM and tell `XevIo` (`alarmHandlerInstalled`), at any
-     point before `start`;
-  4. `start`, `run`, then `isIdle`.
-- **Extension is compile-time.** A Zig function is added to the module
-  that owns the phase: `Server` (admission), `http/router.zig` (route),
-  `balancer.zig` (pick) or `http/proxy.zig` (settle).
-  - There is no runtime hook. A hook could allocate, and the census and
-    Tiger Style do not cross a seam.
-- **Published, not frozen.** There is no external consumer yet, and
-  HTTP/3 would move the exchange's internal shape again.
+  `Server(runtime)`, `Budget(runtime)` and the Io seam are the parts
+  `App` is made of. A build that composes them itself takes on the
+  libcrypto heap, credentials and signals `App` installs. The many
+  other `pub` declarations are module visibility for zoxy's own files,
+  not surface.
+- **The startup sequence**, written once in `app.zig`:
+  0. resolve the options, and refuse a selection the build does not
+     list (`ExtensionUnserved`);
+  1. price the config and print the banner (§5);
+  2. take the fd budget, open the log sink, load every certificate;
+  3. build the loop and the server, bind the extensions, hand over the
+     credentials, install the signal dispositions;
+  4. start, run until a drain completes, print the final tally.
+
+  Endpoint discovery is ordinary code that runs before step zero. There
+  is no hook for it.
+- **What stays in a binary** is what only it knows: its command line,
+  and where its options come from. For the stock binary that is argv
+  and the JSON front-end.
+
+**Extensions.** A build lists types:
+`Extensions{ .pickers, .request_policies }`. Dispatch is a comptime
+switch over the list, not a function pointer, and with empty lists
+every extension call compiles out, as in the stock binary. An instance
+carries its parameters and its state. A selection is the type's index
+and a type-erased pointer to the instance, so `Options` stays
+non-generic. Selecting one instance from several sites shares its
+state. `App.picker` and `App.policy` are the supported constructors:
+the instance's type cannot be checked at runtime, so they check it at
+compile time, and a selection made by hand whose index the build's
+lists do not reach is refused at step zero (`ExtensionUnserved`).
+
+- **Pickers**, one per cluster that selects one:
+  - `pick(*P, *const Candidates, *const PickInput) u16` returns a slot
+    in `0..count`. The set is never empty;
+  - an optional
+    `bind(*P, *const extension.ClusterSite, *const extension.Startup) !void`
+    runs at startup, once per cluster that selects the instance, and
+    may refuse;
+  - the candidates are what remains after drain, retry exclusion,
+    health and panic, ramped caps and standby tiers (§7). A slot indexes
+    that set, not the cluster's endpoints, and each slot exposes
+    its endpoint index, a stable identity, its weight, its in-flight
+    count, its capacity and its address;
+  - the input carries the cluster, the client address (null on a
+    `unix:` listener), the request view on L7 (null on L4), whether
+    this is a retry, whether health is steering, the loop's `now_ns`,
+    and zoxy's seeded entropy;
+  - a slot out of range falls back to p2c over the same set and counts
+    `upstream_fallback_picks`, and per cluster
+    `cluster_upstream_fallback_picks`;
+  - zoxy owns dialing, pooling, retries and accounting.
+- **Request policies**, each an ordered list:
+  - per http listener, run after the head canonicalizes and before
+    filters and routing;
+  - per route, run once the route is chosen and before any resource is
+    taken for it;
+  - `evaluate(*P, *const Request) Verdict` returns `proceed`, or
+    `reject` with a status from the static reject set: 400, 403, 404 or
+    429. The first reject wins;
+  - an optional
+    `bind(*P, *const extension.PolicySite, *const extension.Startup) !void`
+    runs once per site;
+  - the request view holds the method, the canonical host, path and
+    query, the parsed headers, the client address, the verified client
+    certificate's fingerprint when there is one, and the listener. At
+    the route phase it also holds the chosen cluster;
+  - a reject answers with the static response, logs outcome
+    `rejected`, carries Proxy-Status `http_request_denied` where the
+    listener sends it, and counts `l7_policy_rejected`. A retry or a
+    replay does not evaluate again.
+
+**Obligations on every serving call.** These are stated here and
+asserted at the seam wherever zoxy can see them:
+
+- synchronous and run to completion, with bounded loops;
+- no allocation after startup. A serving call never receives an
+  allocator, while `bind` may use the startup arena;
+- deterministic given its inputs and the instance's own state: no wall
+  clock and no private randomness, since `PickInput.entropy` is zoxy's
+  seeded source;
+- no syscalls and no I/O;
+- views are valid only during the call, so copy what must outlive it.
+
+**Testing a build.** `zoxy.testing.Bed(extensions)` runs a build's
+options and extensions over the simulator. It puts an origin on every
+endpoint, each answering with its own address, drives HTTP clients, and
+ends with a drained, reconciled server. `expectNoAllocationAfterStartup`
+is §9's gate over the build's own scenario, run twice: first counted,
+then with every allocation and resize past startup failing. The second
+run must also replay the first's delivery trace, and a clock or private
+randomness breaks that.
+
+zoxy's own simulator runs scripted extensions (`ScriptedPicker`,
+`ScriptedPolicy`), so every dispatch arm, the fallback and both policy
+phases are in the census. An embedder's own functions are theirs to
+cover with the bed. `examples/edge` is a working build:
+- two picker types, one instance selected by two clusters;
+- both policy phases;
+- its own bed tests and a live smoke.
+
+CI builds, tests and smokes it against a fetched package.
+
+**Not offered yet:**
+- live endpoint discovery, which needs preallocated slots and endpoint
+  identities that survive in-flight work;
+- further phases: header edits, response policies, a completion hook
+  for latency-aware pickers, and L4 connection policies;
+- regex in stock filters and routes, which waits until after v1.0.0.
+
+**Published, not frozen.** HTTP/3 would move the exchange's internal
+shape again, and the seam moves with it.
