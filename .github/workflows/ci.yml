@@ -57,7 +57,7 @@ jobs:
 
       # zig-pkg (vendored, hash-pinned deps) is deliberately not checked.
       - name: Check formatting
-        run: zig fmt --check build.zig src bench sim smoke scripts examples/edge/build.zig examples/edge/build.zig.zon examples/edge/src
+        run: zig fmt --check build.zig src bench sim smoke scripts tools examples/edge/build.zig examples/edge/build.zig.zon examples/edge/src examples/edge/smoke
 
       - name: Build
         run: zig build
@@ -85,7 +85,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v2
 
-      - name: Build the example against a fetched zoxy
+      - name: Build, test and smoke the example against a fetched zoxy
         run: |
           work="$RUNNER_TEMP/consumer"
           mkdir -p "$work"
@@ -101,6 +101,14 @@ jobs:
           fi
           zig fetch --save=zoxy "$work/zoxy.tar.gz"
           zig build --summary all
+          # Its own extensions under the simulator, through zoxy.testing:
+          # the zero-allocation gate and a replayed seed.
+          zig build test --summary all
+          # The binary on real sockets (XevIo), drained by SIGTERM — in the
+          # default build, and in the ReleaseSafe one a dependent ships,
+          # whose failure modes a Debug build cannot reproduce (#283).
+          zig build smoke
+          zig build smoke -Doptimize=ReleaseSafe
 
   coverage:
     name: coverage

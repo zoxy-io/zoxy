@@ -21,8 +21,9 @@ direnv activates the shell). Read before writing code:
   against the default build and once against the ReleaseSafe twin
   (`zig build smoke-release`), because the configuration release.yml
   ships has failure modes a Debug build cannot reproduce (#283).
-- `zig fmt --check src scripts smoke examples/edge/src examples/edge/build.zig
-  examples/edge/build.zig.zon build.zig build.zig.zon` — the format gate (a
+- `zig fmt --check src scripts smoke tools examples/edge/src examples/edge/smoke
+  examples/edge/build.zig examples/edge/build.zig.zon build.zig build.zig.zon` —
+  the format gate (a
   PostToolUse hook auto-formats files as they are edited).
 - `zig build h2spec` (h2spec against the shipped build, over h2c and TLS;
   its failures must equal DESIGN.md §12's recorded deviations) runs at
