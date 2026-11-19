@@ -339,8 +339,8 @@ pub const tunnels_max: u32 = conn_slots_max;
 
 /// The default when a listener terminates TLS and the operator did not
 /// say. Follows conn slots like the head-buffer ring does — every
-/// connection could be mid-handshake at once — but capped, because
-/// unlike a head buffer an engine is two orders of magnitude larger and
+/// connection could be mid-handshake at once — but capped, because an
+/// engine is over ten times a head buffer (~92 KiB against 8 KiB) and
 /// `conn_slots_max` engines is memory no box would want by accident.
 /// An operator who wants more concurrent TLS than this raises it
 /// deliberately, having seen the number in the startup banner.

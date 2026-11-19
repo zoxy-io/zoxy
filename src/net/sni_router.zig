@@ -10,10 +10,13 @@
 //! there.
 //!
 //! Matching is exact, deliberately: §7's `host` dimension compares with
-//! `std.mem.eql` and nothing in the tree supports a wildcard. Giving L4
+//! `std.mem.eql`, and neither routing table has a wildcard. Giving L4
 //! one would mean two rules for one idea, and the two disagreeing about
-//! what a host is, which is the thing #298 asked to avoid. A wildcard is
-//! a change to both dimensions or to neither.
+//! what a host is, which is the thing #298 asked to avoid. A wildcard
+//! route is a change to both dimensions or to neither. The `*.` match in
+//! certificate selection (#297, `tls/certificate_set.zig`) is not a
+//! route: it is the rule for a certificate's own names, and decides only
+//! which certificate a terminating listener presents.
 //!
 //! Pure: the table is built, validated and sorted at config load
 //! (`config.zig`) so a named route precedes the any-name one, making a
