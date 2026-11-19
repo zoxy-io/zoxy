@@ -21,7 +21,7 @@ const assert = std.debug.assert;
 
 const SimIo = @This();
 
-const sockets_max: u16 = 1024;
+pub const sockets_max: u16 = 1024;
 const listeners_max: u16 = 32;
 const accept_queue_max: u16 = 64;
 /// The widest a scenario may open a socket ring. The simulator's own
