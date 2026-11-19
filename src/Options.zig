@@ -1,9 +1,9 @@
 //! What a build states about the proxy it runs (#417): the library's one
 //! input. A custom build writes these in code; the stock binary's JSON is
 //! a front-end that writes them from a file, and nothing past this type
-//! knows which happened. The library validates them — every refusal the
-//! stock loader makes, made here, once — and compiles them into the
-//! `Config` the server runs.
+//! knows which happened. `config.resolve` validates them — every refusal
+//! the stock loader makes, made of the options alone — and compiles them
+//! into the `Config` the server runs.
 //!
 //! **Explicit by construction.** A field has no default if it decides
 //! where traffic goes, when work is refused, or what is reserved:
@@ -20,8 +20,13 @@
 //! fork with a choice of keys, these carry an enum and a union, so the
 //! refusals that only a spelling can earn stay in the JSON front-end.
 //!
-//! The split arrives one block at a time (#417's plan); the blocks below
-//! are the ones the loader already resolves from options.
+//! **Named, not indexed.** A route names its cluster as the cluster names
+//! itself, and a page its body; resolving refuses a name nothing declares.
+//!
+//! **Kept, not copied.** The resolved `Config` points into the options'
+//! own memory — names, prefixes, bodies, PEM bytes, selections — so
+//! whoever builds them keeps that memory for the process's life: static
+//! data, or the startup arena.
 
 const std = @import("std");
 
@@ -31,6 +36,25 @@ const filter = @import("http/filter.zig");
 const parser = @import("http/parser.zig");
 const io = @import("io/io.zig");
 const alpn = @import("tls/alpn.zig");
+
+/// The sockets the proxy accepts on; at least one.
+listeners: []const Listener,
+/// The upstream clusters listeners and routes name; at least one.
+clusters: []const Cluster,
+timeouts: Timeouts,
+/// Stated, so leaving the sizing to zoxy is something a build writes
+/// down rather than inherits; each member left null is sized by zoxy's
+/// own rule for this config.
+limits: Limits,
+/// The admin listener (§8), or null for none.
+admin: ?Admin = null,
+/// The access log (§8), or null for none.
+access_log: ?AccessLog = null,
+/// Named bodies, for error pages and `respond` actions (#159).
+bodies: []const Body = &.{},
+/// Bodies for statuses zoxy answers itself; a status no page names keeps
+/// its empty one.
+error_pages: []const ErrorPage = &.{},
 
 /// One listening socket (§4): where it binds, whether it terminates TLS,
 /// and what it speaks.
