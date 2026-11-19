@@ -1126,12 +1126,14 @@ pub const ValidationError = error{
 
 pub const ParseError = std.json.ParseError(std.json.Scanner) || ValidationError;
 
-/// How the loader reads a body's `file` source (#159). A seam rather
-/// than a direct read, so the loader stays pure: `parse` below refuses
-/// every file source (tests, the fuzzer and the simulator need no
-/// filesystem — an `inline` body is theirs), and the binary's entry
-/// point passes the one real reader through `parseWithFiles`, keeping
-/// filesystem access where the config file itself is already read.
+/// How the JSON front-end reads the files a config names (#159, #417):
+/// bodies, certificates, CA bundles. A seam rather than a direct read, so
+/// the front-end stays pure: `parse` below refuses every file source
+/// (tests, the fuzzer and the simulator need no filesystem — an `inline`
+/// body is theirs), and the binary passes the one real reader to
+/// `optionsFromJson`, keeping filesystem access where the config file
+/// itself is already read. `resolve` reads no file at all: the options
+/// carry bytes.
 pub const FileSource = struct {
     context: ?*anyopaque = null,
     /// Read the whole file, at most `limit` bytes, into the arena.
@@ -1170,44 +1172,86 @@ pub fn parseWithFiles(
     json_bytes: []const u8,
     files: FileSource,
 ) ParseError!Config {
+    const options = try optionsFromJson(arena, json_bytes, files);
+    return resolve(arena, &options);
+}
+
+/// The stock binary's front-end (#417): a JSON config read into the
+/// options the library resolves. Every spelling is translated before
+/// anything is judged, so a fault only JSON can have — a literal that
+/// does not parse, a key named twice or not at all, a file that cannot be
+/// read — outranks every rule the options are held to, whichever blocks
+/// the two sit in. The options reference both the arena and `json_bytes`.
+pub fn optionsFromJson(
+    arena: std.mem.Allocator,
+    json_bytes: []const u8,
+    files: FileSource,
+) ParseError!Options {
     const parsed = try std.json.parseFromSliceLeaky(ConfigJson, arena, json_bytes, .{
         .duplicate_field_behavior = .@"error",
         .ignore_unknown_fields = false,
     });
+    return optionsOf(arena, &parsed, files);
+}
 
-    // Timeouts first: a cluster's check budget defaults to the connect
-    // timeout, so that value must already be known to be in range before
-    // any check inherits it.
+/// The JSON front-end's whole translation (#417): every block's spellings
+/// parsed into options, zoxy's stock values applied where the file is
+/// silent, and the files it names read through the seam. Nothing is judged
+/// here that options written in code could also get wrong.
+fn optionsOf(
+    arena: std.mem.Allocator,
+    parsed: *const ConfigJson,
+    files: FileSource,
+) ParseError!Options {
+    // A cluster's check budget defaults to the connect timeout, so the
+    // timeouts translate first.
     const timeouts = timeoutsOf(&parsed.timeouts);
-    try validateTimeouts(&timeouts);
-    const clusters_stated = try clustersOf(arena, &parsed.clusters, timeouts.connect_ms, files);
-    const clusters = try resolveClusters(arena, clusters_stated);
-    // Limits resolve before listeners: the route prefixes inside
-    // `resolveListeners` are gated against the resolved
-    // `head_buffer_bytes` — a prefix longer than the head can never match
-    // a parsed path, and belongs refused at load, not left to 404 forever
-    // at runtime. The listeners' spellings are translated first, though,
-    // since the limits are sized from features the typed listeners state
-    // (#417): so a listener's JSON-only faults — a bind that is not a
-    // literal, a protocol body named twice or not at all, an unreadable
-    // certificate — outrank the limits and the access log, while what
-    // the library judges of a listener still reports after both.
-    // Emptiness still outranks everything after the clusters (the limits
-    // resolver asserts a non-empty set, so the gate fires first here).
-    const listeners_stated = try listenersOf(arena, parsed.listeners, files);
-    if (listeners_stated.len == 0) {
+    const clusters = try clustersOf(arena, &parsed.clusters, timeouts.connect_ms, files);
+    const listeners = try listenersOf(arena, parsed.listeners, files);
+    const options: Options = .{
+        .listeners = listeners,
+        .clusters = clusters,
+        .timeouts = timeouts,
+        .limits = limitsOf(&parsed.limits),
+        .access_log = try accessLogOf(parsed.access_log),
+        .bodies = try bodiesOf(arena, parsed.bodies, files),
+        .admin = try adminOf(parsed.admin),
+        .error_pages = try errorPagesOf(arena, parsed.error_pages),
+    };
+    assert(options.listeners.len == parsed.listeners.len);
+    assert(options.clusters.len == parsed.clusters.entries.len);
+    return options;
+}
+
+/// Validate a build's options and compile them into the `Config` the
+/// server runs (#417): every refusal zoxy makes of a config, made of the
+/// options alone. It reads no file and resolves no name — the bytes and
+/// addresses are the options' own — so it is one function whether a file
+/// or code wrote them. The `Config` references both the arena and the
+/// options' own memory; the caller keeps both for the process's life.
+pub fn resolve(arena: std.mem.Allocator, options: *const Options) ParseError!Config {
+    // Timeouts first: a cluster's check budget is held to the same
+    // ceiling, and its default was priced from the connect timeout.
+    try validateTimeouts(&options.timeouts);
+    const clusters = try resolveClusters(arena, options.clusters);
+    // Emptiness outranks everything after the clusters (the limits
+    // resolver asserts a non-empty set, so the gate fires first here),
+    // and the count's `u16` edge is checked before anything is sized
+    // from it.
+    if (options.listeners.len == 0) {
         return error.ListenersEmpty;
     }
-    const features = try countListenerFeatures(listeners_stated);
-    const access_log_stated = try accessLogOf(parsed.access_log);
-    const access_log_sink = try resolveAccessLogSink(access_log_stated);
+    if (options.listeners.len > std.math.maxInt(u16)) {
+        return error.ListenersOverLimit;
+    }
+    const features = try countListenerFeatures(options.listeners);
+    const access_log_sink = try resolveAccessLogSink(options.access_log);
     // Before the limits, because the named headers widen the line the
     // staging buffer has to be able to hold (#140).
-    const log_headers = try resolveLogHeaders(arena, access_log_stated);
-    const limits_requested = limitsOf(&parsed.limits);
+    const log_headers = try resolveLogHeaders(arena, options.access_log);
     const limits = try resolveLimits(
-        &limits_requested,
-        @intCast(listeners_stated.len),
+        &options.limits,
+        @intCast(options.listeners.len),
         features,
         access_log_sink != null,
         log_headers.count(),
@@ -1224,50 +1268,72 @@ pub fn parseWithFiles(
             .upstream_tls_endpoints = upstreamTlsEndpointsOf(clusters),
         },
     );
-    // Bodies before listeners (#159): a `respond` action names one, and
-    // both consumers render through the same load-time cache — so the
-    // table has to exist before any rule compiles. A body's own errors
-    // therefore outrank a listener's, which is the honest order anyway:
-    // an unreadable file is a fact about the deployment, where a bad
-    // filter is a fact about a rule that may never have loaded.
-    const bodies_stated = try bodiesOf(arena, parsed.bodies, files);
-    const bodies = try resolveBodies(arena, bodies_stated);
+    // Limits resolve before listeners: the route prefixes inside
+    // `resolveListeners` are gated against the resolved
+    // `head_buffer_bytes` — a prefix longer than the head can never match
+    // a parsed path, and belongs refused at load, not left to 404 forever
+    // at runtime. Bodies resolve before listeners too (#159): a `respond`
+    // action names one, and both consumers render through the same
+    // load-time cache, so the table has to exist before any rule compiles.
+    const bodies = try resolveBodies(arena, options.bodies);
     const listeners = try resolveListeners(
         arena,
-        listeners_stated,
+        options.listeners,
         clusters,
         limits.head_buffer_bytes,
         bodies,
     );
-    const admin_stated = try adminOf(parsed.admin);
-    const admin_bind = if (admin_stated) |admin| admin.bind else null;
-    const error_pages_stated = try errorPagesOf(arena, parsed.error_pages);
-    const error_pages = try resolveErrorPages(arena, error_pages_stated, bodies);
-
-    assert(listeners.len >= 1);
-    assert(clusters.len >= 1);
-    return .{
+    const error_pages = try resolveErrorPages(arena, options.error_pages, bodies);
+    assert(listeners.len == options.listeners.len);
+    assert(clusters.len == options.clusters.len);
+    return configOf(options, .{
         .listeners = listeners,
         .clusters = clusters,
+        .limits = limits,
+        .access_log_sink = access_log_sink,
+        .log_headers = log_headers,
+        .error_pages = error_pages,
+    });
+}
+
+/// What `resolve` compiled, gathered for `configOf`.
+const Resolved = struct {
+    listeners: []const Config.Listener,
+    clusters: []const Config.Cluster,
+    limits: Config.Limits,
+    access_log_sink: ?Config.AccessLogSink,
+    log_headers: ResolvedLogHeaders,
+    error_pages: []const *const Config.StaticPage,
+};
+
+/// The `Config` the server runs, from the options and what was compiled
+/// of them — split from `resolve` for the length limit.
+fn configOf(options: *const Options, resolved: Resolved) Config {
+    const timeouts = &options.timeouts;
+    assert(timeouts.connect_ms < timeouts.head_ms);
+    assert(resolved.listeners.len >= 1);
+    return .{
+        .listeners = resolved.listeners,
+        .clusters = resolved.clusters,
         .connect_timeout_ms = timeouts.connect_ms,
         .idle_timeout_ms = timeouts.idle_ms,
         .drain_deadline_ms = timeouts.drain_deadline_ms,
         // Absent is off, and `0` is how the rest of this struct spells
         // that — so the optional collapses here rather than travelling
         // any further. See `TimeoutsJson.loop_watchdog_ms` for why the
-        // JSON side spells it as absence instead of a zero.
+        // options spell it as absence instead of a zero.
         .loop_watchdog_ms = timeouts.loop_watchdog_ms orelse 0,
         .max_lifetime_ms = timeouts.max_lifetime_ms,
         .head_timeout_ms = timeouts.head_ms,
         .request_timeout_ms = timeouts.request_ms,
         .tunnel_timeout_ms = timeouts.tunnel_ms,
         .health_interval_ms = timeouts.health_interval_ms,
-        .limits = limits,
-        .admin_bind = admin_bind,
-        .access_log_sink = access_log_sink,
-        .access_log_request_headers = log_headers.request,
-        .access_log_response_headers = log_headers.response,
-        .error_pages = error_pages,
+        .limits = resolved.limits,
+        .admin_bind = if (options.admin) |admin| admin.bind else null,
+        .access_log_sink = resolved.access_log_sink,
+        .access_log_request_headers = resolved.log_headers.request,
+        .access_log_response_headers = resolved.log_headers.response,
+        .error_pages = resolved.error_pages,
     };
 }
 
@@ -5662,16 +5728,13 @@ fn resolveListeners(
     bodies: []ResolvedBody,
 ) ParseError![]const Config.Listener {
     assert(clusters.len >= 1);
-    if (stated.len == 0) {
-        return error.ListenersEmpty;
-    }
+    // Both refused by `resolve` before anything was sized from the count.
     // No policy ceiling: a listener costs two ring ops and one fd, and
     // both are checked against this config's own budget — `cqFillFits`
     // for the ring (`LimitConnSlotsOverCqFill`), `ensureFdBudget` for the
     // fds. What is left is the `u16` the listener index is stored in.
-    if (stated.len > std.math.maxInt(u16)) {
-        return error.ListenersOverLimit;
-    }
+    assert(stated.len >= 1);
+    assert(stated.len <= std.math.maxInt(u16));
 
     const listeners = try arena.alloc(Config.Listener, stated.len);
     for (stated, listeners) |*listener_stated, *listener| {
@@ -7335,9 +7398,9 @@ fn rejectUpgradeClusters(
 }
 
 /// How many listeners ask for each of the four features whose pools and
-/// buffers are sized before any listener resolves. Split from
-/// `parseWithFiles` for the length limit, and it reads better whole: four
-/// counts taken on one rule.
+/// buffers are sized before any listener resolves. Split from `resolve`
+/// for the length limit, and it reads better whole: the counts taken on
+/// one rule.
 ///
 /// Each count is **presence only**: whether a block is *usable* is its own
 /// resolver's to say, later and per listener. Counting on usability here
@@ -9486,16 +9549,32 @@ test "config: limits shrink pools below the ceilings, never past them" {
         "\"limits\":{\"relay_buffer_bytes\":512}}");
     try expectParseError(error.LimitRelayBufferBytesOutOfRange, http_head ++ tail ++
         "\"limits\":{\"relay_buffer_bytes\":65536}}");
-    // The parse-order precedences the limits-before-listeners reorder
-    // moved, pinned deliberately (see `parse`): emptiness beats a bad
-    // sink; a bad protocol (even on a later listener) beats a bad bind
-    // on an earlier one, because the http count reads every protocol
-    // before any listener resolves.
-    try expectParseError(error.ListenersEmpty,
+    // The precedences the options split set (#417), pinned deliberately
+    // (see `optionsFromJson`): every spelling only JSON can get wrong
+    // outranks every rule the options are held to, so an unknown sink
+    // beats an empty listener list — while among the rules, emptiness
+    // still beats a sink the options state badly. A bad protocol key
+    // (even on a later listener) beats a bad bind on an earlier one,
+    // because the strict parser reads every key before anything is
+    // translated.
+    try expectParseError(error.AccessLogSinkUnknown,
         \\{"listeners":[],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1},
         \\ "access_log":{"sink":"nonsense"}}
+    );
+    try expectParseError(error.ListenersEmpty,
+        \\{"listeners":[],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1},
+        \\ "access_log":{"sink":"file","path":""}}
+    );
+    // Across blocks too: a cluster's unknown protocol outranks timeouts
+    // the options are refused for, though the timeouts judge first.
+    try expectParseError(error.ClusterProtocolUnknown,
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],"protocol":"gopher"}},
+        \\ "timeouts":{"connect_ms":0}}
     );
     try expectParseError(error.UnknownField,
         \\{"listeners":[{"bind":"not-an-address","l4":{"cluster":"a"}},

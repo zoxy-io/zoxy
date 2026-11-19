@@ -17,6 +17,10 @@ pub const balancer = @import("balancer.zig");
 /// `Server.init` reserves, so an embedder inherits it instead of copying it.
 pub const Budget = @import("budget.zig").Budget;
 pub const config = @import("config.zig");
+/// What a build states about the proxy it runs (#417): the library's one
+/// input, validated and compiled by `config.resolve` — by `App.serve`
+/// and `App.check` for a build that runs through them.
+pub const Options = @import("Options.zig");
 /// The extension seam (#417): `Runtime` is what every part of the serving
 /// path is generic over — the Io backend and the build's extensions —
 /// and `Extensions` lists the extension types one build carries.
@@ -109,6 +113,7 @@ test {
     _ = balancer;
     _ = @import("budget.zig");
     _ = config;
+    _ = Options;
     _ = extension;
     _ = config_schema;
     _ = json_schema;
