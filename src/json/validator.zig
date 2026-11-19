@@ -1,7 +1,7 @@
 //! A JSON Schema validator for exactly the dialect this repo emits
 //! (#305, DESIGN.md §5).
 //!
-//! Not a general one, and deliberately so. `config_schema.zig` renders
+//! Not a general one, and deliberately so. `schema.zig` renders
 //! the schema by reflecting over the loader's own DTOs, so the set of
 //! keywords that can appear in it is closed and known — `census` below
 //! walks a rendered document and fails on any keyword this file does not

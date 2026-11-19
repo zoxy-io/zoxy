@@ -17,6 +17,7 @@
 const std = @import("std");
 
 const zoxy = @import("zoxy");
+const zoxy_json = @import("zoxy_json");
 const build_options = @import("build_options");
 
 /// The stock binary lists no extensions: every extension call compiles
@@ -172,7 +173,7 @@ fn readConfig(
     // startup-time reader the config file itself used — the one moment
     // this process touches the filesystem for content (parse-once, §1).
     var file_context: BodyFileContext = .{ .io = io };
-    return zoxy.config.optionsFromJson(arena, config_bytes, .{
+    return zoxy_json.optionsFromJson(arena, config_bytes, .{
         .context = &file_context,
         .read = readBodyFile,
     }) catch |err| {

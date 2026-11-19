@@ -30,8 +30,6 @@ pub const defaults = @import("defaults.zig");
 pub const extension = @import("extension.zig");
 pub const Extensions = extension.Extensions;
 pub const Runtime = extension.Runtime;
-pub const config_schema = @import("config_schema.zig");
-pub const json_schema = @import("json_schema.zig");
 pub const constants = @import("constants.zig");
 pub const counters = @import("counters.zig");
 /// L7 HTTP/1.1 modules (§7). `parser` wraps the vendored hparse behind
@@ -90,6 +88,11 @@ pub const tls = struct {
     pub const testdata = struct {
         pub const cert_pem = @embedFile("tls/testdata/cert.pem");
         pub const key_pem = @embedFile("tls/testdata/key.pem");
+        /// The CA the origin fixtures chain to (#296), and the one client
+        /// certificates are issued under (#304): what the JSON front-end's
+        /// tests serve for a config's CA paths.
+        pub const origin_ca_pem = @embedFile("tls/testdata/origin-ca.pem");
+        pub const client_ca_pem = @embedFile("tls/testdata/client-ca.pem");
         /// The certificate's SAN: a client offering any other name fails
         /// verification for a reason unrelated to what is under test.
         pub const host_name = "spike.zoxy.test";
@@ -119,8 +122,6 @@ test {
     _ = Options;
     _ = defaults;
     _ = extension;
-    _ = config_schema;
-    _ = json_schema;
     _ = constants;
     _ = counters;
     _ = http.parser;

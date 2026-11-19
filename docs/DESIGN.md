@@ -547,8 +547,9 @@ banner, and exits:
 from the parse structs and the metadata beside them. It is a release
 asset and is never committed.
 
-- A differential gate, in `config.zig`'s tests and using the
-  `json_schema.zig` validator, holds schema and loader to each other:
+- A differential gate, in `src/json/loader.zig`'s tests and using the
+  `src/json/validator.zig` validator, holds schema and loader to each
+  other:
   - the schema accepts everything the loader accepts, with no exceptions;
   - what the loader refuses, the schema refuses too, or `schema_gaps`
     names why no schema could. Examples: cross-block references, sums,
@@ -1362,15 +1363,19 @@ binary. h2spec and the speed gates run at merge.
 
 ```
 src/
-  main.zig              the stock binary: argv, reading the JSON config, then zoxy.App
-  app.zig               zoxy as a process: banner, fd budget, log sink, certificates, signals, run
+  main.zig              the stock binary: argv, reading the JSON config into options, then zoxy.App
+  app.zig               zoxy as a process: resolve, banner, fd budget, log sink, certificates, signals, run
   root.zig              the `zoxy` module's exports (§13)
+  Options.zig           what a build states: the library's one input (§5)
+  defaults.zig          zoxy's stock values, named for a build that wants them
   Server.zig            composition root: pools, listeners, admission, teardown; generic over Io
   budget.zig            §5's closed form: pool sizes, fd and ring demands, the banner
   constants.zig         every static limit and the comptime asserts relating them
-  config.zig            strict JSON → arena-owned immutable Config; every load-time refusal
-  config_schema.zig     schema metadata and the emitter (zig build schema)
-  json_schema.zig       the dialect validator behind the schema/loader differential gate
+  config.zig            Options → arena-owned immutable Config; every rule a config is held to
+  json/                 the stock binary's front-end, a module of its own the package does not export
+    loader.zig          strict JSON → Options: DTOs, schema metadata, spellings, file reads
+    schema.zig          the schema emitter (zig build schema)
+    validator.zig       the dialect validator behind the schema/loader differential gate
   balancer.zig          the pick: drain, tried, health, caps, tiers; p2c | rr | hash; cookies
   shed.zig              static answers: the closed set, Date stamping, Proxy-Status, pages
   counters.zig          counters, gauges, labeled families, reconcile

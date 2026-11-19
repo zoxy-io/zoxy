@@ -18,6 +18,7 @@ const std = @import("std");
 
 const Runtime = @import("extension.zig").Runtime;
 const config_module = @import("config.zig");
+const defaults = @import("defaults.zig");
 const constants = @import("constants.zig");
 const Io = @import("io/io.zig");
 const RelayBuffer = @import("net/relay.zig").RelayBuffer;
@@ -508,13 +509,41 @@ pub fn Budget(comptime runtime: Runtime) type {
 
 const testing = std.testing;
 
+/// `config/example.json`, stated as options: the shipped example, priced
+/// here without the JSON front-end, which is not this module's (#417).
+/// Kept in step by hand; the front-end's own test pins what the file
+/// resolves to.
+const example_options: @import("Options.zig") = .{
+    .listeners = &.{.{
+        .bind = .{ .ip = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 8080 } } },
+        .protocol = .{ .l4 = .{ .target = .{ .cluster = "origin" } } },
+    }},
+    .clusters = &.{.{
+        .name = "origin",
+        .endpoints = &.{
+            .{ .address = .{ .ip = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9000 } } } },
+            .{ .address = .{ .ip = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9001 } } }, .weight = 3 },
+        },
+        .pick = defaults.pick,
+        .check = .{
+            .kind = .tcp,
+            .fall = 3,
+            .rise = 2,
+            .timeout_ms = defaults.timeouts.connect_ms,
+        },
+    }},
+    .timeouts = defaults.timeouts,
+    .limits = defaults.limits,
+    .access_log = .{ .sink = .stdout },
+};
+
 test "demandsFor: the effective config sizes both demands, not the ceilings" {
     const SimIo = @import("io/SimIo.zig");
     const BudgetSim = Budget(.{ .Io = SimIo });
 
     var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_instance.deinit();
-    const config = try config_module.parse(arena_instance.allocator(), @embedFile("example_config"));
+    const config = try config_module.resolve(arena_instance.allocator(), &example_options);
 
     const demands = BudgetSim.demandsFor(&config);
     // Both demands are the config's, so both must sit under what the
@@ -533,7 +562,7 @@ test "totalBytes: the measured arena joins the closed form" {
 
     var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_instance.deinit();
-    const config = try config_module.parse(arena_instance.allocator(), @embedFile("example_config"));
+    const config = try config_module.resolve(arena_instance.allocator(), &example_options);
 
     const pools_only = BudgetSim.totalBytes(&config, 0);
     const with_arena = BudgetSim.totalBytes(&config, 4096);
