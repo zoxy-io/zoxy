@@ -29,6 +29,7 @@
 
 const std = @import("std");
 
+const Runtime = @import("extension.zig").Runtime;
 const config_module = @import("config.zig");
 const constants = @import("constants.zig");
 const Io = @import("io/io.zig");
@@ -375,11 +376,12 @@ pub fn captureTruncated(target: []u8, source: []const u8) []const u8 {
 }
 
 /// The sink: two staging buffers, one in-flight write, and the drop rung.
-/// Generic over the Io backend like the rest of the serving path, so the
+/// Generic over the `Runtime` like the rest of the serving path, so the
 /// simulator drives it and can read back exactly what production would
 /// have written (§9).
-pub fn AccessLog(comptime IoType: type) type {
-    const ServerType = @import("Server.zig").Server(IoType);
+pub fn AccessLog(comptime runtime: Runtime) type {
+    const IoType = runtime.Io;
+    const ServerType = @import("Server.zig").Server(runtime);
 
     return struct {
         server: *ServerType,

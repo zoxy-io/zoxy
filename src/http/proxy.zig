@@ -40,6 +40,7 @@
 
 const std = @import("std");
 
+const Runtime = @import("../extension.zig").Runtime;
 const access_log = @import("../access_log.zig");
 const Balancer = @import("../balancer.zig").Balancer;
 const config_module = @import("../config.zig");
@@ -70,7 +71,7 @@ const assert = std.debug.assert;
 /// `::` compression instead of a second spelling of it that could
 /// disagree with the one every other zoxy output uses.
 ///
-/// At file scope, outside `Proxy(IoType)`: it depends on no backend, and
+/// At file scope, outside `Proxy(runtime)`: it depends on no backend, and
 /// the bracket handling is the fiddly part worth testing directly rather
 /// than only through a scenario whose clients happen to be IPv4.
 fn bareAddress(
@@ -154,11 +155,12 @@ pub const RenderScratch = struct {
     head: render.HeadScratch,
 };
 
-pub fn Proxy(comptime IoType: type) type {
-    const ServerType = @import("../Server.zig").Server(IoType);
-    const H2Driver = h2_connection.Driver(IoType);
-    const H2Exchange = h2_exchange.Exchange(IoType);
-    const ConnType = conn_module.Conn(IoType);
+pub fn Proxy(comptime runtime: Runtime) type {
+    const IoType = runtime.Io;
+    const ServerType = @import("../Server.zig").Server(runtime);
+    const H2Driver = h2_connection.Driver(runtime);
+    const H2Exchange = h2_exchange.Exchange(runtime);
+    const ConnType = conn_module.Conn(runtime);
     const StreamType = ConnType.StreamType;
     const UpstreamType = @import("../net/upstream.zig").UpstreamPool(IoType).Upstream;
     const Framing = StreamType.Framing;
@@ -2353,7 +2355,7 @@ pub fn Proxy(comptime IoType: type) type {
             }
         };
 
-        const RequestBodyPump = pump.Pump(IoType, .client_to_upstream, RequestBodyPolicy);
+        const RequestBodyPump = pump.Pump(runtime, .client_to_upstream, RequestBodyPolicy);
         const armRequestBodyRecv = RequestBodyPump.armRecv;
 
         fn startResponseLeg(server: *ServerType, stream: *StreamType) void {
@@ -2957,7 +2959,7 @@ pub fn Proxy(comptime IoType: type) type {
                 constants.tunnel_drain_ms
             else
                 server.config.tunnel_timeout_ms);
-            relay.Relay(IoType).start(server, stream);
+            relay.Relay(runtime).start(server, stream);
         }
 
         /// Relay an interim `1xx` to the client and leave the exchange
@@ -3634,7 +3636,7 @@ pub fn Proxy(comptime IoType: type) type {
             }
         };
 
-        const ResponseBodyPump = pump.Pump(IoType, .upstream_to_client, ResponseBodyPolicy);
+        const ResponseBodyPump = pump.Pump(runtime, .upstream_to_client, ResponseBodyPolicy);
         const armResponseBodyRecv = ResponseBodyPump.armRecv;
 
         /// The response reached the client in full: settle both sides.

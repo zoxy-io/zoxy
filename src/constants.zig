@@ -1547,7 +1547,7 @@ pub fn fdsRequired(
 /// `conn_slots_default` is tuned to that ~32 MiB target against the current
 /// per-slot sizes (a conn slot + its relay buffer is ~17.7 KiB, plus the
 /// fixed upstream pool); it is not derived because `@sizeOf(Conn)` is not
-/// available here (Conn is generic over the Io backend). main.zig prints
+/// available here (Conn is generic over the runtime). main.zig prints
 /// the resulting footprint at startup.
 pub const conn_slots_default: u32 = 1386;
 pub const relay_buffers_default: u32 = conn_slots_default;

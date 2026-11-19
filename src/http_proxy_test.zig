@@ -49,7 +49,7 @@ const fixture_key_pem = @embedFile("tls/testdata/key.pem");
 /// The fixture certificate SAN a TLS client must offer.
 const fixture_host_name = "spike.zoxy.test";
 
-const ServerSim = Server(SimIo);
+const ServerSim = Server(.{ .Io = SimIo });
 
 /// A scripted HTTP client: sends `request` (the adversary may split the
 /// send), then reads until the peer closes, recording the response bytes
@@ -3428,7 +3428,7 @@ const ExpireBehindHeld = struct {
         return stream.armed.data_upstream_to_client;
     }
 
-    const H2Exchange = @import("http/h2/exchange.zig").Exchange(SimIo);
+    const H2Exchange = @import("http/h2/exchange.zig").Exchange(.{ .Io = SimIo });
 };
 
 test "h2: a frame for an exchange its deadline condemned is dropped, not sent (#373)" {

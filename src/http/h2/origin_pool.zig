@@ -38,6 +38,7 @@
 const std = @import("std");
 const h2 = @import("h2");
 
+const Runtime = @import("../../extension.zig").Runtime;
 const Session = @import("Session.zig");
 const origin = @import("origin.zig");
 const parser = @import("../parser.zig");
@@ -268,9 +269,10 @@ pub const ProbeLeg = struct {
     }
 };
 
-pub fn Mux(comptime IoType: type) type {
-    const ServerType = @import("../../Server.zig").Server(IoType);
-    const ConnType = @import("../../net/Conn.zig").Conn(IoType);
+pub fn Mux(comptime runtime: Runtime) type {
+    const IoType = runtime.Io;
+    const ServerType = @import("../../Server.zig").Server(runtime);
+    const ConnType = @import("../../net/Conn.zig").Conn(runtime);
     const StreamType = ConnType.StreamType;
 
     return struct {

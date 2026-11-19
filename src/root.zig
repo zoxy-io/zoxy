@@ -7,11 +7,17 @@ const std = @import("std");
 pub const access_log = @import("access_log.zig");
 pub const balancer = @import("balancer.zig");
 /// The §5/§8 startup budget: pool sizes, fd and ring demands, the banner.
-/// Generic over the Io backend like `Server`, and the reason it is here
+/// Generic over the `Runtime` like `Server`, and the reason it is here
 /// rather than in `main` is §13 — the closed form must price exactly what
 /// `Server.init` reserves, so an embedder inherits it instead of copying it.
 pub const Budget = @import("budget.zig").Budget;
 pub const config = @import("config.zig");
+/// The extension seam (#417): `Runtime` is what every part of the serving
+/// path is generic over — the Io backend and the build's extensions —
+/// and `Extensions` lists the extension types one build carries.
+pub const extension = @import("extension.zig");
+pub const Extensions = extension.Extensions;
+pub const Runtime = extension.Runtime;
 pub const config_schema = @import("config_schema.zig");
 pub const json_schema = @import("json_schema.zig");
 pub const constants = @import("constants.zig");
@@ -91,6 +97,7 @@ test {
     _ = balancer;
     _ = @import("budget.zig");
     _ = config;
+    _ = extension;
     _ = config_schema;
     _ = json_schema;
     _ = constants;

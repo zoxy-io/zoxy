@@ -8,6 +8,7 @@
 
 const std = @import("std");
 
+const Runtime = @import("../extension.zig").Runtime;
 const config_module = @import("../config.zig");
 const constants = @import("../constants.zig");
 const router = @import("../http/router.zig");
@@ -20,8 +21,9 @@ const H2Slot = @import("../http/h2/Connection.zig").Slot;
 
 const assert = std.debug.assert;
 
-pub fn Conn(comptime IoType: type) type {
-    const ServerType = @import("../Server.zig").Server(IoType);
+pub fn Conn(comptime runtime: Runtime) type {
+    const IoType = runtime.Io;
+    const ServerType = @import("../Server.zig").Server(runtime);
 
     return struct {
         pool_next: u32,

@@ -26,8 +26,8 @@ const zoxy = @import("zoxy");
 const build_options = @import("build_options");
 
 const XevIo = zoxy.Io.XevIo;
-const ServerXev = zoxy.Server(XevIo);
-const BudgetXev = zoxy.Budget(XevIo);
+const ServerXev = zoxy.Server(.{ .Io = XevIo });
+const BudgetXev = zoxy.Budget(.{ .Io = XevIo });
 
 const assert = std.debug.assert;
 

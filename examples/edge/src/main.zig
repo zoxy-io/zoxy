@@ -8,5 +8,5 @@ const zoxy = @import("zoxy");
 pub fn main() void {
     // Taking the address forces the whole serving path behind `init` to be
     // analysed and linked, which merely naming the type would not.
-    _ = &zoxy.Server(zoxy.Io.XevIo).init;
+    _ = &zoxy.Server(.{ .Io = zoxy.Io.XevIo }).init;
 }

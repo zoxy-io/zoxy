@@ -39,7 +39,7 @@ const assert = std.debug.assert;
 /// flight per direction, phase says which; per-connection memory stays
 /// constant regardless of stream size. Nothing here depends on the Io
 /// backend, so it lives at file scope rather than being re-instantiated
-/// per `Conn(IoType)` — which is also what makes it unit-testable.
+/// per `Conn(runtime)` — which is also what makes it unit-testable.
 ///
 /// The two counts are one debt, kept in the units *framing* works in:
 /// `framed_len` is what framing assigned to this message out of the last

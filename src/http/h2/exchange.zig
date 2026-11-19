@@ -34,6 +34,7 @@
 const std = @import("std");
 const h2 = @import("h2");
 
+const Runtime = @import("../../extension.zig").Runtime;
 const constants = @import("../../constants.zig");
 const parser = @import("../parser.zig");
 const Session = @import("Session.zig");
@@ -141,17 +142,17 @@ comptime {
     assert(Session.frame_payload_bytes_max <= Session.window_default);
 }
 
-pub fn Exchange(comptime IoType: type) type {
-    const ServerType = @import("../../Server.zig").Server(IoType);
-    const ConnType = @import("../../net/Conn.zig").Conn(IoType);
+pub fn Exchange(comptime runtime: Runtime) type {
+    const ServerType = @import("../../Server.zig").Server(runtime);
+    const ConnType = @import("../../net/Conn.zig").Conn(runtime);
     const StreamType = ConnType.StreamType;
 
     return struct {
-        // A declaration rather than a capture above: `Proxy(IoType)` names
+        // A declaration rather than a capture above: `Proxy(runtime)` names
         // this type in its own body, so evaluating it eagerly here would be
         // a type whose definition needs itself.
-        const Proxy = @import("../proxy.zig").Proxy(IoType);
-        const Driver = @import("Connection.zig").Driver(IoType);
+        const Proxy = @import("../proxy.zig").Proxy(runtime);
+        const Driver = @import("Connection.zig").Driver(runtime);
 
         /// A stream opened with a well-formed request: a shared slot and a
         /// head buffer for it, its request written out as the HTTP/1.1

@@ -37,16 +37,18 @@
 
 const std = @import("std");
 
+const Runtime = @import("../extension.zig").Runtime;
 const Io = @import("../io/io.zig");
 const OriginClient = @import("../tls/OriginClient.zig");
 const constants = @import("../constants.zig");
 
 const assert = std.debug.assert;
 
-pub fn Driver(comptime IoType: type) type {
-    const ConnType = @import("Conn.zig").Conn(IoType);
+pub fn Driver(comptime runtime: Runtime) type {
+    const IoType = runtime.Io;
+    const ConnType = @import("Conn.zig").Conn(runtime);
     const StreamType = ConnType.StreamType;
-    const ServerType = @import("../Server.zig").Server(IoType);
+    const ServerType = @import("../Server.zig").Server(runtime);
     const Upstream = @import("upstream.zig").UpstreamPool(IoType).Upstream;
 
     return struct {

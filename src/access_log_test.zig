@@ -24,7 +24,7 @@ const SimIo = @import("io/SimIo.zig");
 const assert = std.debug.assert;
 const testing = std.testing;
 
-const ServerSim = Server(SimIo);
+const ServerSim = Server(.{ .Io = SimIo });
 
 fn bindAddress() std.Io.net.IpAddress {
     return std.Io.net.IpAddress.parseLiteral("127.0.0.1:8080") catch unreachable;

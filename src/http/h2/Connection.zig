@@ -30,6 +30,7 @@
 
 const std = @import("std");
 
+const Runtime = @import("../../extension.zig").Runtime;
 const Session = @import("Session.zig");
 const Exchange = @import("exchange.zig");
 const Io = @import("../../io/io.zig");
@@ -102,11 +103,11 @@ pub const Slot = struct {
     }
 };
 
-pub fn Driver(comptime IoType: type) type {
-    const ServerType = @import("../../Server.zig").Server(IoType);
-    const ConnType = @import("../../net/Conn.zig").Conn(IoType);
+pub fn Driver(comptime runtime: Runtime) type {
+    const ServerType = @import("../../Server.zig").Server(runtime);
+    const ConnType = @import("../../net/Conn.zig").Conn(runtime);
     const StreamType = ConnType.StreamType;
-    const ExchangeType = Exchange.Exchange(IoType);
+    const ExchangeType = Exchange.Exchange(runtime);
 
     return struct {
         /// The most session steps one completion runs before it must have
