@@ -21,6 +21,7 @@ const render = @import("http/render.zig");
 const shed = @import("shed.zig");
 const io_module = @import("io/io.zig");
 const json_schema = @import("json_schema.zig");
+const Options = @import("Options.zig");
 /// The ALPN vocabulary (#271). Public so the schema emitter states the
 /// same closed set the loader enforces.
 pub const alpn = @import("tls/alpn.zig");
@@ -1172,8 +1173,9 @@ pub fn parseWithFiles(
     // Timeouts first: a cluster's check budget defaults to the connect
     // timeout, so that value must already be known to be in range before
     // any check inherits it.
-    try validateTimeouts(&parsed.timeouts);
-    const clusters = try resolveClusters(arena, &parsed.clusters, parsed.timeouts.connect_ms, files);
+    const timeouts = timeoutsOf(&parsed.timeouts);
+    try validateTimeouts(&timeouts);
+    const clusters = try resolveClusters(arena, &parsed.clusters, timeouts.connect_ms, files);
     // Limits resolve before listeners, off the raw DTO counts: the route
     // prefixes inside `resolveListeners` are gated against the resolved
     // `head_buffer_bytes` — a prefix longer than the head can never
@@ -1235,19 +1237,19 @@ pub fn parseWithFiles(
     return .{
         .listeners = listeners,
         .clusters = clusters,
-        .connect_timeout_ms = parsed.timeouts.connect_ms,
-        .idle_timeout_ms = parsed.timeouts.idle_ms,
-        .drain_deadline_ms = parsed.timeouts.drain_deadline_ms,
+        .connect_timeout_ms = timeouts.connect_ms,
+        .idle_timeout_ms = timeouts.idle_ms,
+        .drain_deadline_ms = timeouts.drain_deadline_ms,
         // Absent is off, and `0` is how the rest of this struct spells
         // that — so the optional collapses here rather than travelling
         // any further. See `TimeoutsJson.loop_watchdog_ms` for why the
         // JSON side spells it as absence instead of a zero.
-        .loop_watchdog_ms = parsed.timeouts.loop_watchdog_ms orelse 0,
-        .max_lifetime_ms = parsed.timeouts.max_lifetime_ms,
-        .head_timeout_ms = resolveHeadTimeout(&parsed.timeouts),
-        .request_timeout_ms = parsed.timeouts.request_ms,
-        .tunnel_timeout_ms = parsed.timeouts.tunnel_ms,
-        .health_interval_ms = parsed.timeouts.health_interval_ms,
+        .loop_watchdog_ms = timeouts.loop_watchdog_ms orelse 0,
+        .max_lifetime_ms = timeouts.max_lifetime_ms,
+        .head_timeout_ms = timeouts.head_ms,
+        .request_timeout_ms = timeouts.request_ms,
+        .tunnel_timeout_ms = timeouts.tunnel_ms,
+        .health_interval_ms = timeouts.health_interval_ms,
         .limits = limits,
         .admin_bind = admin_bind,
         .access_log_sink = access_log_sink,
@@ -4094,7 +4096,7 @@ pub const TimeoutsJson = struct {
     /// nobody named is a restart this proxy chose on their behalf.
     loop_watchdog_ms: ?u32 = null,
     /// Optional #235 head-read budget. Absent is *derived* rather than
-    /// fixed — see `resolveHeadTimeout`, which is what keeps every config
+    /// fixed — see `derivedHeadMs`, which is what keeps every config
     /// written before this field behaving exactly as it did.
     head_ms: ?u32 = null,
     /// Optional #180 tunnel lifetime; absent means an hour. Unlike the
@@ -6873,27 +6875,41 @@ fn validateTunnelTimeout(tunnel_ms: u32) ValidationError!void {
 /// the head budget, since the lazy timer cannot move later at the
 /// re-base. So the default is the ten seconds clamped into the band the
 /// two neighbours leave: strictly above the dial, at or below the idle.
-/// `connect_ms < idle_ms` is already enforced, so that band is never
-/// empty.
-fn defaultHeadMs(timeouts: *const TimeoutsJson) u32 {
-    assert(timeouts.connect_ms < timeouts.idle_ms);
-    const floored = @max(constants.head_ms_default, timeouts.connect_ms + 1);
-    const derived = @min(floored, timeouts.idle_ms);
-    assert(derived > timeouts.connect_ms);
-    assert(derived <= timeouts.idle_ms);
+///
+/// Total, because it runs before anything is validated: the JSON
+/// front-end fills an absent key before the options are judged (#417).
+/// Where the band is empty — `connect_ms` at or above `idle_ms` — what
+/// it returns is moot, since `validateTimeouts` refuses that pair before
+/// it looks at the head budget.
+fn derivedHeadMs(connect_ms: u32, idle_ms: u32) u32 {
+    const floored = @max(constants.head_ms_default, connect_ms +| 1);
+    const derived = @min(floored, idle_ms);
+    assert(derived <= idle_ms);
+    if (connect_ms < idle_ms) assert(derived > connect_ms);
     return derived;
 }
 
-/// The resolved head budget: what the config named, or the derived
-/// default. Plain `u32` rather than the usual resolver error union,
-/// because `validateHeadOrder` has already held both spellings to the
-/// same relations — there is no failure left for this to report, and a
-/// return type that claimed one would be the wider of two that fit.
-fn resolveHeadTimeout(timeouts: *const TimeoutsJson) u32 {
-    const head_ms = timeouts.head_ms orelse defaultHeadMs(timeouts);
-    assert(timeouts.connect_ms < head_ms);
-    assert(head_ms <= timeouts.idle_ms);
-    return head_ms;
+/// The JSON front-end's timeouts (#417): the stock values where a key
+/// is absent, the derived head budget among them, and nothing judged —
+/// every refusal is `validateTimeouts`', made of the options alone.
+fn timeoutsOf(timeouts_json: *const TimeoutsJson) Options.Timeouts {
+    const timeouts: Options.Timeouts = .{
+        .connect_ms = timeouts_json.connect_ms,
+        .idle_ms = timeouts_json.idle_ms,
+        .head_ms = timeouts_json.head_ms orelse
+            derivedHeadMs(timeouts_json.connect_ms, timeouts_json.idle_ms),
+        .tunnel_ms = timeouts_json.tunnel_ms,
+        .health_interval_ms = timeouts_json.health_interval_ms,
+        .request_ms = timeouts_json.request_ms,
+        .max_lifetime_ms = timeouts_json.max_lifetime_ms,
+        .drain_deadline_ms = timeouts_json.drain_deadline_ms,
+        .loop_watchdog_ms = timeouts_json.loop_watchdog_ms,
+    };
+    // A stated budget always wins over the derived one, and the derived
+    // one fills only an absent key.
+    if (timeouts_json.head_ms) |stated| assert(timeouts.head_ms == stated);
+    assert(timeouts.idle_ms == timeouts_json.idle_ms);
+    return timeouts;
 }
 
 /// The #235 head-read budget's two orderings, extracted for the length
@@ -6908,8 +6924,8 @@ fn resolveHeadTimeout(timeouts: *const TimeoutsJson) u32 {
 /// cannot honour, silently cutting the dial short. Rejected rather than
 /// clamped, like its sibling: a config that reads one way and behaves
 /// another is what these checks exist to prevent.
-fn validateHeadOrder(timeouts: *const TimeoutsJson) ValidationError!void {
-    const head_ms = timeouts.head_ms orelse defaultHeadMs(timeouts);
+fn validateHeadOrder(timeouts: *const Options.Timeouts) ValidationError!void {
+    const head_ms = timeouts.head_ms;
     if (head_ms == 0 or head_ms > constants.timeout_ms_max) {
         return error.TimeoutOverLimit;
     }
@@ -6921,12 +6937,13 @@ fn validateHeadOrder(timeouts: *const TimeoutsJson) ValidationError!void {
     }
 }
 
-fn validateTimeouts(timeouts: *const TimeoutsJson) ValidationError!void {
+fn validateTimeouts(timeouts: *const Options.Timeouts) ValidationError!void {
     // Deadlines a zero would break rather than disable: a 0 ms connect or
     // idle budget reaps on arrival, and a 0 ms probe interval would probe
     // in a tight loop (§7) — probing is switched by the cluster `check`
-    // flag, never by zeroing its pace. Each has a default, so absence is
-    // fine here and only an explicit zero is the mistake.
+    // flag, never by zeroing its pace. Refused whoever wrote the options:
+    // the JSON front-end fills an absent key with the stock value, so
+    // only a stated zero reaches this from a file (#417).
     const nonzero = [_]u32{
         timeouts.connect_ms,
         timeouts.idle_ms,
@@ -7002,11 +7019,12 @@ fn validateTimeouts(timeouts: *const TimeoutsJson) ValidationError!void {
 /// bound a consumer reads without checking is in range, every optional
 /// one is at most the ceiling — zero included, which each consumer reads
 /// as "off" — and the three relations the deadline handoff depends on are
-/// ordered. `Server.init` asserts those same relations of any config
-/// however it was built, which is what covers the configs the simulator
-/// and the tests hand-build past this loader entirely.
+/// ordered. Stated of the typed options, so it holds whoever wrote them;
+/// `Server.init` asserts the same relations of any config however it was
+/// built, which is what covers the configs the simulator and the tests
+/// hand-build past this loader entirely.
 fn assertTimeoutsBounded(
-    timeouts: *const TimeoutsJson,
+    timeouts: *const Options.Timeouts,
     nonzero: []const u32,
     optional: []const u32,
 ) void {
@@ -7018,11 +7036,31 @@ fn assertTimeoutsBounded(
         assert(value <= constants.timeout_ms_max);
     }
     assert(timeouts.connect_ms < timeouts.idle_ms);
-    const head_ms = resolveHeadTimeout(timeouts);
-    assert(timeouts.connect_ms < head_ms);
-    assert(head_ms <= timeouts.idle_ms);
+    assert(timeouts.connect_ms < timeouts.head_ms);
+    assert(timeouts.head_ms <= timeouts.idle_ms);
     assert(timeouts.tunnel_ms >= constants.tunnel_ms_min);
     assert(timeouts.tunnel_ms <= constants.tunnel_ms_max);
+}
+
+test "config: the derived head budget is total over every timeout pair (#417)" {
+    // It runs before validation now, so it meets pairs validation would
+    // refuse; none of them may trap, and every pair validation accepts
+    // must land strictly above the dial and at or below the idle window.
+    const max = std.math.maxInt(u32);
+    const pairs = [_][2]u32{
+        .{ 0, 0 },          .{ max, 0 },         .{ max, max }, .{ 0, max },
+        .{ 5_000, 60_000 }, .{ 20_000, 60_000 }, .{ 1, 2 },     .{ 60_000, 5_000 },
+    };
+    for (pairs) |pair| {
+        const head_ms = derivedHeadMs(pair[0], pair[1]);
+        try std.testing.expect(head_ms <= pair[1]);
+        if (pair[0] < pair[1]) try std.testing.expect(head_ms > pair[0]);
+    }
+    // The stock pair keeps the flat default; a slow dial lifts it; a
+    // tight idle window caps it.
+    try std.testing.expectEqual(constants.head_ms_default, derivedHeadMs(5_000, 60_000));
+    try std.testing.expectEqual(@as(u32, 20_001), derivedHeadMs(20_000, 60_000));
+    try std.testing.expectEqual(@as(u32, 2), derivedHeadMs(1, 2));
 }
 
 const example_json = @embedFile("example_config");
