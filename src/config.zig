@@ -1088,6 +1088,10 @@ pub const ValidationError = error{
     ClusterH2WithoutTls,
     ClusterRetriesOnHttp2,
     ClusterRetryBudgetOutOfRange,
+    /// A retry budget on a cluster that does not retry (#393): there is
+    /// nothing for it to bound. JSON's object form cannot spell one, so
+    /// only options written in code reach this (#417).
+    ClusterRetryBudgetWithoutRetries,
     /// An `l4` listener reaching an HTTPS cluster by its `cluster` or by
     /// any SNI route: it relays bytes, and what TLS would carry for it is
     /// not a request this proxy reads.
@@ -1175,7 +1179,8 @@ pub fn parseWithFiles(
     // any check inherits it.
     const timeouts = timeoutsOf(&parsed.timeouts);
     try validateTimeouts(&timeouts);
-    const clusters = try resolveClusters(arena, &parsed.clusters, timeouts.connect_ms, files);
+    const clusters_stated = try clustersOf(arena, &parsed.clusters, timeouts.connect_ms, files);
+    const clusters = try resolveClusters(arena, clusters_stated);
     // Limits resolve before listeners, off the raw DTO counts: the route
     // prefixes inside `resolveListeners` are gated against the resolved
     // `head_buffer_bytes` — a prefix longer than the head can never
@@ -2297,6 +2302,212 @@ fn resolveAccessLogBuffer(
     }
     assert(bytes >= line_bytes);
     return bytes;
+}
+
+/// The JSON front-end's clusters (#417): each entry's spellings parsed
+/// into options, with the stock values for what the file left out and a
+/// CA bundle read through the file seam. Nothing is judged here that a
+/// cluster written in code could also get wrong — that is
+/// `resolveClusters`'.
+fn clustersOf(
+    arena: std.mem.Allocator,
+    clusters_json: *const ClustersJson,
+    connect_ms: u32,
+    files: FileSource,
+) ParseError![]const Options.Cluster {
+    const clusters = try arena.alloc(Options.Cluster, clusters_json.entries.len);
+    for (clusters_json.entries, clusters) |*entry, *cluster| {
+        cluster.* = try clusterOf(arena, entry, connect_ms, files);
+    }
+    assert(clusters.len == clusters_json.entries.len);
+    return clusters;
+}
+
+fn clusterOf(
+    arena: std.mem.Allocator,
+    entry: *const ClustersJson.Entry,
+    connect_ms: u32,
+    files: FileSource,
+) ParseError!Options.Cluster {
+    const cluster_json = &entry.cluster;
+    const cluster: Options.Cluster = .{
+        .name = entry.name,
+        .endpoints = try endpointsOf(arena, cluster_json.endpoints),
+        .pick = try pickOf(&cluster_json.pick),
+        .protocol = try clusterProtocolOf(cluster_json.protocol),
+        .check = try checkOf(cluster_json.check, connect_ms),
+        .passive_ejection = passiveEjectionOf(cluster_json.passive_ejection),
+        .panic_threshold_percent = cluster_json.panic_threshold_percent,
+        .max_inflight = cluster_json.max_inflight,
+        .max_total_inflight = cluster_json.max_total_inflight,
+        .slow_start_ms = cluster_json.slow_start_ms,
+        .retries = .{ .count = cluster_json.retries.count, .budget = cluster_json.retries.budget },
+        .proxy_protocol_send = try proxyProtocolSendOf(cluster_json.proxy_protocol),
+        .tls = try clusterTlsOf(arena, cluster_json.tls, files),
+    };
+    assert(cluster.endpoints.len == cluster_json.endpoints.len);
+    assert(cluster.name.len == entry.name.len);
+    return cluster;
+}
+
+/// An address as JSON spells it (#303): `unix:` and a path, or an IP
+/// literal (`parseLiteral` rejects hostnames, so the no-DNS non-goal
+/// holds structurally). Only the spelling is judged — a path's own rules
+/// are the library's, which an address written in code meets as well.
+fn addressOf(literal: []const u8) ?io_module.Address {
+    if (std.mem.startsWith(u8, literal, unix_address_prefix)) {
+        const path = literal[unix_address_prefix.len..];
+        assert(path.len + unix_address_prefix.len == literal.len);
+        return .{ .unix = path };
+    }
+    const ip = std.Io.net.IpAddress.parseLiteral(literal) catch return null;
+    // `parseLiteral` takes no hostname, so nothing here ever resolved one.
+    assert(literal.len >= 1);
+    return .{ .ip = ip };
+}
+
+/// A cluster's endpoints in either JSON form (#174): the literal parsed,
+/// and the port, weights and tiers left to `resolveEndpoints`.
+fn endpointsOf(
+    arena: std.mem.Allocator,
+    endpoints_json: []const EndpointJson,
+) ParseError![]const Options.Cluster.Endpoint {
+    const endpoints = try arena.alloc(Options.Cluster.Endpoint, endpoints_json.len);
+    for (endpoints_json, endpoints) |entry, *endpoint| {
+        endpoint.* = .{
+            .address = addressOf(entry.address) orelse return error.EndpointInvalid,
+            // A weight past a `u16` is past the ceiling too, and earns the
+            // ceiling's refusal; the schema's `maximum` refuses it first.
+            .weight = std.math.cast(u16, entry.weight) orelse return error.EndpointWeightOverLimit,
+            .priority = entry.priority,
+        };
+    }
+    assert(endpoints.len == endpoints_json.len);
+    return endpoints;
+}
+
+/// Either JSON spelling of `pick` (#178). The policy vocabulary is closed
+/// — a typo ("pc2") fails loudly instead of silently balancing as p2c —
+/// and so is the key's. `hash` *requires* a key, in the object form:
+/// `source_ip` as a silent default was misleading (it reads as "sticky"
+/// and quietly is not, behind NAT), so what the cluster keys on is the
+/// operator's sentence to write. Key settings beside any other policy are
+/// refused rather than left inert — they read as a request for stickiness
+/// the cluster would silently not provide.
+fn pickOf(pick_json: *const PickJson) ParseError!Options.Cluster.Pick {
+    const policy = std.meta.stringToEnum(Config.Cluster.Pick.Builtin, pick_json.policy) orelse
+        return error.ClusterPickUnknown;
+    switch (policy) {
+        .rr, .p2c => {
+            if (pick_json.key != null or pick_json.name != null) {
+                return error.ClusterPickKeyWithoutHash;
+            }
+            return if (policy == .rr) .rr else .p2c;
+        },
+        .hash => {},
+    }
+    const key_literal = pick_json.key orelse return error.ClusterPickKeyMissing;
+    const key = std.meta.stringToEnum(std.meta.Tag(Config.Cluster.HashKey), key_literal) orelse
+        return error.ClusterPickKeyUnknown;
+    const hash_key: Config.Cluster.HashKey = switch (key) {
+        .source_ip => if (pick_json.name != null) return error.ClusterPickNameUnexpected else .source_ip,
+        .header => .{ .header = pick_json.name orelse return error.ClusterPickNameMissing },
+        .cookie => .{ .cookie = pick_json.name orelse return error.ClusterPickNameMissing },
+    };
+    // A name travels exactly when the key reads one.
+    assert((hash_key == .source_ip) == (pick_json.name == null));
+    assert(policy == .hash);
+    return .{ .hash = hash_key };
+}
+
+/// A cluster's §7 check as JSON spells it: the kind named by a string,
+/// the http fields refused under any other kind rather than ignored — a
+/// config that names a path for a check that will never request it is
+/// describing something the process is not doing — and the stock values
+/// for what is absent: the thresholds, a `200` verdict, and the connect
+/// timeout as one probe's budget.
+fn checkOf(check_json: ?CheckJson, connect_ms: u32) ParseError!?Options.Cluster.Check {
+    const check = check_json orelse return null;
+    const kind = std.meta.stringToEnum(Config.Cluster.Check.Kind, check.type) orelse
+        return error.ClusterCheckTypeUnknown;
+    if (kind != .grpc and check.service != null) return error.ClusterCheckServiceWithoutGrpc;
+    const http_fields = check.path != null or check.host != null or check.expect_status != null;
+    const stated: Options.Cluster.Check.Kind = switch (kind) {
+        .tcp => if (http_fields) return error.ClusterCheckHttpFieldOnTcp else .tcp,
+        .http => .{ .http = .{
+            .path = check.path orelse return error.ClusterCheckPathMissing,
+            .host = check.host,
+            .expect_status = check.expect_status orelse 200,
+        } },
+        // The health protocol fixes the path and the verdict (a SERVING
+        // answer, not a status), and the authority is the cluster's.
+        .grpc => blk: {
+            if (http_fields) return error.ClusterCheckHttpFieldOnGrpc;
+            // Absent asks about the server; an empty name would be a
+            // second spelling of that, and the schema's `minLength`
+            // refuses it.
+            if (check.service) |named| {
+                if (named.len == 0) return error.ClusterCheckServiceInvalid;
+            }
+            break :blk .{ .grpc = .{ .service = check.service orelse "" } };
+        },
+    };
+    assert(stated == kind);
+    return .{
+        .kind = stated,
+        .fall = check.fall,
+        .rise = check.rise,
+        .timeout_ms = check.timeout_ms orelse connect_ms,
+    };
+}
+
+fn passiveEjectionOf(
+    passive_ejection_json: ?PassiveEjectionJson,
+) ?Options.Cluster.PassiveEjection {
+    const passive_ejection = passive_ejection_json orelse return null;
+    return .{
+        .fall = passive_ejection.fall,
+        .recovery_ms = passive_ejection.recovery_ms,
+        .recovery_ms_max = passive_ejection.recovery_ms_max,
+    };
+}
+
+/// A cluster's origin protocol (§7): the closed vocabulary, which the
+/// schema states too.
+fn clusterProtocolOf(protocol: []const u8) ValidationError!Config.Cluster.Protocol {
+    return std.meta.stringToEnum(Config.Cluster.Protocol, protocol) orelse error.ClusterProtocolUnknown;
+}
+
+/// A cluster's PROXY protocol announcement (#142): absent is off, and the
+/// version vocabulary is closed. The l4-only restriction is enforced where
+/// listeners resolve — reachability is a property of the listener/cluster
+/// *pair*, and only that side sees both.
+fn proxyProtocolSendOf(
+    proxy_protocol_json: ?ClusterProxyProtocolJson,
+) ValidationError!?Config.Cluster.ProxyProtocolSend {
+    const proxy_protocol = proxy_protocol_json orelse return null;
+    return std.meta.stringToEnum(
+        Config.Cluster.ProxyProtocolSend,
+        proxy_protocol.send,
+    ) orelse error.ClusterProxyProtocolSendUnknown;
+}
+
+/// A cluster's CA bundle, read through the front-end's file seam (§7):
+/// the JSON names a path, and the options carry the bytes.
+fn clusterTlsOf(
+    arena: std.mem.Allocator,
+    tls_json: ?ClusterTlsJson,
+    files: FileSource,
+) ParseError!?Options.Cluster.Tls {
+    const tls = tls_json orelse return null;
+    if (tls.ca.path.len == 0) return error.ClusterTlsCaUnreadable;
+    const pem = files.read(files.context, arena, tls.ca.path, constants.origin_ca_bytes_max) catch |err| switch (err) {
+        error.FileUnreadable, error.FileTooLarge => return error.ClusterTlsCaUnreadable,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    assert(pem.len <= constants.origin_ca_bytes_max);
+    assert(tls.ca.path.len >= 1);
+    return .{ .server_name = tls.server_name, .ca_pem = pem };
 }
 
 // The strict parser binds JSON to these `*Json` DTOs. Each carries the
@@ -4514,61 +4725,66 @@ fn checkedEndpointsOf(clusters: []const Config.Cluster) u32 {
 
 fn resolveClusters(
     arena: std.mem.Allocator,
-    clusters_json: *const ClustersJson,
-    connect_timeout_ms: u32,
-    files: FileSource,
+    stated: []const Options.Cluster,
 ) ParseError![]const Config.Cluster {
-    assert(connect_timeout_ms >= 1);
-    if (clusters_json.entries.len < constants.clusters_min) {
+    if (stated.len < constants.clusters_min) {
         return error.ClustersEmpty;
     }
     // No upper bound: a cluster costs an arena `Config.Cluster` and a row
     // in the §7 endpoint tables, both sized from this count (§5), so how
     // many is the operator's call. `u16` is the one hard edge left — the
     // index type the endpoint key and every `cluster_index` field use.
-    if (clusters_json.entries.len > std.math.maxInt(u16)) {
+    if (stated.len > std.math.maxInt(u16)) {
         return error.ClustersOverLimit;
     }
-
-    const count: u16 = @intCast(clusters_json.entries.len);
-    const clusters = try arena.alloc(Config.Cluster, count);
-    try rejectDuplicateClusterNames(arena, clusters_json.entries);
-
-    for (clusters_json.entries, 0..) |entry, index| {
-        // A name is an identifier an operator writes and the access log
-        // echoes (§8): bounding it is what keeps a log line's width a
-        // function of `constants.zig` rather than of the config file.
-        if (entry.name.len == 0) {
-            return error.ClusterNameEmpty;
-        }
-        if (entry.name.len > constants.cluster_name_bytes_max) {
-            return error.ClusterNameTooLong;
-        }
-        const picked = try resolvePick(&entry.cluster.pick);
-        const endpoints = try resolveEndpoints(arena, entry.cluster.endpoints);
-        clusters[index] = .{
-            .name = entry.name,
-            .endpoints = endpoints.addresses,
-            .weights = endpoints.weights,
-            .priorities = try resolvePriorities(arena, entry.cluster.endpoints),
-            .pick = picked.pick,
-            .check = try resolveCheck(entry.cluster.check, connect_timeout_ms),
-            .passive_ejection = try resolvePassiveEjection(entry.cluster.passive_ejection),
-            .panic_threshold_percent = try resolvePanicThreshold(&entry.cluster),
-            .hash_key = picked.hash_key,
-            .max_inflight = try resolveMaxInflight(entry.cluster.max_inflight),
-            .max_total_inflight = try resolveMaxTotalInflight(entry.cluster.max_total_inflight),
-            .slow_start_ms = try resolveSlowStart(&entry.cluster),
-            .retries = try resolveRetries(entry.cluster.retries.count),
-            .retry_budget = try resolveRetryBudget(entry.cluster.retries),
-            .proxy_protocol_send = try resolveClusterProxyProtocol(entry.cluster.proxy_protocol),
-            .protocol = try resolveClusterProtocol(entry.cluster.protocol),
-            .tls = try resolveClusterTls(arena, entry.cluster.tls, files),
-        };
-        try rejectClusterProtocolShape(&clusters[index]);
+    const clusters = try arena.alloc(Config.Cluster, stated.len);
+    try rejectDuplicateClusterNames(arena, stated);
+    for (stated, clusters) |*cluster_stated, *cluster| {
+        cluster.* = try resolveCluster(arena, cluster_stated);
+        try rejectClusterProtocolShape(cluster);
     }
-    assert(clusters.len == count);
+    assert(clusters.len == stated.len);
+    assert(clusters.len >= constants.clusters_min);
     return clusters;
+}
+
+/// One cluster's options, judged and compiled (§7). Every refusal here
+/// is one options written in code can earn as well as a file; the
+/// spellings only JSON can get wrong are its front-end's (`clusterOf`).
+fn resolveCluster(
+    arena: std.mem.Allocator,
+    stated: *const Options.Cluster,
+) ParseError!Config.Cluster {
+    if (stated.name.len == 0) {
+        return error.ClusterNameEmpty;
+    }
+    if (stated.name.len > constants.cluster_name_bytes_max) {
+        return error.ClusterNameTooLong;
+    }
+    const picked = try resolvePick(&stated.pick);
+    const endpoints = try resolveEndpoints(arena, stated.endpoints);
+    const cluster: Config.Cluster = .{
+        .name = stated.name,
+        .endpoints = endpoints.addresses,
+        .weights = endpoints.weights,
+        .priorities = try resolvePriorities(arena, stated.endpoints),
+        .pick = picked.pick,
+        .check = try resolveCheck(stated.check),
+        .passive_ejection = try resolvePassiveEjection(stated.passive_ejection),
+        .panic_threshold_percent = try resolvePanicThreshold(stated),
+        .hash_key = picked.hash_key,
+        .max_inflight = try resolveMaxInflight(stated.max_inflight),
+        .max_total_inflight = try resolveMaxTotalInflight(stated.max_total_inflight),
+        .slow_start_ms = try resolveSlowStart(stated),
+        .retries = try resolveRetries(stated.retries.count),
+        .retry_budget = try resolveRetryBudget(stated.retries),
+        .proxy_protocol_send = stated.proxy_protocol_send,
+        .protocol = stated.protocol,
+        .tls = try resolveClusterTls(arena, stated.tls),
+    };
+    assert(cluster.endpoints.len == stated.endpoints.len);
+    assert(cluster.name.len >= 1);
+    return cluster;
 }
 
 /// Duplicate names in O(n log n), by sorting an index permutation and
@@ -4580,21 +4796,21 @@ fn resolveClusters(
 /// reads it: the error carries no payload.
 fn rejectDuplicateClusterNames(
     arena: std.mem.Allocator,
-    entries: []const ClustersJson.Entry,
+    stated: []const Options.Cluster,
 ) ParseError!void {
-    assert(entries.len >= 1);
-    assert(entries.len <= std.math.maxInt(u16));
-    const order = try arena.alloc(u16, entries.len);
+    assert(stated.len >= 1);
+    assert(stated.len <= std.math.maxInt(u16));
+    const order = try arena.alloc(u16, stated.len);
     for (order, 0..) |*slot, index| slot.* = @intCast(index);
     const ByName = struct {
-        entries: []const ClustersJson.Entry,
+        clusters: []const Options.Cluster,
         fn lessThan(ctx: @This(), a: u16, b: u16) bool {
-            return std.mem.lessThan(u8, ctx.entries[a].name, ctx.entries[b].name);
+            return std.mem.lessThan(u8, ctx.clusters[a].name, ctx.clusters[b].name);
         }
     };
-    std.mem.sort(u16, order, ByName{ .entries = entries }, ByName.lessThan);
+    std.mem.sort(u16, order, ByName{ .clusters = stated }, ByName.lessThan);
     for (order[1..], order[0 .. order.len - 1]) |current, previous| {
-        if (std.mem.eql(u8, entries[current].name, entries[previous].name)) {
+        if (std.mem.eql(u8, stated[current].name, stated[previous].name)) {
             return error.ClusterNameDuplicate;
         }
     }
@@ -4637,30 +4853,30 @@ pub const unix_address_prefix = "unix:";
 /// nothing that runs a service ever creates one.
 fn resolveEndpointAddress(
     arena: std.mem.Allocator,
-    literal: []const u8,
+    address: io_module.Address,
 ) ParseError!io_module.Address {
-    if (std.mem.startsWith(u8, literal, unix_address_prefix)) {
-        return .{ .unix = resolveUnixPath(arena, literal) catch |err| switch (err) {
-            error.Relative => return error.EndpointUnixPathRelative,
-            error.Invalid => return error.EndpointUnixPathInvalid,
-            error.OutOfMemory => return error.OutOfMemory,
-        } };
-    }
-    return .{ .ip = std.Io.net.IpAddress.parseLiteral(literal) catch {
-        return error.EndpointInvalid;
+    const path = switch (address) {
+        .ip => return address,
+        .unix => |path| path,
+    };
+    const resolved: io_module.Address = .{ .unix = resolveUnixPath(arena, path) catch |err| switch (err) {
+        error.Relative => return error.EndpointUnixPathRelative,
+        error.Invalid => return error.EndpointUnixPathInvalid,
+        error.OutOfMemory => return error.OutOfMemory,
     } };
+    assert(resolved.unix.len == path.len);
+    assert(resolved.unix[0] == '/');
+    return resolved;
 }
 
-/// A `unix:` literal's path, validated and arena-duped. The rules argued
+/// A `unix:` address's path, validated and arena-duped. The rules argued
 /// at `resolveEndpointAddress`, applied once for both fields that take
 /// the grammar — an endpoint and a listener's `bind` — so the two cannot
 /// come to disagree about what a socket path is.
 fn resolveUnixPath(
     arena: std.mem.Allocator,
-    literal: []const u8,
+    path: []const u8,
 ) error{ Invalid, Relative, OutOfMemory }![]const u8 {
-    assert(std.mem.startsWith(u8, literal, unix_address_prefix));
-    const path = literal[unix_address_prefix.len..];
     if (path.len == 0 or path.len > io_module.Address.unix_path_bytes_max) {
         return error.Invalid;
     }
@@ -4670,8 +4886,8 @@ fn resolveUnixPath(
     if (!io_module.Address.pathIsRenderable(path)) {
         return error.Invalid;
     }
-    // Duped so the address outlives the parsed JSON document, the same
-    // lifetime every other resolved string here takes.
+    // Duped so the address outlives whatever the options were written
+    // in — a parsed JSON document, or a caller's buffer.
     return try arena.dupe(u8, path);
 }
 
@@ -4771,15 +4987,15 @@ fn resolveBindAddress(
     arena: std.mem.Allocator,
     literal: []const u8,
 ) ParseError!io_module.Address {
-    if (std.mem.startsWith(u8, literal, unix_address_prefix)) {
-        return .{ .unix = resolveUnixPath(arena, literal) catch |err| switch (err) {
-            error.Relative => return error.ListenerBindUnixPathRelative,
-            error.Invalid => return error.ListenerBindUnixPathInvalid,
-            error.OutOfMemory => return error.OutOfMemory,
-        } };
-    }
-    return .{ .ip = std.Io.net.IpAddress.parseLiteral(literal) catch {
-        return error.ListenerBindInvalid;
+    const address = addressOf(literal) orelse return error.ListenerBindInvalid;
+    const path = switch (address) {
+        .ip => return address,
+        .unix => |path| path,
+    };
+    return .{ .unix = resolveUnixPath(arena, path) catch |err| switch (err) {
+        error.Relative => return error.ListenerBindUnixPathRelative,
+        error.Invalid => return error.ListenerBindUnixPathInvalid,
+        error.OutOfMemory => return error.OutOfMemory,
     } };
 }
 
@@ -4787,11 +5003,11 @@ fn resolveBindAddress(
 /// primary — the `weights` rule, so an untiered cluster carries nothing.
 fn resolvePriorities(
     arena: std.mem.Allocator,
-    endpoints_json: []const EndpointJson,
+    endpoints: []const Options.Cluster.Endpoint,
 ) ParseError!?[]const u8 {
-    assert(endpoints_json.len >= 1);
+    assert(endpoints.len >= 1);
     var tiered = false;
-    for (endpoints_json) |entry| {
+    for (endpoints) |entry| {
         if (entry.priority > constants.endpoint_priority_max) return error.EndpointPriorityOverLimit;
         tiered = tiered or entry.priority != 0;
     }
@@ -4800,22 +5016,22 @@ fn resolvePriorities(
     // so `{"priority": 1}` on every endpoint is a cluster of primaries,
     // and a pick reported `standby` always had a lower tier to pass over.
     var lowest: u8 = constants.endpoint_priority_max;
-    for (endpoints_json) |entry| lowest = @min(lowest, entry.priority);
+    for (endpoints) |entry| lowest = @min(lowest, entry.priority);
     var distinct = false;
-    for (endpoints_json) |entry| distinct = distinct or entry.priority != lowest;
+    for (endpoints) |entry| distinct = distinct or entry.priority != lowest;
     if (!distinct) return null;
-    const priorities = try arena.alloc(u8, endpoints_json.len);
-    for (endpoints_json, priorities) |entry, *priority| priority.* = entry.priority - lowest;
-    assert(priorities.len == endpoints_json.len);
+    const priorities = try arena.alloc(u8, endpoints.len);
+    for (endpoints, priorities) |entry, *priority| priority.* = entry.priority - lowest;
+    assert(priorities.len == endpoints.len);
     assert(std.mem.indexOfScalar(u8, priorities, 0) != null);
     return priorities;
 }
 
 fn resolveEndpoints(
     arena: std.mem.Allocator,
-    endpoints_json: []const EndpointJson,
+    endpoints: []const Options.Cluster.Endpoint,
 ) ParseError!ResolvedEndpoints {
-    if (endpoints_json.len == 0) {
+    if (endpoints.len == 0) {
         return error.EndpointsEmpty;
     }
     // No policy bound: endpoints cost an arena address each and a column
@@ -4824,14 +5040,14 @@ fn resolveEndpoints(
     // `0..n-1`, and the largest of those must stay inside
     // `endpoint_index_max`, which `Conn` asserts sits below its
     // no-endpoint sentinel.
-    if (endpoints_json.len > @as(usize, constants.endpoint_index_max) + 1) {
+    if (endpoints.len > @as(usize, constants.endpoint_index_max) + 1) {
         return error.EndpointsOverLimit;
     }
 
-    const addresses = try arena.alloc(io_module.Address, endpoints_json.len);
+    const addresses = try arena.alloc(io_module.Address, endpoints.len);
     var weighted = false;
     var weight_sum: u64 = 0;
-    for (endpoints_json, addresses) |entry, *address| {
+    for (endpoints, addresses) |entry, *address| {
         address.* = try resolveEndpointAddress(arena, entry.address);
         if (address.* == .ip and address.ip.getPort() == 0) {
             return error.EndpointPortZero;
@@ -4850,14 +5066,14 @@ fn resolveEndpoints(
         // one that can never answer.
         return error.EndpointWeightsAllZero;
     }
-    assert(addresses.len == endpoints_json.len);
+    assert(addresses.len == endpoints.len);
     if (!weighted) {
         return .{ .addresses = addresses, .weights = null };
     }
-    const weights = try arena.alloc(u16, endpoints_json.len);
-    for (endpoints_json, weights) |entry, *weight| {
+    const weights = try arena.alloc(u16, endpoints.len);
+    for (endpoints, weights) |entry, *weight| {
         assert(entry.weight <= constants.endpoint_weight_max);
-        weight.* = @intCast(entry.weight);
+        weight.* = entry.weight;
     }
     assert(weights.len == addresses.len);
     return .{ .addresses = addresses, .weights = weights };
@@ -6085,12 +6301,6 @@ fn validateRoutePrefix(prefix: []const u8, head_buffer_bytes: u32) ParseError!vo
     }
 }
 
-/// Resolve one cluster's §7 check block. Absent leaves the cluster
-/// unprobed. Every limit gets its own error (§5), and the `http` fields
-/// are rejected under `tcp` rather than ignored: a config that names a
-/// path for a check that will never request it is describing something
-/// the process is not doing, which is exactly the negative space this
-/// loader exists to refuse.
 /// Resolve one cluster's §7 passive-ejection block (#230). Absent leaves
 /// it off, the same shape `check` uses: a feature nobody asked for costs
 /// nothing and changes nothing.
@@ -6100,8 +6310,8 @@ fn validateRoutePrefix(prefix: []const u8, head_buffer_bytes: u32) ParseError!vo
 /// punish the config that is about to grow a second endpoint, and the
 /// operator's intent is unambiguous either way. The banner is where that
 /// shows up as a fact, not the loader as an error.
-fn resolvePassiveEjection(passive_ejection_json: ?PassiveEjectionJson) ParseError!?Config.Cluster.PassiveEjection {
-    const passive_ejection = passive_ejection_json orelse return null;
+fn resolvePassiveEjection(stated: ?Options.Cluster.PassiveEjection) ParseError!?Config.Cluster.PassiveEjection {
+    const passive_ejection = stated orelse return null;
     if (passive_ejection.fall < 1 or passive_ejection.fall > constants.health_probe_threshold_max) {
         return error.ClusterPassiveEjectionFallOutOfRange;
     }
@@ -6125,60 +6335,39 @@ fn resolvePassiveEjection(passive_ejection_json: ?PassiveEjectionJson) ParseErro
     };
 }
 
-fn resolveCheck(
-    check_json: ?CheckJson,
-    connect_timeout_ms: u32,
-) ParseError!?Config.Cluster.Check {
-    assert(connect_timeout_ms >= 1);
-    const check = check_json orelse return null;
-    const kind = std.meta.stringToEnum(Config.Cluster.Check.Kind, check.type) orelse
-        return error.ClusterCheckTypeUnknown;
-    if (check.fall < 1 or check.fall > constants.health_probe_threshold_max) {
+/// Resolve one cluster's §7 check block. Absent leaves the cluster
+/// unprobed. Every limit gets its own error (§5); the kind's own fields
+/// are its union payload, so a field one kind would leave inert is not a
+/// shape options can state — JSON's spelling of it is the front-end's
+/// refusal (`checkOf`).
+fn resolveCheck(check: ?Options.Cluster.Check) ParseError!?Config.Cluster.Check {
+    const stated = check orelse return null;
+    if (stated.fall < 1 or stated.fall > constants.health_probe_threshold_max) {
         return error.ClusterCheckThresholdOutOfRange;
     }
-    if (check.rise < 1 or check.rise > constants.health_probe_threshold_max) {
+    if (stated.rise < 1 or stated.rise > constants.health_probe_threshold_max) {
         return error.ClusterCheckThresholdOutOfRange;
     }
-    const timeout_ms = check.timeout_ms orelse connect_timeout_ms;
-    if (timeout_ms < 1 or timeout_ms > constants.timeout_ms_max) {
+    if (stated.timeout_ms < 1 or stated.timeout_ms > constants.timeout_ms_max) {
         return error.ClusterCheckTimeoutOutOfRange;
     }
-    if (kind != .grpc and check.service != null) return error.ClusterCheckServiceWithoutGrpc;
-    const http = switch (kind) {
-        .tcp => blk: {
-            // A TCP probe sends nothing and reads nothing, so every
-            // HTTP-shaped field here would be inert.
-            if (check.path != null or check.host != null or check.expect_status != null) {
-                return error.ClusterCheckHttpFieldOnTcp;
-            }
-            break :blk null;
-        },
-        .http => try resolveHttpCheck(&check),
-        .grpc => blk: {
-            // The health protocol fixes the path and the verdict (a
-            // SERVING answer, not a status), and the authority is the
-            // cluster's: an operator's would be inert.
-            if (check.path != null or check.host != null or check.expect_status != null) {
-                return error.ClusterCheckHttpFieldOnGrpc;
-            }
-            break :blk null;
-        },
+    var resolved: Config.Cluster.Check = .{
+        .kind = stated.kind,
+        .fall = stated.fall,
+        .rise = stated.rise,
+        .timeout_ms = stated.timeout_ms,
     };
-    // Absent asks about the server; an empty name would be a second
-    // spelling of that, and the schema's `minLength` refuses it.
-    if (check.service) |named| {
-        if (named.len == 0) return error.ClusterCheckServiceInvalid;
+    switch (stated.kind) {
+        .tcp => {},
+        .http => |*http| resolved.http = try resolveHttpCheck(http),
+        .grpc => |grpc| {
+            if (!grpcServiceValid(grpc.service)) return error.ClusterCheckServiceInvalid;
+            resolved.grpc_service = grpc.service;
+        },
     }
-    const service = check.service orelse "";
-    if (!grpcServiceValid(service)) return error.ClusterCheckServiceInvalid;
-    return .{
-        .kind = kind,
-        .fall = check.fall,
-        .rise = check.rise,
-        .timeout_ms = timeout_ms,
-        .http = http,
-        .grpc_service = service,
-    };
+    assert((resolved.http != null) == (resolved.kind == .http));
+    assert(resolved.grpc_service.len == 0 or resolved.kind == .grpc);
+    return resolved;
 }
 
 /// A gRPC service name a probe can carry: within the one-octet length
@@ -6195,8 +6384,8 @@ fn grpcServiceValid(service: []const u8) bool {
 /// The `http` half: a canonical path (validated exactly as a route
 /// prefix is, so the probe sends bytes the origin's own router will
 /// recognize), a bounded Host, and a status in the real range.
-fn resolveHttpCheck(check: *const CheckJson) ParseError!Config.Cluster.Check.Http {
-    const path = check.path orelse return error.ClusterCheckPathMissing;
+fn resolveHttpCheck(http: *const Options.Cluster.Check.Http) ParseError!Config.Cluster.Check.Http {
+    const path = http.path;
     if (path.len > constants.health_check_path_bytes_max) {
         return error.ClusterCheckPathTooLong;
     }
@@ -6207,7 +6396,7 @@ fn resolveHttpCheck(check: *const CheckJson) ParseError!Config.Cluster.Check.Htt
     comptime assert(constants.health_check_path_bytes_max < constants.head_buffer_bytes_min);
     validateRoutePrefix(path, constants.head_buffer_bytes_min) catch
         return error.ClusterCheckPathNotCanonical;
-    if (check.host) |host| {
+    if (http.host) |host| {
         if (host.len == 0 or host.len > constants.health_check_host_bytes_max) {
             return error.ClusterCheckHostInvalid;
         }
@@ -6220,20 +6409,20 @@ fn resolveHttpCheck(check: *const CheckJson) ParseError!Config.Cluster.Check.Htt
             }
         }
     }
-    const expect_status = check.expect_status orelse 200;
+    const expect_status = http.expect_status;
     if (expect_status < 100 or expect_status > 599) {
         return error.ClusterCheckStatusInvalid;
     }
     return .{
         .path = path,
-        .host = check.host,
+        .host = http.host,
         .expect_status = expect_status,
     };
 }
 
 /// Resolve #390's panic threshold. Absent keeps the default rule — fail
 /// open only at zero healthy — which needs no value to say.
-fn resolvePanicThreshold(cluster: *const ClusterJson) ValidationError!?u8 {
+fn resolvePanicThreshold(cluster: *const Options.Cluster) ValidationError!?u8 {
     const threshold = cluster.panic_threshold_percent orelse return null;
     // Zero is the absent rule under a second spelling, and 100 would put
     // the cluster in panic at its first ejection — health checks that
@@ -6257,7 +6446,7 @@ fn resolvePanicThreshold(cluster: *const ClusterJson) ValidationError!?u8 {
 /// no cap has nothing to ramp; and it starts at a restore, so a cluster
 /// nothing ejects from never starts it. Refused in both cases rather
 /// than loaded inert.
-fn resolveSlowStart(cluster: *const ClusterJson) ValidationError!?u32 {
+fn resolveSlowStart(cluster: *const Options.Cluster) ValidationError!?u32 {
     const window_ms = cluster.slow_start_ms orelse return null;
     if (window_ms < 1 or window_ms > constants.timeout_ms_max) return error.ClusterSlowStartOutOfRange;
     if (cluster.max_inflight == null) return error.ClusterSlowStartWithoutMaxInflight;
@@ -6303,12 +6492,15 @@ fn resolveRetries(retries: u16) ParseError!u16 {
     return retries;
 }
 
-/// Resolve #393's budget. The object form already refused a zero count,
-/// so a budget here always has retries to bound.
-fn resolveRetryBudget(retries: RetriesJson) ValidationError!?u16 {
+/// Resolve #393's budget. A budget bounds retry dials, so it needs
+/// retries to bound: JSON's object form cannot spell one without a count,
+/// and options written in code are refused the same shape.
+fn resolveRetryBudget(retries: Options.Cluster.Retries) ValidationError!?u16 {
     const budget = retries.budget orelse return null;
+    if (retries.count == 0) return error.ClusterRetryBudgetWithoutRetries;
     assert(retries.count >= 1);
     if (budget < 1 or budget > constants.retry_budget_max) return error.ClusterRetryBudgetOutOfRange;
+    assert(budget >= 1);
     return budget;
 }
 
@@ -6540,43 +6732,35 @@ const ResolvedPick = struct {
     hash_key: Config.Cluster.HashKey,
 };
 
-/// Resolve either spelling of `pick` (#178). The policy vocabulary is
-/// closed — a typo ("pc2") fails loudly instead of silently balancing
-/// as p2c — and so is the key's. `hash` *requires* a key, in the object
-/// form: `source_ip` as a silent default was misleading (it reads as
-/// "sticky" and quietly is not, behind NAT), so what the cluster keys
-/// on is the operator's sentence to write. Key settings beside any
-/// other policy are rejected rather than left inert — they read as a
-/// request for stickiness the cluster would silently not provide.
-fn resolvePick(pick_json: *const PickJson) ParseError!ResolvedPick {
-    const policy = std.meta.stringToEnum(Config.Cluster.Pick.Builtin, pick_json.policy) orelse
-        return error.ClusterPickUnknown;
-    const pick = Config.Cluster.Pick.builtin(policy);
-    if (pick != .hash) {
-        if (pick_json.key != null or pick_json.name != null) {
-            return error.ClusterPickKeyWithoutHash;
-        }
-        return .{ .pick = pick, .hash_key = .source_ip };
-    }
-    const key_literal = pick_json.key orelse return error.ClusterPickKeyMissing;
-    const key = std.meta.stringToEnum(std.meta.Tag(Config.Cluster.HashKey), key_literal) orelse
-        return error.ClusterPickKeyUnknown;
+/// Resolve a cluster's pick (#178, #417): a built-in policy, `hash` with
+/// the key it reads, or a picker the build lists. A selection the build
+/// cannot serve is refused at startup, where the server meets it
+/// (`Server.selectsExtensions`); what this judges is the hash key's name.
+fn resolvePick(pick: *const Options.Cluster.Pick) ParseError!ResolvedPick {
+    const resolved: ResolvedPick = switch (pick.*) {
+        .rr => .{ .pick = .rr, .hash_key = .source_ip },
+        .p2c => .{ .pick = .p2c, .hash_key = .source_ip },
+        .hash => |key| .{ .pick = .hash, .hash_key = try resolveHashKey(key) },
+        .extension => |selection| .{ .pick = .{ .extension = selection }, .hash_key = .source_ip },
+    };
+    // Only `hash` reads a key; every other policy carries the inert one.
+    assert(resolved.pick == .hash or resolved.hash_key == .source_ip);
+    assert((resolved.pick == .extension) == (pick.* == .extension));
+    return resolved;
+}
+
+/// What `hash` keys on: the client address needs no name, and a header
+/// or cookie name meets the token grammar `validatePickName` states.
+fn resolveHashKey(key: Config.Cluster.HashKey) ParseError!Config.Cluster.HashKey {
     switch (key) {
-        .source_ip => {
-            if (pick_json.name != null) {
-                return error.ClusterPickNameUnexpected;
-            }
-            return .{ .pick = pick, .hash_key = .source_ip };
-        },
-        .header => return .{
-            .pick = pick,
-            .hash_key = .{ .header = try resolvePickName(pick_json.name) },
-        },
-        .cookie => return .{
-            .pick = pick,
-            .hash_key = .{ .cookie = try resolvePickName(pick_json.name) },
+        .source_ip => {},
+        .header, .cookie => |name| {
+            try validatePickName(name);
+            assert(name.len >= 1);
+            assert(name.len <= constants.pick_name_bytes_max);
         },
     }
+    return key;
 }
 
 /// The header or cookie name a request-derived key reads (#178). One
@@ -6585,8 +6769,7 @@ fn resolvePick(pick_json: *const PickJson) ParseError!ResolvedPick {
 /// job is the response-side stamp: every Set-Cookie a cookie cluster
 /// answers with re-speaks this name into a scratch sized by that
 /// constant.
-fn resolvePickName(name_json: ?[]const u8) ParseError![]const u8 {
-    const name = name_json orelse return error.ClusterPickNameMissing;
+fn validatePickName(name: []const u8) ParseError!void {
     if (name.len == 0) {
         return error.ClusterPickNameInvalid;
     }
@@ -6594,12 +6777,12 @@ fn resolvePickName(name_json: ?[]const u8) ParseError![]const u8 {
         return error.ClusterPickNameTooLong;
     }
     assert(name.len >= 1);
+    assert(name.len <= constants.pick_name_bytes_max);
     for (name) |byte| {
         if (!isTokenByte(byte)) {
             return error.ClusterPickNameInvalid;
         }
     }
-    return name;
 }
 
 /// A cluster that sends PROXY protocol (#142) may only be reached by l4
@@ -6664,27 +6847,24 @@ fn rejectClusterProtocolShape(cluster: *const Config.Cluster) ValidationError!vo
 }
 
 /// A cluster's TLS block (§7): the name checked as a DNS name, and the CA
-/// bundle read through the loader's file seam and parsed into anchors —
-/// a bundle that holds no certificate fails here, at load, not at the
-/// first handshake.
+/// bundle parsed into anchors — a bundle that holds no certificate fails
+/// here, at load, not at the first handshake.
 fn resolveClusterTls(
     arena: std.mem.Allocator,
-    tls_json: ?ClusterTlsJson,
-    files: FileSource,
+    tls: ?Options.Cluster.Tls,
 ) ParseError!?Config.Cluster.Tls {
-    const tls = tls_json orelse return null;
-    if (!dnsName(tls.server_name)) return error.ClusterTlsServerNameInvalid;
-    if (tls.ca.path.len == 0) return error.ClusterTlsCaUnreadable;
-    const pem = files.read(files.context, arena, tls.ca.path, constants.origin_ca_bytes_max) catch |err| switch (err) {
-        error.FileUnreadable, error.FileTooLarge => return error.ClusterTlsCaUnreadable,
-        error.OutOfMemory => return error.OutOfMemory,
-    };
-    const anchors = trust.parseAnchors(arena, pem) catch |err| switch (err) {
+    const stated = tls orelse return null;
+    if (!dnsName(stated.server_name)) return error.ClusterTlsServerNameInvalid;
+    // The bound the front-end's file read imposes, held for a bundle
+    // written in code too: it is what the startup arena is sized against.
+    if (stated.ca_pem.len > constants.origin_ca_bytes_max) return error.ClusterTlsCaInvalid;
+    const anchors = trust.parseAnchors(arena, stated.ca_pem) catch |err| switch (err) {
         error.AnchorsInvalid, error.AnchorsTooMany => return error.ClusterTlsCaInvalid,
         error.OutOfMemory => return error.OutOfMemory,
     };
     assert(anchors.len >= 1);
-    return .{ .server_name = tls.server_name, .anchors = anchors };
+    assert(stated.server_name.len >= 1);
+    return .{ .server_name = stated.server_name, .anchors = anchors };
 }
 
 /// A DNS name a certificate can carry: labels of letters, digits and
@@ -6708,12 +6888,6 @@ fn dnsName(name: []const u8) bool {
     return letters;
 }
 
-/// A cluster's origin protocol (§7): the closed vocabulary, which the
-/// schema states too.
-fn resolveClusterProtocol(protocol: []const u8) ValidationError!Config.Cluster.Protocol {
-    return std.meta.stringToEnum(Config.Cluster.Protocol, protocol) orelse error.ClusterProtocolUnknown;
-}
-
 /// Where an HTTP/2 or an HTTPS cluster may be routed from (§7, #296):
 /// only an `http` listener — `l4ClusterIndexOf` refuses every l4 route to
 /// one, SNI routes included — and only one that carries no upgrade. An
@@ -6732,20 +6906,6 @@ fn rejectUpgradeClusters(
         if (cluster.protocol.http2()) return error.ClusterH2cWithUpgrades;
         if (cluster.tls != null) return error.ClusterTlsWithUpgrades;
     }
-}
-
-/// Resolve a cluster's PROXY protocol announcement (#142): absent is
-/// off, and the version vocabulary is closed. The l4-only restriction is
-/// enforced where listeners resolve — reachability is a property of the
-/// listener/cluster *pair*, and only that side sees both.
-fn resolveClusterProxyProtocol(
-    proxy_protocol_json: ?ClusterProxyProtocolJson,
-) ValidationError!?Config.Cluster.ProxyProtocolSend {
-    const proxy_protocol = proxy_protocol_json orelse return null;
-    return std.meta.stringToEnum(
-        Config.Cluster.ProxyProtocolSend,
-        proxy_protocol.send,
-    ) orelse error.ClusterProxyProtocolSendUnknown;
 }
 
 /// How many listeners ask for each of the four features whose pools and
@@ -7081,6 +7241,58 @@ test "config: the derived head budget is total over every timeout pair (#417)" {
     try std.testing.expectEqual(constants.head_ms_default, derivedHeadMs(5_000, 60_000));
     try std.testing.expectEqual(@as(u32, 20_001), derivedHeadMs(20_000, 60_000));
     try std.testing.expectEqual(@as(u32, 2), derivedHeadMs(1, 2));
+}
+
+test "config: clusters written as options meet the loader's rules (#417)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const origin = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:9000");
+    const base: Options.Cluster = .{
+        .name = "origin",
+        .endpoints = &.{.{ .address = .{ .ip = origin } }},
+        .pick = .p2c,
+    };
+    const plain = try resolveClusters(arena, &[_]Options.Cluster{base});
+    try std.testing.expectEqual(@as(usize, 1), plain.len);
+    try std.testing.expect(plain[0].pick == .p2c);
+    try std.testing.expectEqual(@as(?[]const u16, null), plain[0].weights);
+
+    // A budget with no retries to bound: JSON's object form cannot spell
+    // it, so it is the one cluster refusal only code can earn.
+    var budgeted = base;
+    budgeted.retries = .{ .budget = 4 };
+    try std.testing.expectError(
+        error.ClusterRetryBudgetWithoutRetries,
+        resolveClusters(arena, &[_]Options.Cluster{budgeted}),
+    );
+    budgeted.retries.count = 1;
+    const retrying = try resolveClusters(arena, &[_]Options.Cluster{budgeted});
+    try std.testing.expectEqual(@as(?u16, 4), retrying[0].retry_budget);
+
+    // The rules a file meets, met from code: a hash key's token grammar
+    // and a socket path's.
+    var hashed = base;
+    hashed.pick = .{ .hash = .{ .header = "bad name" } };
+    try std.testing.expectError(
+        error.ClusterPickNameInvalid,
+        resolveClusters(arena, &[_]Options.Cluster{hashed}),
+    );
+    var relative = base;
+    relative.endpoints = &.{.{ .address = .{ .unix = "relative.sock" } }};
+    try std.testing.expectError(
+        error.EndpointUnixPathRelative,
+        resolveClusters(arena, &[_]Options.Cluster{relative}),
+    );
+
+    // A picker the build lists passes through to the server, which is
+    // where a selection it cannot serve is refused.
+    var instance: u8 = 0;
+    var picked = base;
+    picked.pick = .{ .extension = .{ .index = 0, .instance = &instance } };
+    const with_picker = try resolveClusters(arena, &[_]Options.Cluster{picked});
+    try std.testing.expect(with_picker[0].pick == .extension);
+    try std.testing.expect(with_picker[0].hash_key == .source_ip);
 }
 
 const example_json = @embedFile("example_config");
