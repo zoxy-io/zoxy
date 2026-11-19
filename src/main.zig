@@ -131,7 +131,7 @@ fn serve(init: std.process.Init, arena: std.mem.Allocator, config_path: []const 
         .version = build_options.version,
         .id_suffix = build_id_suffix,
     });
-    const resources = try openStartupResources(init.io, arena, &config, demands);
+    const resources = try openStartupResources(arena, &config, demands);
 
     // The ring is the config's to size (§5), count and unit both;
     // Server.init asserts its own accounting against the same numbers.
@@ -197,7 +197,6 @@ const StartupResources = struct {
 /// `checkStartFits` both call this, so the two cannot drift and no
 /// comment has to guard that they don't.
 fn openStartupResources(
-    io: std.Io,
     arena: std.mem.Allocator,
     config: *const zoxy.config.Config,
     demands: BudgetXev.Demands,
@@ -212,13 +211,13 @@ fn openStartupResources(
     // first thing the box can refuse and the first thing asked of it.
     try ensureFdBudget(demands.fds);
     const log_sink_fd = try openLogSinkFd(config);
-    // Certificates before the loop, on `openLogSinkFd`'s reasoning: the
-    // config named a file, so open it while a failure can still name it
-    // and stop the process, rather than surfacing as a broken connection
-    // under traffic (§4).
-    const tls_credentials = try loadTlsCredentials(io, arena, config);
+    // Certificates parsed before the loop, on `openLogSinkFd`'s
+    // reasoning: the loader read their bytes (#417), and a pair that will
+    // not parse stops the process here, where the error can still name
+    // it, rather than surfacing as a broken connection under traffic (§4).
+    const tls_credentials = try loadTlsCredentials(arena, config);
     assert(tls_credentials.len == 0 or tls_credentials.len == config.listeners.len);
-    const tls_certificate_sets = try loadTlsCertificateSets(io, arena, config, tls_credentials);
+    const tls_certificate_sets = try loadTlsCertificateSets(arena, config, tls_credentials);
     assert(tls_certificate_sets.len == tls_credentials.len);
     return .{
         .log_sink_fd = log_sink_fd,
@@ -233,7 +232,6 @@ fn openStartupResources(
 /// names no DNS host could never be chosen, so it stops startup rather
 /// than sit in the table as a typo nobody notices.
 fn loadTlsCertificateSets(
-    io: std.Io,
     arena: std.mem.Allocator,
     config: *const zoxy.config.Config,
     credentials: []const ?zoxy.tls.Credentials,
@@ -245,7 +243,7 @@ fn loadTlsCertificateSets(
         set.* = &.{};
         const tls = listener.tls orelse continue;
         if (tls.certificates.len == 0) continue;
-        set.* = try loadCertificateSet(io, arena, tls, &default_credentials.*.?, index);
+        set.* = try loadCertificateSet(arena, tls, &default_credentials.*.?, index);
     }
     assert(sets.len == credentials.len);
     return sets;
@@ -254,7 +252,6 @@ fn loadTlsCertificateSets(
 /// One listener's set: its default first, then each further pair loaded
 /// in config order.
 fn loadCertificateSet(
-    io: std.Io,
     arena: std.mem.Allocator,
     tls: zoxy.config.Config.Listener.Tls,
     default_credentials: *const zoxy.tls.Credentials,
@@ -264,29 +261,24 @@ fn loadCertificateSet(
     const choices = try arena.alloc(zoxy.tls.certificate_set.Choice, 1 + tls.certificates.len);
     choices[0] = .{
         .credentials = default_credentials,
-        .names = try leafNames(arena, default_credentials, tls.cert_path, index),
+        .names = try leafNames(arena, default_credentials, tls.label, index),
         .schemes = default_credentials.schemes(),
     };
     const loaded = try arena.alloc(zoxy.tls.Credentials, tls.certificates.len);
     for (tls.certificates, loaded, choices[1..]) |certificate, *credentials, *choice| {
-        const cert_pem = try readPemFile(io, arena, certificate.cert_path);
-        const key_pem = try readPemFile(io, arena, certificate.key_path);
-        credentials.* = zoxy.tls.Credentials.load(arena, cert_pem, key_pem, .{}) catch |err| {
-            std.debug.print(
-                "zoxy: listener {d} cannot use '{s}' + '{s}': {t}\n",
-                .{ index, certificate.cert_path, certificate.key_path, err },
-            );
+        credentials.* = zoxy.tls.Credentials.load(arena, certificate.cert_pem, certificate.key_pem, .{}) catch |err| {
+            std.debug.print("zoxy: listener {d} cannot use {s}: {t}\n", .{ index, certificate.label, err });
             return err;
         };
         choice.* = .{
             .credentials = credentials,
-            .names = try leafNames(arena, credentials, certificate.cert_path, index),
+            .names = try leafNames(arena, credentials, certificate.label, index),
             .schemes = credentials.schemes(),
         };
         if (choice.names.len == 0) {
             std.debug.print(
-                "zoxy: listener {d}: '{s}' names no DNS host, so no server name could choose it\n",
-                .{ index, certificate.cert_path },
+                "zoxy: listener {d}: {s} names no DNS host, so no server name could choose it\n",
+                .{ index, certificate.label },
             );
             return error.CertificateNamesNoHost;
         }
@@ -296,16 +288,16 @@ fn loadCertificateSet(
 }
 
 /// The DNS names a loaded certificate's leaf covers, or a startup error
-/// naming the file.
+/// naming the pair by its label.
 fn leafNames(
     arena: std.mem.Allocator,
     credentials: *const zoxy.tls.Credentials,
-    cert_path: []const u8,
+    label: []const u8,
     index: usize,
 ) ![]const []const u8 {
     assert(credentials.chain.len >= 1);
     return zoxy.tls.trust.dnsNames(arena, credentials.chain[0]) catch |err| {
-        std.debug.print("zoxy: listener {d}: cannot read the names in '{s}': {t}\n", .{ index, cert_path, err });
+        std.debug.print("zoxy: listener {d}: cannot read the names in {s}: {t}\n", .{ index, label, err });
         return err;
     };
 }
@@ -370,7 +362,7 @@ fn checkConfig(init: std.process.Init, arena: std.mem.Allocator, config_path: []
     // limit toward the demand, so asking afterwards would report what
     // this check just did rather than what it found.
     const nofile = try std.posix.getrlimit(.NOFILE);
-    const verdict = checkStartFits(init.io, arena, &config, demands);
+    const verdict = checkStartFits(arena, &config, demands);
     try writeCheckReport(init.io, &.{
         .config = &config,
         .demands = demands,
@@ -391,14 +383,13 @@ fn checkConfig(init: std.process.Init, arena: std.mem.Allocator, config_path: []
 /// out (§5's rule that a path which cannot open stops the process), so
 /// what comes back here is only the verdict.
 fn checkStartFits(
-    io: std.Io,
     arena: std.mem.Allocator,
     config: *const zoxy.config.Config,
     demands: BudgetXev.Demands,
 ) CheckExit {
     assert(config.listeners.len >= 1);
     assert(demands.fds > 0);
-    const resources = openStartupResources(io, arena, config, demands) catch |err|
+    const resources = openStartupResources(arena, config, demands) catch |err|
         return checkExitFor(err);
     // Given straight back, because a check holds nothing. The `file`
     // sink was still *created* if it was absent, exactly as a start
@@ -581,7 +572,6 @@ var libcrypto_heap_storage: [zoxy.constants.libcrypto_heap_bytes]u8 align(16) = 
 /// that only shows up under traffic, and reports it as a failed
 /// connection rather than as the config being wrong.
 fn loadTlsCredentials(
-    io: std.Io,
     arena: std.mem.Allocator,
     config: *const zoxy.config.Config,
 ) ![]const ?zoxy.tls.Credentials {
@@ -615,16 +605,11 @@ fn loadTlsCredentials(
             credentials[index] = null;
             continue;
         };
-        const cert_pem = try readPemFile(io, arena, tls.cert_path);
-        const key_pem = try readPemFile(io, arena, tls.key_path);
-        credentials[index] = zoxy.tls.Credentials.load(arena, cert_pem, key_pem, .{}) catch |err| {
-            // Which listener and which verdict: the paths are right here,
+        credentials[index] = zoxy.tls.Credentials.load(arena, tls.cert_pem, tls.key_pem, .{}) catch |err| {
+            // Which listener and which verdict: the label names the pair,
             // and an operator with several listeners needs to know which
             // one to look at.
-            std.debug.print(
-                "zoxy: listener {d} cannot use '{s}' + '{s}': {t}\n",
-                .{ index, tls.cert_path, tls.key_path, err },
-            );
+            std.debug.print("zoxy: listener {d} cannot use {s}: {t}\n", .{ index, tls.label, err });
             return err;
         };
     }
@@ -633,22 +618,6 @@ fn loadTlsCredentials(
     // hand some listener another's key or none at all.
     assert(credentials.len == config.listeners.len);
     return credentials;
-}
-
-/// One PEM file into the arena, bounded. The bound's job is to turn "the
-/// operator pointed at the wrong file" into a named error rather than an
-/// arena the size of whatever was on disk.
-fn readPemFile(io: std.Io, arena: std.mem.Allocator, path: []const u8) ![]const u8 {
-    assert(path.len >= 1);
-    return std.Io.Dir.cwd().readFileAlloc(
-        io,
-        path,
-        arena,
-        .limited(zoxy.constants.tls_pem_bytes_max),
-    ) catch |err| {
-        std.debug.print("zoxy: cannot read TLS file '{s}': {t}\n", .{ path, err });
-        return err;
-    };
 }
 
 /// The loader's `FileSource.read` against the real filesystem: whole
@@ -673,8 +642,10 @@ fn readBodyFile(
         error.StreamTooLong => error.FileTooLarge,
         else => blk: {
             // Which file and why, here where both are known: the
-            // loader's error names the verdict, not the path.
-            std.debug.print("zoxy: cannot read body file '{s}': {t}\n", .{ path, err });
+            // loader's error names the verdict, not the path. Bodies, CA
+            // bundles and a listener's certificate pair all come through
+            // here (#417).
+            std.debug.print("zoxy: cannot read '{s}': {t}\n", .{ path, err });
             break :blk error.FileUnreadable;
         },
     };

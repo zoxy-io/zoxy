@@ -1785,13 +1785,15 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
             // that only ever drew one would leave the other's states
             // reachable by nothing.
             .protocol = harness.tls_protocol,
-            // Paths nothing reads: the harness embeds the PEMs, so what
-            // this states is only that the listener terminates — which is
-            // what `Server.start` checks its credentials table against.
+            // The harness loads its credentials itself from these same
+            // bytes, so what this states is only that the listener
+            // terminates — which is what `Server.start` checks its
+            // credentials table against.
             .tls = if (harness.tls_clients >= 1)
                 .{
-                    .cert_path = "cert.pem",
-                    .key_path = "key.pem",
+                    .cert_pem = zoxy.tls.testdata.cert_pem,
+                    .key_pem = zoxy.tls.testdata.key_pem,
+                    .label = "the harness's fixture",
                     .alpn = switch (harness.tls_protocol) {
                         .http => zoxy.config.alpn.http_default,
                         .l4 => &.{},

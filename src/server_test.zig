@@ -471,11 +471,17 @@ pub const TestBed = struct {
             .sni_routes = bed.sni_routes,
             .protocol = .l4,
             .proxy_protocol = options.proxy_protocol,
-            // Paths nothing reads: the bed embeds the PEMs, so what this
-            // states is only that the listener terminates — which is what
-            // `Server.start` checks its credentials against.
+            // The bed loads its credentials itself from these same bytes,
+            // so what this states is only that the listener terminates —
+            // which is what `Server.start` checks its credentials against.
             .tls = if (options.tls)
-                .{ .cert_path = "cert.pem", .key_path = "key.pem", .alpn = &.{}, .client_ca = options.tls_client_ca }
+                .{
+                    .cert_pem = fixture_cert_pem,
+                    .key_pem = fixture_key_pem,
+                    .label = "the bed's fixture",
+                    .alpn = &.{},
+                    .client_ca = options.tls_client_ca,
+                }
             else
                 null,
         }};
