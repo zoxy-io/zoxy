@@ -5,13 +5,10 @@
 //! not per connection.
 //!
 //! ECDSA P-256/P-384, or RSA of 2048 to 4096 bits signing RSA-PSS (#411).
-//! zssl's CertificateVerify offers no Ed25519 scheme. RSA was refused
-//! until #411 for its cost on the loop — a sign is ~0.5 ms at 2048 bits
-//! and ~2.4 ms at 4096, against ~15 µs for P-256 (IMPLEMENTATION_NOTES.md)
-//! — and is admitted now as the operator's choice: configuring an RSA key
-//! is the opt-in, a listener holding both kinds signs ECDSA for every
-//! client that can verify it (`certificate_set.zig`), and
-//! `tls_rsa_signed` counts what the loop paid.
+//! Configuring an RSA key opts into its signing cost on the loop (§3).
+//! Certificate selection prefers ECDSA among compatible keys within
+//! each name tier (`certificate_set.zig`), and `tls_rsa_signed` counts
+//! completed handshakes that used RSA.
 //!
 //! Decoding and key loading are zssl's; what this adds is the two
 //! startup checks zssl has no reason to make — the wire bound the engine

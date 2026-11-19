@@ -377,11 +377,9 @@ pub fn Server(comptime IoType: type) type {
         /// `conn_ops_max` budget and `Stream.arm` the `stream_ops_max`
         /// one, and both record this *combined* peak — which is the
         /// number the CQ is charged per admitted connection, and so the
-        /// one that must not move when ops change slots. Under runtime
-        /// safety only (Debug and ReleaseSafe — the shipped build is
-        /// ReleaseSafe, see docs/IMPLEMENTATION_NOTES.md "Shipping
-        /// ReleaseSafe"), so a test can claim a race co-armed exactly the
-        /// budgeted worst case, not merely stayed under it.
+        /// one that must not move when ops change slots. Recorded with
+        /// runtime safety enabled (Debug and ReleaseSafe), so a test can
+        /// assert that a race reached the budgeted worst case.
         armed_ops_peak: u8,
         /// The stream half of that peak (#274), tracked beside it because
         /// the combined number cannot distinguish the two shapes the
@@ -1155,12 +1153,8 @@ pub fn Server(comptime IoType: type) type {
                 u8,
                 @as(usize, options.upstream_head_buffers) * options.head_buffer_bytes,
             );
-            // Deliberately not faulted in: pages become resident as
-            // exchanges actually use them, so the printed §5 total is a
-            // ceiling RSS approaches under load, never a startup floor
-            // (IMPLEMENTATION_NOTES "lazy fault-in"). Nothing reads a
-            // buffer byte it did not first write, so the content of a
-            // fresh page is never observed.
+            // Pages become resident as exchanges use them (§5).
+            // Reads are limited to bytes already written into the slab.
             for (server.upstream_head_buffers.slots, 0..) |*head_buffer, index| {
                 head_buffer.data =
                     upstream_head_slab[index * options.head_buffer_bytes ..][0..options.head_buffer_bytes];
@@ -1258,11 +1252,8 @@ pub fn Server(comptime IoType: type) type {
         /// acquire/release afterwards — the same contract
         /// `initHeadBuffers` relies on.
         ///
-        /// Deliberately not faulted in: pages become resident as relays
-        /// actually use them, so the printed §5 total stays a ceiling RSS
-        /// approaches under load rather than a startup floor
-        /// (IMPLEMENTATION_NOTES "lazy fault-in"). Nothing reads a byte it
-        /// did not first write, so a fresh page's content is never seen.
+        /// Pages become resident as relays use them (§5). The pump reads
+        /// only bytes already written into the buffer.
         fn wireRelayHalves(
             arena: std.mem.Allocator,
             slots: []relay.RelayBuffer,
@@ -4449,18 +4440,10 @@ pub fn Server(comptime IoType: type) type {
             }
         }
 
-        /// §8 kernel-pressure rung: a non-orderly op failure on a live
-        /// socket is resource exhaustion (ENOBUFS/ENOMEM), which the seam
-        /// collapses to Unexpected. Orderly failures (EndOfStream, Reset,
-        /// Canceled) are peeled off by the caller; only Unexpected is
-        /// witnessed here. Shared by every site — the accept and
-        /// setNodelay ones included, so no path can reach the total
-        /// without naming the op it failed on.
-        ///
-        /// `op` is comptime and mandatory for that reason. The errno is
-        /// gone before this is called (libxev discards it), so the op is
-        /// the only thing left to distinguish a full NIC queue from an
-        /// exhausted fd table — and those want opposite responses.
+        /// Count Unexpected failures under kernel pressure (§8).
+        /// Each call records the operation and the seam's classification.
+        /// On io_uring, the fork preserves the raw errno from a completion,
+        /// including network errors that fall through to Unexpected.
         pub fn witnessKernelPressure(
             server: *Self,
             comptime op: counters_module.Counters.KernelPressureOp,

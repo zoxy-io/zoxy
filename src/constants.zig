@@ -45,55 +45,15 @@ pub const admin_scrape_deadline_ms: u32 = 5_000;
 /// in a loop to EOF suffices — sized only to keep the read count modest.
 pub const admin_drain_scratch_bytes: u32 = 512;
 
-/// Connection slots (`Pool(Conn)`). The binding constraint is the
-/// io_uring completion queue, not fds or memory (§8): every admitted
-/// connection — L4 relaying or L7 in any phase — can hold up to
-/// `conn_ops_max` armed ops whether or not it holds a relay buffer
-/// (an L7 head read is a data op like any other), so every slot claims
-/// its worst-case share of the pre-budgeted ring. The ring requests the
-/// deepest CQ the kernel allows (`completion_queue_entries`,
-/// IORING_SETUP_CQSIZE) against the 4096 SQ, so at the largest fill a
-/// config may pick (`cq_fill_eighths_default` = ⅞, 57344) with the
-/// parked-upstream, admin, access-log and health-probe reservations
-/// carved out first, this caps at
-/// `(57344 - 12) / (conn_ops_max + 1) = 11466` —
-/// comptime-derived below (the 12 is the fixed ops: two for the admin
-/// listener [2], the admin client's op budget [3], the access log's
-/// in-flight sink write [1], the health prober's op budget [3], the signal
-/// wake [1], the drain timer [1], and #311's loop-watchdog tick [1]).
-/// That clears a round 10k on a
-/// single ring; a deployment trades the ceiling back down for more burst
-/// headroom via `limits.cq_fill_eighths` (§8).
+/// Connection slots (`Pool(Conn)`). The io_uring completion queue sets
+/// the ceiling (§5). Each slot costs `conn_ops_max + stream_ops_max`
+/// plus one op for the matching upstream slot. The comptime assertion
+/// below fits both pools in the default ⅞ CQ budget after the fixed
+/// reservations, including the maximum health probe concurrency.
 ///
-/// **Configured listeners are not in that 11.** They cost two ring ops
-/// each like the admin listener does, but there is no listener ceiling to
-/// reserve against — so this is the ceiling at *zero* configured
-/// listeners, and each one a config declares spends two ops out of the
-/// same budget. `cqFillFits` refuses the combination at load
-/// (`LimitConnSlotsOverCqFill`) rather than a comptime assert refusing it
-/// at build time, which is the trade this ceiling now rests on: a
-/// deployment wanting both the maximum conn slots and many listeners is
-/// told so at startup instead of being pre-empted by a number chosen for
-/// it here.
-///
-/// `upstream_slots_max` is pinned to this, and the `+ 1` in the divisor
-/// is that pin: on the L7 path an admitted connection that is mid-exchange
-/// holds one upstream slot as well as its conn slot, and at saturation
-/// every admitted connection can be mid-exchange at once. A conn ceiling
-/// above the upstream ceiling is therefore capacity that cannot be served
-/// — slots that admit connections the pool has no upstream for — and one
-/// below it is a pool that can never be drawn down. `11466` is the
-/// largest N with `N * (conn_ops_max + 1) <= 57332`, which keeps both
-/// ceilings clear of a round 10k: what §1 asks for, c10k reachable on
-/// either axis rather than a shape tuned for it.
-///
-/// It was 12282 against an upstream ceiling of 8192, which measured out
-/// as ~2200 conn slots that stayed idle while the pool they depend on
-/// pinned at its own ceiling; IMPLEMENTATION_NOTES.md ("The upstream pool
-/// tracks connections, not requests") is the one home for those numbers.
-/// The pair is still a policy choice made on the operator's behalf;
-/// IMPLEMENTATION_NOTES.md ("Open questions" — pool ceilings) holds the
-/// standing question of handing it to them instead.
+/// This ceiling assumes zero configured listeners and no shared HTTP/2
+/// streams or HTTP/2 origin connections. `cqFillFits` validates the
+/// effective pool sizes, listener count and fill fraction at load.
 pub const conn_slots_max: u32 = 11457;
 
 /// Relay buffer pairs (`Pool(RelayBuffer)`) — the bound on concurrent L4
@@ -103,52 +63,19 @@ pub const conn_slots_max: u32 = 11457;
 /// acquired.
 pub const relay_buffers_max: u32 = conn_slots_max;
 
-/// Bytes per relay direction; a `RelayBuffer` is a pair of these. The
-/// operator's to size (`limits.relay_buffer_bytes`), because the right
-/// value is a property of the bodies a deployment moves and nothing here
-/// knows those.
-///
-/// The default is one full TLS record, and that is the measurement rather
-/// than a round number. §6's strict recv→send→recv relay is correct at any
-/// size, so the buffer sets how many round trips a body costs — a 256 KiB
-/// response is 64 of them at 4 KiB and 16 at 16 KiB — and
-/// `tls_app_chunk_bytes` below rides the same number, so a small buffer
-/// also emits quarter-size TLS records against RFC 8446 §5.1's 2^14
-/// ceiling. Held at 4 KiB, both together cost ~40% of bulk latency
-/// (IMPLEMENTATION_NOTES.md, "The relay buffer sets the TLS record size").
-///
-/// The price is `relay_buffers` × 2 × this, which the c10k ceiling
-/// multiplies by 11457 — so a deployment moving small bodies at high
-/// concurrency is exactly who should turn it down, and the knob exists
-/// for them.
+/// Bytes per relay direction (`limits.relay_buffer_bytes`). The default
+/// fits one full TLS record's plaintext. Larger chunks can move large
+/// bodies in fewer recv/send cycles (§6), and the slab reserves twice
+/// this size per relay slot (§5).
 pub const relay_buffer_bytes_default: u32 = 16 * 1024;
 
 /// Floor. Below this a `PROXY` header or a chunked size line could not be
 /// staged in one buffer, which the asserts below pin.
 pub const relay_buffer_bytes_min: u32 = 1024;
 
-/// Ceiling, and it is an IMPLEMENTATION bound rather than a protocol one.
-/// RFC 8446 §5.1 caps a RECORD at 2^14, not a buffer;
-/// `ResponseBodyPolicy.transformOut` hands a whole relay chunk to
-/// `Engine.sendApp` with no loop around it, so on a *terminating* listener
-/// one chunk is one record and a buffer past `tls_app_chunk_bytes` has
-/// nowhere to go. That was once the reason this number was 16 KiB for
-/// everyone; the bound is conditional now, which is the second of the two
-/// exits the previous comment named. A config whose listeners all speak
-/// plaintext may take the full ceiling here; one that terminates TLS is
-/// refused above `tls_app_chunk_bytes` at load
-/// (`LimitRelayBufferOverTlsRecord`) rather than emitting a record no peer
-/// may accept — §5's rule that a shape which cannot serve is a config
-/// error, not a runtime surprise. Chunking inside the transform is the
-/// other exit and stays open; it would retire that refusal.
-///
-/// 32 KiB because the relay buffer sets how many event-loop round trips a
-/// body costs, and the large-body band is where that is visible: a 100 KiB
-/// response is 7 chunks at 16 KiB and 4 at 32 (IMPLEMENTATION_NOTES.md,
-/// "The relay buffer sets the TLS record size" for the 4 → 16 KiB move
-/// this follows). The price is the pool term below, which doubles with
-/// it — `relay_buffers` x 2 x this — so the ceiling is what an operator
-/// moving large bodies may reach for, never what they get by default.
+/// Configurations that terminate TLS have a lower ceiling of
+/// `tls_app_chunk_bytes` (`LimitRelayBufferOverTlsRecord`). The response
+/// pump hands a whole chunk to `Engine.sendApp` for a single record.
 pub const relay_buffer_bytes_max: u32 = 32 * 1024;
 
 /// Most bytes a PROXY protocol header may occupy before the listener
@@ -482,28 +409,18 @@ pub const tls_certificates_max: u32 = 256;
 /// silently selecting on a prefix of what the certificate covers.
 pub const tls_certificate_names_max: u32 = 128;
 
-/// What the heap costs before any session: libcrypto's one-time tables
-/// plus the first handshake's distinct block footprint, which every later
-/// handshake reuses off the class free lists rather than growing
-/// (IMPLEMENTATION_NOTES.md). Measured at ~1 MiB — 384 KiB at startup,
-/// ~960 KiB once the first handshakes settle — reserved at 2 MiB.
+/// The heap baseline covers libcrypto's one-time tables and the working
+/// set that sequential handshakes recycle through the class free lists.
+/// See the plateau checks in `tls/heap_proof_test.zig`.
 pub const libcrypto_heap_base_bytes: u32 = 2 * 1024 * 1024;
 
-/// The fixed heap libcrypto allocates from (§4, `tls/libcrypto_heap.zig`),
-/// reserved at startup exactly when some listener terminates TLS.
-///
-/// Scales with the engine pool, because the heap's occupancy does. The
-/// previous fixed 4 MiB was sized against a *sequential* measurement — one
-/// handshake at a time, each freeing before the next — which is true
-/// serially and false concurrently, and the gap was an outage rather than
-/// a rounding error: the heap ran out at ~675 concurrent sessions, and
-/// because the engine retried that allocation failure forever, the process
-/// livelocked at 100% CPU with every listener dark (#222).
+/// Price a fixed libcrypto heap for concurrent sessions and loaded
+/// certificates (§5). Each live session can hold its own blocks.
+/// Production reserves the compiled size below.
 pub fn libcryptoHeapBytes(tls_engines: u32, tls_certificates: u32) u32 {
     assert(tls_engines <= tls_engines_max);
     assert(tls_certificates <= tls_certificates_max);
-    // Zero exactly when no listener terminates TLS — the same condition
-    // that makes the engine pool itself free (§5).
+    // With no sessions to serve, the reservation is zero.
     if (tls_engines == 0) return 0;
     return libcrypto_heap_base_bytes + tls_engines * libcrypto_heap_bytes_per_engine +
         tls_certificates * libcrypto_heap_bytes_per_certificate;
@@ -586,31 +503,13 @@ pub const chunked_line_bytes_max: u32 = 256;
 /// (§7). Same bounding argument as the size line.
 pub const chunked_trailer_bytes_max: u32 = 1024;
 
-/// Shared upstream connection slots (`Pool(Upstream)`) — one pool for
-/// the whole process, checked out by any request and parked per endpoint
-/// on keep-alive (§3, §5). Counted in the §8 budgets below: a parked
-/// upstream holds a socket (fd budget) and, once keep-alive lands, one
-/// armed idle-timer op (ring budget) — both reserved now so composing
-/// keep-alive does not re-cut the budgets.
+/// Shared upstream slots (`Pool(Upstream)`). An exchange leases a slot.
+/// An HTTP/1.1 origin connection keeps its slot while parked on its
+/// endpoint's idle list (§5). One sweep timer reaps parked sockets.
 ///
-/// This is the *ceiling*, not the out-of-box size — `upstream_slots_default`
-/// stays lean below it, the same two-layer shape conn slots have. It was
-/// 1024, where ceiling and default were the same number and an operator
-/// could only go *down*; at 10k connections that pool pinned and shed a
-/// third of all responses. Then 8192, which still sat below
-/// `conn_slots_max` — and since the pool holds one live upstream per live
-/// client connection, a conn ceiling the pool cannot cover is unreachable
-/// capacity. Both are measured, not guessed; IMPLEMENTATION_NOTES.md
-/// ("The upstream pool was a wall, not a range" and "The upstream pool
-/// tracks connections, not requests") is their one home.
-///
-/// Pinned to `conn_slots_max`, the same way `relay_buffers_max` is and
-/// for the same reason: a slot past the conn-slot count could never be
-/// acquired, and a slot short of it admits a connection nothing can
-/// serve. The two trade against each other on one CQ line, so pinning
-/// them collapses that line to a single divisor — `conn_ops_max + 1` ring
-/// ops per admitted connection — instead of two numbers that must be
-/// edited together and can silently drift apart.
+/// Matching the conn ceiling reserves room in the CQ budget for one
+/// upstream slot per admitted connection. The config chooses the
+/// actual size of each pool.
 pub const upstream_slots_max: u32 = conn_slots_max;
 
 /// Listen backlog for every listener.

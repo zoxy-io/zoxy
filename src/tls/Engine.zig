@@ -637,12 +637,9 @@ comptime {
 /// seal it into a ticket only this server can open, and encrypt the
 /// message onto the application stream (RFC 8446 §4.6.1).
 ///
-/// **When this is called is the point of it.** The flight must go out
-/// *after* the client's Finished is processed, not alongside the server
-/// flight — TLS 1.3 permits either, but only the later one carries an
-/// ACK covering that Finished. Without it the client's next small write
-/// sits in its own Nagle queue waiting for an ACK zoxy has no reason to
-/// send, which is the ~45 ms stall (IMPLEMENTATION_NOTES).
+/// Call after processing the client's Finished. The ticket flight can
+/// carry the TCP ACK for Finished, releasing a client's first request
+/// if Nagle is holding that write (§4).
 ///
 /// The randomness is passed in rather than drawn: the engine has no I/O,
 /// and a seeded simulator must be able to replay a ticket byte for byte

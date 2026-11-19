@@ -9,9 +9,6 @@ direnv activates the shell). Read before writing code:
 - [docs/TIGER_STYLE.md](docs/TIGER_STYLE.md) — enforced coding rules:
   static allocation only, ≤ 70-line functions, assertion density ≥ 2,
   bounded loops, explicitly-sized integers, naming conventions.
-- [docs/IMPLEMENTATION_NOTES.md](docs/IMPLEMENTATION_NOTES.md) — measured
-  findings, shelved experiments, and open technical questions; do not
-  re-litigate settled verdicts.
 
 ## Gates — run before every commit
 

@@ -2,11 +2,9 @@
 //! zrk load (coordinated-omission-corrected) against the origin directly,
 //! through zoxy, and through haproxy as the state-of-the-art reference,
 //! printed as comparable bands — never single numbers; compare bands
-//! across runs. Also witnesses the §5 closed form from the outside: the
-//! slabs are lazily resident (IMPLEMENTATION_NOTES "lazy fault-in"), a
-//! saturating warmup drives RSS toward its bound, and the measured run
-//! must hold RSS under the banner's memory total plus a fixed overhead
-//! slack — the budget as a machine-checked ceiling, every run.
+//! across runs. A saturating warmup touches the buffer slabs (§5).
+//! The measured run checks RSS against the banner's memory total plus
+//! a fixed allowance.
 //!
 //! By default an nginx origin is spawned with a generated config (the dev
 //! shell provides nginx and haproxy); pass `--origin host:port` to reuse
@@ -112,36 +110,16 @@ comptime {
     assert(rss_ceiling_slack_kb <= 16 * 1024);
 }
 
-/// The §9 rate floor, as a percentage of the offered rate. A band that
-/// cannot keep up is a finding, not a pass: the error gates check *how*
-/// requests failed and never *whether* they happened, which is how a TLS
-/// band delivering 704 of 2000 req/s once went green
-/// (IMPLEMENTATION_NOTES.md). Every band this applies to has measured
-/// within a fraction of a percent of its offer, so the floor sits far
-/// enough below to leave loopback jitter alone while catching a collapse.
-/// The overload scenario is exempt by construction — it offers far past
-/// capacity on purpose.
+/// The §9 rate floor catches stalled requests that produce few socket
+/// errors. The overload scenario deliberately offers more work than
+/// the proxy can admit and checks timeouts separately.
 const rate_floor_percent: u64 = 90;
 
 const Flags = struct {
     rate: u64 = 20_000,
-    // Connection: close is one TCP handshake per request — and, on the
-    // terminating paths, one *TLS* handshake too. That is what sets this
-    // rate: an ECDSA signature plus a key exchange per connection tops
-    // out near 840/s on a single pinned core, measured, and measured the
-    // same for haproxy (843 vs 830 — IMPLEMENTATION_NOTES). Offering
-    // past that makes the *terminating* paths' latency a queueing
-    // artefact rather than a hop cost, which is the opposite of what this
-    // band is for: it is a latency band (the per-request hop cost), never
-    // a throughput number. The plaintext paths held 2000/s and were never
-    // the constraint.
-    //
-    // So the offer is one every path can actually hold, which keeps all
-    // seven directly comparable — the whole point of a band. It also
-    // eases what the previous rate had to lean on: at 2000/s the
-    // TIME_WAIT population (rate x 60 s) exceeded the ~28k ephemeral-port
-    // pool and the run depended on net.ipv4.tcp_tw_reuse to reclaim
-    // source ports.
+    // Each request needs a TCP handshake and, on terminating paths,
+    // a TLS handshake. Keep the offer below handshake capacity so the
+    // band measures hop latency before those paths start queueing.
     close_rate: u64 = 500,
     /// Requests per second for the large-body bands. At
     /// `large_body_bytes` each, 400/s offers ~100 MiB/s through the hop —
@@ -732,16 +710,9 @@ fn benchPassed(
         // and a socket-error rate under 1% (a relay stall must not pass
         // silently; faithfully relayed 4xx/5xx are excluded).
         if (!proxiesHealthy(band.label, band.runs)) bands_ok = false;
-        // And *every* path holds its offered rate — by reflection over
-        // `Runs`, so adding a path to that struct is what puts it under the
-        // floor, instead of also remembering a line here. The gate exists
-        // because a band once delivered 704 of 2000 req/s through green
-        // error checks (IMPLEMENTATION_NOTES.md); a gate you have to
-        // remember to extend reopens that hole the first time someone
-        // doesn't. The reference bands are in scope for the same reason the
-        // baseline is: haproxy missing the offer means the *offer* is wrong,
-        // and a comparison against a reference that could not keep up
-        // measures nothing.
+        // Iterating the fields of `Runs` puts each path under the rate
+        // floor. The direct and HAProxy paths must sustain the offer for
+        // their latency to be comparable.
         const runs_info = @typeInfo(Runs).@"struct";
         inline for (runs_info.field_names, runs_info.field_types) |name, FieldType| {
             comptime assert(FieldType == zrk.runner.Report);

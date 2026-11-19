@@ -104,20 +104,16 @@ test "a handshake runs entirely on the fixed libcrypto heap" {
     try std.testing.expect(per_rsa_key > per_certificate);
     try std.testing.expect(per_rsa_key <= constants.libcrypto_heap_bytes_per_certificate);
 
-    // And an RSA sign's working set recycles like an ECDSA one: once the
-    // first rounds have populated the classes, more handshakes cost
-    // nothing, so a long-lived proxy signing RSA does not creep. The
-    // rounds are the measurement's own (IMPLEMENTATION_NOTES.md): the
-    // frontier grew inside the first 64 and by nothing in the five after,
-    // and blinding makes the first round's exact sizes data-dependent.
+    // Warm the size classes used by RSA signing, then check that the
+    // next round reuses those blocks. Blinding makes the first round's
+    // exact footprint data-dependent.
     for (0..plateau_rsa_handshakes) |_| try handshake(&warm);
     const settled = heap_mod.usedPeak();
     for (0..plateau_rsa_handshakes) |_| try handshake(&warm);
     try std.testing.expectEqual(settled, heap_mod.usedPeak());
 }
 
-/// Sequential RSA handshakes per plateau round (#411): what the
-/// measurement used, so the settle phase is the one that was observed.
+/// Sequential RSA handshakes per plateau round (#411).
 const plateau_rsa_handshakes: u8 = 64;
 
 /// #411's worst case: the largest RSA key zssl admits.
