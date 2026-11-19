@@ -508,42 +508,42 @@ pub fn Bed(comptime extensions: extension.Extensions) type {
 }
 
 /// The §9 zero-allocation gate over a build's own scenario (#417): run it
-/// once counting, and require that nothing past startup allocated; then
-/// again with every allocation past startup failing, and require that it
-/// still passes — so the equality is structural, not a count that happened
-/// to match — and that it replays the first run's trace exactly, so the
-/// scenario is deterministic under its seed. `scenario` starts requests
-/// on the bed it is handed, runs it, and checks what it wants of the
-/// answers.
+/// once counting, and require that nothing past startup allocated or
+/// grew; then again with every allocation and every resize past startup
+/// failing, and require that it still passes — so the equality is
+/// structural, not a count that happened to match — and that it replays
+/// the first run's trace exactly, so the scenario is deterministic under
+/// its seed. `scenario` starts requests on the bed it is handed, runs it,
+/// and checks what it wants of the answers.
+///
+/// Startup is measured in each run rather than carried from the first:
+/// how many allocations it takes depends on whether the arena's chunks
+/// grew in place, which is the backing heap's to say, not the bed's.
 pub fn expectNoAllocationAfterStartup(
     comptime BedType: type,
     options: *const Options,
     seed: u64,
     scenario: *const fn (bed: *BedType) anyerror!void,
 ) !void {
-    var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    const first = try runGated(BedType, &counting, options, seed, scenario);
-    try std.testing.expectEqual(first.startup_allocations, counting.allocations);
-    var strict = std.testing.FailingAllocator.init(std.testing.allocator, .{
-        .fail_index = first.startup_allocations,
-    });
-    const second = try runGated(BedType, &strict, options, seed, scenario);
-    try std.testing.expectEqual(first.startup_allocations, second.startup_allocations);
-    try std.testing.expectEqual(first.trace, second.trace);
+    const counted = try runGated(BedType, options, seed, scenario, .counting);
+    const strict = try runGated(BedType, options, seed, scenario, .strict);
+    try std.testing.expectEqual(counted.trace, strict.trace);
 }
 
 const Gated = struct {
-    startup_allocations: usize,
     trace: u64,
 };
 
+const GateMode = enum { counting, strict };
+
 fn runGated(
     comptime BedType: type,
-    failing: *std.testing.FailingAllocator,
     options: *const Options,
     seed: u64,
     scenario: *const fn (bed: *BedType) anyerror!void,
+    mode: GateMode,
 ) !Gated {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     // On the heap rather than the stack: a bed is the size of its fixed
     // tables, and the gate's allocator is the one under test.
     const bed = try std.testing.allocator.create(BedType);
@@ -551,9 +551,18 @@ fn runGated(
     try bed.setUp(failing.allocator(), options, seed);
     defer bed.tearDown();
     const startup_allocations = failing.allocations;
+    const startup_resizes = failing.resize_index;
+    if (mode == .strict) {
+        // From here on, every allocation and every growth fails.
+        failing.fail_index = failing.alloc_index;
+        failing.resize_fail_index = failing.resize_index;
+    }
     try scenario(bed);
     assert(bed.ran); // A scenario runs its bed.
-    return .{ .startup_allocations = startup_allocations, .trace = bed.trace() };
+    try std.testing.expectEqual(startup_allocations, failing.allocations);
+    try std.testing.expectEqual(startup_resizes, failing.resize_index);
+    try std.testing.expect(!failing.has_induced_failure);
+    return .{ .trace = bed.trace() };
 }
 
 const ScriptedPicker = @import("picker.zig").ScriptedPicker;
