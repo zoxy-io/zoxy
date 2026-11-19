@@ -1043,8 +1043,9 @@ pub const ValidationError = error{
     /// An `h2c` cluster probed by HTTP/1.1, which its origins may not
     /// speak at all: every probe would fail, and eject every endpoint.
     ClusterH2cHttpCheck,
-    /// An `l4` listener routing to an `h2c` cluster: what it relays is
-    /// whatever the client sent, not HTTP/2 this proxy speaks.
+    /// An `l4` listener reaching an HTTP/2 cluster (`h2c` or `h2`) by
+    /// its `cluster` or by any SNI route: what it relays is whatever the
+    /// client sent, not HTTP/2 this proxy speaks.
     ClusterH2cOnL4Listener,
     /// An `http` listener carrying an upgrade to an `h2c` cluster: the
     /// tunnel would need a `101`, which HTTP/2 does not have.
@@ -1055,8 +1056,9 @@ pub const ValidationError = error{
     ClusterH2WithoutTls,
     ClusterRetriesOnHttp2,
     ClusterRetryBudgetOutOfRange,
-    /// An `l4` listener routing to an HTTPS cluster: it relays bytes, and
-    /// what TLS would carry for it is not a request this proxy reads.
+    /// An `l4` listener reaching an HTTPS cluster by its `cluster` or by
+    /// any SNI route: it relays bytes, and what TLS would carry for it is
+    /// not a request this proxy reads.
     ClusterTlsOnL4Listener,
     /// An upgrade to an HTTPS cluster: the tunnel's relay reads and writes
     /// the socket itself, under the TLS this proxy would have to keep.
@@ -4913,11 +4915,11 @@ fn resolveListener(
     }
     if (listener.protocol == .http) {
         try rejectHttpClusterSend(listener.routes, clusters);
+        try rejectUpgradeClusters(&listener, clusters);
     }
     if (listener.tls != null) {
         try rejectTlsClusterSend(listener.routes, clusters);
     }
-    try rejectH2cRoutes(&listener, clusters);
     assert(listener.routes.len >= 1);
     return listener;
 }
@@ -5168,13 +5170,19 @@ fn sniRouteMoreSpecific(_: void, left: sni_router.Route, right: sni_router.Route
 
 /// A cluster named by an `l4` listener, by any route it has.
 ///
-/// The reachability rule `HashKey` states — "`header` and `cookie` read
-/// the parsed request, so clusters carrying them are unreachable from
-/// `l4` listeners" — has to hold for *every* cluster such a listener can
-/// reach, not just the one it admits under. An SNI table (#298) makes
-/// that a real distinction: a named route can reach a cluster the
-/// admitted route never names, and a request-keyed hash there would be a
-/// pick the relay has no parsed head to compute.
+/// Every rule about what an l4 relay can reach lives here, because it has
+/// to hold for *every* cluster such a listener can reach, not just the
+/// one it admits under. An SNI table (#298) makes that a real
+/// distinction: a named route can reach a cluster the admitted route
+/// never names, and `routes` holds only the admitted one.
+///
+/// - `HashKey`'s rule: `header` and `cookie` read the parsed request, and
+///   a request-keyed hash would be a pick the relay has no head to
+///   compute.
+/// - §7's protocol rule (#296): the relay forwards the client's bytes, so
+///   an HTTP/2 origin would be sent whatever the client wrote, and an
+///   HTTPS one's `tls` block — the name and CA this proxy verifies
+///   against — would never be used.
 fn l4ClusterIndexOf(
     clusters: []const Config.Cluster,
     cluster_name: []const u8,
@@ -5182,22 +5190,27 @@ fn l4ClusterIndexOf(
     assert(clusters.len >= 1);
     const cluster_index = try clusterIndexOf(clusters, cluster_name);
     assert(cluster_index < clusters.len);
-    switch (clusters[cluster_index].hash_key) {
+    const cluster = &clusters[cluster_index];
+    switch (cluster.hash_key) {
         .source_ip => {},
         .header, .cookie => return error.ListenerL4RequestKeyedHash,
     }
+    if (cluster.protocol.http2()) return error.ClusterH2cOnL4Listener;
+    if (cluster.tls != null) return error.ClusterTlsOnL4Listener;
     return cluster_index;
 }
 
 /// An `l4` listener's one route: the whole table, because there is no
 /// path to match on and therefore nothing to choose between.
 ///
-/// The hash-key check lives here rather than beside the other cluster
-/// validations because it is a property of *this pairing*, not of the
-/// cluster: a request-derived hash key reads the parsed head (#178) and
-/// an l4 listener never parses one. Reachability rather than
-/// exclusivity, like an http route to a PROXY-sending cluster — the same
-/// cluster stays valid beside any http listener.
+/// The l4 checks (`l4ClusterIndexOf`) run here rather than beside the
+/// other cluster validations because they are properties of *this
+/// pairing*, not of the cluster: a request-derived hash key reads the
+/// parsed head (#178), and an HTTP/2 or HTTPS origin needs a protocol
+/// this proxy speaks, where an l4 listener parses and speaks none.
+/// Reachability rather than exclusivity, like an http route to a
+/// PROXY-sending cluster — the same cluster stays valid beside any http
+/// listener.
 fn resolveL4Route(
     arena: std.mem.Allocator,
     cluster_name: []const u8,
@@ -6618,26 +6631,22 @@ fn resolveClusterProtocol(protocol: []const u8) ValidationError!Config.Cluster.P
 }
 
 /// Where an HTTP/2 or an HTTPS cluster may be routed from (§7, #296):
-/// only an `http` listener, and only one that carries no upgrade. An
-/// `l4` listener relays bytes, not HTTP/2 or requests this proxy speaks
-/// over TLS; an upgrade's tunnel begins with a `101` HTTP/2 does not
-/// have, and relays the socket itself, under TLS it would have to keep.
-fn rejectH2cRoutes(
+/// only an `http` listener — `l4ClusterIndexOf` refuses every l4 route to
+/// one, SNI routes included — and only one that carries no upgrade. An
+/// upgrade's tunnel begins with a `101` HTTP/2 does not have, and relays
+/// the socket itself, under TLS it would have to keep.
+fn rejectUpgradeClusters(
     listener: *const Config.Listener,
     clusters: []const Config.Cluster,
 ) ValidationError!void {
+    assert(listener.protocol == .http);
     assert(listener.routes.len >= 1);
+    if (!listener.upgrades.any()) return;
     for (listener.routes) |route| {
         assert(route.cluster_index < clusters.len);
         const cluster = &clusters[route.cluster_index];
-        if (cluster.protocol.http2()) {
-            if (listener.protocol == .l4) return error.ClusterH2cOnL4Listener;
-            if (listener.upgrades.any()) return error.ClusterH2cWithUpgrades;
-            continue;
-        }
-        if (cluster.tls == null) continue;
-        if (listener.protocol == .l4) return error.ClusterTlsOnL4Listener;
-        if (listener.upgrades.any()) return error.ClusterTlsWithUpgrades;
+        if (cluster.protocol.http2()) return error.ClusterH2cWithUpgrades;
+        if (cluster.tls != null) return error.ClusterTlsWithUpgrades;
     }
 }
 
@@ -7561,6 +7570,28 @@ test "config: an l4 route cannot reach a request-keyed hash cluster" {
         "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"routes\":[" ++
             "{\"cluster\":\"keyed\"}]}}]," ++ tail,
     );
+}
+
+test "config: an sni table reaches only clusters an l4 relay can speak to" {
+    // §7's protocol rule on #298's terms: an l4 listener relays bytes, so
+    // an HTTP/2 origin would be sent whatever the client wrote, and an
+    // HTTPS one's `tls` block (the name and CA this proxy verifies
+    // against) would never be used. The admitted cluster was always held
+    // to that; a named route reaches clusters it never names, and every
+    // one of them has to be held to it too.
+    const routes = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"routes\":[" ++
+        "{\"sni\":\"a.example.com\",\"cluster\":\"origin\"}," ++
+        "{\"cluster\":\"plain\"}]}}],";
+    const plain = "\"plain\":{\"endpoints\":[\"127.0.0.1:2\"]}";
+    const timeouts = "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
+    try expectParseError(error.ClusterH2cOnL4Listener, routes ++ "\"clusters\":{" ++ plain ++
+        ",\"origin\":{\"endpoints\":[\"127.0.0.1:3\"],\"protocol\":\"h2c\"}}," ++ timeouts);
+    try expectH2ParseError(error.ClusterTlsOnL4Listener, routes ++ "\"clusters\":{" ++ plain ++
+        ",\"origin\":{\"endpoints\":[\"127.0.0.1:3\"]," ++
+        "\"tls\":{\"server_name\":\"origin.zoxy.test\",\"ca\":{\"path\":\"/ca.pem\"}}}}," ++ timeouts);
+    try expectH2ParseError(error.ClusterH2cOnL4Listener, routes ++ "\"clusters\":{" ++ plain ++
+        ",\"origin\":{\"endpoints\":[\"127.0.0.1:3\"],\"protocol\":\"h2\"," ++
+        "\"tls\":{\"server_name\":\"origin.zoxy.test\",\"ca\":{\"path\":\"/ca.pem\"}}}}," ++ timeouts);
 }
 
 test "config: sni routing and terminating this listener are different proxies" {
