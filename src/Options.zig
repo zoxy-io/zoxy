@@ -194,3 +194,23 @@ pub const Limits = struct {
     cq_fill_eighths: ?u32 = null,
     access_log_buffer_bytes: ?u32 = null,
 };
+
+/// A named response body (#159), for an error page or a `respond` action
+/// to send.
+pub const Body = struct {
+    /// Unique across the build, at most `body_name_bytes_max` bytes.
+    name: []const u8,
+    /// Sent as they are, at most `body_bytes_max`.
+    bytes: []const u8,
+    /// The `Content-Type` sent with them.
+    content_type: []const u8,
+};
+
+/// A body for a status zoxy answers itself (#159). A status listed by no
+/// page keeps its empty one.
+pub const ErrorPage = struct {
+    /// One of the statuses zoxy can answer itself (`shed.static_statuses`).
+    status: u16,
+    /// The name of one of the build's bodies.
+    body: []const u8,
+};
