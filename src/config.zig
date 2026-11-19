@@ -1197,10 +1197,11 @@ pub fn parseWithFiles(
         return error.ListenersEmpty;
     }
     const features = try countListenerFeatures(parsed.listeners);
-    const access_log_sink = try resolveAccessLogSink(parsed.access_log);
+    const access_log_stated = try accessLogOf(parsed.access_log);
+    const access_log_sink = try resolveAccessLogSink(access_log_stated);
     // Before the limits, because the named headers widen the line the
     // staging buffer has to be able to hold (#140).
-    const log_headers = try resolveLogHeaders(arena, parsed.access_log);
+    const log_headers = try resolveLogHeaders(arena, access_log_stated);
     const limits_requested = limitsOf(&parsed.limits);
     const limits = try resolveLimits(
         &limits_requested,
@@ -1237,7 +1238,8 @@ pub fn parseWithFiles(
         bodies,
         files,
     );
-    const admin_bind = try resolveAdminBind(parsed.admin);
+    const admin_stated = try adminOf(parsed.admin);
+    const admin_bind = if (admin_stated) |admin| admin.bind else null;
     const error_pages_stated = try errorPagesOf(arena, parsed.error_pages);
     const error_pages = try resolveErrorPages(arena, error_pages_stated, bodies);
 
@@ -1284,33 +1286,32 @@ const ResolvedLogHeaders = struct {
 
 fn resolveLogHeaders(
     arena: std.mem.Allocator,
-    access_log_json: ?AccessLogJson,
+    access_log: ?Options.AccessLog,
 ) ParseError!ResolvedLogHeaders {
-    const access_log = access_log_json orelse return .{ .request = &.{}, .response = &.{} };
-    const request_json = access_log.request_headers orelse &.{};
-    const response_json = access_log.response_headers orelse &.{};
-    if (request_json.len + response_json.len > constants.access_log_headers_max) {
+    const stated = access_log orelse return .{ .request = &.{}, .response = &.{} };
+    const headers_count = stated.request_headers.len + stated.response_headers.len;
+    if (headers_count > constants.access_log_headers_max) {
         return error.AccessLogHeadersOverLimit;
     }
-    const request = try resolveLogHeaderNames(arena, request_json);
-    const response = try resolveLogHeaderNames(arena, response_json);
+    const request = try resolveLogHeaderNames(arena, stated.request_headers);
+    const response = try resolveLogHeaderNames(arena, stated.response_headers);
     // Deduplicated per direction, not across: the same name on both
     // sides is two different facts — what the client sent and what the
     // origin answered — and they land in different objects.
-    assert(request.len == request_json.len);
-    assert(response.len == response_json.len);
+    assert(request.len == stated.request_headers.len);
+    assert(response.len == stated.response_headers.len);
     return .{ .request = request, .response = response };
 }
 
 fn resolveLogHeaderNames(
     arena: std.mem.Allocator,
-    names_json: []const []const u8,
+    stated: []const []const u8,
 ) ParseError![]const []const u8 {
-    if (names_json.len == 0) {
+    if (stated.len == 0) {
         return &.{};
     }
-    const names = try arena.alloc([]const u8, names_json.len);
-    for (names_json, 0..) |raw, index| {
+    const names = try arena.alloc([]const u8, stated.len);
+    for (stated, 0..) |raw, index| {
         if (raw.len == 0) {
             return error.AccessLogHeaderNameInvalid;
         }
@@ -1334,7 +1335,7 @@ fn resolveLogHeaderNames(
         }
         names[index] = lowered;
     }
-    assert(names.len == names_json.len);
+    assert(names.len == stated.len);
     return names;
 }
 
@@ -1556,42 +1557,24 @@ fn renderStaticPage(
 }
 
 /// Resolve the optional access log (§8): absent means off — no staging
-/// buffers reserved, no lines emitted. A present block names its sink from
-/// a closed set, so an unknown value fails at load rather than silently
-/// logging somewhere the operator did not ask for; `path` is required by
-/// exactly the sink that uses it. Both mismatches are rejected, not
-/// ignored — the `ClusterCheckHttpFieldOnTcp` rule, one block over: a
-/// field the named sink cannot honor describes a config the operator
-/// misread, and this proxy does not start on those.
+/// buffers reserved, no lines emitted. The sink is a union, so a path
+/// beside stdout or a file sink without one is not a shape the options
+/// can state; JSON's spellings of both, and of an unknown sink, are its
+/// front-end's refusals (`accessLogOf`). What is left to judge is the
+/// file sink's path, which an empty string would leave naming nothing.
 fn resolveAccessLogSink(
-    access_log_json: ?AccessLogJson,
+    access_log: ?Options.AccessLog,
 ) ValidationError!?Config.AccessLogSink {
-    const access_log = access_log_json orelse return null;
-    const kind = std.meta.stringToEnum(Config.AccessLogSinkKind, access_log.sink) orelse
-        return error.AccessLogSinkUnknown;
-    switch (kind) {
-        .stdout => {
-            if (access_log.path != null) return error.AccessLogPathOnStdout;
-            return .stdout;
-        },
-        .file => {
-            const path = access_log.path orelse return error.AccessLogPathMissing;
-            // Empty is missing, not "a file named nothing": openat would
-            // reject it later and worse — at startup's end, not load time.
-            if (path.len == 0) return error.AccessLogPathMissing;
-            // The postcondition `openLogSinkFd` (main) leans on.
-            assert(path.len >= 1);
-            return .{ .file = path };
-        },
+    const stated = access_log orelse return null;
+    switch (stated.sink) {
+        .stdout => {},
+        // Empty is missing, not "a file named nothing": openat would
+        // reject it later and worse — at startup's end, not load time.
+        .file => |path| if (path.len == 0) return error.AccessLogPathMissing,
     }
-}
-
-/// Resolve the optional admin/metrics listener (§8):
-/// absent means the plane is off; a present `bind` must be a static IP:port
-/// literal (hostnames rejected, like every other bind — DNS is a non-goal).
-fn resolveAdminBind(admin_json: ?AdminJson) ValidationError!?std.Io.net.IpAddress {
-    const admin = admin_json orelse return null;
-    return std.Io.net.IpAddress.parseLiteral(admin.bind) catch error.AdminBindInvalid;
+    // The postcondition `openLogSinkFd` (app) leans on.
+    if (stated.sink == .file) assert(stated.sink.file.len >= 1);
+    return stated.sink;
 }
 
 /// The pools a *feature* switches on, as `resolveFeaturePools` sizes them.
@@ -2554,6 +2537,36 @@ fn errorPagesOf(
     }
     assert(pages.len == parsed.entries.len);
     return pages;
+}
+
+/// The JSON front-end's access log (§8): the sink named by a string, and
+/// `path` required by the file sink and refused beside stdout — the fork
+/// the schema states too. Absent lists record no header.
+fn accessLogOf(access_log_json: ?AccessLogJson) ValidationError!?Options.AccessLog {
+    const access_log = access_log_json orelse return null;
+    const kind = std.meta.stringToEnum(Config.AccessLogSinkKind, access_log.sink) orelse
+        return error.AccessLogSinkUnknown;
+    const sink: Options.AccessLog.Sink = switch (kind) {
+        .stdout => if (access_log.path != null) return error.AccessLogPathOnStdout else .stdout,
+        .file => .{ .file = access_log.path orelse return error.AccessLogPathMissing },
+    };
+    assert(@as(Config.AccessLogSinkKind, sink) == kind);
+    assert((sink == .file) == (access_log.path != null));
+    return .{
+        .sink = sink,
+        .request_headers = access_log.request_headers orelse &.{},
+        .response_headers = access_log.response_headers orelse &.{},
+    };
+}
+
+/// The JSON front-end's admin listener (§8): a present `bind` must be a
+/// static IP:port literal (hostnames rejected, like every other bind —
+/// DNS is a non-goal).
+fn adminOf(admin_json: ?AdminJson) ValidationError!?Options.Admin {
+    const admin = admin_json orelse return null;
+    const bind = std.Io.net.IpAddress.parseLiteral(admin.bind) catch
+        return error.AdminBindInvalid;
+    return .{ .bind = bind };
 }
 
 // The strict parser binds JSON to these `*Json` DTOs. Each carries the
@@ -7377,6 +7390,27 @@ test "config: bodies and error pages written as options (#417)" {
         .bytes = oversized,
         .content_type = "text/plain",
     }}));
+}
+
+test "config: an access log written as options (#417)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const stated: Options.AccessLog = .{
+        .sink = .{ .file = "/var/log/zoxy/access.log" },
+        .request_headers = &.{"X-Request-ID"},
+    };
+    const sink = (try resolveAccessLogSink(stated)).?;
+    try std.testing.expectEqualStrings("/var/log/zoxy/access.log", sink.file);
+    const headers = try resolveLogHeaders(arena, stated);
+    try std.testing.expectEqualStrings("x-request-id", headers.request[0]);
+    try std.testing.expectEqual(@as(usize, 0), headers.response.len);
+    // An empty path is a missing one from code as from a file.
+    try std.testing.expectError(
+        error.AccessLogPathMissing,
+        resolveAccessLogSink(.{ .sink = .{ .file = "" } }),
+    );
+    try std.testing.expectEqual(@as(?Config.AccessLogSink, null), try resolveAccessLogSink(null));
 }
 
 const example_json = @embedFile("example_config");
