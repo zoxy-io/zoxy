@@ -23,6 +23,8 @@
 //! The split arrives one block at a time (#417's plan); the blocks below
 //! are the ones the loader already resolves from options.
 
+const std = @import("std");
+
 const config = @import("config.zig");
 const extension = @import("extension.zig");
 const io = @import("io/io.zig");
@@ -213,4 +215,27 @@ pub const ErrorPage = struct {
     status: u16,
     /// The name of one of the build's bodies.
     body: []const u8,
+};
+
+/// The admin listener (§8): the process counters in Prometheus text
+/// format.
+pub const Admin = struct {
+    /// An IP and port; the plane takes no `unix:` path.
+    bind: std.Io.net.IpAddress,
+};
+
+/// The access log (§8): one JSON line per HTTP exchange and per L4
+/// connection, dropped and counted rather than blocking the loop when the
+/// sink cannot keep up.
+pub const AccessLog = struct {
+    sink: Sink,
+    /// Request headers each line records (#140), matched without regard
+    /// to case and logged lowercase.
+    request_headers: []const []const u8 = &.{},
+    /// Response headers each line records (#140).
+    response_headers: []const []const u8 = &.{},
+
+    /// Standard output, or a file opened for append (never truncated, so
+    /// copy-truncate rotation is safe).
+    pub const Sink = config.Config.AccessLogSink;
 };
