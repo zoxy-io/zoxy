@@ -57,7 +57,7 @@ jobs:
 
       # zig-pkg (vendored, hash-pinned deps) is deliberately not checked.
       - name: Check formatting
-        run: zig fmt --check build.zig src bench sim smoke scripts
+        run: zig fmt --check build.zig src bench sim smoke scripts examples/edge/build.zig examples/edge/build.zig.zon examples/edge/src
 
       - name: Build
         run: zig build
@@ -69,6 +69,38 @@ jobs:
       # at merge, not a blind shared-runner pass.
       - name: Run gates (test + lint + sim)
         run: zig build ci --summary all
+
+  consumer:
+    name: consumer (fetched package)
+    # A dependent builds against what `zig fetch` takes from a tarball:
+    # build.zig.zon's `.paths`, nothing more (#417). The example is built
+    # against exactly that, so a file the library needs and the package
+    # leaves out fails here rather than for a dependent. A fresh runner
+    # also has no lazy dependency cached, so one the library's build asks
+    # for without needing it shows up as a fetch in this log.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+
+      - name: Build the example against a fetched zoxy
+        run: |
+          work="$RUNNER_TEMP/consumer"
+          mkdir -p "$work"
+          git archive --format=tar.gz --prefix=zoxy/ -o "$work/zoxy.tar.gz" HEAD
+          cp -R examples/edge "$work/edge"
+          cd "$work/edge"
+          # The committed manifest depends on the tree by path; drop that
+          # entry so `--save` writes the fetched package's url and hash.
+          sed -i '/\.zoxy = \.{ \.path = "\.\.\/\.\." },/d' build.zig.zon
+          if grep -q '"\.\./\.\."' build.zig.zon; then
+            echo "the path dependency survived the sed; update its pattern" >&2
+            exit 1
+          fi
+          zig fetch --save=zoxy "$work/zoxy.tar.gz"
+          zig build --summary all
 
   coverage:
     name: coverage
