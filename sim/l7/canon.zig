@@ -115,6 +115,10 @@ pub const overridden_host = "overridden.example";
 /// client oracle demands this exact value on every one it parses.
 pub const redirect_location = "https://sim/redirect";
 
+/// The path prefix the harness's #417 listener policy refuses, which only
+/// the `policy_reject` script asks for.
+pub const policy_prefix = "/policy";
+
 /// The #178 cookie name a sticky seed's http cluster is keyed on, and
 /// the exact tag of the one http endpoint (127.0.0.1:9001). The tag is
 /// *pinned* — computed once from `endpointId`'s published formula and

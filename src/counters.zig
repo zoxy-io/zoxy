@@ -141,6 +141,12 @@ pub const Counters = struct {
     /// (403/404/429/400). A reject, not a shed; same persistence rule as
     /// `l7_no_route`.
     l7_filtered: Value = Value.init(0),
+    /// A #417 request policy — an extension the build selected in code,
+    /// on the listener or the route — rejected the request with one of
+    /// the same statuses. Apart from `l7_filtered` so an operator can tell
+    /// a JSON rule from compiled code; answered the same way, so outside
+    /// `reconcile`'s shed sum like it.
+    l7_policy_rejected: Value = Value.init(0),
     /// A §7 filter rule answered the request with a redirect (#176):
     /// one of the closed statuses plus a Location rendered per request.
     /// `l7_filtered`'s sibling — admitted and answered, so outside

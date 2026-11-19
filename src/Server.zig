@@ -493,6 +493,9 @@ pub fn Server(comptime runtime: Runtime) type {
             /// admitted L7 connection so `routeRequest` can evaluate
             /// policy.
             request_filters: []const filter.Rule,
+            /// The listener's #417 request policies, handed over the same
+            /// way and run ahead of the filters.
+            request_policies: []const extension.Selection,
             /// The listener's #175 response filter rules, handed over the
             /// same way so the response re-render can apply its edits.
             response_filters: []const filter.ResponseRule,
@@ -1693,6 +1696,7 @@ pub fn Server(comptime runtime: Runtime) type {
                     .max_body_bytes = listener_config.max_body_bytes,
                     .keepalive_requests = listener_config.keepalive_requests,
                     .request_filters = listener_config.request_filters,
+                    .request_policies = listener_config.request_policies,
                     .response_filters = listener_config.response_filters,
                     .forwarded = listener_config.forwarded,
                     .proxy_status = listener_config.proxy_status,
@@ -2711,6 +2715,7 @@ pub fn Server(comptime runtime: Runtime) type {
             conn.routes = listener.routes;
             conn.sni_routes = listener.sni_routes;
             conn.request_filters = listener.request_filters;
+            conn.request_policies = listener.request_policies;
             conn.response_filters = listener.response_filters;
             conn.upgrades = listener.upgrades;
             conn.h2c = listener.h2c;
@@ -4525,7 +4530,17 @@ pub fn Server(comptime runtime: Runtime) type {
                     .rr, .p2c, .hash => {},
                 }
             }
-            if (runtime.extensions.pickers.len == 0) assert(!selects);
+            for (config.listeners) |*listener| {
+                // A policy reads a request, and an l4 listener has none.
+                if (listener.request_policies.len >= 1) assert(listener.protocol == .http);
+                for (listener.request_policies) |selection| {
+                    assert(selection.index < runtime.extensions.request_policies.len);
+                    selects = true;
+                }
+            }
+            if (runtime.extensions.pickers.len == 0 and runtime.extensions.request_policies.len == 0) {
+                assert(!selects);
+            }
             return selects;
         }
 
@@ -4549,7 +4564,63 @@ pub fn Server(comptime runtime: Runtime) type {
                 };
                 try bindPicker(selection, &site, startup);
             }
+            for (server.config.listeners, 0..) |*listener, index| {
+                const site: extension.PolicySite = .{
+                    .listener_index = @intCast(index),
+                    .route_index = null,
+                    .cluster_index = null,
+                };
+                for (listener.request_policies) |selection| try bindPolicy(selection, &site, startup);
+            }
             server.extensions_bound = true;
+        }
+
+        fn bindPolicy(
+            selection: extension.Selection,
+            site: *const extension.PolicySite,
+            startup: *const extension.Startup,
+        ) anyerror!void {
+            assert(selection.index < runtime.extensions.request_policies.len);
+            assert(site.listener_index < std.math.maxInt(u16));
+            inline for (runtime.extensions.request_policies, 0..) |Policy, index| {
+                if (selection.index == index) {
+                    if (comptime !@hasDecl(Policy, "bind")) return;
+                    const policy: *Policy = @ptrCast(@alignCast(selection.instance));
+                    return Policy.bind(policy, site, startup);
+                }
+            }
+            unreachable;
+        }
+
+        /// Run `selections` over `request` in order (#417): the first
+        /// reject wins and is returned, and null means every one said
+        /// proceed. Dispatch is the comptime list's, like `callPicker`.
+        pub fn evaluatePolicies(
+            server: *Self,
+            selections: []const extension.Selection,
+            request: *const extension.Request,
+        ) ?extension.RejectStatus {
+            assert(server.extensions_bound);
+            assert(selections.len >= 1);
+            for (selections) |selection| {
+                switch (callPolicy(selection, request)) {
+                    .proceed => {},
+                    .reject => |status| return status,
+                }
+            }
+            return null;
+        }
+
+        fn callPolicy(selection: extension.Selection, request: *const extension.Request) extension.Verdict {
+            assert(selection.index < runtime.extensions.request_policies.len);
+            assert(request.path.len >= 1);
+            inline for (runtime.extensions.request_policies, 0..) |Policy, index| {
+                if (selection.index == index) {
+                    const policy: *Policy = @ptrCast(@alignCast(selection.instance));
+                    return Policy.evaluate(policy, request);
+                }
+            }
+            unreachable;
         }
 
         fn bindPicker(

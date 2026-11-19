@@ -27,7 +27,10 @@ const SimIo = zoxy.Io.SimIo;
 /// adversary like every other part of the pick.
 const runtime: zoxy.Runtime = .{
     .Io = SimIo,
-    .extensions = .{ .pickers = &.{zoxy.testing.ScriptedPicker} },
+    .extensions = .{
+        .pickers = &.{zoxy.testing.ScriptedPicker},
+        .request_policies = &.{zoxy.testing.ScriptedPolicy},
+    },
 };
 const ServerSim = zoxy.Server(runtime);
 const Origin = zoxy.testing.Origin(SimIo);
@@ -387,6 +390,12 @@ scenario_prng: std.Random.DefaultPrng,
 pickers: [2]zoxy.testing.ScriptedPicker,
 picker_l4: bool,
 picker_http: bool,
+/// #417's listener policy, on every seed and on every listener that runs
+/// the http filter chain: it refuses `l7.canon.policy_prefix`, which only
+/// the `policy_reject` script asks for, and proceeds with every other
+/// request — so every L7 exchange of the sweep passes through it.
+policy_listener: zoxy.testing.ScriptedPolicy,
+policy_selections: [1]zoxy.extension.Selection,
 
 fn bindAddress() std.Io.net.IpAddress {
     return std.Io.net.IpAddress.parseLiteral("127.0.0.1:8080") catch unreachable;
@@ -435,6 +444,10 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
     harness.scenario_prng = std.Random.DefaultPrng.init(seed ^ 0x5a5a5a5a5a5a5a5a);
     const random = harness.scenario_prng.random();
     harness.drawPickers(seed);
+    harness.policy_listener = .{ .reject_prefix = l7.canon.policy_prefix };
+    harness.policy_selections = .{
+        zoxy.extension.select(runtime.extensions.request_policies, &harness.policy_listener),
+    };
 
     // A quarter of seeds run clean: adversary off, origin
     // well-behaved, so the L7 golden oracles demand each script's
@@ -1694,6 +1707,7 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
             .bind_mode = null,
             .routes = &harness.routes_http,
             .request_filters = &harness.request_filters_http,
+            .request_policies = &harness.policy_selections,
             .response_filters = &harness.response_filters_http,
             .protocol = .http,
             .forwarded = forwarded,
@@ -1731,6 +1745,7 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
             // (`ListenerL4ResponseFilters`) and an l4 relay has no head to
             // apply them to.
             .request_filters = if (terminates_http) &harness.request_filters_http else &.{},
+            .request_policies = if (terminates_http) &harness.policy_selections else &.{},
             .response_filters = if (terminates_http) &harness.response_filters_http else &.{},
             // Both, across seeds. Termination is a phase ahead of the
             // protocol (§4), so the two combinations exercise genuinely
@@ -3268,6 +3283,7 @@ fn l7OutcomeTotal(counters: *const zoxy.counters.Counters) u64 {
         "l7_not_implemented",
         "l7_no_route",
         "l7_filtered",
+        "l7_policy_rejected",
         "l7_redirected",
         "l7_responded",
         // The #240 final-recipient answer: served, so it owes a line like

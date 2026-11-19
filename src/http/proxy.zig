@@ -805,6 +805,20 @@ pub fn Proxy(comptime runtime: Runtime) type {
             return .{ .match = canonical.path, .forward = canonical, .origin_form = true };
         }
 
+        /// Answer a #417 request policy's reject from the static set, counted
+        /// apart from a filter's so an operator can tell compiled code from
+        /// a JSON rule — the answer itself is the same page.
+        fn respondPolicy(server: *ServerType, stream: *StreamType, status: extension.RejectStatus) void {
+            assert(stream.phase == .reading_head);
+            assert(!stream.l7.response_started);
+            switch (status) {
+                .bad_request => respond(server, stream, 400, "l7_policy_rejected"),
+                .forbidden => respond(server, stream, 403, "l7_policy_rejected"),
+                .not_found => respond(server, stream, 404, "l7_policy_rejected"),
+                .too_many_requests => respond(server, stream, 429, "l7_policy_rejected"),
+            }
+        }
+
         /// Answer a §7 filter reject with its runtime policy status — each
         /// a closed-set static response, all counted as one filter reject.
         fn respondFilter(server: *ServerType, stream: *StreamType, status: u16) void {
@@ -1138,6 +1152,15 @@ pub fn Proxy(comptime runtime: Runtime) type {
                 return respond(server, stream, 400, "l7_bad_request");
             };
             captureTarget(stream, keys.host, keys.views.match);
+            // #417: the listener's policies run first, on the same
+            // canonical view the filters read, and a reject is answered
+            // the way a filter's is — before any resource is taken.
+            if (conn.request_policies.len >= 1) {
+                const view = requestView(stream, request, keys.host, &keys.views, render_scratch, null);
+                if (server.evaluatePolicies(conn.request_policies, &view)) |status| {
+                    return respondPolicy(server, stream, status);
+                }
+            }
             // §7 filters run before routing: a terminal verdict — reject
             // or redirect (#176) — stops the request whether or not it
             // would have routed.
@@ -1360,6 +1383,9 @@ pub fn Proxy(comptime runtime: Runtime) type {
             host: ?[]const u8,
             views: *const TargetViews,
             scratch: *RenderScratch,
+            /// The routed cluster, or null at the listener phase, before
+            /// routing has chosen one.
+            cluster_index: ?u16,
         ) extension.Request {
             assert(views.match.len >= 1);
             assert(views.match[0] == '/');
@@ -1372,7 +1398,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
                 .client = clientAddressOf(stream),
                 .client_cert_sha256 = planClientCert(stream, &scratch.client_cert),
                 .listener_index = stream.conn.listener_index,
-                .cluster_index = stream.cluster_index,
+                .cluster_index = cluster_index,
             };
         }
 
@@ -1396,7 +1422,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             defer server.returnRenderScratch();
             // The same bytes canonicalized at routing, so this cannot fail.
             const keys = requestKeys(request, server.target_scratch, &scratch.route_host) catch unreachable;
-            const view = requestView(stream, request, keys.host, &keys.views, scratch);
+            const view = requestView(stream, request, keys.host, &keys.views, scratch, stream.cluster_index);
             return pickEndpointOrShed(server, stream, request_key, &view);
         }
 
@@ -1440,7 +1466,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             };
             var view: extension.Request = undefined;
             const picker_request: ?*const extension.Request = if (clusterSelectsPicker(server, stream)) blk: {
-                view = requestView(stream, request, host, views, scratch);
+                view = requestView(stream, request, host, views, scratch, stream.cluster_index);
                 break :blk &view;
             } else null;
             const pick = pickEndpointOrShed(server, stream, request_key, picker_request) orelse return;
@@ -4967,6 +4993,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
                 "l7_not_implemented",
                 "l7_no_route",
                 "l7_filtered",
+                "l7_policy_rejected",
             };
             for (rejects) |name| {
                 if (std.mem.eql(u8, counter, name)) return .rejected;

@@ -113,6 +113,12 @@ pub const Script = enum(u8) {
     /// resource is acquired or origin dialed. The golden outcome is exactly
     /// that 403, and the origin must never see the request.
     filter_reject,
+    /// A GET under `/policy`: the listener's #417 request policy rejects
+    /// it with 403 ahead of the filters, before any resource is acquired
+    /// or origin dialed. The golden outcome is exactly that 403 — the
+    /// configured page and all, since the policy answers with the filter
+    /// reject's own static set — and the origin must never see it.
+    policy_reject,
     /// A GET under `/redirect`: a §7 filter answers 301 with a Location
     /// composed from the request's own host and path (#176), before any
     /// resource is acquired or origin dialed — `filter_reject`'s shape
@@ -659,6 +665,17 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .method = .get,
         .allowed_statuses = &.{ 403, 408, 503 },
     },
+    .policy_reject = .{
+        // `filter_reject`'s timing exactly: the policy runs before the
+        // filters, so the §5 head ring's 503 is again the one verdict
+        // that can arrive instead.
+        .request = "GET " ++ canon.policy_prefix ++ " HTTP/1.1\r\nHost: sim\r\n\r\n",
+        .expected_responses = 1,
+        .transcript_cap = 1,
+        .golden_status = 403,
+        .method = .get,
+        .allowed_statuses = &.{ 403, 408, 503 },
+    },
     .filter_redirect = .{
         // `filter_reject`'s timing exactly — answered before any
         // post-parse resource — so the same one preemption applies: the
@@ -838,6 +855,7 @@ pub const terminating_scripts = [_]Script{
     .options_hop,
     .absolute_form,
     .filter_reject,
+    .policy_reject,
     .filter_redirect,
     .filter_respond,
     .filter_allow,

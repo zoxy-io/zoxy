@@ -8,7 +8,8 @@
 
 const std = @import("std");
 
-const Runtime = @import("../extension.zig").Runtime;
+const extension = @import("../extension.zig");
+const Runtime = extension.Runtime;
 const config_module = @import("../config.zig");
 const constants = @import("../constants.zig");
 const router = @import("../http/router.zig");
@@ -129,6 +130,9 @@ pub fn Conn(comptime runtime: Runtime) type {
         /// The listener this connection arrived on, by config index —
         /// installed with the listener's tables, read by extensions (#417).
         listener_index: u16,
+        /// The listener's #417 request policies, installed like its
+        /// filters; empty on every l4 listener.
+        request_policies: []const extension.Selection,
         /// Whether this listener takes h2c by prior knowledge (#275): a
         /// plaintext connection whose first octets are HTTP/2's preface
         /// speaks HTTP/2. Handed over at admission like the tables beside
@@ -348,6 +352,7 @@ pub fn Conn(comptime runtime: Runtime) type {
             // Placeholders until the admission tail installs the
             // listener's real tables (§7); L4 never reads them.
             conn.listener_index = 0;
+            conn.request_policies = &.{};
             conn.routes = &.{};
             conn.sni_routes = &.{};
             conn.request_filters = &.{};
