@@ -4537,6 +4537,13 @@ pub fn Server(comptime runtime: Runtime) type {
                     assert(selection.index < runtime.extensions.request_policies.len);
                     selects = true;
                 }
+                for (listener.routes) |*route| {
+                    if (route.request_policies.len >= 1) assert(listener.protocol == .http);
+                    for (route.request_policies) |selection| {
+                        assert(selection.index < runtime.extensions.request_policies.len);
+                        selects = true;
+                    }
+                }
             }
             if (runtime.extensions.pickers.len == 0 and runtime.extensions.request_policies.len == 0) {
                 assert(!selects);
@@ -4571,8 +4578,28 @@ pub fn Server(comptime runtime: Runtime) type {
                     .cluster_index = null,
                 };
                 for (listener.request_policies) |selection| try bindPolicy(selection, &site, startup);
+                try bindRoutePolicies(listener, @intCast(index), startup);
             }
             server.extensions_bound = true;
+        }
+
+        /// One listener's route-phase policies (#417), each bound with the
+        /// route it sits on and the cluster that route sends to.
+        fn bindRoutePolicies(
+            listener: *const config_module.Config.Listener,
+            listener_index: u16,
+            startup: *const extension.Startup,
+        ) anyerror!void {
+            assert(listener.routes.len >= 1);
+            assert(listener_index < std.math.maxInt(u16));
+            for (listener.routes, 0..) |*route, route_index| {
+                const site: extension.PolicySite = .{
+                    .listener_index = listener_index,
+                    .route_index = @intCast(route_index),
+                    .cluster_index = route.cluster_index,
+                };
+                for (route.request_policies) |selection| try bindPolicy(selection, &site, startup);
+            }
         }
 
         fn bindPolicy(

@@ -203,13 +203,19 @@ weights_http: [2]u16,
 priorities_http: [2]u8,
 clusters: [2]zoxy.config.Config.Cluster,
 routes_l4: [1]zoxy.http.router.Route,
-routes_http: [1]zoxy.http.router.Route,
+/// The catch-all, behind #417's guarded route: a longer prefix carrying
+/// a route-phase policy, which only the `route_policy_reject` script
+/// reaches.
+routes_http: [2]zoxy.http.router.Route,
 request_filters_http: [7]zoxy.http.filter.Rule,
 /// The #175 response rules beside them: the always-on stamp the client
 /// oracle requires on every proxied 200, and the 5xx rule whose edit
 /// must never appear (the scripted origin answers no 5xx).
 response_filters_http: [2]zoxy.http.filter.ResponseRule,
-routes_tls: [1]zoxy.http.router.Route,
+/// One route on an l4 draw; on an http draw the plaintext listener's two,
+/// guarded route included — a terminator runs the http chain whole.
+routes_tls: [2]zoxy.http.router.Route,
+routes_tls_count: u8,
 listener_configs: [3]zoxy.config.Config.Listener,
 /// How many of `listener_configs` this seed actually binds: two on a
 /// plaintext seed, three when it drew TLS clients (§4).
@@ -396,6 +402,9 @@ picker_http: bool,
 /// request — so every L7 exchange of the sweep passes through it.
 policy_listener: zoxy.testing.ScriptedPolicy,
 policy_selections: [1]zoxy.extension.Selection,
+/// #417's route-phase policy, on the guarded route of both http chains.
+policy_route: zoxy.testing.ScriptedPolicy,
+route_policy_selections: [1]zoxy.extension.Selection,
 
 fn bindAddress() std.Io.net.IpAddress {
     return std.Io.net.IpAddress.parseLiteral("127.0.0.1:8080") catch unreachable;
@@ -447,6 +456,10 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
     harness.policy_listener = .{ .reject_prefix = l7.canon.policy_prefix };
     harness.policy_selections = .{
         zoxy.extension.select(runtime.extensions.request_policies, &harness.policy_listener),
+    };
+    harness.policy_route = .{ .reject_prefix = l7.canon.route_policy_path };
+    harness.route_policy_selections = .{
+        zoxy.extension.select(runtime.extensions.request_policies, &harness.policy_route),
     };
 
     // A quarter of seeds run clean: adversary off, origin
@@ -701,6 +714,21 @@ fn deriveAdversary(random: std.Random, clean: bool) SimIo.Adversary {
     };
 }
 
+/// An http chain's route table (#417): the guarded route ahead of the
+/// catch-all, as the loader would sort them — the longer prefix first.
+fn httpRoutes(harness: *const Harness) [2]zoxy.http.router.Route {
+    assert(harness.route_policy_selections.len == 1);
+    assert(l7.canon.guarded_prefix.len > 1);
+    return .{
+        .{
+            .prefix = l7.canon.guarded_prefix,
+            .cluster_index = 1,
+            .request_policies = &harness.route_policy_selections,
+        },
+        .{ .prefix = "/", .cluster_index = 1 },
+    };
+}
+
 /// Whether each cluster selects its #417 picker this seed: a quarter of
 /// seeds each, independently, from a stream apart from the scenario's.
 /// The picker answers by the entropy zoxy hands it, so across a sweep it
@@ -901,7 +929,7 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
         .http_hash_key = http_hash_key,
     }, health);
     harness.routes_l4 = .{.{ .prefix = "/", .cluster_index = 0 }};
-    harness.routes_http = .{.{ .prefix = "/", .cluster_index = 1 }};
+    harness.routes_http = harness.httpRoutes();
     harness.proxy_protocol_l4 = deriveProxyProtocol(random);
     harness.deriveTerminatingDraws(random);
     harness.wireListeners(deriveForwarded(random));
@@ -998,10 +1026,13 @@ fn deriveTerminatingDraws(harness: *Harness, random: std.Random) void {
     // its own route, so `verifyUpstreamIdentities` can tell a terminated
     // connection's origin conn from a plaintext one's.
     harness.tls_protocol = if (random.boolean()) .http else .l4;
-    harness.routes_tls = .{.{
-        .prefix = "/",
-        .cluster_index = if (harness.tls_protocol == .http) 1 else 0,
-    }};
+    if (harness.tls_protocol == .http) {
+        harness.routes_tls = harness.httpRoutes();
+        harness.routes_tls_count = 2;
+    } else {
+        harness.routes_tls[0] = .{ .prefix = "/", .cluster_index = 0 };
+        harness.routes_tls_count = 1;
+    }
     harness.tls_clients = deriveTlsClients(
         random,
         harness.proxy_protocol_send_l4,
@@ -1733,7 +1764,7 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
             // one `verifyUpstreamIdentities` can tell from a plaintext
             // client's. Which cluster it points at follows the protocol:
             // an http terminator has to reach an origin that speaks HTTP.
-            .routes = &harness.routes_tls,
+            .routes = harness.routes_tls[0..harness.routes_tls_count],
             // The same filter chain the plaintext http listener runs
             // (#215). The claim termination rests on is that TLS is a
             // phase ahead of the protocol and not a protocol of its own —

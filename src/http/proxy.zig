@@ -1179,9 +1179,18 @@ pub fn Proxy(comptime runtime: Runtime) type {
                     .respond => |page| return respondWithPage(server, stream, page),
                 }
             }
-            stream.cluster_index = router.route(conn.routes, keys.host, keys.views.match, request.headers) orelse {
+            const routed = router.match(conn.routes, keys.host, keys.views.match, request.headers) orelse {
                 return respond(server, stream, 404, "l7_no_route");
             };
+            stream.cluster_index = routed.cluster_index;
+            // #417: the route's own policies, now that the cluster is
+            // known, and still before the first resource below.
+            if (routed.request_policies.len >= 1) {
+                const view = requestView(stream, request, keys.host, &keys.views, render_scratch, routed.cluster_index);
+                if (server.evaluatePolicies(routed.request_policies, &view)) |status| {
+                    return respondPolicy(server, stream, status);
+                }
+            }
 
             stream.relay_buffer = server.acquireRelayBuffer() orelse {
                 return respond(server, stream, 503, "l7_shed_relay_buffers");
