@@ -1211,8 +1211,11 @@ const Http1Bed = struct {
         };
         if (!options.origin_listens) return;
         if (options.origin_h2) {
-            assert(!options.unix_origin);
-            return bed.h2_origin.start(arena, &bed.sim_io, originAddress());
+            const address: Io.Address = if (options.unix_origin)
+                .{ .unix = origin_socket_path }
+            else
+                .{ .ip = originAddress() };
+            return bed.h2_origin.start(arena, &bed.sim_io, &address);
         }
         if (options.origin_https) {
             assert(!options.unix_origin);
@@ -2106,6 +2109,26 @@ fn expectTrailers(options: Http1Bed.Options, body: []const u8, trailers: []const
 
 fn h2OriginOptions(seed: u64) Http1Bed.Options {
     return .{ .seed = seed, .origin_h2 = true };
+}
+
+test "h2 origin: an h2c origin on a socket path carries a request (#303)" {
+    // The pool's own dial, the one `upstream` path a socket-path endpoint
+    // reaches without the exchange's: a unix socket has no Nagle, so the
+    // dial must not ask for TCP_NODELAY — `SimIo` asserts it never does,
+    // and production would count the refusal as kernel pressure.
+    var options = h2OriginOptions(74);
+    options.unix_origin = true;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+    bed.h2_origin.body = "hello";
+
+    try bed.exchange("GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expectEqual(@as(u32, 1), bed.h2_origin.accepted_count);
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("kernel_pressure_errors"));
+    try bed.expectDrained();
 }
 
 test "h2 origin: an HTTP/1.1 request reaches an h2c origin as HTTP/2, and its answer comes back chunked" {

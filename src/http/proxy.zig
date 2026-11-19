@@ -1670,9 +1670,11 @@ pub fn Proxy(comptime IoType: type) type {
             };
             stream.upstream.?.socket = socket;
             stream.upstream_socket = socket;
-            server.io.setNodelay(socket) catch |err| {
-                server.witnessKernelPressure(.set_option, err);
-            };
+            const upstream = stream.upstream.?;
+            server.disableNagle(
+                socket,
+                server.endpointIsUnix(upstream.cluster_index, upstream.endpoint_index),
+            );
             renderAndStartLegs(server, stream);
         }
 

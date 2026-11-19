@@ -315,7 +315,9 @@ pub fn TestOrigin(comptime IoType: type) type {
         };
 
         /// Listen on `address`, the sessions' buffers carved from `arena`.
-        pub fn start(origin: *Self, arena: std.mem.Allocator, io: *IoType, address: std.Io.net.IpAddress) !void {
+        /// Listen on `address`: an IP port, or a socket path for a
+        /// scenario whose endpoint is one (#303).
+        pub fn start(origin: *Self, arena: std.mem.Allocator, io: *IoType, address: *const Io.Address) !void {
             origin.io = io;
             if (origin.tls) {
                 origin.tls_servers = try arena.alloc(TestTlsServer, conns_max);
@@ -329,7 +331,7 @@ pub fn TestOrigin(comptime IoType: type) type {
                 conn.session = carved.session;
                 conn.buffers = carved.buffers;
             }
-            origin.listener = try io.listen(&.{ .ip = address }, null);
+            origin.listener = try io.listen(address, null);
             origin.listening = true;
             origin.armAccept();
         }

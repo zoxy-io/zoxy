@@ -1165,7 +1165,7 @@ pub fn Mux(comptime IoType: type) type {
             };
             slot.socket = socket;
             slot.socket_open = true;
-            server.io.setNodelay(socket) catch |err| server.witnessKernelPressure(.set_option, err);
+            server.disableNagle(socket, server.endpointIsUnix(slot.cluster_index, slot.endpoint_index));
             if (server.config.clusters[slot.cluster_index].tls) |*tls| return startTls(server, slot, tls);
             openSession(server, slot);
         }

@@ -332,7 +332,12 @@ pub const TestBed = struct {
         tls: bool = false,
         /// #304: the TLS listener's client CA, when `tls` is set.
         tls_client_ca: ?config_module.Config.Listener.ClientCa = null,
+        /// The origin on a socket path instead of an IP port (#303): the
+        /// one endpoint is `unix:` and the double listens there.
+        unix_origin: bool = false,
     };
+
+    const origin_socket_path = "/run/zoxy-test/l4-origin.sock";
 
     pub fn bindAddress() std.Io.net.IpAddress {
         return std.Io.net.IpAddress.parseLiteral("127.0.0.1:8080") catch unreachable;
@@ -352,9 +357,14 @@ pub const TestBed = struct {
         bed: *TestBed,
         arena: std.mem.Allocator,
         blackholed: u8,
+        unix_origin: bool,
     ) !void {
         assert(blackholed <= bed.endpoints.len - 1);
-        bed.endpoints = .{ .{ .ip = originAddress() }, undefined, undefined, undefined };
+        const origin: io_module.Address = if (unix_origin)
+            .{ .unix = origin_socket_path }
+        else
+            .{ .ip = originAddress() };
+        bed.endpoints = .{ origin, undefined, undefined, undefined };
         bed.endpoints_count = 1 + blackholed;
         for (bed.endpoints[1..bed.endpoints_count], 0..) |*endpoint, index| {
             const literal = try std.fmt.allocPrintSentinel(
@@ -396,6 +406,17 @@ pub const TestBed = struct {
         }
     }
 
+    /// The origin double on whichever family the one endpoint names —
+    /// what `initEndpoints` chose, so the dial and the listener agree.
+    fn startOrigin(bed: *TestBed, unix_origin: bool) !void {
+        if (unix_origin) {
+            assert(bed.endpoints[0] == .unix);
+            return bed.scenario.origin.startUnix(&bed.sim_io, origin_socket_path);
+        }
+        assert(bed.endpoints[0] == .ip);
+        return bed.scenario.origin.start(&bed.sim_io, originAddress());
+    }
+
     pub fn setUp(bed: *TestBed, gpa: std.mem.Allocator, options: SetUpOptions) !void {
         bed.arena_state = std.heap.ArenaAllocator.init(gpa);
         errdefer bed.arena_state.deinit();
@@ -411,7 +432,7 @@ pub const TestBed = struct {
         // size whether or not a ring was registered.
         sim_options.buffer_group_bytes = options.server.head_buffer_bytes;
         try bed.sim_io.init(arena, sim_options);
-        try bed.initEndpoints(arena, options.blackholed_endpoints);
+        try bed.initEndpoints(arena, options.blackholed_endpoints, options.unix_origin);
         bed.clusters = .{.{
             .name = "origin",
             .endpoints = bed.endpoints[0..bed.endpoints_count],
@@ -473,7 +494,7 @@ pub const TestBed = struct {
         bed.scenario.origin.context = &bed.scenario;
         bed.scenario.origin.expect_proxy_header = options.proxy_protocol_send != null;
         if (options.origin_listens) {
-            try bed.scenario.origin.start(&bed.sim_io, originAddress());
+            try bed.startOrigin(options.unix_origin);
         }
     }
 
@@ -1715,6 +1736,28 @@ test "proxy protocol: a silent peer is reaped on the connect budget" {
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l4_proxy_header_invalid"));
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l4_proxy_header_accepted"));
+}
+
+test "l4: a socket-path endpoint relays, and is asked no TCP option (#303)" {
+    // The L4 dial's half of #303's endpoint: a unix socket has no Nagle,
+    // so the dial must not ask for TCP_NODELAY — `SimIo` asserts it never
+    // does, and production would count the refusal as kernel pressure on
+    // every connection.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 17, .adversary = .{ .partial_io = true } },
+        .unix_origin = true,
+    });
+    defer bed.tearDown();
+
+    bed.startClients(1, true);
+    try bed.sim_io.run();
+    try bed.expectDrained();
+
+    const client = &bed.scenario.clients[0];
+    try std.testing.expectEqual(Client.Outcome.eof, client.outcome);
+    try std.testing.expectEqualStrings(echo_token, client.receive_buffer[0..client.received_len]);
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("kernel_pressure_errors"));
 }
 
 test "proxy protocol send: the origin hears who connected, and only the payload echoes" {

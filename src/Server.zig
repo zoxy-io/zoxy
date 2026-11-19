@@ -2771,9 +2771,7 @@ pub fn Server(comptime IoType: type) type {
                 else
                     server.io.peerAddress(client_socket),
             );
-            server.io.setNodelay(client_socket) catch |err| {
-                server.witnessKernelPressure(.set_option, err);
-            };
+            server.disableNagle(client_socket, listener.unix_bind);
             server.installListenerState(conn, buffer, listener);
             server.storeDeadline(conn, server.entryTimeoutMs(listener.protocol));
             server.armDeadline(conn);
@@ -4134,9 +4132,10 @@ pub fn Server(comptime IoType: type) type {
                 return;
             };
             conn.stream.upstream_socket = socket;
-            server.io.setNodelay(socket) catch |err| {
-                server.witnessKernelPressure(.set_option, err);
-            };
+            server.disableNagle(
+                socket,
+                server.endpointIsUnix(conn.charged_cluster, conn.charged_endpoint),
+            );
             conn.enter(.relaying);
             server.storeDeadline(conn, server.idleTimeoutMs());
             relay.Relay(IoType).start(server, conn.stream);
@@ -4449,6 +4448,30 @@ pub fn Server(comptime IoType: type) type {
                 server.counters.increment("upstream_standby_picks");
                 server.labeled.incrementCluster(.standby_picks, cluster_index);
             }
+        }
+
+        /// Turn Nagle off on a connected socket (§4), unless it is a
+        /// socket file's (#303). A unix socket has no Nagle to turn off,
+        /// and Linux refuses the TCP-level option there with EOPNOTSUPP:
+        /// asking would count a kernel-pressure error on every connection
+        /// a `unix:` listener or endpoint carries, on the counter whose
+        /// rises are meant to page someone. The caller knows which the
+        /// socket is — the listener's bind for an accepted one, the
+        /// endpoint for a dialed one — so it says.
+        pub fn disableNagle(server: *Self, socket: IoType.Socket, unix_socket: bool) void {
+            if (unix_socket) return;
+            server.io.setNodelay(socket) catch |err| {
+                server.witnessKernelPressure(.set_option, err);
+            };
+        }
+
+        /// Whether a cluster's endpoint is a socket path (#303): what a
+        /// dialed socket's `disableNagle` is told.
+        pub fn endpointIsUnix(server: *const Self, cluster_index: u16, endpoint_index: u16) bool {
+            assert(cluster_index < server.config.clusters.len);
+            const endpoints = server.config.clusters[cluster_index].endpoints;
+            assert(endpoint_index < endpoints.len);
+            return endpoints[endpoint_index] == .unix;
         }
 
         /// Count Unexpected failures under kernel pressure (§8).
