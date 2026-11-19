@@ -201,25 +201,31 @@ weights_http: [2]u16,
 /// does so by failing over to it — a retry off the refused primary, or the
 /// healthy pass once the primary is ejected.
 priorities_http: [2]u8,
-clusters: [2]zoxy.config.Config.Cluster,
-routes_l4: [1]zoxy.http.router.Route,
+/// Each cluster's endpoints as options state them: the address with its
+/// #174 weight and #396 tier folded in.
+endpoint_options_l4: [1]zoxy.Options.Cluster.Endpoint,
+endpoint_options_http: [2]zoxy.Options.Cluster.Endpoint,
+clusters: [2]zoxy.Options.Cluster,
 /// The catch-all, behind #417's guarded route: a longer prefix carrying
 /// a route-phase policy, which only the `route_policy_reject` script
 /// reaches.
-routes_http: [2]zoxy.http.router.Route,
-request_filters_http: [7]zoxy.http.filter.Rule,
+routes_http: [2]zoxy.Options.Listener.Route,
+request_filters_http: [7]zoxy.Options.Listener.Filter,
 /// The #175 response rules beside them: the always-on stamp the client
 /// oracle requires on every proxied 200, and the 5xx rule whose edit
 /// must never appear (the scripted origin answers no 5xx).
-response_filters_http: [2]zoxy.http.filter.ResponseRule,
-/// One route on an l4 draw; on an http draw the plaintext listener's two,
-/// guarded route included — a terminator runs the http chain whole.
-routes_tls: [2]zoxy.http.router.Route,
-routes_tls_count: u8,
-listener_configs: [3]zoxy.config.Config.Listener,
-/// How many of `listener_configs` this seed actually binds: two on a
+response_filters_http: [2]zoxy.Options.Listener.ResponseFilter,
+/// On an http draw the plaintext listener's two routes, guarded route
+/// included — a terminator runs the http chain whole.
+routes_tls: [2]zoxy.Options.Listener.Route,
+listener_options: [3]zoxy.Options.Listener,
+/// How many of `listener_options` this seed actually binds: two on a
 /// plaintext seed, three when it drew TLS clients (§4).
 listeners_count: u8,
+/// The seed's config, stated as options (#417) and resolved by the
+/// library's own `config.resolve` — so every seed's config is held to
+/// every rule a file or a custom build is.
+options: zoxy.Options,
 config: zoxy.config.Config,
 origin: Origin,
 origin_http: HttpOrigin,
@@ -656,7 +662,7 @@ fn onDrainStart(harness: *Harness, result: Io.TimerError!void) void {
 /// against roughly 288 faults drawn.
 fn injectOneShotFaults(harness: *Harness, random: std.Random) void {
     assert(harness.server.listeners.len >= 1);
-    assert(harness.server.listeners.len <= harness.listener_configs.len);
+    assert(harness.server.listeners.len <= harness.listener_options.len);
     if (harness.clean) return;
     if (random.uintLessThan(u8, 4) == 0) {
         const faults = 1 + random.uintAtMost(u8, 1);
@@ -715,19 +721,23 @@ fn deriveAdversary(random: std.Random, clean: bool) SimIo.Adversary {
 }
 
 /// An http chain's route table (#417): the guarded route ahead of the
-/// catch-all, as the loader would sort them — the longer prefix first.
-fn httpRoutes(harness: *const Harness) [2]zoxy.http.router.Route {
+/// catch-all — the order resolving sorts them into anyway, the longer
+/// prefix first.
+fn httpRoutes(harness: *const Harness) [2]zoxy.Options.Listener.Route {
     assert(harness.route_policy_selections.len == 1);
     assert(l7.canon.guarded_prefix.len > 1);
     return .{
         .{
             .prefix = l7.canon.guarded_prefix,
-            .cluster_index = 1,
+            .cluster = http_cluster_name,
             .request_policies = &harness.route_policy_selections,
         },
-        .{ .prefix = "/", .cluster_index = 1 },
+        .{ .prefix = "/", .cluster = http_cluster_name },
     };
 }
+
+const l4_cluster_name = "origin-l4";
+const http_cluster_name = "origin-http";
 
 /// Whether each cluster selects its #417 picker this seed: a quarter of
 /// seeds each, independently, from a stream apart from the scenario's.
@@ -750,8 +760,8 @@ fn pickerOr(
     harness: *Harness,
     index: u1,
     selects: bool,
-    drawn: zoxy.config.Config.Cluster.Pick,
-) zoxy.config.Config.Cluster.Pick {
+    drawn: zoxy.Options.Cluster.Pick,
+) zoxy.Options.Cluster.Pick {
     assert(drawn != .extension);
     if (!selects) return drawn;
     const selection = zoxy.extension.select(runtime.extensions.pickers, &harness.pickers[index]);
@@ -759,9 +769,14 @@ fn pickerOr(
     return .{ .extension = selection };
 }
 
-fn randomPick(random: std.Random) zoxy.config.Config.Cluster.Pick {
-    const Pick = zoxy.config.Config.Cluster.Pick;
-    return Pick.builtin(random.enumValue(Pick.Builtin));
+/// A stock policy, drawn: one draw whichever it is. `hash` keys on the
+/// client's address here; the cookie key is `deriveSticky`'s.
+fn randomPick(random: std.Random) zoxy.Options.Cluster.Pick {
+    return switch (random.enumValue(zoxy.config.Config.Cluster.Pick.Builtin)) {
+        .rr => .rr,
+        .p2c => .p2c,
+        .hash => .{ .hash = .source_ip },
+    };
 }
 
 /// The #181 draw: a third of seeds give the http cluster a retry budget
@@ -892,8 +907,10 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     const pick_l4 = harness.pickerOr(0, harness.picker_l4, randomPick(random));
     const http_hash_key = deriveSticky(harness, random);
     // A sticky cluster keeps `hash`: its cookie is what the scripts check.
-    const pick_http = if (harness.sticky_http)
-        .hash
+    // Every other seed's hash keys on the client's address.
+    assert(harness.sticky_http or http_hash_key == .source_ip);
+    const pick_http: zoxy.Options.Cluster.Pick = if (harness.sticky_http)
+        .{ .hash = http_hash_key }
     else
         harness.pickerOr(1, harness.picker_http, randomPick(random));
     // Each cluster draws §7 active health checks independently, so the
@@ -910,9 +927,11 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     // #174 weights on a single-endpoint topology: the share itself is
     // moot (there is nobody to share against, and one endpoint at any
     // nonzero weight routes identically), but drawing a table at all
-    // flows the weights contract — parallel lengths, the nonzero-sum
-    // init assertion, the eligibility filter's weight read — through
-    // every schedule the adversary can produce. The proportional
+    // flows the weights contract — the nonzero-sum init assertion, the
+    // eligibility filter's weight read — through the schedules the
+    // adversary can produce. (A drawn weight of 1 everywhere is the
+    // unweighted table, which resolving collapses to none: one seed in a
+    // few hundred.) The proportional
     // properties are pinned by balancer.zig's own tests, exactly like
     // `hash`'s stickiness above.
     harness.weights_l4 = .{1 + random.uintAtMost(u16, 255)};
@@ -926,9 +945,7 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     wireClusters(harness, random, .{
         .l4 = pick_l4,
         .http = pick_http,
-        .http_hash_key = http_hash_key,
     }, health);
-    harness.routes_l4 = .{.{ .prefix = "/", .cluster_index = 0 }};
     harness.routes_http = harness.httpRoutes();
     harness.proxy_protocol_l4 = deriveProxyProtocol(random);
     harness.deriveTerminatingDraws(random);
@@ -937,12 +954,11 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
 }
 
 /// The picks the two clusters were drawn with, bundled so `wireClusters`
-/// takes one argument for them rather than three positional ones that
+/// takes one argument for them rather than two positional ones that
 /// read alike at the call site.
 const ClusterPicks = struct {
-    l4: zoxy.config.Config.Cluster.Pick,
-    http: zoxy.config.Config.Cluster.Pick,
-    http_hash_key: zoxy.config.Config.Cluster.HashKey,
+    l4: zoxy.Options.Cluster.Pick,
+    http: zoxy.Options.Cluster.Pick,
 };
 
 /// The two cluster records, split from `deriveTopology` for exactly the
@@ -961,55 +977,94 @@ fn wireClusters(
     assert(harness.endpoints_http_count <= harness.endpoints_http.len);
     const l4_max_inflight = deriveMaxInflight(harness.clean, random);
     const http_max_inflight = deriveMaxInflight(harness.clean, random);
-    harness.clusters = .{
-        .{
-            .name = "origin-l4",
-            .endpoints = &harness.endpoints_l4,
-            .weights = if (random.boolean()) &harness.weights_l4 else null,
-            .pick = picks.l4,
-            .check = health.check_l4,
-            .passive_ejection = health.passive_l4,
-            .panic_threshold_percent = derivePanicThreshold(random, health.check_l4 != null or health.passive_l4 != null),
-            .max_inflight = l4_max_inflight,
-            .slow_start_ms = deriveSlowStart(random, l4_max_inflight, health.check_l4 != null or health.passive_l4 != null),
-            .max_total_inflight = deriveMaxInflight(harness.clean, random),
-            .proxy_protocol_send = harness.proxy_protocol_send_l4,
-        },
-        .{
-            .name = "origin-http",
-            .endpoints = harness.endpoints_http[0..harness.endpoints_http_count],
-            .weights = if (random.boolean())
-                harness.weights_http[0..harness.endpoints_http_count]
-            else
-                null,
-            .pick = picks.http,
-            .priorities = if (harness.endpoints_http_count == 2 and random.boolean())
-                &harness.priorities_http
-            else
-                null,
-            .hash_key = picks.http_hash_key,
-            .check = health.check_http,
-            .passive_ejection = health.passive_http,
-            .panic_threshold_percent = derivePanicThreshold(random, health.check_http != null or health.passive_http != null),
-            .max_inflight = http_max_inflight,
-            .slow_start_ms = deriveSlowStart(random, http_max_inflight, health.check_http != null or health.passive_http != null),
-            .max_total_inflight = deriveMaxInflight(harness.clean, random),
-            .retries = harness.retries_http,
-            // #393: a budget of one or two retry dials on half the
-            // adversary seeds that retry, so concurrent clients meet it,
-            // and the leak invariant holds every permit back by the
-            // scenario's end. Never on a clean seed: a budget turns a
-            // retry into a `502`, which its golden transcript forbids —
-            // the reason `max_inflight` stays off them too.
-            .retry_budget = if (!harness.clean and harness.retries_http >= 1 and random.boolean())
-                1 + random.uintAtMost(u16, 1)
-            else
-                null,
-        },
-    };
+    harness.clusters[0] = harness.l4Cluster(random, picks.l4, health, l4_max_inflight);
+    harness.clusters[1] = harness.httpCluster(random, picks.http, health, http_max_inflight);
     // The retry budget and the endpoint that makes it spendable ride
     // together (`deriveRetries`), so neither is ever configured alone.
     assert((harness.retries_http == 0) == (harness.endpoints_http_count == 1));
+}
+
+/// The l4 cluster. Its draws — a weights coin, the panic threshold, slow
+/// start, the cluster cap — come in the order the record always drew
+/// them, so every seed's stream stays where it was.
+fn l4Cluster(
+    harness: *Harness,
+    random: std.Random,
+    pick: zoxy.Options.Cluster.Pick,
+    health: HealthDraw,
+    max_inflight: ?u32,
+) zoxy.Options.Cluster {
+    const weighted = random.boolean();
+    const ejects = health.check_l4 != null or health.passive_l4 != null;
+    const panic_threshold_percent = derivePanicThreshold(random, ejects);
+    const slow_start_ms = deriveSlowStart(random, max_inflight, ejects);
+    const max_total_inflight = deriveMaxInflight(harness.clean, random);
+    harness.endpoint_options_l4 = .{.{
+        .address = harness.endpoints_l4[0],
+        .weight = if (weighted) harness.weights_l4[0] else 1,
+    }};
+    assert(harness.endpoint_options_l4[0].weight >= 1);
+    assert(max_total_inflight == null or !harness.clean);
+    return .{
+        .name = l4_cluster_name,
+        .endpoints = &harness.endpoint_options_l4,
+        .pick = pick,
+        .check = health.check_l4,
+        .passive_ejection = health.passive_l4,
+        .panic_threshold_percent = panic_threshold_percent,
+        .max_inflight = max_inflight,
+        .slow_start_ms = slow_start_ms,
+        .max_total_inflight = max_total_inflight,
+        .proxy_protocol_send = harness.proxy_protocol_send_l4,
+    };
+}
+
+/// The http cluster, on the same terms: a weights coin, a tiers coin on a
+/// two-endpoint seed, the panic threshold, slow start, the cluster cap,
+/// and the #393 retry budget, in the record's own order.
+fn httpCluster(
+    harness: *Harness,
+    random: std.Random,
+    pick: zoxy.Options.Cluster.Pick,
+    health: HealthDraw,
+    max_inflight: ?u32,
+) zoxy.Options.Cluster {
+    const count = harness.endpoints_http_count;
+    const weighted = random.boolean();
+    const tiered = count == 2 and random.boolean();
+    const ejects = health.check_http != null or health.passive_http != null;
+    const panic_threshold_percent = derivePanicThreshold(random, ejects);
+    const slow_start_ms = deriveSlowStart(random, max_inflight, ejects);
+    const max_total_inflight = deriveMaxInflight(harness.clean, random);
+    // #393: a budget of one or two retry dials on half the adversary
+    // seeds that retry, so concurrent clients meet it, and the leak
+    // invariant holds every permit back by the scenario's end. Never on a
+    // clean seed: a budget turns a retry into a `502`, which its golden
+    // transcript forbids — the reason `max_inflight` stays off them too.
+    const retry_budget: ?u16 = if (!harness.clean and harness.retries_http >= 1 and random.boolean())
+        1 + random.uintAtMost(u16, 1)
+    else
+        null;
+    for (harness.endpoint_options_http[0..count], 0..) |*endpoint, index| {
+        endpoint.* = .{
+            .address = harness.endpoints_http[index],
+            .weight = if (weighted) harness.weights_http[index] else 1,
+            .priority = if (tiered) harness.priorities_http[index] else 0,
+        };
+    }
+    assert(count <= harness.endpoint_options_http.len);
+    return .{
+        .name = http_cluster_name,
+        .endpoints = harness.endpoint_options_http[0..count],
+        .pick = pick,
+        .check = health.check_http,
+        .passive_ejection = health.passive_http,
+        .panic_threshold_percent = panic_threshold_percent,
+        .max_inflight = max_inflight,
+        .slow_start_ms = slow_start_ms,
+        .max_total_inflight = max_total_inflight,
+        .retries = .{ .count = harness.retries_http, .budget = retry_budget },
+    };
 }
 
 /// The §4 terminating draws, split from `deriveTopology` when the #202
@@ -1026,13 +1081,9 @@ fn deriveTerminatingDraws(harness: *Harness, random: std.Random) void {
     // its own route, so `verifyUpstreamIdentities` can tell a terminated
     // connection's origin conn from a plaintext one's.
     harness.tls_protocol = if (random.boolean()) .http else .l4;
-    if (harness.tls_protocol == .http) {
-        harness.routes_tls = harness.httpRoutes();
-        harness.routes_tls_count = 2;
-    } else {
-        harness.routes_tls[0] = .{ .prefix = "/", .cluster_index = 0 };
-        harness.routes_tls_count = 1;
-    }
+    // An http terminator runs the plaintext http chain's routes; an l4
+    // one relays to the l4 cluster, which its listener names directly.
+    harness.routes_tls = harness.httpRoutes();
     harness.tls_clients = deriveTlsClients(
         random,
         harness.proxy_protocol_send_l4,
@@ -1053,14 +1104,15 @@ fn deriveTerminatingDraws(harness: *Harness, random: std.Random) void {
     for (&harness.tls_alpn_offers) |*offer| {
         offer.* = random.enumValue(TlsAlpnOffer);
     }
-    assert(harness.listeners_count <= harness.listener_configs.len);
+    assert(harness.listeners_count <= harness.listener_options.len);
     assert(harness.tls_clients >= 1 or !harness.clock_jump_wanted);
 }
 
-/// The top-level `Config` draw — the timeouts, the deadlines, and the
+/// The top-level options draw — the timeouts, the deadlines, and the
 /// access-log coin — split from `deriveTopology` when the #178 draw
 /// pushed that one past the length limit; the cluster and listener
-/// tables it points at are the caller's, already wired.
+/// tables it points at are the caller's, already wired. The options are
+/// resolved by `startServerAndOrigins`, once the arena exists.
 fn deriveServerConfig(
     harness: *Harness,
     random: std.Random,
@@ -1069,80 +1121,84 @@ fn deriveServerConfig(
 ) void {
     assert(connect_timeout_ms >= 1);
     assert(health_interval_ms >= 1);
+    // Drawn *above* the dial budget rather than independently: resolving
+    // refuses the other order (§5), so an independent draw would spend
+    // seeds on a config production cannot load.
     const idle_timeout_ms = connect_timeout_ms + 10 + random.uintAtMost(u32, 70);
-    harness.config = .{
+    // In the order the draws have always come, so every seed keeps its
+    // stream positions.
+    const head_ms = deriveHeadTimeoutMs(harness.clean, random, connect_timeout_ms, idle_timeout_ms);
+    const drain_deadline_ms = deriveDrainDeadlineMs(harness.drain_at_ns, random);
+    // The §6 age cap: measured from the connection's birth, so the clamp
+    // sometimes reaps an actively-relaying connection.
+    const max_lifetime_ms = deriveOptionalDeadlineMs(random);
+    // The §8 per-exchange deadline: measured from routing instead, so the
+    // same range lands on a different clock.
+    const request_ms = deriveOptionalDeadlineMs(random);
+    // Three seeds in four run with the access log on, so the sink, its
+    // staging swap, and the per-request captures all take the schedule
+    // fuzz; the fourth leaves it off, which is the shape that must
+    // reserve nothing and read no clock (§5, §8).
+    const access_log_on = random.uintLessThan(u8, 4) != 0;
+    harness.options = .{
         // The terminating listener is the third, and only a seed that drew
         // TLS clients binds it. Sliced rather than left inert so a
         // plaintext seed's fd, ring and listener budgets are exactly what
-        // they were before TLS existed — otherwise every seed in the sweep
-        // would shift, and the coverage this gate already has with it.
-        .listeners = harness.listener_configs[0..harness.listeners_count],
+        // they were before TLS existed.
+        .listeners = harness.listener_options[0..harness.listeners_count],
         .clusters = &harness.clusters,
-        .connect_timeout_ms = connect_timeout_ms,
-        // Drawn *above* the dial budget rather than independently: the
-        // loader rejects the other order (§5), so an independent draw would
-        // spend seeds on a config production cannot load.
-        .idle_timeout_ms = idle_timeout_ms,
-        .head_timeout_ms = deriveHeadTimeoutMs(
-            harness.clean,
-            random,
-            connect_timeout_ms,
-            idle_timeout_ms,
-        ),
-        .drain_deadline_ms = deriveDrainDeadlineMs(harness.drain_at_ns, random),
-        // #311's serving watchdog is off for the whole sweep, and not
-        // because it is untested — `server_test.zig` provokes it and
-        // asserts the exit code. It is off because arming it here would
-        // change what this gate *measures*: a tick every second of
-        // virtual time mixes into every seed's trace, so all 4096
-        // schedules would shift and the coverage this sweep has
-        // accumulated would go with them. Worse, `.timer` is in the
-        // strand draw (#226) — the seeds that strand it are the ones that
-        // reach the drain watchdog, and a serving watchdog armed over
-        // them would end those runs in its own give-up instead, which is
-        // the sweep's most interesting cases answering a different
-        // question.
-        .loop_watchdog_ms = 0,
-        // The §6 age cap: measured from the connection's birth, so the
-        // clamp sometimes reaps an actively-relaying connection.
-        .max_lifetime_ms = deriveOptionalDeadlineMs(random),
-        // The §8 per-exchange deadline: measured from routing instead, so
-        // the same range lands on a different clock.
-        .request_timeout_ms = deriveOptionalDeadlineMs(random),
-        // Stated, not drawn: no seed allows an upgrade yet, so this clock
-        // is inert and drawing it would move every seed's stream position
-        // for coverage that does not exist. The draw arrives with the
-        // tunnels themselves (#180).
-        .tunnel_timeout_ms = zoxy.constants.tunnel_ms_default,
-        // The #237 cap is read off the config, where the loader puts it;
-        // `deriveInitOptions` sizes the pools separately. Drawn only under
-        // the adversary, for the reason `deriveMaxInflight` gives: a
-        // capped connection announces a close its script did not ask for,
-        // and a clean seed's golden transcript forbids that. `0` leaves it
-        // unlimited, which is every clean seed and most others.
-        .limits = .{},
-        // Three seeds in four run with the access log on, so the sink,
-        // its staging swap, and the per-request captures all take the
-        // schedule fuzz; the fourth leaves it off, which is the shape
-        // that must reserve nothing and read no clock (§5, §8).
-        .access_log_sink = if (random.uintLessThan(u8, 4) == 0) null else .stdout,
-        // #140, on every seed: two scripts send the request header and
-        // the sized origin answers with the response one, so both
-        // captures run under the whole schedule fuzz. What the sweep
-        // proves is shape and value — the objects on exactly the http
-        // lines, and never a value the scripts did not send; staleness
-        // needs distinguishable values and is the directed tests'.
-        .access_log_request_headers = &log_request_headers,
-        .access_log_response_headers = &log_response_headers,
-        .health_interval_ms = health_interval_ms,
-        // #159: a page for `403` on every seed — the one status a
-        // script earns from a filter reject — so the configured-page
-        // arm of the static path runs under the whole schedule fuzz,
-        // and the client can demand its bytes on every 403. `503` is
-        // deliberately left out: the sheds keep their empty bodies,
+        .timeouts = .{
+            .connect_ms = connect_timeout_ms,
+            .idle_ms = idle_timeout_ms,
+            .head_ms = head_ms,
+            // Stated, not drawn: drawing it would move every seed's stream
+            // position for a clock whose coverage is the tunnels' own.
+            .tunnel_ms = zoxy.defaults.timeouts.tunnel_ms,
+            .health_interval_ms = health_interval_ms,
+            .request_ms = request_ms,
+            .max_lifetime_ms = max_lifetime_ms,
+            .drain_deadline_ms = drain_deadline_ms,
+            // #311's serving watchdog is off for the whole sweep: a tick
+            // every second of virtual time would shift all 4096 schedules,
+            // and the seeds that strand `.timer` reach the drain watchdog
+            // that a serving one would answer instead. `server_test.zig`
+            // provokes it and asserts the exit code.
+            .loop_watchdog_ms = null,
+        },
+        .limits = harness.limitsStated(),
+        // #140, on every seed with a log: two scripts send the request
+        // header and the sized origin answers with the response one, so
+        // both captures run under the whole schedule fuzz.
+        .access_log = if (access_log_on) .{
+            .sink = .stdout,
+            .request_headers = &log_request_headers,
+            .response_headers = &log_response_headers,
+        } else null,
+        // #159: a page for `403` on every seed, and the `respond` body. `503`
+        // is deliberately left out: the sheds keep their empty bodies,
         // which is the opt-in rule stated as a property.
+        .bodies = &bodies,
         .error_pages = &error_pages,
     };
+}
+
+/// The pools the options must state for this seed to resolve: tunnels
+/// where a listener allows an upgrade, streams where one speaks HTTP/2 —
+/// neither has a default. Every other pool is left to zoxy's rule.
+///
+/// What these size is not what the server runs with: the simulator hands
+/// `Server.init` its own pool sizes (`deriveInitOptions`), because a
+/// starved seed sizes them past what options may state — no tunnel for a
+/// listener that allows upgrades, no session for one that speaks h2c —
+/// and those rungs are the coverage it is starved for.
+fn limitsStated(harness: *const Harness) zoxy.Options.Limits {
+    const stated: zoxy.Options.Limits = .{
+        .tunnels = if (harness.upgrades_http) harness.tunnels else null,
+        .h2_streams = if (harness.h2c_http) harness.stream_slots else null,
+    };
+    assert(!harness.upgrades_http or harness.tunnels >= 1);
+    assert(!harness.h2c_http or harness.stream_slots >= 1);
+    return stated;
 }
 
 /// The #178 draw: a quarter of seeds key the http cluster on the sim
@@ -1350,8 +1406,8 @@ const HealthDraw = struct {
     http_origin_stop_at_ns: u64,
 };
 
-const Check = zoxy.config.Config.Cluster.Check;
-const PassiveEjection = zoxy.config.Config.Cluster.PassiveEjection;
+const Check = zoxy.Options.Cluster.Check;
+const PassiveEjection = zoxy.Options.Cluster.PassiveEjection;
 
 /// A cluster's #390 panic threshold. Drawn only where something can
 /// eject — the loader refuses the key anywhere else, and a draw there
@@ -1419,6 +1475,7 @@ fn deriveHealthChecks(clean: bool, random: std.Random, timeout_ms: u32) HealthDr
     // Thresholds draw around their defaults so a configured fall/rise —
     // not only the compiled one — decides ejections under the fuzz.
     const tcp_check: Check = .{
+        .kind = .tcp,
         .timeout_ms = timeout_ms,
         .fall = 1 + random.uintAtMost(u8, 3),
         .rise = 1 + random.uintAtMost(u8, 2),
@@ -1431,11 +1488,10 @@ fn deriveHealthChecks(clean: bool, random: std.Random, timeout_ms: u32) HealthDr
     // failure here is a transport failure, and a check that could not
     // tell those apart would be the whole point missed.
     var http_check = tcp_check;
-    http_check.kind = .http;
-    http_check.http = .{
+    http_check.kind = .{ .http = .{
         .path = "/health",
         .expect_status = if (random.uintLessThan(u8, 4) == 0) 599 else 200,
-    };
+    } };
     const checked_http = outage or random.boolean();
     const draw: HealthDraw = .{
         // The L4 origin echoes bytes rather than speaking HTTP, so only
@@ -1579,72 +1635,21 @@ fn deriveClockJump(tls_clients: u8, random: std.Random) bool {
     return random.boolean();
 }
 
-/// The two #159 pages the sweep serves, rendered here exactly as
-/// `config.zig`'s loader renders one — the simulator builds its
-/// `Config` by hand (no filesystem, no parse), so the shape is spelled
-/// out rather than loaded. The client oracle demands these bodies
-/// byte-for-byte on every seed.
-///
-/// The duplication is deliberate but not free: this spelling and the
-/// loader's could drift, and nothing here would notice, because what
-/// the serving path consumes is the `StaticPage` *fields* — it never
-/// re-reads the head it was handed. What that costs is coverage of the
-/// loader's exact byte layout, which `config.zig`'s own tests pin
-/// instead (`bodies render into complete pages`). Same trade, same
-/// reason, as `src/http_proxy_test.zig`'s hand-spelled page.
-const ErrorPage = SimPage(403, l7.canon.error_page_body);
-const RespondPage = SimPage(200, l7.canon.respond_body);
-const error_page = &ErrorPage.page;
-const respond_page = &RespondPage.page;
-const error_pages = [_]*const zoxy.config.Config.StaticPage{error_page};
+/// The #159 bodies every seed's config names: the page for `403` — the
+/// one status a script earns from a filter reject — and the `respond`
+/// action's answer. Rendered by resolving, as a file's would be, and the
+/// client oracle demands them byte for byte on every seed.
+const error_body_name = "sim-error";
+const respond_body_name = "sim-respond";
+const bodies = [_]zoxy.Options.Body{
+    .{ .name = error_body_name, .bytes = l7.canon.error_page_body, .content_type = l7.canon.page_content_type },
+    .{ .name = respond_body_name, .bytes = l7.canon.respond_body, .content_type = l7.canon.page_content_type },
+};
+const error_pages = [_]zoxy.Options.ErrorPage{.{ .status = 403, .body = error_body_name }};
 
-/// The #140 names every seed's config logs, already lowercased the way
-/// the loader would leave them (the simulator builds its `Config` by
-/// hand, so it owes that spelling itself).
+/// The #140 names every seed's config logs.
 const log_request_headers = [_][]const u8{l7.canon.log_request_header};
 const log_response_headers = [_][]const u8{l7.canon.log_response_header};
-
-/// One #159 page as the loader would have rendered it — storage rather
-/// than a constant, because a page now carries a `Date` slot the serving
-/// path stamps in place (#234). A type per page, so each owns its bytes
-/// the way two arena allocations would.
-fn SimPage(comptime status: u16, comptime body: []const u8) type {
-    return struct {
-        // The loader's own preconditions, restated where the loader is
-        // being stood in for: a status a page may carry, and a body the
-        // client oracle can demand.
-        comptime {
-            assert(zoxy.shed.isPageStatus(status));
-            assert(body.len >= 1);
-        }
-        const head = std.fmt.comptimePrint(
-            "HTTP/1.1 {d} {s}\r\nContent-Length: {d}\r\nContent-Type: {s}\r\nDate: ",
-            .{ status, zoxy.shed.reasonPhrase(status), body.len, l7.canon.page_content_type },
-        );
-        const keep_template = head ++ zoxy.shed.date_placeholder ++ "\r\n" ++
-            zoxy.shed.server_line ++ "\r\n" ++ body;
-        const close_template = head ++ zoxy.shed.date_placeholder ++ "\r\n" ++
-            zoxy.shed.server_line ++ "Connection: close\r\n\r\n" ++ body;
-        // `renderStaticPage`'s postcondition: the head is a real prefix, so
-        // the HEAD slice the serve path takes is never the whole response.
-        comptime {
-            assert(keep_template.len > body.len);
-            assert(close_template.len > keep_template.len);
-        }
-
-        var keep: [keep_template.len]u8 = keep_template.*;
-        var close: [close_template.len]u8 = close_template.*;
-        var page: zoxy.config.Config.StaticPage = .{
-            .status = status,
-            .keep = &keep,
-            .close = &close,
-            .keep_head_len = keep_template.len - body.len,
-            .close_head_len = close_template.len - body.len,
-            .keep_date = keep[head.len..][0..zoxy.shed.date_bytes],
-            .close_date = close[head.len..][0..zoxy.shed.date_bytes],
-        };
-    };
-}
 
 /// The §7 request rules and the #175 response rules the http listener
 /// runs — and, on the seeds whose tls listener terminates http, that one
@@ -1669,10 +1674,10 @@ fn wireFilters(harness: *Harness) void {
         .{
             // #159: answered from a configured body, before any
             // post-parse resource is acquired and without reaching an
-            // origin. The page is pre-rendered like the loader's, so
-            // the sweep exercises the static path's body-carrying arm.
+            // origin, so the sweep exercises the static path's
+            // body-carrying arm.
             .match = .{ .path_prefix = "/respond" },
-            .actions = &.{.{ .respond = respond_page }},
+            .actions = &.{.{ .respond = .{ .status = 200, .body = respond_body_name } }},
         },
         .{
             .match = .{ .path_prefix = "/edit" },
@@ -1706,101 +1711,88 @@ fn wireFilters(harness: *Harness) void {
     harness.response_filters_http = .{
         .{
             .match = .{},
-            .edits = &.{.{
-                .kind = .set,
+            .actions = &.{.{ .header_set = .{
                 .name = l7.canon.response_edit_name,
                 .value = l7.canon.response_edit_value,
-            }},
+            } }},
         },
         .{
-            .match = .{ .status_class = 5 },
-            .edits = &.{.{ .kind = .set, .name = l7.canon.response_never_name, .value = "1" }},
+            .match = .{ .status_class = .@"5xx" },
+            .actions = &.{.{ .header_set = .{ .name = l7.canon.response_never_name, .value = "1" } }},
         },
     };
 }
 
 fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forwarded) void {
     harness.wireFilters();
-    // One binding for both filter fields: a tls listener either runs the
-    // http listener's whole chain or none of it, and two spellings of the
-    // same condition are two chances to edit one and not the other.
-    const terminates_http = harness.tls_protocol == .http;
-    harness.listener_configs = .{
+    harness.listener_options = .{
         .{
-            .bind_address = .{ .ip = bindAddress() },
-            .bind_mode = null,
-            .routes = &harness.routes_l4,
-            .protocol = .l4,
-            .proxy_protocol = harness.proxy_protocol_l4,
+            .bind = .{ .ip = bindAddress() },
+            .protocol = .{ .l4 = .{
+                .target = .{ .cluster = l4_cluster_name },
+                .proxy_protocol = harness.proxy_protocol_l4,
+            } },
         },
         .{
-            .bind_address = .{ .ip = httpBindAddress() },
-            .bind_mode = null,
-            .routes = &harness.routes_http,
-            .request_filters = &harness.request_filters_http,
-            .request_policies = &harness.policy_selections,
-            .response_filters = &harness.response_filters_http,
-            .protocol = .http,
-            .forwarded = forwarded,
-            .upgrades = .{ .websocket = harness.upgrades_http },
-            .h2c = harness.h2c_http,
-            .max_body_bytes = harness.max_body_bytes,
-            .keepalive_requests = harness.keepalive_requests,
+            .bind = .{ .ip = httpBindAddress() },
+            .protocol = .{ .http = .{
+                .target = .{ .routes = &harness.routes_http },
+                .request_filters = &harness.request_filters_http,
+                .request_policies = &harness.policy_selections,
+                .response_filters = &harness.response_filters_http,
+                .forwarded = forwarded,
+                .upgrades = .{ .websocket = harness.upgrades_http },
+                .h2c = harness.h2c_http,
+                .max_body_bytes = harness.max_body_bytes,
+                .keepalive_requests = harness.keepalive_requests,
+            } },
         },
-        .{
-            .bind_address = .{ .ip = tlsBindAddress() },
-            .bind_mode = null,
-            // No #236 body cap, stated rather than inherited. The draw is
-            // a *plaintext-leg* one, and that is exactly what makes
-            // `routed_canonical`'s per-leg argument in `scripts.zig`
-            // exact: a terminated run of a body-carrying script is judged
-            // by `terminating_pair`'s spec, whose legal set omits `413`.
-            // Left to the struct default this listener would silently
-            // carry the one-MiB production cap — never firing today, and
-            // turning the first script whose body outgrew it into an
-            // oracle failure that looked unrelated to its cause.
-            .max_body_bytes = 0,
-            // Its own route, so a terminated connection's origin conn is
-            // one `verifyUpstreamIdentities` can tell from a plaintext
-            // client's. Which cluster it points at follows the protocol:
-            // an http terminator has to reach an origin that speaks HTTP.
-            .routes = harness.routes_tls[0..harness.routes_tls_count],
-            // The same filter chain the plaintext http listener runs
-            // (#215). The claim termination rests on is that TLS is a
-            // phase ahead of the protocol and not a protocol of its own —
-            // the same render, the same filters, the same stamps — and a
-            // listener configured with no filters cannot test any of it:
-            // the response oracle these clients now run would be asking
-            // for a stamp the config never ordered. Only on the http
-            // draw, since filters on an l4 listener are a config error
-            // (`ListenerL4ResponseFilters`) and an l4 relay has no head to
-            // apply them to.
-            .request_filters = if (terminates_http) &harness.request_filters_http else &.{},
-            .request_policies = if (terminates_http) &harness.policy_selections else &.{},
-            .response_filters = if (terminates_http) &harness.response_filters_http else &.{},
-            // Both, across seeds. Termination is a phase ahead of the
-            // protocol (§4), so the two combinations exercise genuinely
-            // different code — the L4 relay's transform hooks against the
-            // L7 head-fill source and client-write channel — and a sweep
-            // that only ever drew one would leave the other's states
-            // reachable by nothing.
-            .protocol = harness.tls_protocol,
-            // The harness loads its credentials itself from these same
-            // bytes, so what this states is only that the listener
-            // terminates — which is what `Server.start` checks its
-            // credentials table against.
-            .tls = if (harness.tls_clients >= 1)
-                .{
-                    .cert_pem = zoxy.tls.testdata.cert_pem,
-                    .key_pem = zoxy.tls.testdata.key_pem,
-                    .label = "the harness's fixture",
-                    .alpn = switch (harness.tls_protocol) {
-                        .http => zoxy.config.alpn.http_default,
-                        .l4 => &.{},
-                    },
-                }
-            else
-                null,
+        harness.terminatingListener(),
+    };
+}
+
+/// The §4 terminating listener: bound only on a seed that drew TLS
+/// clients, and speaking whichever protocol `deriveTerminatingDraws`
+/// chose. Both, across seeds: termination is a phase ahead of the
+/// protocol, so the two combinations exercise genuinely different code —
+/// the L4 relay's transform hooks against the L7 head-fill source and
+/// client-write channel.
+fn terminatingListener(harness: *Harness) zoxy.Options.Listener {
+    // The harness loads its credentials itself from these same bytes, so
+    // what this states is only that the listener terminates — which is
+    // what `Server.start` checks its credentials table against.
+    const tls: ?zoxy.Options.Listener.Tls = if (harness.tls_clients >= 1) .{
+        .cert_pem = zoxy.tls.testdata.cert_pem,
+        .key_pem = zoxy.tls.testdata.key_pem,
+        .label = "the harness's fixture",
+    } else null;
+    return .{
+        .bind = .{ .ip = tlsBindAddress() },
+        .tls = tls,
+        .protocol = switch (harness.tls_protocol) {
+            // The same chain the plaintext http listener runs (#215): the
+            // claim termination rests on is that TLS is a phase ahead of
+            // the protocol and not a protocol of its own — the same
+            // render, the same filters, the same stamps. Its own routes,
+            // so a terminated connection's origin conn is one
+            // `verifyUpstreamIdentities` can tell from a plaintext one's.
+            .http => .{
+                .http = .{
+                    .target = .{ .routes = &harness.routes_tls },
+                    .request_filters = &harness.request_filters_http,
+                    .request_policies = &harness.policy_selections,
+                    .response_filters = &harness.response_filters_http,
+                    // No #236 body cap, stated rather than inherited: the cap
+                    // is a *plaintext-leg* draw, and a terminated run of a
+                    // body-carrying script is judged by `terminating_pair`'s
+                    // spec, whose legal set omits `413`.
+                    .max_body_bytes = 0,
+                    .keepalive_requests = zoxy.defaults.keepalive_requests,
+                },
+            },
+            // An l4 terminator relays to the l4 cluster, which the http
+            // chain's filters and policies have no head to apply to.
+            .l4 => .{ .l4 = .{ .target = .{ .cluster = l4_cluster_name } } },
         },
     };
 }
@@ -1821,10 +1813,9 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
 /// directed test's.
 ///
 /// The floor is one line of *this* config, not the static minimum:
-/// #140's named headers widen a line, and the loader holds a real
-/// config to the wider bound — a hand-built one owes itself the same,
-/// or the drop rung would fire on arithmetic rather than on the
-/// backpressure it is there to force.
+/// #140's named headers widen a line, so the floor is computed from this
+/// config's own header lists, or the drop rung would fire on arithmetic
+/// rather than on the backpressure it is there to force.
 fn deriveAccessLogBuffer(harness: *const Harness) u32 {
     if (harness.config.access_log_sink == null) {
         return 0;
@@ -1849,6 +1840,9 @@ fn deriveAccessLogBuffer(harness: *const Harness) u32 {
 /// ample pools so golden outcomes never meet a shed. Decided in `setUp`
 /// (see `force_exhaustion`) because the ring size had to precede
 /// `io.init`.
+/// The pool sizes the server runs with. Authoritative here, not the
+/// resolved `config.limits`: a starved seed sizes pools past what options
+/// may state (`limitsStated`).
 fn deriveInitOptions(harness: *const Harness, random: std.Random) ServerSim.InitOptions {
     const force_exhaustion = harness.force_exhaustion;
     const access_log_buffer_bytes = harness.deriveAccessLogBuffer();
@@ -1912,6 +1906,10 @@ fn deriveInitOptions(harness: *const Harness, random: std.Random) ServerSim.Init
 }
 
 fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: std.Random) !void {
+    // Resolved by the library, as every build's options are: a seed whose
+    // draws make a config zoxy would refuse fails here, by name, rather
+    // than running a shape production cannot load.
+    harness.config = try zoxy.config.resolve(arena, &harness.options);
     const options = harness.deriveInitOptions(random);
     try harness.server.init(arena, &harness.io, &harness.config, options);
     try harness.server.bindExtensions(&.{ .arena = arena });

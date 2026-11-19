@@ -3020,8 +3020,8 @@ pub fn Server(comptime runtime: Runtime) type {
             const total = config.access_log_request_headers.len +
                 config.access_log_response_headers.len;
             // The loader's shared cap, restated where every table sized
-            // by it is about to be allocated (§9: a hand-built config —
-            // a test, the simulator — never reaches the loader).
+            // by it is about to be allocated (§9: a config a test builds
+            // by hand never reaches `resolve`).
             assert(total <= constants.access_log_headers_max);
             return @intCast(total);
         }
