@@ -318,8 +318,8 @@ pub const Balancer = struct {
     ) error{OutOfMemory}!void {
         assert(config.clusters.len >= 1);
         assert(keys.count >= 1);
-        // The keys must describe *this* config. Tests and the simulator
-        // build a `Config` directly, bypassing the loader, so a mismatched
+        // The keys must describe *this* config. Tests build a `Config`
+        // directly, bypassing `resolve`, so a mismatched
         // pair would size these tables for one shape and index them for
         // another — which is what the `clusters_max` ceiling used to catch
         // here, before the tables stopped being sized by it.
@@ -343,8 +343,8 @@ pub const Balancer = struct {
             assert(cluster.endpoints.len <= keys.stride);
             // The #174 weights contract: parallel to the endpoints, and
             // at least one endpoint routable. The loader rejects both
-            // breaches (`EndpointWeightsAllZero`); a config built by
-            // hand — tests, the simulator — re-proves them here, since
+            // breaches (`EndpointWeightsAllZero`); a config a test builds
+            // by hand re-proves them here, since
             // an all-drained cluster would fail `eligibleEndpoints`'s
             // count assertion on its first pick instead of at startup.
             var weight_sum: u32 = 0;
@@ -364,8 +364,8 @@ pub const Balancer = struct {
             if (cluster.weights) |weights| {
                 assert(weights.len == cluster.endpoints.len);
             }
-            // #396's tiers are the loader's to bound; a table built any
-            // other way (a test, the simulator) is held to the same range.
+            // #396's tiers are the loader's to bound; a table a test builds
+            // any other way is held to the same range.
             if (cluster.priorities) |priorities| {
                 assert(priorities.len == cluster.endpoints.len);
                 for (priorities) |priority| assert(priority <= constants.endpoint_priority_max);

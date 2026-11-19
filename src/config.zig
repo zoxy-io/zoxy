@@ -4345,8 +4345,8 @@ fn validateTimeouts(timeouts: *const Options.Timeouts) ValidationError!void {
 /// as "off" — and the three relations the deadline handoff depends on are
 /// ordered. Stated of the typed options, so it holds whoever wrote them;
 /// `Server.init` asserts the same relations of any config however it was
-/// built, which is what covers the configs the simulator and the tests
-/// hand-build past this loader entirely.
+/// built, which is what covers the configs tests hand-build past resolving
+/// entirely.
 fn assertTimeoutsBounded(
     timeouts: *const Options.Timeouts,
     nonzero: []const u32,
