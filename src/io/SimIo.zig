@@ -421,6 +421,11 @@ const SocketEntry = struct {
     kernel_pressure: bool,
     linger_rst: bool,
     nodelay: bool,
+    /// Whether this is one end of a socket-file pair (#303), which has no
+    /// Nagle for `setNodelay` to turn off: the seam's contract keeps that
+    /// call to TCP sockets, and this is what lets the simulator hold every
+    /// caller to it.
+    unix: bool,
     inbox: Ring,
 };
 
@@ -1058,6 +1063,10 @@ pub fn signalWait(
 }
 
 pub fn setNodelay(io: *SimIo, socket: Socket) Io.SetOptionError!void {
+    // The seam's contract, held where production cannot hold it: Linux
+    // answers a socket file's TCP_NODELAY with EOPNOTSUPP, which XevIo
+    // can only report as an unclassified failure.
+    assert(!io.socketEntry(socket).unix);
     if (io.takeSetOptionError()) |err| return err;
     io.socketEntry(socket).nodelay = true;
 }
@@ -1757,6 +1766,10 @@ fn finishConnect(
     initSocketEntry(server_entry, io.adversary.inbox_bytes);
     client_entry.peer = @intCast(io.sockets.indexOf(server_entry));
     server_entry.peer = @intCast(io.sockets.indexOf(client_entry));
+    // A pair is one family end to end: the listener a socket path names
+    // accepts the other half of the dial that named it.
+    client_entry.unix = address.* == .unix;
+    server_entry.unix = address.* == .unix;
     // Each end names the other, the way a kernel's socket pair does: the
     // dialer's peer is what it dialed, the accepted socket's peer is the
     // client that reached it. Ports climb so every simulated client is
@@ -2081,6 +2094,7 @@ fn initSocketEntry(entry: *SocketEntry, inbox_capacity: u32) void {
     entry.kernel_pressure = false;
     entry.linger_rst = false;
     entry.nodelay = false;
+    entry.unix = false;
     entry.inbox.head = 0;
     entry.inbox.count = 0;
     entry.inbox.capacity = inbox_capacity;

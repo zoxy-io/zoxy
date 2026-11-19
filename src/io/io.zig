@@ -45,7 +45,9 @@
 //!       refresh one rather than cancel and re-arm every tick.)
 //!   alarmCancel(io) void                                (sync)
 //!   signalWait(io, U, u, cb(u, Signal))                 (persistent waiter)
-//!   setNodelay / setLingerRst (io, socket) SetOptionError!void   (sync)
+//!   setNodelay / setLingerRst (io, socket) SetOptionError!void   (sync;
+//!       setNodelay on TCP sockets only: a socket file has no Nagle, and
+//!       Linux refuses the option there with EOPNOTSUPP)
 //!   shutdown(io, socket, how) void                      (sync control op)
 //!   closeNow(io, socket) void                           (sync; un-admitted sheds)
 //!   peerAddress(io, socket) IpAddress                   (sync; who connected)
