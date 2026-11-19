@@ -32,10 +32,13 @@ direnv activates the shell). Read before writing code:
 ## Policies
 
 - Dependencies are audited forks pinned by content hash in build.zig.zon
-  (libxev, hparse, zssl). A pin moves only after re-audit. libxev and
-  hparse are pure Zig; zssl is the one C surface — a Zig TLS 1.3 protocol
-  layer over libcrypto primitives (DESIGN.md §4's scoped exception), and
-  the C binding lives inside it, so `@cImport` stays lint-forbidden here.
+  (libxev, hparse, h2, zssl, and openssl, which builds the libcrypto zssl
+  binds). A pin moves only after re-audit. libxev, hparse and h2 are pure
+  Zig; zssl is the one C surface — a Zig TLS 1.3 protocol layer over
+  libcrypto primitives (DESIGN.md §4's scoped exception), and the C
+  binding lives inside it, so `@cImport` stays lint-forbidden here. zrk
+  and zio are pinned too: they build the bench and profile harnesses
+  (which `ci` compiles), never the zoxy binary.
 - Boundaries (lint-enforced): raw syscalls and the `xev` import live only
   under `src/io/`; `hparse` is imported only by `src/http/parser.zig`;
   `h2` only under `src/http/h2/`; `zssl` only under `src/tls/`.
