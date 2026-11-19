@@ -1119,12 +1119,14 @@ const Http1Bed = struct {
             .keepalive_requests = options.keepalive_requests,
             .forwarded = options.forwarded,
             .proxy_status = options.proxy_status,
-            // Paths nothing reads: the bed embeds the PEMs, so what this
-            // states is only that the listener terminates.
+            // The bed loads its credentials itself (`loadTlsCredentials`),
+            // so what this states is only that the listener terminates —
+            // with the bytes it would have loaded them from.
             .tls = if (options.tls)
                 .{
-                    .cert_path = "cert.pem",
-                    .key_path = "key.pem",
+                    .cert_pem = @embedFile("tls/testdata/cert.pem"),
+                    .key_pem = @embedFile("tls/testdata/key.pem"),
+                    .label = "the bed's fixture",
                     .alpn = options.alpn,
                     .client_ca = options.tls_client_ca,
                 }

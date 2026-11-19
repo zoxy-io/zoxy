@@ -539,18 +539,22 @@ pub const Config = struct {
             require,
         };
 
-        /// Where this listener's certificate and key live (§4). Paths
-        /// only: this loader is IO-free (§1), so it validates the shape
-        /// and `main` does the reading — which is also what puts a
-        /// missing or malformed certificate in the startup error that
-        /// names the file, rather than in the first client's handshake.
+        /// This listener's certificate and key (§4), as PEM bytes (#417):
+        /// whoever builds the config reads them — the JSON loader through
+        /// its file seam, a custom build from wherever it keeps them — so
+        /// nothing past this point touches a filesystem. They are parsed
+        /// at startup, before the first handshake, so a malformed one
+        /// stops the start rather than failing a client.
         pub const Tls = struct {
             /// PEM certificate chain, leaf first.
-            cert_path: []const u8,
+            cert_pem: []const u8,
             /// PEM private key for the leaf: ECDSA P-256 or P-384, or RSA
             /// of 2048 to 4096 bits (#411); any other key is refused at
-            /// load (`tls/Credentials.zig`).
-            key_path: []const u8,
+            /// startup (`tls/Credentials.zig`).
+            key_pem: []const u8,
+            /// What a startup error calls this pair: the two paths a JSON
+            /// config named, or whatever the code that built it says.
+            label: []const u8,
             /// What this listener offers in ALPN (#271), most preferred
             /// first: canonical `tls/alpn.zig` tokens, never the config's
             /// own spellings. `["http/1.1"]` on an `http` listener whose
@@ -570,11 +574,12 @@ pub const Config = struct {
             certificates: []const Certificate = &.{},
         };
 
-        /// One more certificate a listener can present (#297): paths only,
-        /// read by `main` like the default pair.
+        /// One more certificate a listener can present (#297), in the
+        /// default pair's shape.
         pub const Certificate = struct {
-            cert_path: []const u8,
-            key_path: []const u8,
+            cert_pem: []const u8,
+            key_pem: []const u8,
+            label: []const u8,
         };
 
         /// A listener's mutual-TLS policy (#304). Per listener, never per
@@ -975,6 +980,9 @@ pub const ValidationError = error{
     LimitRelayBufferOverTlsRecord,
     ListenerTlsCertPathEmpty,
     ListenerTlsKeyPathEmpty,
+    /// A listener's certificate or key file that the file seam could not
+    /// read, or that is past `tls_pem_bytes_max` (#417).
+    ListenerTlsFileUnreadable,
     ListenerTlsCertificatesEmpty,
     ListenerTlsCertificatesOverLimit,
     ListenerTlsAlpnEmpty,
@@ -6348,12 +6356,11 @@ fn resolveProxyProtocol(
         error.ListenerProxyProtocolModeUnknown;
 }
 
-/// A listener's TLS block, shape-checked only (§4). This loader does no
-/// IO, so whether the files exist, parse, or carry a key of a type the
-/// on-loop handshake can afford is `main`'s to find out — where the error
-/// can name the path. What is checkable here is that a path was given at
-/// all: an empty string would otherwise reach `openat` as a request to
-/// open the current directory, which fails somewhere far less obvious.
+/// A listener's TLS block (§4). The certificate and key are read here,
+/// through the file seam (#417), so a file that is missing, unreadable or
+/// past `tls_pem_bytes_max` fails the load and names the path. Whether the
+/// bytes parse, and carry a key of a type the on-loop handshake can
+/// afford, is found out at startup, which names the pair by its label.
 /// Shared by both protocols rather than living in either body: both
 /// speak over a terminated session (§4, §7). The one key that differs
 /// between them is `alpn`, so the protocol rides along for it.
@@ -6364,34 +6371,67 @@ fn resolveTls(
     files: FileSource,
 ) ParseError!?Config.Listener.Tls {
     const tls = tls_json orelse return null;
-    if (tls.cert.len == 0) return error.ListenerTlsCertPathEmpty;
-    if (tls.key.len == 0) return error.ListenerTlsKeyPathEmpty;
+    const pair = try readCertificatePair(arena, tls.cert, tls.key, files);
     return .{
-        .cert_path = tls.cert,
-        .key_path = tls.key,
+        .cert_pem = pair.cert_pem,
+        .key_pem = pair.key_pem,
+        .label = pair.label,
         .alpn = try resolveAlpn(arena, tls.alpn, protocol),
         .client_ca = try resolveClientCa(arena, tls.client_ca, files),
-        .certificates = try resolveCertificates(arena, tls.certificates),
+        .certificates = try resolveCertificates(arena, tls.certificates, files),
     };
 }
 
-/// A listener's #297 further certificates, paths checked for shape only;
-/// `main` reads them, as it reads the default pair.
+/// A listener's #297 further certificates, each read like the default
+/// pair.
 fn resolveCertificates(
     arena: std.mem.Allocator,
     certificates_json: ?[]const CertificateJson,
+    files: FileSource,
 ) ParseError![]const Config.Listener.Certificate {
     const entries = certificates_json orelse return &.{};
     if (entries.len == 0) return error.ListenerTlsCertificatesEmpty;
     if (entries.len >= constants.tls_certificates_max) return error.ListenerTlsCertificatesOverLimit;
     const certificates = try arena.alloc(Config.Listener.Certificate, entries.len);
     for (entries, certificates) |entry, *certificate| {
-        if (entry.cert.len == 0) return error.ListenerTlsCertPathEmpty;
-        if (entry.key.len == 0) return error.ListenerTlsKeyPathEmpty;
-        certificate.* = .{ .cert_path = entry.cert, .key_path = entry.key };
+        certificate.* = try readCertificatePair(arena, entry.cert, entry.key, files);
     }
     assert(certificates.len < constants.tls_certificates_max);
     return certificates;
+}
+
+/// One certificate and key, read through the file seam (#417) — an empty
+/// path refused first, since it would reach `openat` as a request to open
+/// the current directory — and labelled with both paths for the startup
+/// error that names them if the PEM inside turns out to be unusable.
+fn readCertificatePair(
+    arena: std.mem.Allocator,
+    cert_path: []const u8,
+    key_path: []const u8,
+    files: FileSource,
+) ParseError!Config.Listener.Certificate {
+    if (cert_path.len == 0) return error.ListenerTlsCertPathEmpty;
+    if (key_path.len == 0) return error.ListenerTlsKeyPathEmpty;
+    const pair: Config.Listener.Certificate = .{
+        .cert_pem = try readListenerPem(arena, files, cert_path),
+        .key_pem = try readListenerPem(arena, files, key_path),
+        .label = try std.fmt.allocPrint(arena, "'{s}' + '{s}'", .{ cert_path, key_path }),
+    };
+    assert(pair.label.len > cert_path.len + key_path.len);
+    return pair;
+}
+
+fn readListenerPem(arena: std.mem.Allocator, files: FileSource, path: []const u8) ParseError![]const u8 {
+    assert(path.len >= 1);
+    const pem = files.read(files.context, arena, path, constants.tls_pem_bytes_max) catch |err| switch (err) {
+        error.FileUnreadable, error.FileTooLarge => return error.ListenerTlsFileUnreadable,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    // An empty file holds no certificate and no key: refused with the
+    // unreadable ones, so a loaded pair is never empty.
+    if (pem.len == 0) return error.ListenerTlsFileUnreadable;
+    assert(pem.len <= constants.tls_pem_bytes_max);
+    return pem;
 }
 
 /// Every certificate the process will load, each listener's default
@@ -8710,7 +8750,7 @@ test "config: max_lifetime_ms still obeys the shared ceiling" {
 fn expectParseError(expected: ParseError, json_bytes: []const u8) !void {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    try std.testing.expectError(expected, parse(arena_state.allocator(), json_bytes));
+    try std.testing.expectError(expected, parseWithFiles(arena_state.allocator(), json_bytes, TestCaFiles.source));
     try expectSchemaAgrees(expected, json_bytes);
 }
 
@@ -8915,6 +8955,7 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "ClusterTlsCaUnreadable", .gap = .filesystem },
     .{ .name = "ClusterTlsCaInvalid", .gap = .filesystem },
     .{ .name = "ListenerTlsClientCaUnreadable", .gap = .filesystem },
+    .{ .name = "ListenerTlsFileUnreadable", .gap = .filesystem },
     .{ .name = "ListenerTlsClientCaInvalid", .gap = .filesystem },
     .{ .name = "ListenerTlsCertificatesOverLimit", .gap = .budget },
     .{ .name = "LimitUpstreamH2TlsOverEngines", .gap = .budget },
@@ -9034,7 +9075,7 @@ fn renderedSchema() !std.json.Parsed(std.json.Value) {
 /// early return would deinit an uninitialized arena.
 fn expectParseOk(arena_state: *std.heap.ArenaAllocator, json_bytes: []const u8) !Config {
     arena_state.* = std.heap.ArenaAllocator.init(std.testing.allocator);
-    const parsed = try parse(arena_state.allocator(), json_bytes);
+    const parsed = try parseWithFiles(arena_state.allocator(), json_bytes, TestCaFiles.source);
     try expectSchemaAccepts(json_bytes);
     return parsed;
 }
@@ -9428,10 +9469,10 @@ const fuzz_seed_json =
 // grammar is a starting point rather than a shape the mutator must
 // blindly discover. The `inline` body arm is the one it can reach:
 // `parse` refuses `file` sources outright, since the fuzzer has no
-// filesystem. The `tls` block (#125) rides here for the same reason its
-// paths can be nonsense: the loader is IO-free, so what the mutator gets
-// to explore is the grammar and its `tls_engines` relation, which is all
-// of the TLS surface this layer owns.
+// filesystem. The `tls` block (#125) rides here too: the fuzz target
+// reads through in-memory fixtures that answer any `.pem` or `.key`
+// path, so what the mutator gets to explore is the grammar and its
+// `tls_engines` relation, which is all of the TLS surface this layer owns.
 
 test "config: the fuzz seed carrying every block parses" {
     // It is a corpus entry, so it has to be a *valid* config — an
@@ -9458,8 +9499,7 @@ test "config: the fuzz seed carrying every block parses" {
     try std.testing.expectEqual(@as(u16, 200), rules[3].actions[0].respond.status);
     // The #125 grammar and the limit that follows it: both in the seed, so
     // the mutator has the vocabulary for either branch.
-    try std.testing.expectEqualStrings("/c.pem", parsed.listeners[1].tls.?.cert_path);
-    try std.testing.expectEqualStrings("/k.pem", parsed.listeners[1].tls.?.key_path);
+    try std.testing.expectEqualStrings("'/c.pem' + '/k.pem'", parsed.listeners[1].tls.?.label);
     try std.testing.expectEqual(@as(u32, 16), parsed.limits.tls_engines);
 }
 
@@ -9475,7 +9515,10 @@ fn fuzzParse(context: void, smith: *std.testing.Smith) !void {
     const input = input_buffer[0..input_len];
 
     var fixed = std.heap.FixedBufferAllocator.init(&fuzz_arena_buffer);
-    if (parse(fixed.allocator(), input)) |parsed| {
+    // The in-memory fixtures, not a filesystem: a listener's certificate
+    // pair is read at load (#417), and a source refusing every file would
+    // stop each TLS mutation there, short of everything resolved after it.
+    if (parseWithFiles(fixed.allocator(), input, TestCaFiles.source)) |parsed| {
         // Success implies the resolved invariants hold — no third outcome.
         assert(parsed.listeners.len >= 1);
         assert(parsed.clusters.len >= 1);
@@ -9498,8 +9541,9 @@ fn fuzzParse(context: void, smith: *std.testing.Smith) !void {
             }
             if (listener.tls) |tls| {
                 tls_listeners += 1;
-                assert(tls.cert_path.len >= 1);
-                assert(tls.key_path.len >= 1);
+                assert(tls.cert_pem.len >= 1);
+                assert(tls.key_pem.len >= 1);
+                assert(tls.label.len >= 1);
             }
         }
         assert((tls_listeners >= 1) == (parsed.limits.tls_engines >= 1));
@@ -10987,19 +11031,22 @@ test "config: the tls block resolves paths, and only shape-checks them" {
                 ",\"tls\":{\"cert\":\"/c.pem\",\"key\":\"/k.pem\"}" ++ tail,
         );
         const tls = parsed.listeners[0].tls.?;
-        try std.testing.expectEqualStrings("/c.pem", tls.cert_path);
-        try std.testing.expectEqualStrings("/k.pem", tls.key_path);
+        // The pair arrives read (#417), labelled with both paths for any
+        // startup error that has to name it.
+        try std.testing.expectEqualStrings(@embedFile("tls/testdata/cert.pem"), tls.cert_pem);
+        try std.testing.expectEqualStrings(@embedFile("tls/testdata/cert.pem"), tls.key_pem);
+        try std.testing.expectEqualStrings("'/c.pem' + '/k.pem'", tls.label);
     }
-    // Paths that do not exist still load: this loader does no IO (§1), and
-    // `main` is where a missing file becomes an error that can name it.
-    {
-        var arena_state: std.heap.ArenaAllocator = undefined;
-        defer arena_state.deinit();
-        _ = try expectParseOk(
-            &arena_state,
-            head ++ ",\"tls\":{\"cert\":\"/nope\",\"key\":\"/nope\"}" ++ tail,
-        );
-    }
+    // A path the file seam cannot read stops the load: the loader reads
+    // through it, and nothing downstream touches a filesystem (#417).
+    try expectParseError(
+        error.ListenerTlsFileUnreadable,
+        head ++ ",\"tls\":{\"cert\":\"/nope\",\"key\":\"/k.pem\"}" ++ tail,
+    );
+    try expectParseError(
+        error.ListenerTlsFileUnreadable,
+        head ++ ",\"tls\":{\"cert\":\"/c.pem\",\"key\":\"/nope\"}" ++ tail,
+    );
     // An empty path is checkable here, and worth checking: it would reach
     // `openat` as a request to open the current directory, failing
     // somewhere far less obvious than the config that asked for it.
@@ -11162,8 +11209,10 @@ test "config: an h2c cluster is reached over HTTP/2, sizes the origin pools, and
         "\"upgrades\":{\"websocket\":true}}}]," ++ h2c ++ timeouts ++ ",\"limits\":{\"tunnels\":4}}");
 }
 
-/// The CA bundles the h2 cluster tests name, served the way `main` reads
-/// a file: a fixture by path, and nothing anywhere else.
+/// The files the loader tests name, served the way `main` reads them: a
+/// CA bundle by its path, a listener's certificate or key by its suffix
+/// (#417), and nothing anywhere else — so every other file arm is
+/// refused exactly as `parse`'s own source refuses it.
 const TestCaFiles = struct {
     fn read(
         context: ?*anyopaque,
@@ -11179,8 +11228,15 @@ const TestCaFiles = struct {
             @embedFile("tls/testdata/client-ca.pem")
         else if (std.mem.eql(u8, path, "/garbage.pem"))
             "not a certificate"
+            // Refused by name, ahead of the suffix rule below that would
+            // otherwise serve them: the tests' stand-ins for a missing file.
+        else if (std.mem.eql(u8, path, "/nope") or std.mem.eql(u8, path, "/missing.pem"))
+            return error.FileUnreadable
+        else if (std.mem.endsWith(u8, path, ".pem") or std.mem.endsWith(u8, path, ".key"))
+            @embedFile("tls/testdata/cert.pem")
         else
             return error.FileUnreadable;
+        assert(bytes.len <= limit);
         return try arena.dupe(u8, bytes);
     }
 
@@ -11204,10 +11260,9 @@ test "config: a listener may hold more certificates, counted across the process 
             ",\"certificates\":[{\"cert\":\"/a.pem\",\"key\":\"/ak.pem\"},{\"cert\":\"/b.pem\",\"key\":\"/bk.pem\"}]}," ++ tail);
         const tls = parsed.listeners[0].tls.?;
         // The pair above stays the default; the list is what SNI chooses among.
-        try std.testing.expectEqualStrings("/c.pem", tls.cert_path);
+        try std.testing.expectEqualStrings("'/c.pem' + '/k.pem'", tls.label);
         try std.testing.expectEqual(@as(usize, 2), tls.certificates.len);
-        try std.testing.expectEqualStrings("/b.pem", tls.certificates[1].cert_path);
-        try std.testing.expectEqualStrings("/bk.pem", tls.certificates[1].key_path);
+        try std.testing.expectEqualStrings("'/b.pem' + '/bk.pem'", tls.certificates[1].label);
     }
     {
         var arena_state: std.heap.ArenaAllocator = undefined;
@@ -11217,6 +11272,8 @@ test "config: a listener may hold more certificates, counted across the process 
     }
     try expectParseError(error.ListenerTlsCertificatesEmpty, head ++ ",\"certificates\":[]}," ++ tail);
     try expectParseError(error.ListenerTlsCertPathEmpty, head ++ ",\"certificates\":[{\"cert\":\"\",\"key\":\"/k\"}]}," ++ tail);
+    // A further pair is read like the default one (#417).
+    try expectParseError(error.ListenerTlsFileUnreadable, head ++ ",\"certificates\":[{\"cert\":\"/nope\",\"key\":\"/k.pem\"}]}," ++ tail);
     try expectParseError(error.ListenerTlsKeyPathEmpty, head ++ ",\"certificates\":[{\"cert\":\"/c\",\"key\":\"\"}]}," ++ tail);
     // The ceiling is the process's, each listener's default included: two
     // listeners of 129 is over where either alone is not.
