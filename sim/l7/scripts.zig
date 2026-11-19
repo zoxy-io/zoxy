@@ -119,6 +119,11 @@ pub const Script = enum(u8) {
     /// configured page and all, since the policy answers with the filter
     /// reject's own static set — and the origin must never see it.
     policy_reject,
+    /// A GET of `/guarded/deny`: it routes to the guarded route, whose own
+    /// #417 policy rejects it with 403 — after the route is chosen, before
+    /// the request takes a relay buffer or an upstream slot. The golden
+    /// outcome is that 403, and the origin must never see the request.
+    route_policy_reject,
     /// A GET under `/redirect`: a §7 filter answers 301 with a Location
     /// composed from the request's own host and path (#176), before any
     /// resource is acquired or origin dialed — `filter_reject`'s shape
@@ -676,6 +681,17 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .method = .get,
         .allowed_statuses = &.{ 403, 408, 503 },
     },
+    .route_policy_reject = .{
+        // Answered after routing and before the first post-parse
+        // resource, so the §5 head ring's 503 is still the one verdict
+        // that can arrive instead: no rung sits between the two.
+        .request = "GET " ++ canon.route_policy_path ++ " HTTP/1.1\r\nHost: sim\r\n\r\n",
+        .expected_responses = 1,
+        .transcript_cap = 1,
+        .golden_status = 403,
+        .method = .get,
+        .allowed_statuses = &.{ 403, 408, 503 },
+    },
     .filter_redirect = .{
         // `filter_reject`'s timing exactly — answered before any
         // post-parse resource — so the same one preemption applies: the
@@ -856,6 +872,7 @@ pub const terminating_scripts = [_]Script{
     .absolute_form,
     .filter_reject,
     .policy_reject,
+    .route_policy_reject,
     .filter_redirect,
     .filter_respond,
     .filter_allow,

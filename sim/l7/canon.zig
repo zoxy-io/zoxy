@@ -119,6 +119,12 @@ pub const redirect_location = "https://sim/redirect";
 /// the `policy_reject` script asks for.
 pub const policy_prefix = "/policy";
 
+/// The prefix of the http chain's guarded route (#417), and the one path
+/// under it the route-phase policy refuses: `route_policy_reject` asks for
+/// exactly that, and no other script reaches the route at all.
+pub const guarded_prefix = "/guarded";
+pub const route_policy_path = guarded_prefix ++ "/deny";
+
 /// The #178 cookie name a sticky seed's http cluster is keyed on, and
 /// the exact tag of the one http endpoint (127.0.0.1:9001). The tag is
 /// *pinned* — computed once from `endpointId`'s published formula and
