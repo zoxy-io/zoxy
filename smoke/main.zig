@@ -676,6 +676,7 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
 
     enterStage(.awaiting_listener);
     try awaitListening(io, ports.http);
+    try awaitFirstGrpcProbe(io);
     enterStage(.load);
     const memory = try runLoad(arena, io, &ports, child.id);
 
@@ -2845,6 +2846,31 @@ fn awaitListening(io: Io, port: u16) !void {
     std.debug.print("smoke: zoxy never listened on port {d}\n", .{port});
     printZoxyLog(io);
     return error.ZoxyNeverListened;
+}
+
+/// Hold the load until the `grpc` check's first call has been answered.
+///
+/// The prober opens that cluster's HTTP/2 origin connection on its first
+/// sweep, and the first use of a pooled connection faults in its client
+/// session and buffers — about 100 KiB the resident set takes once and
+/// keeps (§5). Lazy residency, not allocation; but if it landed between
+/// the two passes the memory gate would blame the second one for it, and
+/// how early the sweep runs is the prober's random first offset. Waiting
+/// for the first answer puts it before both readings, every run.
+fn awaitFirstGrpcProbe(io: Io) !void {
+    const attempts_max: u16 = 400;
+    const retry_delay = Io.Duration.fromNanoseconds(5 * std.time.ns_per_ms);
+    var attempt: u16 = 0;
+    while (attempt < attempts_max) : (attempt += 1) {
+        if (h2_origin.health_answered.load(.monotonic) >= 1) return;
+        // Pacing only: a sleep that failed or woke early runs the next
+        // look sooner, and the attempt cap bounds the wait either way.
+        io.sleep(retry_delay, .awake) catch {};
+    }
+    assert(attempt == attempts_max);
+    std.debug.print("smoke: the grpc check was never answered\n", .{});
+    printZoxyLog(io);
+    return error.GrpcProbeNeverAnswered;
 }
 
 /// The head of zoxy's captured output, for a failing run — the banner and
