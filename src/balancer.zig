@@ -86,6 +86,7 @@ const std = @import("std");
 
 const config_module = @import("config.zig");
 const constants = @import("constants.zig");
+const extension = @import("extension.zig");
 const upstream = @import("net/upstream.zig");
 const io_module = @import("io/io.zig");
 
@@ -450,6 +451,18 @@ pub const Balancer = struct {
         /// different questions — one origin full, or this cluster's share
         /// of the process spent — and an operator widens different things.
         cluster_capped,
+        /// #417: the cluster selected an extension picker, and the set it
+        /// chooses among is narrowed into `eligible_scratch`. The caller,
+        /// which knows the build's picker types, hands `extensionCandidates`
+        /// to the picker and `finishExtension` turns its slot into the dial.
+        extension: Choice,
+    };
+
+    /// A narrowed set a policy chooses among: how many candidates sit at
+    /// the front of `eligible_scratch`, and whether health steered them.
+    pub const Choice = struct {
+        count: u16,
+        panicked: bool,
     };
 
     /// Choose the endpoint to dial for `cluster_index` under the
@@ -484,8 +497,10 @@ pub const Balancer = struct {
         // left to go, which is the quiet direction to be wrong in.
         for (tried) |index| assert(index < cluster.endpoints.len);
         const steers = healthSteers(balancer.keys, cluster_index, cluster, healthy);
-        if (tried.len == 0 and cluster.endpoints.len == 1 and cluster.max_inflight == null and
-            cluster.max_total_inflight == null)
+        // An extension picker is called for every pick on its cluster
+        // (#417), the forced one included, so it never takes this path.
+        if (cluster.pick != .extension and tried.len == 0 and cluster.endpoints.len == 1 and
+            cluster.max_inflight == null and cluster.max_total_inflight == null)
         {
             // Neither a rotation nor a draw: uncapped single-endpoint
             // clusters stay branch-cheap and policy state is untouched.
@@ -531,23 +546,104 @@ pub const Balancer = struct {
                 client_address,
                 request_key,
             ),
+            .extension => return .{ .extension = set },
         };
-        assert(chosen < cluster.endpoints.len);
         assert(!alreadyTried(tried, chosen)); // The exclusion is not advisory.
-        const ejected = !healthy[balancer.keys.key(cluster_index, chosen)];
-        return .{ .dial = .{
+        return .{ .dial = balancer.pickOf(cluster_index, chosen, healthy, set.panicked) };
+    }
+
+    /// The dial for `chosen`, with what a caller counts about it.
+    fn pickOf(
+        balancer: *const Balancer,
+        cluster_index: u16,
+        chosen: u16,
+        healthy: []const bool,
+        panicked: bool,
+    ) Pick {
+        const cluster = &balancer.config.clusters[cluster_index];
+        assert(chosen < cluster.endpoints.len);
+        assert(balancer.keys.key(cluster_index, chosen) < healthy.len);
+        return .{
             .address = cluster.endpoints[chosen],
             .endpoint_index = chosen,
-            .ejected = ejected,
-            .panicked = set.panicked,
+            .ejected = !healthy[balancer.keys.key(cluster_index, chosen)],
+            .panicked = panicked,
             .standby = tierOf(cluster, chosen) > 0,
-        } };
+        };
+    }
+
+    /// The set an `.extension` outcome left in `eligible_scratch`, as the
+    /// picker reads it (#417). Valid until the next pick, which is after
+    /// the picker returns: the loop is single-threaded and a pick never
+    /// re-enters.
+    pub fn extensionCandidates(
+        balancer: *const Balancer,
+        cluster_index: u16,
+        choice: Choice,
+        load: *const upstream.Load,
+    ) extension.Candidates {
+        const cluster = &balancer.config.clusters[cluster_index];
+        assert(cluster.pick == .extension);
+        assert(choice.count >= 1);
+        assert(choice.count <= cluster.endpoints.len);
+        return .{
+            .endpoints = balancer.eligible_scratch[0..choice.count],
+            .cluster_index = cluster_index,
+            .cluster = cluster,
+            .keys = balancer.keys,
+            .load = load,
+            .identities = balancer.endpoint_hashes,
+        };
+    }
+
+    /// What an extension pick concluded: the dial, and whether the
+    /// picker's slot named no candidate.
+    pub const Finished = struct {
+        pick: Pick,
+        fell_back: bool,
+    };
+
+    /// Turn an extension picker's `slot` into the dial (#417). A slot
+    /// outside the set it was offered is the picker's bug, and has a
+    /// defined outcome rather than a crash: the load-aware placement p2c
+    /// runs, over the same narrowed set, so the request still goes to an
+    /// endpoint every rule above allowed — and the caller counts it.
+    pub fn finishExtension(
+        balancer: *Balancer,
+        cluster_index: u16,
+        choice: Choice,
+        slot: u16,
+        load: *const upstream.Load,
+        healthy: []const bool,
+    ) Finished {
+        assert(balancer.config.clusters[cluster_index].pick == .extension);
+        assert(choice.count >= 1);
+        const eligible = balancer.eligible_scratch[0..choice.count];
+        const fell_back = slot >= choice.count;
+        const chosen = if (fell_back)
+            balancer.placeByLoad(cluster_index, eligible, load)
+        else
+            eligible[slot];
+        return .{
+            .pick = balancer.pickOf(cluster_index, chosen, healthy, choice.panicked),
+            .fell_back = fell_back,
+        };
+    }
+
+    /// One draw from the pick generator, for an extension picker's
+    /// `entropy` (#417): the same seeded stream p2c draws from, so a
+    /// picker that uses it replays exactly under the simulator (§9).
+    pub fn drawEntropy(balancer: *Balancer) u64 {
+        assert(balancer.pick_state != 0);
+        const value = balancer.next();
+        assert(balancer.pick_state != 0); // A full-period generator never reaches zero.
+        return value;
     }
 
     /// What a pick chooses between, left in `eligible_scratch`, or why it
     /// cannot choose at all.
     const Narrowed = union(enum) {
-        choose: struct { count: u16, panicked: bool },
+        choose: Choice,
         exhausted,
         capped,
     };
@@ -910,7 +1006,8 @@ pub const Balancer = struct {
         load: *const upstream.Load,
     ) u16 {
         const cluster = &balancer.config.clusters[cluster_index];
-        assert(cluster.pick == .p2c or cluster.pick == .hash);
+        // `.extension` too: it is where an out-of-set slot falls back.
+        assert(cluster.pick == .p2c or cluster.pick == .hash or cluster.pick == .extension);
         assert(eligible.len >= 1);
         if (eligible.len == 1) {
             return eligible[0];
@@ -2964,4 +3061,110 @@ test "balancer: a hash retry lands where ejection would send the key" {
         if (hits > 0) reached += 1;
     }
     try std.testing.expect(reached > 1);
+}
+
+test "balancer: an extension cluster is offered exactly what every rule left (#417)" {
+    // Four endpoints: 1 is drained, 2 sits at its cap and 3 was dialed
+    // and refused. Every rule zoxy owns has spoken before a picker is
+    // asked, so the one candidate it may be offered is endpoint 0.
+    const quad = [_]io_module.Address{
+        ipEndpoint("127.0.0.1:1"), ipEndpoint("127.0.0.1:2"),
+        ipEndpoint("127.0.0.1:3"), ipEndpoint("127.0.0.1:4"),
+    };
+    const weights = [_]u16{ 1, 0, 1, 1 };
+    var instance: u8 = 0;
+    const clusters = [_]config_module.Config.Cluster{.{
+        .name = "custom",
+        .endpoints = &quad,
+        .weights = &weights,
+        .max_inflight = 2,
+        .pick = .{ .extension = .{ .index = 0, .instance = &instance } },
+    }};
+    const config = testConfig(&clusters);
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
+    var balancer: Balancer = undefined;
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
+
+    var l7: [test_keys.count]u16 = @splat(0);
+    l7[2] = 2;
+    const load = testLoad(&l7);
+    const outcome = balancer.pick(0, &load, &test_healthy_all, &test_client, .none, &.{3});
+    const choice = outcome.extension;
+    try std.testing.expectEqual(@as(u16, 1), choice.count);
+    try std.testing.expect(!choice.panicked);
+
+    const candidates = balancer.extensionCandidates(0, choice, &load);
+    try std.testing.expectEqual(@as(u16, 1), candidates.count());
+    try std.testing.expectEqual(@as(u16, 0), candidates.endpointIndex(0));
+    try std.testing.expectEqual(@as(u16, 1), candidates.weight(0));
+    try std.testing.expectEqual(@as(?u32, 2), candidates.capacity(0));
+    try std.testing.expectEqual(@as(u32, 0), candidates.inFlight(0));
+    try std.testing.expectEqual(balancer.endpointIdentity(0, 0), candidates.identity(0));
+
+    const finished = balancer.finishExtension(0, choice, 0, &load, &test_healthy_all);
+    try std.testing.expect(!finished.fell_back);
+    try std.testing.expectEqual(@as(u16, 0), finished.pick.endpoint_index);
+}
+
+test "balancer: an extension slot past its set falls back to placement inside it (#417)" {
+    const trio = [_]io_module.Address{
+        ipEndpoint("127.0.0.1:1"), ipEndpoint("127.0.0.1:2"), ipEndpoint("127.0.0.1:3"),
+    };
+    var instance: u8 = 0;
+    const clusters = [_]config_module.Config.Cluster{.{
+        .name = "custom",
+        .endpoints = &trio,
+        .pick = .{ .extension = .{ .index = 0, .instance = &instance } },
+    }};
+    const config = testConfig(&clusters);
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
+    var balancer: Balancer = undefined;
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
+
+    var l7: [test_keys.count]u16 = @splat(0);
+    const load = testLoad(&l7);
+    var seen: [3]bool = @splat(false);
+    for (0..64) |_| {
+        const choice = balancer.pick(0, &load, &test_healthy_all, &test_client, .none, test_untried).extension;
+        try std.testing.expectEqual(@as(u16, 3), choice.count);
+        // A slot inside the set is followed exactly.
+        const followed = balancer.finishExtension(0, choice, 2, &load, &test_healthy_all);
+        try std.testing.expect(!followed.fell_back);
+        try std.testing.expectEqual(@as(u16, 2), followed.pick.endpoint_index);
+        // One past it names no candidate: the dial still lands inside
+        // the set, by placement rather than by the picker's word.
+        const again = balancer.pick(0, &load, &test_healthy_all, &test_client, .none, test_untried).extension;
+        const fallen = balancer.finishExtension(0, again, again.count, &load, &test_healthy_all);
+        try std.testing.expect(fallen.fell_back);
+        try std.testing.expect(fallen.pick.endpoint_index < trio.len);
+        seen[fallen.pick.endpoint_index] = true;
+    }
+    // Placement draws, so the fallback is not a fixed endpoint.
+    try std.testing.expect(seen[0] and seen[1] and seen[2]);
+}
+
+test "balancer: a one-endpoint extension cluster still asks its picker (#417)" {
+    // The fast path a built-in single-endpoint cluster takes would skip
+    // the picker, and the contract is that every pick on its cluster
+    // reaches it.
+    const solo = [_]io_module.Address{ipEndpoint("127.0.0.1:1")};
+    var instance: u8 = 0;
+    const clusters = [_]config_module.Config.Cluster{.{
+        .name = "custom",
+        .endpoints = &solo,
+        .pick = .{ .extension = .{ .index = 0, .instance = &instance } },
+    }};
+    const config = testConfig(&clusters);
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
+    var balancer: Balancer = undefined;
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
+
+    var l7: [test_keys.count]u16 = @splat(0);
+    const load = testLoad(&l7);
+    const outcome = balancer.pick(0, &load, &test_healthy_all, &test_client, .none, test_untried);
+    try std.testing.expect(outcome == .extension);
+    try std.testing.expectEqual(@as(u16, 1), outcome.extension.count);
 }

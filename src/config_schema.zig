@@ -31,7 +31,7 @@ const assert = std.debug.assert;
 
 const Writer = std.Io.Writer;
 const Stringify = std.json.Stringify;
-const Pick = config.Config.Cluster.Pick;
+const Pick = config.Config.Cluster.Pick.Builtin;
 
 /// Emit the whole schema document, pretty-printed (it is a shipped,
 /// human-read artifact). `std.json.Stringify` owns all punctuation, quoting,
@@ -739,7 +739,7 @@ test "config_schema: pick accepts both spellings, and only the object names hash
     const properties = object_arm.get("properties").?.object;
     const policies = properties.get("policy").?.object.get("enum").?.array;
     try std.testing.expectEqual(
-        @typeInfo(config.Config.Cluster.Pick).@"enum".field_names.len,
+        @typeInfo(config.Config.Cluster.Pick.Builtin).@"enum".field_names.len,
         policies.items.len,
     );
     const keys = properties.get("key").?.object.get("enum").?.array;

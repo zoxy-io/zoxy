@@ -22,7 +22,14 @@ const l7 = @import("l7.zig");
 
 const Io = zoxy.Io;
 const SimIo = zoxy.Io.SimIo;
-const ServerSim = zoxy.Server(.{ .Io = SimIo });
+/// The sweep's runtime lists one picker (#417), which some seeds select
+/// for a cluster, so the extension dispatch and its fallback run under the
+/// adversary like every other part of the pick.
+const runtime: zoxy.Runtime = .{
+    .Io = SimIo,
+    .extensions = .{ .pickers = &.{zoxy.testing.ScriptedPicker} },
+};
+const ServerSim = zoxy.Server(runtime);
 const Origin = zoxy.testing.Origin(SimIo);
 const HttpOrigin = l7.HttpOrigin(SimIo);
 const HttpClient = l7.Client(SimIo);
@@ -373,6 +380,13 @@ http_origin_stop_completion: SimIo.Completion,
 drain_at_ns: u64,
 drain_completion: SimIo.Completion,
 scenario_prng: std.Random.DefaultPrng,
+/// #417's picker instances, one per cluster, and whether each cluster
+/// selects its own this seed. Drawn from a stream of their own, so every
+/// seed's scenario draws are the ones they were before pickers existed:
+/// a seed that selects none runs exactly the sweep it always ran.
+pickers: [2]zoxy.testing.ScriptedPicker,
+picker_l4: bool,
+picker_http: bool,
 
 fn bindAddress() std.Io.net.IpAddress {
     return std.Io.net.IpAddress.parseLiteral("127.0.0.1:8080") catch unreachable;
@@ -420,6 +434,7 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
     // seed, so harness decisions never perturb delivery order.
     harness.scenario_prng = std.Random.DefaultPrng.init(seed ^ 0x5a5a5a5a5a5a5a5a);
     const random = harness.scenario_prng.random();
+    harness.drawPickers(seed);
 
     // A quarter of seeds run clean: adversary off, origin
     // well-behaved, so the L7 golden oracles demand each script's
@@ -673,8 +688,39 @@ fn deriveAdversary(random: std.Random, clean: bool) SimIo.Adversary {
     };
 }
 
+/// Whether each cluster selects its #417 picker this seed: a quarter of
+/// seeds each, independently, from a stream apart from the scenario's.
+/// The picker answers by the entropy zoxy hands it, so across a sweep it
+/// names every slot and, now and then, one past the end — the fallback.
+fn drawPickers(harness: *Harness, seed: u64) void {
+    var picker_prng = std.Random.DefaultPrng.init(seed ^ 0x0417_0417_0417_0417);
+    const random = picker_prng.random();
+    harness.pickers = @splat(.{ .choice = .by_entropy });
+    harness.picker_l4 = random.uintLessThan(u8, 4) == 0;
+    harness.picker_http = random.uintLessThan(u8, 4) == 0;
+    assert(harness.pickers[0].calls == 0);
+    assert(harness.pickers[1].calls == 0);
+}
+
+/// The cluster's pick: its picker instance when this seed selects one,
+/// otherwise the built-in policy it drew — drawn either way, so the
+/// scenario stream stays where it was.
+fn pickerOr(
+    harness: *Harness,
+    index: u1,
+    selects: bool,
+    drawn: zoxy.config.Config.Cluster.Pick,
+) zoxy.config.Config.Cluster.Pick {
+    assert(drawn != .extension);
+    if (!selects) return drawn;
+    const selection = zoxy.extension.select(runtime.extensions.pickers, &harness.pickers[index]);
+    assert(selection.index == 0);
+    return .{ .extension = selection };
+}
+
 fn randomPick(random: std.Random) zoxy.config.Config.Cluster.Pick {
-    return random.enumValue(zoxy.config.Config.Cluster.Pick);
+    const Pick = zoxy.config.Config.Cluster.Pick;
+    return Pick.builtin(random.enumValue(Pick.Builtin));
 }
 
 /// The #181 draw: a third of seeds give the http cluster a retry budget
@@ -802,9 +848,13 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     // exists for (stickiness, minimal disruption on ejection) are pinned
     // by `balancer.zig`'s own tests, which can hold thousands of distinct
     // clients against a multi-endpoint cluster as a scenario cannot.
-    const pick_l4 = randomPick(random);
+    const pick_l4 = harness.pickerOr(0, harness.picker_l4, randomPick(random));
     const http_hash_key = deriveSticky(harness, random);
-    const pick_http = if (harness.sticky_http) .hash else randomPick(random);
+    // A sticky cluster keeps `hash`: its cookie is what the scripts check.
+    const pick_http = if (harness.sticky_http)
+        .hash
+    else
+        harness.pickerOr(1, harness.picker_http, randomPick(random));
     // Each cluster draws §7 active health checks independently, so the
     // prober runs its whole lifecycle — sweeps, fall/rise transitions
     // under the adversary's connect fates, parked-close on ejection, and
@@ -1816,6 +1866,7 @@ fn deriveInitOptions(harness: *const Harness, random: std.Random) ServerSim.Init
 fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: std.Random) !void {
     const options = harness.deriveInitOptions(random);
     try harness.server.init(arena, &harness.io, &harness.config, options);
+    try harness.server.bindExtensions(&.{ .arena = arena });
     harness.tls_credentials = .{ null, null, null };
     if (harness.tls_clients >= 1) {
         // Index 2: the terminating listener is the third.

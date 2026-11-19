@@ -26,7 +26,13 @@ const upstream_module = @import("net/upstream.zig");
 
 const assert = std.debug.assert;
 
-const ServerSim = Server(.{ .Io = SimIo });
+const extension = @import("extension.zig");
+const ScriptedPicker = @import("testing/picker.zig").ScriptedPicker;
+
+/// The bed's runtime lists one picker (#417), so a scenario can select an
+/// instance of it; every scenario that selects none runs the stock path.
+const runtime: extension.Runtime = .{ .Io = SimIo, .extensions = .{ .pickers = &.{ScriptedPicker} } };
+const ServerSim = Server(runtime);
 const Origin = origin_mod.Origin(SimIo);
 
 // The throwaway self-signed fixtures (`tls/testdata/README.md`), embedded
@@ -335,6 +341,9 @@ pub const TestBed = struct {
         /// The origin on a socket path instead of an IP port (#303): the
         /// one endpoint is `unix:` and the double listens there.
         unix_origin: bool = false,
+        /// An extension picker instance the one cluster selects (#417);
+        /// null keeps the built-in p2c every other scenario uses.
+        picker: ?*ScriptedPicker = null,
     };
 
     const origin_socket_path = "/run/zoxy-test/l4-origin.sock";
@@ -417,6 +426,25 @@ pub const TestBed = struct {
         return bed.scenario.origin.start(&bed.sim_io, originAddress());
     }
 
+    /// The bed's one cluster, over the endpoints `initEndpoints` chose —
+    /// split from `setUp` for the length limit.
+    fn installCluster(bed: *TestBed, options: *const SetUpOptions) void {
+        assert(bed.endpoints_count >= 1);
+        assert(bed.endpoints_count <= bed.endpoints.len);
+        bed.clusters = .{.{
+            .name = "origin",
+            .endpoints = bed.endpoints[0..bed.endpoints_count],
+            .check = options.check,
+            .passive_ejection = options.passive_ejection,
+            .max_inflight = options.max_inflight,
+            .proxy_protocol_send = options.proxy_protocol_send,
+            .pick = if (options.picker) |picker|
+                .{ .extension = extension.select(runtime.extensions.pickers, picker) }
+            else
+                .p2c,
+        }};
+    }
+
     pub fn setUp(bed: *TestBed, gpa: std.mem.Allocator, options: SetUpOptions) !void {
         bed.arena_state = std.heap.ArenaAllocator.init(gpa);
         errdefer bed.arena_state.deinit();
@@ -433,14 +461,7 @@ pub const TestBed = struct {
         sim_options.buffer_group_bytes = options.server.head_buffer_bytes;
         try bed.sim_io.init(arena, sim_options);
         try bed.initEndpoints(arena, options.blackholed_endpoints, options.unix_origin);
-        bed.clusters = .{.{
-            .name = "origin",
-            .endpoints = bed.endpoints[0..bed.endpoints_count],
-            .check = options.check,
-            .passive_ejection = options.passive_ejection,
-            .max_inflight = options.max_inflight,
-            .proxy_protocol_send = options.proxy_protocol_send,
-        }};
+        bed.installCluster(&options);
         bed.routes = .{.{ .prefix = "/", .cluster_index = 0 }};
         bed.sni_routes = options.sni_routes;
         bed.listeners = .{.{
@@ -480,6 +501,7 @@ pub const TestBed = struct {
         else
             0;
         try bed.server.init(arena, &bed.sim_io, &bed.config, server_options);
+        try bed.server.bindExtensions(&.{ .arena = arena });
         try bed.loadCredentials(arena, options, server_options);
         try bed.server.start();
 
@@ -2496,4 +2518,51 @@ test "tls: engine exhaustion sheds at admission, before the gate identity" {
     try std.testing.expect(bed.server.relay_buffers.isFullyReleased());
     try std.testing.expect(bed.server.reconcile());
     try bed.expectDrained();
+}
+
+test "l4: a cluster's extension picker chooses the dial, and a slot past its set falls back (#417)" {
+    {
+        // The origin first, then one endpoint that never answers: the
+        // picker is offered both, in config order, and its slot 0 is the
+        // origin — so the echo coming back proves its answer was dialed.
+        var picker: ScriptedPicker = .{ .choice = .first };
+        var bed: TestBed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .sim = .{ .seed = 417 },
+            .blackholed_endpoints = 1,
+            .picker = &picker,
+        });
+        defer bed.tearDown();
+
+        bed.startClients(1, true);
+        try bed.sim_io.run();
+
+        try std.testing.expectEqual(@as(u8, 1), bed.scenario.outcomeCount(.eof));
+        try std.testing.expectEqual(@as(u32, 1), picker.binds);
+        try std.testing.expectEqual(@as(u32, 1), picker.calls);
+        try std.testing.expectEqualSlices(u16, &.{ 0, 1 }, picker.offered[0..picker.offered_count]);
+        // An L4 connection carries no request, and its one dial is no retry.
+        try std.testing.expect(!picker.had_request);
+        try std.testing.expect(!picker.retry);
+        try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("upstream_fallback_picks"));
+        try bed.expectDrained();
+    }
+    {
+        // A slot past the end of the set is the picker's bug, and it has
+        // a defined outcome: placement inside the same set, counted
+        // against the cluster that selected the picker.
+        var picker: ScriptedPicker = .{ .choice = .past_end };
+        var bed: TestBed = undefined;
+        try bed.setUp(std.testing.allocator, .{ .sim = .{ .seed = 418 }, .picker = &picker });
+        defer bed.tearDown();
+
+        bed.startClients(1, true);
+        try bed.sim_io.run();
+
+        try std.testing.expectEqual(@as(u8, 1), bed.scenario.outcomeCount(.eof));
+        try std.testing.expectEqual(@as(u32, 1), picker.calls);
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_fallback_picks"));
+        try std.testing.expectEqual(@as(u64, 1), bed.server.labeled.fallback_picks[0].get());
+        try bed.expectDrained();
+    }
 }
