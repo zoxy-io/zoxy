@@ -41,6 +41,7 @@
 const std = @import("std");
 
 const extension = @import("../extension.zig");
+const pickers = @import("../pickers.zig");
 const Runtime = extension.Runtime;
 const access_log = @import("../access_log.zig");
 const Balancer = @import("../balancer.zig").Balancer;
@@ -1198,41 +1199,29 @@ pub fn Proxy(comptime runtime: Runtime) type {
             beginUpstream(server, stream, request, keys.host, &keys.views, render_scratch);
         }
 
-        /// The request-derived half of this exchange's pick (#178): what
-        /// the routed cluster's hash key reads off the parsed head —
-        /// `.none` for every cluster that keys on nothing or on the
-        /// address. Derived while the head is live: at routing on the
-        /// first try, and from the replay's re-parse on the second, the
-        /// same source-of-truth rule the replay applies to the framing.
-        fn requestKeyFor(
+        /// The endpoint a sticky cookie names (#178), for the response's
+        /// half of the contract — "did the request already name the
+        /// endpoint it got?" — or null when the cluster keys on no cookie
+        /// or the request named none. Derived while the head is live: at
+        /// routing on the first try, and from the replay's re-parse on the
+        /// second, the same source-of-truth rule the replay applies to the
+        /// framing.
+        fn stickyCookieOf(
             server: *const ServerType,
             stream: *const StreamType,
             request: *const parser.RequestHead,
-        ) Balancer.RequestKey {
+        ) ?u64 {
             assert(stream.cluster_index < server.config.clusters.len);
             assert(request.head_len >= 1);
             const cluster = &server.config.clusters[stream.cluster_index];
-            if (cluster.pick != .hash) {
-                return .none;
-            }
-            switch (cluster.hash_key) {
-                .source_ip => return .none,
-                .header => |name| {
-                    const value = parser.headerValue(request.headers, name) orelse
-                        return .absent;
-                    if (value.len == 0) {
-                        return .absent;
-                    }
-                    return .{ .key = Balancer.bytesKey(value) };
-                },
-                .cookie => |name| {
-                    const value = parser.cookieValue(request.headers, name) orelse
-                        return .absent;
-                    const identity = Balancer.parseEndpointTag(value) orelse
-                        return .absent;
-                    return .{ .endpoint = identity };
-                },
-            }
+            if (cluster.pick != .hash) return null;
+            if (cluster.hash_key != .cookie) return null;
+            // The derivation the stock picker keys on, so the stamp and
+            // the pick cannot disagree about what the request named.
+            return switch (pickers.materialOf(&cluster.hash_key, null, request.headers)) {
+                .endpoint => |identity| identity,
+                .key, .absent => null,
+            };
         }
 
         /// Whether a chunked request body has outgrown the listener's cap
@@ -1321,16 +1310,14 @@ pub fn Proxy(comptime runtime: Runtime) type {
         fn pickEndpointOrShed(
             server: *ServerType,
             stream: *StreamType,
-            request_key: Balancer.RequestKey,
-            /// The request an extension picker reads (#417); null when the
-            /// cluster selected none, so no view was built for it.
+            /// The request the cluster's pick reads (#417); null when its
+            /// pick reads none, so no view was built for it.
             request: ?*const extension.Request,
         ) ?Balancer.Pick {
-            if (request != null) assert(clusterSelectsPicker(server, stream));
+            assert((request != null) == clusterReadsRequest(server, stream));
             const outcome = server.pickEndpoint(
                 stream.cluster_index,
                 clientAddressOf(stream),
-                request_key,
                 stream.l7.tried[0..stream.l7.tried_count],
                 request,
             );
@@ -1382,6 +1369,17 @@ pub fn Proxy(comptime runtime: Runtime) type {
             return cluster.pick == .extension;
         }
 
+        /// Whether the routed cluster's pick reads the request (#417): a
+        /// build's picker does, and so does the stock `hash` on a header or
+        /// a cookie, which keys on what the request carries. Every other
+        /// pick needs no view, so none is built for it.
+        fn clusterReadsRequest(server: *const ServerType, stream: *const StreamType) bool {
+            const cluster = &server.config.clusters[stream.cluster_index];
+            if (clusterSelectsPicker(server, stream)) return true;
+            if (cluster.pick != .hash) return false;
+            return cluster.hash_key != .source_ip;
+        }
+
         /// The request as an extension reads it (#417): the parsed head and
         /// the canonical keys routing computed. It aliases both, and the
         /// render scratch for the certificate's hex, so it lives exactly as
@@ -1420,19 +1418,18 @@ pub fn Proxy(comptime runtime: Runtime) type {
             server: *ServerType,
             stream: *StreamType,
             request: *const parser.RequestHead,
-            request_key: Balancer.RequestKey,
         ) ?Balancer.Pick {
             assert(stream.phase == .dialing or stream.phase == .exchanging);
             assert(request.head_len == stream.l7.request_head_len);
-            if (!clusterSelectsPicker(server, stream)) {
-                return pickEndpointOrShed(server, stream, request_key, null);
+            if (!clusterReadsRequest(server, stream)) {
+                return pickEndpointOrShed(server, stream, null);
             }
             const scratch = server.borrowRenderScratch();
             defer server.returnRenderScratch();
             // The same bytes canonicalized at routing, so this cannot fail.
             const keys = requestKeys(request, server.target_scratch, &scratch.route_host) catch unreachable;
             const view = requestView(stream, request, keys.host, &keys.views, scratch, stream.cluster_index);
-            return pickEndpointOrShed(server, stream, request_key, &view);
+            return pickEndpointOrShed(server, stream, &view);
         }
 
         /// Route resolved and a relay buffer held: choose an endpoint and
@@ -1465,20 +1462,16 @@ pub fn Proxy(comptime runtime: Runtime) type {
             // out a parked connection starts a request the origin has to
             // serve, which is the thing being bounded — the saved
             // handshake does not make it free.
-            const request_key = requestKeyFor(server, stream, request);
             // The head bytes are gone by the response render (§7 buffer
             // rotation), so the render's half of #178 — "did the request
             // already name the endpoint it got?" — is recorded now.
-            stream.l7.sticky_cookie = switch (request_key) {
-                .endpoint => |identity| identity,
-                else => null,
-            };
+            stream.l7.sticky_cookie = stickyCookieOf(server, stream, request);
             var view: extension.Request = undefined;
-            const picker_request: ?*const extension.Request = if (clusterSelectsPicker(server, stream)) blk: {
+            const picker_request: ?*const extension.Request = if (clusterReadsRequest(server, stream)) blk: {
                 view = requestView(stream, request, host, views, scratch, stream.cluster_index);
                 break :blk &view;
             } else null;
-            const pick = pickEndpointOrShed(server, stream, request_key, picker_request) orelse return;
+            const pick = pickEndpointOrShed(server, stream, picker_request) orelse return;
             // An h2c cluster's exchanges share connections as streams (§7):
             // there is no socket to check out or dial, only a connection to
             // join — so the render follows at once, as on the reuse path.
@@ -1893,8 +1886,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             // announcement still names whichever endpoint finally serves,
             // because `sticky_cookie` records what the *client* asked for
             // and that has not changed.
-            const request_key = requestKeyFor(server, stream, &request);
-            const pick = pickAgain(server, stream, &request, request_key) orelse return;
+            const pick = pickAgain(server, stream, &request) orelse return;
             assert(pick.endpoint_index != stream.l7.tried[stream.l7.tried_count - 1]);
             stream.l7.retries_used += 1;
             server.counters.increment("upstream_retried");
@@ -4327,12 +4319,8 @@ pub fn Proxy(comptime runtime: Runtime) type {
             // a cap hit here answers rather than replaying again — and
             // the same request key (#178), re-derived from the re-parse
             // exactly like the framing: same bytes, same key.
-            const request_key = requestKeyFor(server, stream, &request);
-            stream.l7.sticky_cookie = switch (request_key) {
-                .endpoint => |identity| identity,
-                else => null,
-            };
-            const pick = pickAgain(server, stream, &request, request_key) orelse return;
+            stream.l7.sticky_cookie = stickyCookieOf(server, stream, &request);
+            const pick = pickAgain(server, stream, &request) orelse return;
             dialUpstream(server, stream, pick, .fresh);
         }
 

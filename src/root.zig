@@ -30,6 +30,11 @@ pub const defaults = @import("defaults.zig");
 pub const extension = @import("extension.zig");
 pub const Extensions = extension.Extensions;
 pub const Runtime = extension.Runtime;
+/// zoxy's stock pick policies — round-robin, the power of two choices,
+/// rendezvous hashing — on the picker contract (#417): what the balancer
+/// runs for `rr`, `p2c` and `hash`, and what a build may select or call
+/// like any picker it lists.
+pub const pickers = @import("pickers.zig");
 pub const constants = @import("constants.zig");
 pub const counters = @import("counters.zig");
 /// L7 HTTP/1.1 modules (§7). `parser` wraps the vendored hparse behind
@@ -131,6 +136,7 @@ test {
     _ = Options;
     _ = defaults;
     _ = extension;
+    _ = pickers;
     _ = constants;
     _ = counters;
     _ = http.parser;

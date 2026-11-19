@@ -226,9 +226,37 @@ pub const PickInput = struct {
     panicked: bool,
     /// The loop's monotonic clock (§4).
     now_ns: u64,
-    /// A fresh draw from zoxy's own seeded generator, for a picker
-    /// that wants randomness and must stay deterministic (§9).
-    entropy: u64,
+    /// zoxy's own seeded generator, for a picker that wants randomness
+    /// and must stay deterministic (§9): draw what the pick needs, in
+    /// order, and a seed replays every draw. The stock policies draw from
+    /// it too — p2c twice per pick — so it is one stream, not one per
+    /// picker.
+    random: *Random,
+};
+
+/// zoxy's pick generator (§9): xorshift64* (Vigna), the full-period
+/// 64-bit shift generator with a multiplicative output scramble — plenty
+/// for candidate draws, one multiply and three shifts on the pick path.
+/// Seeded once per process; the modulo bias of a draw is at most 2⁻⁴⁸
+/// even at the `u16` index type's edge.
+pub const Random = struct {
+    state: u64,
+
+    pub fn init(seed: u64) Random {
+        assert(seed != 0); // xorshift64* cycles on a nonzero state.
+        return .{ .state = seed };
+    }
+
+    pub fn next(random: *Random) u64 {
+        assert(random.state != 0);
+        var x = random.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        random.state = x;
+        assert(x != 0); // A nonzero state maps to a nonzero state.
+        return x *% 0x2545F4914F6CDD1D;
+    }
 };
 
 /// The cluster a `bind` is called for.

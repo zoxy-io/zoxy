@@ -36,8 +36,8 @@ pub const ScriptedPicker = struct {
         last,
         /// One past the end, which no candidate answers to.
         past_end,
-        /// `entropy` modulo one more than the count: every slot, and now
-        /// and then the one past the end, in the generator's own order.
+        /// A draw modulo one more than the count: every slot, and now and
+        /// then the one past the end, in the generator's own order.
         by_entropy,
     };
 
@@ -77,7 +77,7 @@ pub const ScriptedPicker = struct {
             .first => 0,
             .last => count - 1,
             .past_end => count,
-            .by_entropy => @intCast(input.entropy % (@as(u64, count) + 1)),
+            .by_entropy => @intCast(input.random.next() % (@as(u64, count) + 1)),
         };
     }
 
