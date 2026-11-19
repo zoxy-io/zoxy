@@ -12,6 +12,7 @@ const std = @import("std");
 const trust = @import("tls/trust.zig");
 
 const constants = @import("constants.zig");
+const extension_module = @import("extension.zig");
 const router = @import("http/router.zig");
 const sni_router = @import("net/sni_router.zig");
 const filter = @import("http/filter.zig");
@@ -705,7 +706,7 @@ pub const Config = struct {
             anchors: []const []const u8,
         };
 
-        pub const Pick = enum(u2) {
+        pub const Pick = union(enum) {
             rr,
             p2c,
             /// Rendezvous hashing (§7): the same key always lands on the
@@ -715,6 +716,23 @@ pub const Config = struct {
             /// behind SO_REUSEPORT computes it identically with nothing
             /// shared (§3).
             hash,
+            /// A picker the build lists (#417), selected in code. The JSON
+            /// loader never produces one: it reads only `Builtin` names, so
+            /// a stock config cannot reach an extension at all.
+            extension: extension_module.Selection,
+
+            /// The policies the config may name. Apart from `Pick`'s own
+            /// tag, so the loader's closed vocabulary and the schema's
+            /// enum stay exactly what they were before `extension` existed.
+            pub const Builtin = enum(u2) { rr, p2c, hash };
+
+            pub fn builtin(policy: Builtin) Pick {
+                return switch (policy) {
+                    .rr => .rr,
+                    .p2c => .p2c,
+                    .hash => .hash,
+                };
+            }
         };
 
         /// The identity a `hash` cluster is sticky on (#178). `header`
@@ -3678,7 +3696,7 @@ pub const PickJson = struct {
         .policy = .{
             .desc = "Pick policy: p2c (power of two choices), rr (strict " ++
                 "round-robin), or hash (sticky on an explicit key).",
-            .enum_type = Config.Cluster.Pick,
+            .enum_type = Config.Cluster.Pick.Builtin,
         },
         .key = .{
             .desc = "What a hash cluster is sticky on: source_ip (the whole IPv4 " ++
@@ -6464,8 +6482,9 @@ const ResolvedPick = struct {
 /// other policy are rejected rather than left inert — they read as a
 /// request for stickiness the cluster would silently not provide.
 fn resolvePick(pick_json: *const PickJson) ParseError!ResolvedPick {
-    const pick = std.meta.stringToEnum(Config.Cluster.Pick, pick_json.policy) orelse
+    const policy = std.meta.stringToEnum(Config.Cluster.Pick.Builtin, pick_json.policy) orelse
         return error.ClusterPickUnknown;
+    const pick = Config.Cluster.Pick.builtin(policy);
     if (pick != .hash) {
         if (pick_json.key != null or pick_json.name != null) {
             return error.ClusterPickKeyWithoutHash;
@@ -8152,9 +8171,9 @@ test "config: cluster pick policy parses, defaults to p2c, rejects typos" {
             \\   "c":{"endpoints":["127.0.0.1:4"]}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
         );
-        try std.testing.expectEqual(Config.Cluster.Pick.rr, parsed.clusters[0].pick);
-        try std.testing.expectEqual(Config.Cluster.Pick.p2c, parsed.clusters[1].pick);
-        try std.testing.expectEqual(Config.Cluster.Pick.p2c, parsed.clusters[2].pick);
+        try std.testing.expect(parsed.clusters[0].pick == .rr);
+        try std.testing.expect(parsed.clusters[1].pick == .p2c);
+        try std.testing.expect(parsed.clusters[2].pick == .p2c);
     }
     // A typo must not silently balance as the default.
     try expectParseError(error.ClusterPickUnknown,
@@ -9637,7 +9656,7 @@ test "config: pick resolves both spellings, and hash names its key" {
             &arena_state,
             head ++ endpoints ++ ",\"pick\":{\"policy\":\"hash\",\"key\":\"source_ip\"}" ++ tail,
         );
-        try std.testing.expectEqual(Config.Cluster.Pick.hash, parsed.clusters[0].pick);
+        try std.testing.expect(parsed.clusters[0].pick == .hash);
         try std.testing.expectEqual(
             @as(std.meta.Tag(Config.Cluster.HashKey), .source_ip),
             std.meta.activeTag(parsed.clusters[0].hash_key),
@@ -9673,7 +9692,7 @@ test "config: pick resolves both spellings, and hash names its key" {
             &arena_state,
             head ++ endpoints ++ ",\"pick\":{\"policy\":\"rr\"}" ++ tail,
         );
-        try std.testing.expectEqual(Config.Cluster.Pick.rr, parsed.clusters[0].pick);
+        try std.testing.expect(parsed.clusters[0].pick == .rr);
     }
     // A cluster that says nothing keeps the p2c default and the default
     // key, which is inert there.
@@ -9681,7 +9700,7 @@ test "config: pick resolves both spellings, and hash names its key" {
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
         const parsed = try expectParseOk(&arena_state, head ++ endpoints ++ tail);
-        try std.testing.expectEqual(Config.Cluster.Pick.p2c, parsed.clusters[0].pick);
+        try std.testing.expect(parsed.clusters[0].pick == .p2c);
     }
 
     // A bare `"hash"` is the misleading spelling this grammar replaced

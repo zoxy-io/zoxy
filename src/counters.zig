@@ -316,6 +316,11 @@ pub const Counters = struct {
     /// had nothing usable — ejected, drained or full. A rising rate is
     /// failover spending its reserved capacity.
     upstream_standby_picks: Value = Value.init(0),
+    /// Extension picks (#417) whose slot named no candidate, sent instead
+    /// by p2c's load-aware placement over the same narrowed set. Every one
+    /// is a picker bug — zoxy offered a set and the answer was not in it —
+    /// and this is how its author finds out without the proxy crashing.
+    upstream_fallback_picks: Value = Value.init(0),
     /// Upgrade requests refused for want of a §5 tunnel (#180). Its own
     /// rung rather than a share of the other sheds: each of those says
     /// "widen this pool", and they name different pools. Counted before
@@ -1226,6 +1231,9 @@ pub const Labeled = struct {
     ejected_picks: []Value,
     panic_picks: []Value,
     standby_picks: []Value,
+    /// #417's out-of-set extension picks, per cluster: a picker is chosen
+    /// per cluster, so the cluster is the label that names whose bug it is.
+    fallback_picks: []Value,
     /// #392's sheds, per cluster: a cluster-wide cap names the cluster
     /// and nothing narrower.
     l7_shed_total_inflight: []Value,
@@ -1326,6 +1334,7 @@ pub const Labeled = struct {
         ejected_picks,
         panic_picks,
         standby_picks,
+        fallback_picks,
         l7_shed_total_inflight,
         l4_shed_total_inflight,
 
@@ -1336,6 +1345,7 @@ pub const Labeled = struct {
                 .ejected_picks => "cluster_upstream_ejected_picks",
                 .panic_picks => "cluster_upstream_panic_picks",
                 .standby_picks => "cluster_upstream_standby_picks",
+                .fallback_picks => "cluster_upstream_fallback_picks",
                 .l7_shed_total_inflight => "cluster_l7_shed_total_inflight",
                 .l4_shed_total_inflight => "cluster_l4_shed_total_inflight",
             };
@@ -1381,6 +1391,7 @@ pub const Labeled = struct {
         labeled.ejected_picks = try allocValues(arena, cluster_count);
         labeled.panic_picks = try allocValues(arena, cluster_count);
         labeled.standby_picks = try allocValues(arena, cluster_count);
+        labeled.fallback_picks = try allocValues(arena, cluster_count);
         labeled.l7_shed_total_inflight = try allocValues(arena, cluster_count);
         labeled.l4_shed_total_inflight = try allocValues(arena, cluster_count);
         // Holes stay empty — the one answer to "what did init leave
@@ -1993,6 +2004,7 @@ pub const Labeled = struct {
         assert(tableTotal(labeled.ejected_picks) == counters.get("upstream_ejected_picks"));
         assert(tableTotal(labeled.panic_picks) == counters.get("upstream_panic_picks"));
         assert(tableTotal(labeled.standby_picks) == counters.get("upstream_standby_picks"));
+        assert(tableTotal(labeled.fallback_picks) == counters.get("upstream_fallback_picks"));
         assert(tableTotal(labeled.l7_shed_total_inflight) == counters.get("l7_shed_total_inflight"));
         assert(tableTotal(labeled.l4_shed_total_inflight) == counters.get("l4_shed_total_inflight"));
         // #299's two families partition the same total, because both are
@@ -2399,17 +2411,17 @@ test "counters: labeled render speaks the exposition dialect" {
     try std.testing.expect(std.mem.indexOf(u8, with_observations, "zoxy_cluster_duration_seconds_count{cluster=\"api\"} 2\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_observations, "zoxy_cluster_duration_seconds_sum{cluster=\"api\"} 0.003030000\n") != null);
 
-    // One TYPE line per family: four endpoint counters, four cluster
-    // counters (the two inflight sheds and #390's two pick families),
-    // #299's status classes and histogram, the inflight gauge, and
-    // healthy (a checked cluster exists).
+    // One TYPE line per family: the five endpoint counters, the eight
+    // cluster counters (`ClusterFamily`), #299's status classes and
+    // histogram, the inflight gauge, and healthy (a checked cluster
+    // exists).
     var type_lines: usize = 0;
     var search: usize = 0;
     while (std.mem.indexOfPos(u8, text, search, "# TYPE ")) |at| {
         type_lines += 1;
         search = at + "# TYPE ".len;
     }
-    try std.testing.expectEqual(@as(usize, 16), type_lines);
+    try std.testing.expectEqual(@as(usize, 17), type_lines);
     try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE zoxy_cluster_upstream_panic_picks counter\n") != null);
 }
 
@@ -2429,7 +2441,7 @@ test "counters: labeled render bound is exact at the maximum values" {
         labeled.cluster_duration_sum_ns, labeled.cluster_duration_count,
         labeled.ejected_picks,           labeled.panic_picks,
         labeled.standby_picks,           labeled.l7_shed_total_inflight,
-        labeled.l4_shed_total_inflight,
+        labeled.l4_shed_total_inflight,  labeled.fallback_picks,
     }) |table| {
         for (table) |*value| value.set(std.math.maxInt(u64));
     }

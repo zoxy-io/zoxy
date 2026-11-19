@@ -49,7 +49,13 @@ const fixture_key_pem = @embedFile("tls/testdata/key.pem");
 /// The fixture certificate SAN a TLS client must offer.
 const fixture_host_name = "spike.zoxy.test";
 
-const ServerSim = Server(.{ .Io = SimIo });
+const extension = @import("extension.zig");
+const ScriptedPicker = @import("testing/picker.zig").ScriptedPicker;
+
+/// The beds' runtime lists one picker (#417), so a scenario can select an
+/// instance of it; every scenario that selects none runs the stock path.
+const runtime: extension.Runtime = .{ .Io = SimIo, .extensions = .{ .pickers = &.{ScriptedPicker} } };
+const ServerSim = Server(runtime);
 
 /// A scripted HTTP client: sends `request` (the adversary may split the
 /// send), then reads until the peer closes, recording the response bytes
@@ -1181,6 +1187,7 @@ const Http1Bed = struct {
             .h2_origin_streams = if (options.origin_h2) options.h2_origin_streams else 0,
             .upstream_tls_sessions = if (options.origin_https) options.upstream_tls_sessions else 0,
         });
+        try bed.server.bindExtensions(&.{ .arena = arena });
         try bed.loadTlsCredentials(arena, options.tls);
         try bed.server.start();
         bed.origin = .{
@@ -3428,7 +3435,7 @@ const ExpireBehindHeld = struct {
         return stream.armed.data_upstream_to_client;
     }
 
-    const H2Exchange = @import("http/h2/exchange.zig").Exchange(.{ .Io = SimIo });
+    const H2Exchange = @import("http/h2/exchange.zig").Exchange(runtime);
 };
 
 test "h2: a frame for an exchange its deadline condemned is dropped, not sent (#373)" {
@@ -9816,5 +9823,62 @@ test "l7: a redirect discarded for an oversize head counts the cap once" {
         @as(u64, 1),
         bed.server.counters.get("l7_keepalive_requests_capped"),
     );
+    try bed.expectDrained();
+}
+
+test "l7: an extension picker reads the request, and a retry asks it again without what it tried (#417)" {
+    // The refusing endpoint first, then the origin. The picker's slot 0
+    // sends the first dial to the refusal; the retry asks it again, and
+    // the endpoint it tried is already out of what it is offered.
+    var picker: ScriptedPicker = .{ .choice = .first };
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 417,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .refusing_endpoint_first = true,
+        .retries = 1,
+        .pick = .{ .extension = extension.select(runtime.extensions.pickers, &picker) },
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /tenants/7/reports?x=1 HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u32, 1), picker.binds);
+    try std.testing.expectEqual(@as(u32, 2), picker.calls);
+    // The second call is the retry's: endpoint 0 refused, so only the
+    // origin is left, and the view is the same canonical request.
+    try std.testing.expect(picker.retry);
+    try std.testing.expectEqualSlices(u16, &.{1}, picker.offered[0..picker.offered_count]);
+    try std.testing.expect(picker.had_request);
+    try std.testing.expectEqualStrings("/tenants/7/reports", picker.lastPath());
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_retried"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("upstream_fallback_picks"));
+    try bed.expectDrained();
+}
+
+test "h2: an HTTP/2 stream's request reaches its cluster's extension picker (#417)" {
+    var picker: ScriptedPicker = .{ .choice = .last };
+    var options = h2BedOptions(4171);
+    options.pick = .{ .extension = extension.select(runtime.extensions.pickers, &picker) };
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    var wire: H2Wire = .{};
+    wire.preface(&.{});
+    wire.get(1, "GET", "/streams/one");
+    try bed.exchange(wire.written());
+
+    var storage: [2]H2Answer = undefined;
+    const answers = try h2Answers(bed.client.response(), &storage);
+    try std.testing.expectEqual(@as(u16, 200), answers[0].status);
+    try std.testing.expectEqual(@as(u32, 1), picker.calls);
+    try std.testing.expect(picker.had_request);
+    try std.testing.expect(!picker.retry);
+    try std.testing.expectEqualStrings("/streams/one", picker.lastPath());
     try bed.expectDrained();
 }

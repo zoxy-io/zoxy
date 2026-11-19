@@ -40,7 +40,8 @@
 
 const std = @import("std");
 
-const Runtime = @import("../extension.zig").Runtime;
+const extension = @import("../extension.zig");
+const Runtime = extension.Runtime;
 const access_log = @import("../access_log.zig");
 const Balancer = @import("../balancer.zig").Balancer;
 const config_module = @import("../config.zig");
@@ -1162,7 +1163,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             stream.relay_buffer = server.acquireRelayBuffer() orelse {
                 return respond(server, stream, 503, "l7_shed_relay_buffers");
             };
-            beginUpstream(server, stream, request, &keys.views, render_scratch);
+            beginUpstream(server, stream, request, keys.host, &keys.views, render_scratch);
         }
 
         /// The request-derived half of this exchange's pick (#178): what
@@ -1289,14 +1290,17 @@ pub fn Proxy(comptime runtime: Runtime) type {
             server: *ServerType,
             stream: *StreamType,
             request_key: Balancer.RequestKey,
+            /// The request an extension picker reads (#417); null when the
+            /// cluster selected none, so no view was built for it.
+            request: ?*const extension.Request,
         ) ?Balancer.Pick {
-            const outcome = server.balancer.pick(
+            if (request != null) assert(clusterSelectsPicker(server, stream));
+            const outcome = server.pickEndpoint(
                 stream.cluster_index,
-                &server.endpointLoad(),
-                server.health.healthy,
                 clientAddressOf(stream),
                 request_key,
                 stream.l7.tried[0..stream.l7.tried_count],
+                request,
             );
             switch (outcome) {
                 .dial => |chosen| {
@@ -1332,7 +1336,68 @@ pub fn Proxy(comptime runtime: Runtime) type {
                     respond(server, stream, 503, "l7_shed_endpoint_inflight");
                     return null;
                 },
+                // `pickEndpoint` finishes every extension pick itself.
+                .extension => unreachable,
             }
+        }
+
+        /// Whether the routed cluster selected an extension picker (#417),
+        /// which reads the request a pick is for.
+        fn clusterSelectsPicker(server: *const ServerType, stream: *const StreamType) bool {
+            assert(stream.cluster_index < server.config.clusters.len);
+            const cluster = &server.config.clusters[stream.cluster_index];
+            assert(cluster.endpoints.len >= 1);
+            return cluster.pick == .extension;
+        }
+
+        /// The request as an extension reads it (#417): the parsed head and
+        /// the canonical keys routing computed. It aliases both, and the
+        /// render scratch for the certificate's hex, so it lives exactly as
+        /// long as the call it is built for.
+        fn requestView(
+            stream: *const StreamType,
+            request: *const parser.RequestHead,
+            host: ?[]const u8,
+            views: *const TargetViews,
+            scratch: *RenderScratch,
+        ) extension.Request {
+            assert(views.match.len >= 1);
+            assert(views.match[0] == '/');
+            return .{
+                .method = request.method,
+                .host = host,
+                .path = views.match,
+                .query = views.forward.query,
+                .headers = request.headers,
+                .client = clientAddressOf(stream),
+                .client_cert_sha256 = planClientCert(stream, &scratch.client_cert),
+                .listener_index = stream.conn.listener_index,
+                .cluster_index = stream.cluster_index,
+            };
+        }
+
+        /// A retry's or a replay's pick (#181, §7), from the head re-parsed
+        /// after the await. A cluster with an extension picker is handed
+        /// the request again (#417), its keys rebuilt from the same bytes
+        /// routing canonicalized — and the scratch they live in goes back
+        /// before the dial, which may render into it.
+        fn pickAgain(
+            server: *ServerType,
+            stream: *StreamType,
+            request: *const parser.RequestHead,
+            request_key: Balancer.RequestKey,
+        ) ?Balancer.Pick {
+            assert(stream.phase == .dialing or stream.phase == .exchanging);
+            assert(request.head_len == stream.l7.request_head_len);
+            if (!clusterSelectsPicker(server, stream)) {
+                return pickEndpointOrShed(server, stream, request_key, null);
+            }
+            const scratch = server.borrowRenderScratch();
+            defer server.returnRenderScratch();
+            // The same bytes canonicalized at routing, so this cannot fail.
+            const keys = requestKeys(request, server.target_scratch, &scratch.route_host) catch unreachable;
+            const view = requestView(stream, request, keys.host, &keys.views, scratch);
+            return pickEndpointOrShed(server, stream, request_key, &view);
         }
 
         /// Route resolved and a relay buffer held: choose an endpoint and
@@ -1345,6 +1410,9 @@ pub fn Proxy(comptime runtime: Runtime) type {
             server: *ServerType,
             stream: *StreamType,
             request: *const parser.RequestHead,
+            /// The canonical host routing matched, for an extension
+            /// picker's view of the request (#417).
+            host: ?[]const u8,
             views: *const TargetViews,
             /// The caller's render scratches, carried through to the reuse
             /// path's render (see `RenderScratch`). The dial path re-parses
@@ -1370,7 +1438,12 @@ pub fn Proxy(comptime runtime: Runtime) type {
                 .endpoint => |identity| identity,
                 else => null,
             };
-            const pick = pickEndpointOrShed(server, stream, request_key) orelse return;
+            var view: extension.Request = undefined;
+            const picker_request: ?*const extension.Request = if (clusterSelectsPicker(server, stream)) blk: {
+                view = requestView(stream, request, host, views, scratch);
+                break :blk &view;
+            } else null;
+            const pick = pickEndpointOrShed(server, stream, request_key, picker_request) orelse return;
             // An h2c cluster's exchanges share connections as streams (§7):
             // there is no socket to check out or dial, only a connection to
             // join — so the render follows at once, as on the reuse path.
@@ -1786,7 +1859,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             // because `sticky_cookie` records what the *client* asked for
             // and that has not changed.
             const request_key = requestKeyFor(server, stream, &request);
-            const pick = pickEndpointOrShed(server, stream, request_key) orelse return;
+            const pick = pickAgain(server, stream, &request, request_key) orelse return;
             assert(pick.endpoint_index != stream.l7.tried[stream.l7.tried_count - 1]);
             stream.l7.retries_used += 1;
             server.counters.increment("upstream_retried");
@@ -4224,7 +4297,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
                 .endpoint => |identity| identity,
                 else => null,
             };
-            const pick = pickEndpointOrShed(server, stream, request_key) orelse return;
+            const pick = pickAgain(server, stream, &request, request_key) orelse return;
             dialUpstream(server, stream, pick, .fresh);
         }
 

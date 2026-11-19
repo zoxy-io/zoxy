@@ -90,6 +90,9 @@ pub const testing = struct {
     pub const Mode = @import("testing/origin.zig").Mode;
     /// Comptime byte repetition, for the simulator's canned wire bytes.
     pub const repeat = @import("testing/bytes.zig").repeat;
+    /// A picker that records what it was offered and answers a scripted
+    /// slot (#417): the gates' way through the extension seam.
+    pub const ScriptedPicker = @import("testing/picker.zig").ScriptedPicker;
 };
 
 test {
@@ -137,6 +140,7 @@ test {
     _ = @import("net/upstream.zig");
     _ = @import("testing/origin.zig");
     _ = @import("testing/bytes.zig");
+    _ = @import("testing/picker.zig");
     _ = @import("net/pump_transform_test.zig");
     _ = @import("io/contract_test.zig");
     _ = @import("io/sim_io_test.zig");

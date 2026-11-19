@@ -12,7 +12,8 @@
 
 const std = @import("std");
 
-const Runtime = @import("extension.zig").Runtime;
+const extension = @import("extension.zig");
+const Runtime = extension.Runtime;
 const access_log_module = @import("access_log.zig");
 const admin_module = @import("admin.zig");
 const Balancer = @import("balancer.zig").Balancer;
@@ -52,6 +53,7 @@ const assert = std.debug.assert;
 pub fn Server(comptime runtime: Runtime) type {
     const IoType = runtime.Io;
     Io.assertIoInterface(IoType);
+    comptime extension.assertExtensions(runtime.extensions);
 
     return struct {
         io: *IoType,
@@ -202,6 +204,12 @@ pub fn Server(comptime runtime: Runtime) type {
         /// dial. Owns its own per-cluster state so the serving path never
         /// hardcodes how an endpoint is chosen (§7).
         balancer: Balancer,
+        /// #417: whether the config selects any extension instance, read
+        /// once at `init`; `start` refuses to serve one never bound.
+        selects_extensions: bool,
+        /// Set by `bindExtensions`, the startup step that hands each
+        /// selected instance the cluster it serves before its first pick.
+        extensions_bound: bool,
         counters: counters_module.Counters,
         /// The #179 labeled breakdown beside the process totals: which
         /// backend, per cluster and endpoint. Tables sized by the loaded
@@ -465,6 +473,9 @@ pub fn Server(comptime runtime: Runtime) type {
 
         const ListenerState = struct {
             server: *Self,
+            /// This listener's index in the config, which an extension
+            /// reads to tell its listeners apart (#417).
+            listener_index: u16,
             listener: IoType.Listener,
             accept_completion: IoType.Completion,
             /// Backoff timer for kernel-pressure accept failures; never
@@ -715,6 +726,8 @@ pub fn Server(comptime runtime: Runtime) type {
             // one the Io seam had not been asked for.
             server.tls_tickets.init();
             try server.balancer.init(arena, config, keys);
+            server.selects_extensions = selectsExtensions(config);
+            server.extensions_bound = false;
             try server.initMetrics(arena, config, keys);
             server.resetRuntimeState(&options);
             try server.admin.init(server, config.admin_bind, arena);
@@ -1652,12 +1665,17 @@ pub fn Server(comptime runtime: Runtime) type {
         pub fn start(server: *Self) Io.ListenError!void {
             assert(!server.draining);
             assert(server.listeners_count >= 1);
+            // An extension instance is handed its cluster before it is
+            // asked to pick there (#417): a start that skipped the step
+            // would call a picker that was never told where it serves.
+            if (server.selects_extensions) assert(server.extensions_bound);
             server.installTicketKey();
             for (server.config.listeners, 0..) |listener_config, index| {
                 const state = &server.listeners[index];
                 const offer: []const []const u8 = if (listener_config.tls) |tls| tls.alpn else &.{};
                 state.* = .{
                     .server = server,
+                    .listener_index = @intCast(index),
                     .listener = try server.io.listen(
                         &listener_config.bind_address,
                         listener_config.bind_mode,
@@ -2689,6 +2707,7 @@ pub fn Server(comptime runtime: Runtime) type {
             // decides whether it reads them — an l4 listener resolves to
             // exactly one catch-all route and no filters, so this is one
             // rule rather than a third fork.
+            conn.listener_index = listener.listener_index;
             conn.routes = listener.routes;
             conn.sni_routes = listener.sni_routes;
             conn.request_filters = listener.request_filters;
@@ -4019,10 +4038,8 @@ pub fn Server(comptime runtime: Runtime) type {
 
         fn armConnect(server: *Self, conn: *ConnType, cluster_index: u16) void {
             assert(conn.state == .connecting);
-            const pick = server.balancer.pick(
+            const pick = server.pickEndpoint(
                 cluster_index,
-                &server.endpointLoad(),
-                server.health.healthy,
                 if (conn.client_address) |*address| address else null,
                 // L4 parses no head, so there is nothing request-derived
                 // to key on — and the loader keeps request-keyed clusters
@@ -4033,6 +4050,8 @@ pub fn Server(comptime runtime: Runtime) type {
                 // dial produced, so there is nothing tried to exclude
                 // (#181): a failed L4 dial has no request to re-send.
                 &.{},
+                // Nor any request for an extension picker to read.
+                null,
             );
             const dial = switch (pick) {
                 .dial => |chosen| blk: {
@@ -4042,6 +4061,8 @@ pub fn Server(comptime runtime: Runtime) type {
                 // Unreachable with nothing tried: only a retry can run
                 // the routable set empty.
                 .exhausted => unreachable,
+                // `pickEndpoint` finishes every extension pick itself.
+                .extension => unreachable,
                 .cluster_capped => {
                     // #392's cap, answered the way L4 answers every cap:
                     // a close, before anything was armed for a dial.
@@ -4427,6 +4448,125 @@ pub fn Server(comptime runtime: Runtime) type {
         ) ?[]const u8 {
             const engine = conn.tls orelse return null;
             return engine.clientFingerprintHex(out);
+        }
+
+        /// The pick both data paths make (§7). The balancer narrows the
+        /// cluster's endpoints by every rule it owns; a cluster that selected
+        /// an extension picker (#417) then has that picker choose among what
+        /// is left. Never returns `.extension`: that outcome ends here.
+        pub fn pickEndpoint(
+            server: *Self,
+            cluster_index: u16,
+            client: ?*const std.Io.net.IpAddress,
+            request_key: Balancer.RequestKey,
+            tried: []const u16,
+            request: ?*const extension.Request,
+        ) Balancer.Outcome {
+            const load = server.endpointLoad();
+            const outcome = server.balancer.pick(cluster_index, &load, server.health.healthy, client, request_key, tried);
+            const choice = switch (outcome) {
+                .extension => |choice| choice,
+                .dial, .capped, .exhausted, .cluster_capped => return outcome,
+            };
+            assert(server.extensions_bound);
+            const candidates = server.balancer.extensionCandidates(cluster_index, choice, &load);
+            const input: extension.PickInput = .{
+                .cluster_index = cluster_index,
+                .client = client,
+                .request = request,
+                .retry = tried.len >= 1,
+                .panicked = choice.panicked,
+                .now_ns = load.now_ns,
+                .entropy = server.balancer.drawEntropy(),
+            };
+            const selection = server.config.clusters[cluster_index].pick.extension;
+            const slot = callPicker(selection, &candidates, &input);
+            const finished = server.balancer.finishExtension(cluster_index, choice, slot, &load, server.health.healthy);
+            assert(finished.pick.endpoint_index < server.config.clusters[cluster_index].endpoints.len);
+            if (!finished.fell_back) assert(slot < choice.count);
+            if (finished.fell_back) {
+                server.counters.increment("upstream_fallback_picks");
+                server.labeled.incrementCluster(.fallback_picks, cluster_index);
+            }
+            return .{ .dial = finished.pick };
+        }
+
+        /// The selected picker's `pick`, by the comptime list: a switch the
+        /// compiler unrolls, never a function pointer, and nothing at all
+        /// in a build that lists no pickers.
+        fn callPicker(
+            selection: extension.Selection,
+            candidates: *const extension.Candidates,
+            input: *const extension.PickInput,
+        ) u16 {
+            assert(selection.index < runtime.extensions.pickers.len);
+            assert(candidates.count() >= 1);
+            inline for (runtime.extensions.pickers, 0..) |Picker, index| {
+                if (selection.index == index) {
+                    const picker: *Picker = @ptrCast(@alignCast(selection.instance));
+                    return Picker.pick(picker, candidates, input);
+                }
+            }
+            unreachable;
+        }
+
+        /// Whether `config` selects any extension (#417), checking every
+        /// selection against the build's list on the way: `select` proves
+        /// the index at compile time, but a hand-built config can write one.
+        fn selectsExtensions(config: *const config_module.Config) bool {
+            assert(config.clusters.len >= 1);
+            var selects = false;
+            for (config.clusters) |*cluster| {
+                switch (cluster.pick) {
+                    .extension => |selection| {
+                        assert(selection.index < runtime.extensions.pickers.len);
+                        selects = true;
+                    },
+                    .rr, .p2c, .hash => {},
+                }
+            }
+            if (runtime.extensions.pickers.len == 0) assert(!selects);
+            return selects;
+        }
+
+        /// Hand every selected extension instance the cluster it serves
+        /// (#417), once, before `start`. An instance's `bind` may take what
+        /// it needs from the startup arena, and may refuse; a refusal stops
+        /// the start with the instance's own error, which is why the set is
+        /// `anyerror` — it is the extension author's, not this proxy's.
+        pub fn bindExtensions(server: *Self, startup: *const extension.Startup) anyerror!void {
+            assert(!server.extensions_bound);
+            assert(server.config.clusters.len >= 1);
+            for (server.config.clusters, 0..) |*cluster, index| {
+                const selection = switch (cluster.pick) {
+                    .extension => |selection| selection,
+                    .rr, .p2c, .hash => continue,
+                };
+                const site: extension.ClusterSite = .{
+                    .index = @intCast(index),
+                    .name = cluster.name,
+                    .endpoints = cluster.endpoints,
+                };
+                try bindPicker(selection, &site, startup);
+            }
+            server.extensions_bound = true;
+        }
+
+        fn bindPicker(
+            selection: extension.Selection,
+            site: *const extension.ClusterSite,
+            startup: *const extension.Startup,
+        ) anyerror!void {
+            assert(selection.index < runtime.extensions.pickers.len);
+            assert(site.endpoints.len >= 1);
+            inline for (runtime.extensions.pickers, 0..) |Picker, index| {
+                if (selection.index == index) {
+                    if (comptime !@hasDecl(Picker, "bind")) return;
+                    const picker: *Picker = @ptrCast(@alignCast(selection.instance));
+                    return Picker.bind(picker, site, startup);
+                }
+            }
+            unreachable;
         }
 
         /// Count what a pick did beyond dialing (#390): it chose an
