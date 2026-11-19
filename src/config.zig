@@ -1195,8 +1195,9 @@ pub fn parseWithFiles(
     // Before the limits, because the named headers widen the line the
     // staging buffer has to be able to hold (#140).
     const log_headers = try resolveLogHeaders(arena, parsed.access_log);
+    const limits_requested = limitsOf(&parsed.limits);
     const limits = try resolveLimits(
-        &parsed.limits,
+        &limits_requested,
         @intCast(parsed.listeners.len),
         features,
         access_log_sink != null,
@@ -1645,23 +1646,23 @@ const FeaturePools = struct {
 /// makes each feature free — and each is bounded by the conn slots above
 /// or a ceiling of its own.
 fn resolveFeaturePools(
-    limits_json: *const LimitsJson,
+    requested: *const Options.Limits,
     conn_slots: u32,
     features: ListenerFeatures,
 ) ValidationError!FeaturePools {
     const tls_engines = try resolveTlsEngines(
-        limits_json.tls_engines,
+        requested.tls_engines,
         conn_slots,
         features.tls,
     );
     const tunnels = try resolveTunnels(
-        limits_json.tunnels,
+        requested.tunnels,
         conn_slots,
         features.upgrades,
     );
-    const stream_slots = try resolveStreamSlots(limits_json.h2_streams, features.http2);
+    const stream_slots = try resolveStreamSlots(requested.h2_streams, features.http2);
     const h2_connections = try resolveH2Connections(
-        limits_json.h2_connections,
+        requested.h2_connections,
         conn_slots,
         features.http2,
     );
@@ -1718,18 +1719,18 @@ fn resolveH2Connections(
 /// are gated on the same `http_listeners_count` and each is bounded by a
 /// different slot count above.
 fn resolveHeadPools(
-    limits_json: *const LimitsJson,
+    requested: *const Options.Limits,
     conn_slots: u32,
     upstream_slots: u32,
     http_listeners_count: u32,
 ) ValidationError!struct { head_buffers: u32, upstream_head_buffers: u32 } {
     const head_buffers = try resolveHeadBuffers(
-        limits_json.head_buffers,
+        requested.head_buffers,
         conn_slots,
         http_listeners_count,
     );
     const upstream_head_buffers = try resolveUpstreamHeadBuffers(
-        limits_json.upstream_head_buffers,
+        requested.upstream_head_buffers,
         upstream_slots,
         http_listeners_count,
     );
@@ -1787,7 +1788,7 @@ fn rejectRelayBufferShape(features: ListenerFeatures, relay_buffer_bytes: u32) V
 /// beyond the slot count could never be acquired); a *specified* count
 /// above them is a contradiction and fails loudly.
 fn resolveLimits(
-    limits_json: *const LimitsJson,
+    requested: *const Options.Limits,
     listeners_count: u32,
     features: ListenerFeatures,
     access_log_on: bool,
@@ -1800,23 +1801,23 @@ fn resolveLimits(
     assert(health_probes <= constants.health_probe_concurrency_max);
     // Bounds are `countListenerFeatures`'s postcondition, not re-checked
     // here — restating them would be two places to keep in step.
-    const slots = try resolveSlotCounts(limits_json);
+    const slots = try resolveSlotCounts(requested);
     const conn_slots = slots.conn_slots;
     const relay_buffers = slots.relay_buffers;
     const upstream_slots = slots.upstream_slots;
     const head_pools = try resolveHeadPools(
-        limits_json,
+        requested,
         conn_slots,
         upstream_slots,
         features.http,
     );
-    const head_buffer_bytes = try resolveHeadBufferBytes(limits_json.head_buffer_bytes);
-    const relay_buffer_bytes = try resolveRelayBufferBytes(limits_json.relay_buffer_bytes);
+    const head_buffer_bytes = try resolveHeadBufferBytes(requested.head_buffer_bytes);
+    const relay_buffer_bytes = try resolveRelayBufferBytes(requested.relay_buffer_bytes);
     try rejectRelayBufferShape(features, relay_buffer_bytes);
-    const feature_pools = try resolveFeaturePools(limits_json, conn_slots, features);
-    const origin_pools = try resolveOriginLimits(limits_json, upstream_slots, feature_pools.tls_engines, origins);
+    const feature_pools = try resolveFeaturePools(requested, conn_slots, features);
+    const origin_pools = try resolveOriginLimits(requested, upstream_slots, feature_pools.tls_engines, origins);
     const cq_fill_eighths = try resolveCqFill(
-        limits_json.cq_fill_eighths,
+        requested.cq_fill_eighths,
         conn_slots,
         feature_pools.stream_slots,
         listeners_count,
@@ -1829,7 +1830,7 @@ fn resolveLimits(
     // for something contradictory, and is told so rather than quietly
     // getting no log.
     const access_log_buffer_bytes = try resolveAccessLogBuffer(
-        limits_json.access_log_buffer_bytes,
+        requested.access_log_buffer_bytes,
         access_log_on,
         log_header_count,
     );
@@ -1854,6 +1855,25 @@ fn resolveLimits(
     };
 }
 
+/// The JSON front-end's limits (#417): the same nullable members, copied
+/// across. Absence already means "zoxy's rule" on both sides, so there is
+/// no stock value to apply here — the rule lives in the resolvers below,
+/// where options written in code meet it too.
+fn limitsOf(limits_json: *const LimitsJson) Options.Limits {
+    // One vocabulary in two places. The count pins the two name sets
+    // equal (the loop below fails to compile on a JSON member the options
+    // lack, and the count catches the reverse), and the type check keeps
+    // a member from quietly widening on one side only.
+    comptime assert(@typeInfo(LimitsJson).@"struct".field_names.len ==
+        @typeInfo(Options.Limits).@"struct".field_names.len);
+    var limits: Options.Limits = .{};
+    inline for (@typeInfo(LimitsJson).@"struct".field_names) |name| {
+        comptime assert(@FieldType(LimitsJson, name) == @FieldType(Options.Limits, name));
+        @field(limits, name) = @field(limits_json, name);
+    }
+    return limits;
+}
+
 /// The three pool counts that bound the others (§5). Their own group
 /// because they are the only limits resolved against nothing but the
 /// compiled ceilings and each other — everything after them is gated on
@@ -1864,16 +1884,16 @@ const SlotCounts = struct {
     upstream_slots: u32,
 };
 
-/// Omitted limits default to the lean out-of-box sizes, not the compiled
+/// Unstated limits take the lean out-of-box sizes, not the compiled
 /// ceilings (§5): a small footprint unless the operator opts up. Relay
-/// buffers still follow conn slots when omitted (one buffer per L4
+/// buffers still follow conn slots when unstated (one buffer per L4
 /// connection), capped at their own ceiling.
-fn resolveSlotCounts(limits_json: *const LimitsJson) ValidationError!SlotCounts {
-    const conn_slots = limits_json.conn_slots orelse constants.conn_slots_default;
+fn resolveSlotCounts(requested: *const Options.Limits) ValidationError!SlotCounts {
+    const conn_slots = requested.conn_slots orelse constants.conn_slots_default;
     if (conn_slots < 1 or conn_slots > constants.conn_slots_max) {
         return error.LimitConnSlotsOutOfRange;
     }
-    const relay_buffers = limits_json.relay_buffers orelse
+    const relay_buffers = requested.relay_buffers orelse
         @min(constants.relay_buffers_max, conn_slots);
     if (relay_buffers < 1 or relay_buffers > constants.relay_buffers_max) {
         return error.LimitRelayBuffersOutOfRange;
@@ -1881,7 +1901,7 @@ fn resolveSlotCounts(limits_json: *const LimitsJson) ValidationError!SlotCounts 
     if (relay_buffers > conn_slots) {
         return error.LimitRelayBuffersOverConnSlots;
     }
-    const upstream_slots = limits_json.upstream_slots orelse constants.upstream_slots_default;
+    const upstream_slots = requested.upstream_slots orelse constants.upstream_slots_default;
     if (upstream_slots < 1 or upstream_slots > constants.upstream_slots_max) {
         return error.LimitUpstreamSlotsOutOfRange;
     }
@@ -1899,22 +1919,22 @@ fn resolveSlotCounts(limits_json: *const LimitsJson) ValidationError!SlotCounts 
 /// streams that may hold an answer at once — one per upstream slot unless
 /// sized, and never more, since every one of those exchanges holds a slot.
 fn resolveOriginPools(
-    limits_json: *const LimitsJson,
+    requested: *const Options.Limits,
     upstream_slots: u32,
     h2c_endpoints: u32,
 ) ValidationError!struct { connections: u32, streams: u32 } {
     assert(upstream_slots >= 1);
     if (h2c_endpoints == 0) {
-        if (limits_json.upstream_h2_connections != null) return error.LimitUpstreamH2ConnectionsWithoutHttp2;
-        if (limits_json.upstream_h2_streams != null) return error.LimitUpstreamH2StreamsWithoutHttp2;
+        if (requested.upstream_h2_connections != null) return error.LimitUpstreamH2ConnectionsWithoutHttp2;
+        if (requested.upstream_h2_streams != null) return error.LimitUpstreamH2StreamsWithoutHttp2;
         return .{ .connections = 0, .streams = 0 };
     }
-    const connections = limits_json.upstream_h2_connections orelse
+    const connections = requested.upstream_h2_connections orelse
         @min(2 * @as(u64, h2c_endpoints), constants.h2_origin_connections_max);
     if (connections < 1 or connections > constants.h2_origin_connections_max) {
         return error.LimitUpstreamH2ConnectionsOutOfRange;
     }
-    const streams = limits_json.upstream_h2_streams orelse upstream_slots;
+    const streams = requested.upstream_h2_streams orelse upstream_slots;
     if (streams < 1 or streams > constants.upstream_slots_max) return error.LimitUpstreamH2StreamsOutOfRange;
     if (streams > upstream_slots) return error.LimitUpstreamH2StreamsOverUpstreamSlots;
     assert(streams <= upstream_slots);
@@ -1945,15 +1965,15 @@ const OriginDemand = struct {
 /// connections and streams, and the HTTPS sessions sized into the heap
 /// room they and the listeners' engines leave.
 fn resolveOriginLimits(
-    limits_json: *const LimitsJson,
+    requested: *const Options.Limits,
     upstream_slots: u32,
     tls_engines: u32,
     origins: OriginDemand,
 ) ValidationError!struct { connections: u32, streams: u32, upstream_tls_sessions: u32 } {
-    const pools = try resolveOriginPools(limits_json, upstream_slots, origins.h2c_endpoints);
+    const pools = try resolveOriginPools(requested, upstream_slots, origins.h2c_endpoints);
     const h2_tls_connections = if (origins.h2_origin_tls) pools.connections else 0;
     const sessions = try resolveTlsSessions(
-        limits_json,
+        requested,
         upstream_slots,
         tls_engines,
         h2_tls_connections,
@@ -1967,7 +1987,7 @@ fn resolveOriginLimits(
 /// listeners' engines and the `h2` origins' connections must fit, and the
 /// HTTPS origins' sessions are sized into what is left. Answers those.
 fn resolveTlsSessions(
-    limits_json: *const LimitsJson,
+    requested: *const Options.Limits,
     upstream_slots: u32,
     tls_engines: u32,
     h2_tls_connections: u32,
@@ -1976,7 +1996,7 @@ fn resolveTlsSessions(
     try rejectTlsSessionsOverHeap(tls_engines, h2_tls_connections);
     assert(tls_engines + h2_tls_connections <= constants.tls_engines_max);
     const heap_room = constants.tls_engines_max - tls_engines - h2_tls_connections;
-    return resolveUpstreamTls(limits_json, upstream_slots, upstream_tls_endpoints, heap_room);
+    return resolveUpstreamTls(requested, upstream_slots, upstream_tls_endpoints, heap_room);
 }
 
 /// The TLS sessions HTTPS origins draw on (#296): one per upstream
@@ -1985,7 +2005,7 @@ fn resolveTlsSessions(
 /// listeners' engines and the `h2` origins' connections (`heap_room`).
 /// Zero exactly when no such cluster exists.
 fn resolveUpstreamTls(
-    limits_json: *const LimitsJson,
+    requested: *const Options.Limits,
     upstream_slots: u32,
     tls_endpoints: u32,
     heap_room: u32,
@@ -1993,7 +2013,7 @@ fn resolveUpstreamTls(
     assert(upstream_slots >= 1);
     assert(heap_room <= constants.tls_engines_max);
     if (tls_endpoints == 0) {
-        if (limits_json.upstream_tls_sessions != null) return error.LimitUpstreamTlsSessionsWithoutTls;
+        if (requested.upstream_tls_sessions != null) return error.LimitUpstreamTlsSessionsWithoutTls;
         return 0;
     }
     if (heap_room == 0) return error.LimitUpstreamTlsOverEngines;
@@ -2002,7 +2022,7 @@ fn resolveUpstreamTls(
         upstream_slots,
         heap_room,
     );
-    const sessions = limits_json.upstream_tls_sessions orelse default;
+    const sessions = requested.upstream_tls_sessions orelse default;
     if (sessions < 1 or sessions > constants.upstream_tls_sessions_max) {
         return error.LimitUpstreamTlsSessionsOutOfRange;
     }
