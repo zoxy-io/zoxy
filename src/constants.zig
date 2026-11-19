@@ -142,6 +142,13 @@ comptime {
 
 pub const proxy_header_bytes_max: u32 = 512;
 
+/// The longest PROXY header this proxy *sends* (#142 send): the spec's
+/// own bound on a v1 line, which the worst one either writer emits (104
+/// bytes, v1 TCP6) sits under. The derivation lives beside the writers in
+/// `net/proxy_protocol.zig`, which aliases this; the number lives here
+/// because the SNI peek below is sized against it.
+pub const proxy_header_send_bytes_max: u32 = 107;
+
 /// The most of a client's opening bytes an `l4` listener with SNI routes
 /// will stage to find a ClientHello (#298). The record layer's own
 /// ceiling rather than a number chosen against today's clients: a TLS
@@ -150,13 +157,12 @@ pub const proxy_header_bytes_max: u32 = 512;
 /// post-quantum key shares are offered, well inside it.
 ///
 /// Staged in the relay buffer's client->upstream half, which is why the
-/// loader will refuse SNI routes on a listener whose `relay_buffer_bytes`
-/// cannot hold one — §5's rule that a shape which cannot serve is a
-/// config error, not a runtime surprise. That check arrives with the
-/// config surface; today nothing reads SNI routes yet. A maximal record
-/// is five bytes larger (the header sits outside the fragment length),
-/// which no ClientHello approaches and which a peer could only reach by
-/// padding one deliberately.
+/// loader refuses SNI routes beside a `relay_buffer_bytes` that cannot
+/// hold one (`LimitRelayBufferUnderSniRouting`) — §5's rule that a shape
+/// which cannot serve is a config error, not a runtime surprise. A
+/// maximal record is five bytes larger (the header sits outside the
+/// fragment length), which no ClientHello approaches and which a peer
+/// could only reach by padding one deliberately.
 ///
 /// The number comes from the record layer, not from the relay buffer.
 /// This aliased `relay_buffer_bytes_max` while the two were equal and the
@@ -165,6 +171,20 @@ pub const proxy_header_bytes_max: u32 = 512;
 /// relay ceiling must not widen this — it would only raise how much a
 /// peer may make an `l4` listener stage before the peek gives up.
 pub const client_hello_bytes_max: u32 = tls_record_plaintext_bytes_max;
+
+/// How much of an `l4` client's opening the §6 SNI peek stages (#298):
+/// a hello's worth, less the room a sending cluster's PROXY header takes
+/// in front of it (#142 send). The two share the relay buffer's
+/// client->upstream half, and the peek runs before the cluster — so
+/// before whether a header is owed — is known, so the room is kept on
+/// every SNI listener. The loader floors that half at
+/// `client_hello_bytes_max`; a peek allowed the whole floor would leave a
+/// sent header nowhere to go.
+///
+/// A hello still incomplete at this edge is refused as `l4_sni_invalid`.
+/// That is 107 bytes short of the record layer's ceiling, a size no
+/// client reaches without padding its hello on purpose.
+pub const sni_peek_bytes_max: u32 = client_hello_bytes_max - proxy_header_send_bytes_max;
 
 /// §8 "watermarks before walls": each pool flips a pressure flag before
 /// it hits the wall so the proxy sheds *idle* capacity before it must
@@ -1607,6 +1627,14 @@ comptime {
     assert(proxy_header_bytes_max <= relay_buffer_bytes_min);
     assert(proxy_header_bytes_max >= 16 + 216);
     assert(proxy_header_bytes_max >= 107);
+    // A sent header is one a chained zoxy must accept on receive.
+    assert(proxy_header_send_bytes_max <= proxy_header_bytes_max);
+    // The SNI peek and a sent header share the half the loader floors at
+    // `client_hello_bytes_max`; the stage site asserts this at runtime.
+    assert(sni_peek_bytes_max + proxy_header_send_bytes_max <= client_hello_bytes_max);
+    // And the peek still holds any hello a client sends unpadded:
+    // post-quantum key shares put a modern one at 2-3 KiB.
+    assert(sni_peek_bytes_max >= 8 * 1024);
     assert(clusters_min >= 1);
     // The §8 cap ceiling is the largest load one endpoint can carry: one
     // L7 lease per upstream slot plus one L4 charge per conn slot, since

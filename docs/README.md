@@ -274,6 +274,11 @@ reassembling one would mean buffering inside a parser that reads
 attacker-controlled bytes. Such a connection is counted in
 `zoxy_l4_sni_invalid` and closed.
 
+The proxy reads at most 16,277 bytes of the hello: 16 KiB less room for
+the PROXY header a cluster with `"proxy_protocol": {"send": ...}` puts in
+front of it. Real hellos are 2–3 KiB, so only one padded on purpose runs
+longer; it is counted in `zoxy_l4_sni_invalid` and closed too.
+
 #### Terminating TLS
 
 Add a `tls` block and the listener speaks TLS 1.3 instead of plaintext. Its

@@ -114,6 +114,10 @@ pub fn Origin(comptime IoType: type) type {
             /// What the header announced (null: LOCAL/UNKNOWN), for the
             /// harness's identity oracles.
             announced: ?std.Io.net.IpAddress = null,
+            /// Every byte this connection received, whatever its mode did
+            /// with them: the oracle for a `mute` origin, which judges
+            /// nothing it reads and so has no other record of what came.
+            received_bytes: u32 = 0,
 
             fn armRecv(conn: *Conn) void {
                 // While a header is owed, bytes land in its accumulator —
@@ -142,6 +146,7 @@ pub fn Origin(comptime IoType: type) type {
                     return;
                 };
                 assert(received >= 1);
+                conn.received_bytes += received;
                 switch (conn.mode) {
                     .echo => {
                         if (conn.origin.expect_proxy_header and !conn.header_done) {

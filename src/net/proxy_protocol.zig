@@ -376,8 +376,9 @@ fn v2Address(family: u8, protocol: u8, block: []const u8) ?std.Io.net.IpAddress 
 /// "PROXY TCP6 " + two uncompressed 39-char addresses + two 5-digit
 /// ports + separators + CRLF = 104 bytes (v2 tops out at 52). Bounded by
 /// the spec's own 107, and asserted under the receive cap so a chained
-/// zoxy always accepts what another zoxy sends.
-pub const send_bytes_max: u32 = 107;
+/// zoxy always accepts what another zoxy sends. The number is
+/// `constants`', because the SNI peek's window is sized against it.
+pub const send_bytes_max: u32 = constants.proxy_header_send_bytes_max;
 
 comptime {
     assert(send_bytes_max <= constants.proxy_header_bytes_max);
@@ -386,6 +387,11 @@ comptime {
     // they stage in, together, or the memmove there would clobber.
     assert(send_bytes_max + constants.proxy_header_bytes_max <=
         constants.relay_buffer_bytes_min);
+    // The other receive phase that frames payload ahead of it, the §6
+    // SNI peek, stops short of the floor an SNI listener's half has by
+    // exactly a sent header.
+    assert(send_bytes_max + constants.sni_peek_bytes_max <=
+        constants.client_hello_bytes_max);
     // "PROXY TCP6 " + 39 + " " + 39 + " 65535 65535\r\n".
     assert(11 + 39 + 1 + 39 + 14 == 104);
     assert(104 <= send_bytes_max);
