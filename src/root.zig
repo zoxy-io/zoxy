@@ -111,6 +111,15 @@ pub const testing = struct {
     /// A request policy that refuses one path prefix and records what it
     /// evaluated (#417).
     pub const ScriptedPolicy = @import("testing/policy.zig").ScriptedPolicy;
+    /// A build's own test bed (#417): its options resolved, a server over
+    /// the simulator with its extensions, origins on every endpoint, and
+    /// HTTP clients to drive — the serving path zoxy's own gates run.
+    pub const Bed = @import("testing/bed.zig").Bed;
+    /// The §9 zero-allocation gate, over a build's own scenario on a
+    /// `Bed`.
+    pub const expectNoAllocationAfterStartup = @import("testing/bed.zig").expectNoAllocationAfterStartup;
+    /// The simulator a `Bed` runs on, for a test that drives it further.
+    pub const SimIo = @import("io/SimIo.zig");
 };
 
 test {
@@ -161,6 +170,7 @@ test {
     _ = @import("testing/bytes.zig");
     _ = @import("testing/picker.zig");
     _ = @import("testing/policy.zig");
+    _ = @import("testing/bed.zig");
     _ = @import("net/pump_transform_test.zig");
     _ = @import("io/contract_test.zig");
     _ = @import("io/sim_io_test.zig");
