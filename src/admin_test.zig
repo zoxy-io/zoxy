@@ -24,7 +24,7 @@ const SimIo = @import("io/SimIo.zig");
 const assert = std.debug.assert;
 const testing = std.testing;
 
-const ServerSim = Server(SimIo);
+const ServerSim = Server(.{ .Io = SimIo });
 
 const request = "GET /metrics HTTP/1.1\r\nHost: admin\r\n\r\n";
 

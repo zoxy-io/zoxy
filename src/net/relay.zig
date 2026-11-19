@@ -13,6 +13,7 @@
 
 const std = @import("std");
 
+const Runtime = @import("../extension.zig").Runtime;
 const constants = @import("../constants.zig");
 const conn_module = @import("Conn.zig");
 const stream_module = @import("Stream.zig");
@@ -43,9 +44,10 @@ pub const RelayBuffer = struct {
 /// propagates as a FIN to the other side (half-close honored); the
 /// connection tears down when both directions have finished, on any
 /// error, or when the deadline fires.
-pub fn Relay(comptime IoType: type) type {
-    const ServerType = @import("../Server.zig").Server(IoType);
-    const ConnType = conn_module.Conn(IoType);
+pub fn Relay(comptime runtime: Runtime) type {
+    const IoType = runtime.Io;
+    const ServerType = @import("../Server.zig").Server(runtime);
+    const ConnType = conn_module.Conn(runtime);
     const StreamType = ConnType.StreamType;
     const Direction = StreamType.Direction;
 
@@ -366,8 +368,8 @@ pub fn Relay(comptime IoType: type) type {
             }
         };
 
-        const PumpClientToUpstream = pump.Pump(IoType, .client_to_upstream, Policy(.client_to_upstream));
-        const PumpUpstreamToClient = pump.Pump(IoType, .upstream_to_client, Policy(.upstream_to_client));
+        const PumpClientToUpstream = pump.Pump(runtime, .client_to_upstream, Policy(.client_to_upstream));
+        const PumpUpstreamToClient = pump.Pump(runtime, .upstream_to_client, Policy(.upstream_to_client));
 
         pub fn start(server: *ServerType, stream: *StreamType) void {
             const conn = stream.conn;

@@ -26,7 +26,7 @@ const upstream_module = @import("net/upstream.zig");
 
 const assert = std.debug.assert;
 
-const ServerSim = Server(SimIo);
+const ServerSim = Server(.{ .Io = SimIo });
 const Origin = origin_mod.Origin(SimIo);
 
 // The throwaway self-signed fixtures (`tls/testdata/README.md`), embedded

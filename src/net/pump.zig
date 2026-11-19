@@ -90,6 +90,7 @@
 
 const std = @import("std");
 
+const Runtime = @import("../extension.zig").Runtime;
 const conn_module = @import("Conn.zig");
 const stream_module = @import("Stream.zig");
 const Io = @import("../io/io.zig");
@@ -115,13 +116,14 @@ pub const FeedResult = struct {
 };
 
 pub fn Pump(
-    comptime IoType: type,
-    comptime direction: conn_module.Conn(IoType).StreamType.Direction,
+    comptime runtime: Runtime,
+    comptime direction: conn_module.Conn(runtime).StreamType.Direction,
     comptime Policy: type,
 ) type {
-    const ConnType = conn_module.Conn(IoType);
+    const IoType = runtime.Io;
+    const ConnType = conn_module.Conn(runtime);
     const StreamType = ConnType.StreamType;
-    const ServerType = @import("../Server.zig").Server(IoType);
+    const ServerType = @import("../Server.zig").Server(runtime);
     const direction_tag = @tagName(direction);
 
     return struct {

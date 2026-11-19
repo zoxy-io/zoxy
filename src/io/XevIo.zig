@@ -205,7 +205,7 @@ pub fn init(
     /// same `listen` — with nowhere to go, and it fails as
     /// `AddressUnavailable`, which reads as a bad bind rather than a full
     /// table. Every admin-enabled deployment hits it, and nothing in the
-    /// test suite would: `Server(XevIo)` is instantiated only by main.
+    /// test suite would: `Server(.{ .Io = XevIo })` is instantiated only by main.
     configured_listeners: u32,
     /// The provided-buffer group (§5's head-buffer ring): how many
     /// buffers, how wide each. Zero count is a group nobody registered —

@@ -15,11 +15,13 @@
 //!
 //! The request is never parsed: the endpoint serves the same counters
 //! regardless of method or path, so there is no routing, no head buffer,
-//! and no attack surface beyond a fixed-size drain. Generic over the Io
-//! backend like the rest of the data path, so the simulator drives it too.
+//! and no attack surface beyond a fixed-size drain. Generic over the
+//! `Runtime` like the rest of the data path, so the simulator drives it
+//! too.
 
 const std = @import("std");
 
+const Runtime = @import("extension.zig").Runtime;
 const constants = @import("constants.zig");
 const counters_module = @import("counters.zig");
 const Io = @import("io/io.zig");
@@ -40,8 +42,9 @@ pub const response_head =
 /// the buffer bound went from a comptime constant to a value `init`
 /// derives per server (`response.len`) and the memory banner prices
 /// (`Server.metricsBytes`).
-pub fn Admin(comptime IoType: type) type {
-    const ServerType = @import("Server.zig").Server(IoType);
+pub fn Admin(comptime runtime: Runtime) type {
+    const IoType = runtime.Io;
+    const ServerType = @import("Server.zig").Server(runtime);
 
     return struct {
         server: *ServerType,

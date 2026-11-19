@@ -58,6 +58,7 @@
 
 const std = @import("std");
 
+const Runtime = @import("../extension.zig").Runtime;
 const config_module = @import("../config.zig");
 const constants = @import("../constants.zig");
 const Io = @import("../io/io.zig");
@@ -67,8 +68,9 @@ const upstream = @import("upstream.zig");
 
 const assert = std.debug.assert;
 
-pub fn Checker(comptime IoType: type) type {
-    const ServerType = @import("../Server.zig").Server(IoType);
+pub fn Checker(comptime runtime: Runtime) type {
+    const IoType = runtime.Io;
+    const ServerType = @import("../Server.zig").Server(runtime);
 
     return struct {
         server: *ServerType,

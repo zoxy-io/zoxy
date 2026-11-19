@@ -10,12 +10,13 @@
 //! looking correct. `main.zig` keeps what is genuinely the application's:
 //! reading files, raising `RLIMIT_NOFILE`, installing signal handlers.
 //!
-//! Generic over the Io backend for the same reason `Server` is: a conn
-//! slot's size and an upstream slot's size are properties of the backend,
-//! so the closed form cannot be stated without one.
+//! Generic over the `Runtime` for the same reason `Server` is: a conn
+//! slot's size and an upstream slot's size are properties of the backend
+//! it names, so the closed form cannot be stated without one.
 
 const std = @import("std");
 
+const Runtime = @import("extension.zig").Runtime;
 const config_module = @import("config.zig");
 const constants = @import("constants.zig");
 const Io = @import("io/io.zig");
@@ -26,11 +27,12 @@ const upstream_module = @import("net/upstream.zig");
 
 const assert = std.debug.assert;
 
-pub fn Budget(comptime IoType: type) type {
+pub fn Budget(comptime runtime: Runtime) type {
+    const IoType = runtime.Io;
     Io.assertIoInterface(IoType);
 
     return struct {
-        const ServerType = Server(IoType);
+        const ServerType = Server(runtime);
         const UpstreamType = upstream_module.UpstreamPool(IoType).Upstream;
 
         /// What the effective config demands of the process before a
@@ -508,7 +510,7 @@ const testing = std.testing;
 
 test "demandsFor: the effective config sizes both demands, not the ceilings" {
     const SimIo = @import("io/SimIo.zig");
-    const BudgetSim = Budget(SimIo);
+    const BudgetSim = Budget(.{ .Io = SimIo });
 
     var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_instance.deinit();
@@ -527,7 +529,7 @@ test "demandsFor: the effective config sizes both demands, not the ceilings" {
 
 test "totalBytes: the measured arena joins the closed form" {
     const SimIo = @import("io/SimIo.zig");
-    const BudgetSim = Budget(SimIo);
+    const BudgetSim = Budget(.{ .Io = SimIo });
 
     var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_instance.deinit();
@@ -544,7 +546,7 @@ test "totalBytes: the measured arena joins the closed form" {
 
 test "h2 pools: `Server.init` reserves exactly what the budget prices (#275)" {
     const SimIo = @import("io/SimIo.zig");
-    const BudgetSim = Budget(SimIo);
+    const BudgetSim = Budget(.{ .Io = SimIo });
 
     var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_instance.deinit();
@@ -577,7 +579,7 @@ test "h2 pools: `Server.init` reserves exactly what the budget prices (#275)" {
     config.limits = .{ .conn_slots = 4, .relay_buffers = 1, .h2_connections = 2, .stream_slots = 8 };
 
     const sizes = BudgetSim.poolSizesFor(&config);
-    var server: Server(SimIo) = undefined;
+    var server: Server(.{ .Io = SimIo }) = undefined;
     try server.init(arena, &io, &config, config.limits);
 
     // The stream slots: one per connection in admission's own pool, and

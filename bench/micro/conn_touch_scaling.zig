@@ -35,7 +35,7 @@ const zoxy = @import("zoxy");
 
 const assert = std.debug.assert;
 
-const ServerType = zoxy.Server(zoxy.Io.XevIo);
+const ServerType = zoxy.Server(.{ .Io = zoxy.Io.XevIo });
 const ConnType = ServerType.ConnType;
 const StreamType = ServerType.StreamType;
 

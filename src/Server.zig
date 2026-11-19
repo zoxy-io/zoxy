@@ -1,7 +1,7 @@
 //! The composition root (DESIGN.md §3, §5, §8): owns the pools, the
-//! listeners, the counters, and the drain flag; generic over the Io
-//! backend so the simulator instantiates the whole serving path without
-//! main. All admission decisions happen here — the ladder's single
+//! listeners, the counters, and the drain flag; generic over a
+//! `Runtime` — the Io backend and the build's extensions (#417) — so the
+//! simulator instantiates the whole serving path without main. All admission decisions happen here — the ladder's single
 //! choke point. Admission forks on the listener's protocol: an `l4`
 //! listener runs the strict TCP relay (`net/relay.zig`), an `http`
 //! listener runs the L7 state machine (`http/proxy.zig`); the shared
@@ -12,6 +12,7 @@
 
 const std = @import("std");
 
+const Runtime = @import("extension.zig").Runtime;
 const access_log_module = @import("access_log.zig");
 const admin_module = @import("admin.zig");
 const Balancer = @import("balancer.zig").Balancer;
@@ -48,7 +49,8 @@ const upstream_tls_module = @import("net/upstream_tls.zig");
 
 const assert = std.debug.assert;
 
-pub fn Server(comptime IoType: type) type {
+pub fn Server(comptime runtime: Runtime) type {
+    const IoType = runtime.Io;
     Io.assertIoInterface(IoType);
 
     return struct {
@@ -416,7 +418,7 @@ pub fn Server(comptime IoType: type) type {
         /// The dedicated admin/metrics listener (§8): one
         /// reserved scrape slot off the shared pools, budgeted separately
         /// (`constants.admin_*`). Off unless a bind is set before `start`.
-        admin: admin_module.Admin(IoType),
+        admin: admin_module.Admin(runtime),
         /// The access log (§8): one JSON line per exchange and per L4
         /// connection, off unless the config names a sink. It holds one
         /// ring op and two staging buffers, both reserved unconditionally
@@ -426,18 +428,18 @@ pub fn Server(comptime IoType: type) type {
         /// flight, budgeted separately (`constants.health_probe_ops_max`
         /// each). Off unless a cluster sets `check`; its `healthy` mask
         /// is what the balancer picks through.
-        health: health_module.Checker(IoType),
+        health: health_module.Checker(runtime),
 
         const Self = @This();
 
-        pub const ConnType = conn_module.Conn(IoType);
+        pub const ConnType = conn_module.Conn(runtime);
         pub const StreamType = ConnType.StreamType;
-        pub const AccessLogType = access_log_module.AccessLog(IoType);
-        pub const Proxy = proxy.Proxy(IoType);
-        const H2Driver = H2Connection.Driver(IoType);
-        const H2ExchangeType = H2Exchange.Exchange(IoType);
-        pub const OriginMux = H2Origin.Mux(IoType);
-        pub const UpstreamTls = upstream_tls_module.Driver(IoType);
+        pub const AccessLogType = access_log_module.AccessLog(runtime);
+        pub const Proxy = proxy.Proxy(runtime);
+        const H2Driver = H2Connection.Driver(runtime);
+        const H2ExchangeType = H2Exchange.Exchange(runtime);
+        pub const OriginMux = H2Origin.Mux(runtime);
+        pub const UpstreamTls = upstream_tls_module.Driver(runtime);
 
         /// `h2_origin_scratch`'s shape: a parse's headers, the fields an
         /// origin is sent, and the octets of the names they lowercase.
@@ -4138,7 +4140,7 @@ pub fn Server(comptime IoType: type) type {
             );
             conn.enter(.relaying);
             server.storeDeadline(conn, server.idleTimeoutMs());
-            relay.Relay(IoType).start(server, conn.stream);
+            relay.Relay(runtime).start(server, conn.stream);
         }
 
         /// Teardown is a state, not an event (§5): shutdown both fds,

@@ -49,8 +49,8 @@ const SimIo = @import("../io/SimIo.zig");
 const assert = std.debug.assert;
 const repeat = @import("../testing/bytes.zig").repeat;
 
-const ServerSim = server_module.Server(SimIo);
-const ConnSim = conn_module.Conn(SimIo);
+const ServerSim = server_module.Server(.{ .Io = SimIo });
+const ConnSim = conn_module.Conn(.{ .Io = SimIo });
 const ConnType = ConnSim;
 const StreamType = ConnSim.StreamType;
 const Direction = ConnSim.StreamType.Direction;
@@ -382,8 +382,8 @@ const ToClientPolicy = struct {
     }
 };
 
-const PumpToUpstream = pump.Pump(SimIo, .client_to_upstream, ToUpstreamPolicy);
-const PumpToClient = pump.Pump(SimIo, .upstream_to_client, ToClientPolicy);
+const PumpToUpstream = pump.Pump(.{ .Io = SimIo }, .client_to_upstream, ToUpstreamPolicy);
+const PumpToClient = pump.Pump(.{ .Io = SimIo }, .upstream_to_client, ToClientPolicy);
 
 /// Frame `payload` into `out` as `client_frames` dictates, returning the
 /// bytes written. Shared by the client's own wire and by the tests that

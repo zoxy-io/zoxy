@@ -22,7 +22,7 @@ const l7 = @import("l7.zig");
 
 const Io = zoxy.Io;
 const SimIo = zoxy.Io.SimIo;
-const ServerSim = zoxy.Server(SimIo);
+const ServerSim = zoxy.Server(.{ .Io = SimIo });
 const Origin = zoxy.testing.Origin(SimIo);
 const HttpOrigin = l7.HttpOrigin(SimIo);
 const HttpClient = l7.Client(SimIo);
