@@ -47,3 +47,28 @@ pub const Timeouts = struct {
     /// The serving loop's watchdog (#311), or null for none.
     loop_watchdog_ms: ?u32 = null,
 };
+
+/// Pool counts and buffer sizes (§5). Each member left null is sized by
+/// zoxy's own rule for this config — the stock binary's, which the banner
+/// prints — and each one stated is held to the same ceilings and
+/// relations the rule obeys. Stated as a block even when every member is
+/// null, so that leaving the sizing to zoxy is a decision the author
+/// wrote down.
+pub const Limits = struct {
+    conn_slots: ?u32 = null,
+    relay_buffers: ?u32 = null,
+    upstream_slots: ?u32 = null,
+    head_buffers: ?u32 = null,
+    upstream_head_buffers: ?u32 = null,
+    head_buffer_bytes: ?u32 = null,
+    relay_buffer_bytes: ?u32 = null,
+    tls_engines: ?u32 = null,
+    tunnels: ?u32 = null,
+    h2_connections: ?u32 = null,
+    h2_streams: ?u32 = null,
+    upstream_h2_connections: ?u32 = null,
+    upstream_h2_streams: ?u32 = null,
+    upstream_tls_sessions: ?u32 = null,
+    cq_fill_eighths: ?u32 = null,
+    access_log_buffer_bytes: ?u32 = null,
+};
