@@ -1555,7 +1555,8 @@ extensions they list.
   loader is the stock binary's private front-end, so a custom build has
   no config file. `zoxy.defaults` names the stock values a build may
   choose by name. The simulator is a build too: `sim/Harness.zig`
-  states its configs from a seed.
+  states every seed's config as options and resolves it, so the sweep's
+  configs meet every rule a file's do.
 - **The entry points:**
   - `zoxy.App(extensions)`, the application half of a build that lists
     `extensions`;
@@ -1571,6 +1572,9 @@ extensions they list.
     selections. A type the build does not list is a compile error;
   - `config.resolve(arena, *const Options)` is step zero on its own, for
     a build that wants the verdict alone;
+  - `zoxy.pickers`, the stock policies on the picker contract — what the
+    balancer runs for `rr`, `p2c` and `hash`, and what a build may select
+    or call from a picker of its own;
   - `zoxy.testing`, the bed and gate below.
 
   `Server(runtime)`, `Budget(runtime)` and the Io seam are the parts
