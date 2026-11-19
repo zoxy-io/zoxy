@@ -1182,21 +1182,23 @@ pub fn parseWithFiles(
     try validateTimeouts(&timeouts);
     const clusters_stated = try clustersOf(arena, &parsed.clusters, timeouts.connect_ms, files);
     const clusters = try resolveClusters(arena, clusters_stated);
-    // Limits resolve before listeners, off the raw DTO counts: the route
-    // prefixes inside `resolveListeners` are gated against the resolved
-    // `head_buffer_bytes` — a prefix longer than the head can never
-    // match a parsed path, and belongs refused at load, not left to 404
-    // forever at runtime. The reorder moves precedences, pinned by
-    // tests: emptiness still outranks everything after the clusters
-    // (the limits resolver asserts a non-empty set, so the gate fires
-    // first here); a listener naming neither protocol body, or both,
-    // surfaces from the count below — before any bind or sink is looked
-    // at; and a bad bind, resolved last, now reports after a bad
-    // access-log sink.
-    if (parsed.listeners.len == 0) {
+    // Limits resolve before listeners: the route prefixes inside
+    // `resolveListeners` are gated against the resolved
+    // `head_buffer_bytes` — a prefix longer than the head can never match
+    // a parsed path, and belongs refused at load, not left to 404 forever
+    // at runtime. The listeners' spellings are translated first, though,
+    // since the limits are sized from features the typed listeners state
+    // (#417): so a listener's JSON-only faults — a bind that is not a
+    // literal, a protocol body named twice or not at all, an unreadable
+    // certificate — outrank the limits and the access log, while what
+    // the library judges of a listener still reports after both.
+    // Emptiness still outranks everything after the clusters (the limits
+    // resolver asserts a non-empty set, so the gate fires first here).
+    const listeners_stated = try listenersOf(arena, parsed.listeners, files);
+    if (listeners_stated.len == 0) {
         return error.ListenersEmpty;
     }
-    const features = try countListenerFeatures(parsed.listeners);
+    const features = try countListenerFeatures(listeners_stated);
     const access_log_stated = try accessLogOf(parsed.access_log);
     const access_log_sink = try resolveAccessLogSink(access_log_stated);
     // Before the limits, because the named headers widen the line the
@@ -1205,7 +1207,7 @@ pub fn parseWithFiles(
     const limits_requested = limitsOf(&parsed.limits);
     const limits = try resolveLimits(
         &limits_requested,
-        @intCast(parsed.listeners.len),
+        @intCast(listeners_stated.len),
         features,
         access_log_sink != null,
         log_headers.count(),
@@ -1232,11 +1234,10 @@ pub fn parseWithFiles(
     const bodies = try resolveBodies(arena, bodies_stated);
     const listeners = try resolveListeners(
         arena,
-        parsed.listeners,
+        listeners_stated,
         clusters,
         limits.head_buffer_bytes,
         bodies,
-        files,
     );
     const admin_stated = try adminOf(parsed.admin);
     const admin_bind = if (admin_stated) |admin| admin.bind else null;
@@ -2567,6 +2568,532 @@ fn adminOf(admin_json: ?AdminJson) ValidationError!?Options.Admin {
     const bind = std.Io.net.IpAddress.parseLiteral(admin.bind) catch
         return error.AdminBindInvalid;
     return .{ .bind = bind };
+}
+
+/// The JSON front-end's listeners (#417): each one's spellings parsed into
+/// options — the bind literal, the protocol body its key chose, the mode's
+/// octal string, the strings and forks inside — and its TLS files read
+/// through the seam. Nothing is judged here that a listener written in
+/// code could also get wrong; that is `resolveListeners`'.
+fn listenersOf(
+    arena: std.mem.Allocator,
+    listeners_json: []const ListenerJson,
+    files: FileSource,
+) ParseError![]const Options.Listener {
+    const listeners = try arena.alloc(Options.Listener, listeners_json.len);
+    for (listeners_json, listeners) |*listener_json, *listener| {
+        listener.* = try listenerOf(arena, listener_json, files);
+    }
+    assert(listeners.len == listeners_json.len);
+    return listeners;
+}
+
+fn listenerOf(
+    arena: std.mem.Allocator,
+    listener_json: *const ListenerJson,
+    files: FileSource,
+) ParseError!Options.Listener {
+    const bind = addressOf(listener_json.bind) orelse return error.ListenerBindInvalid;
+    // The key decides the body, so a listener that names neither body or
+    // both is refused before anything inside either is read (#305).
+    const kind = try protocolOf(listener_json);
+    const tls = try tlsOf(arena, &listener_json.tls, files);
+    const protocol: Options.Listener.Protocol = switch (kind) {
+        .http => .{ .http = try httpOf(arena, &listener_json.http.?) },
+        .l4 => .{ .l4 = try l4Of(arena, &listener_json.l4.?) },
+    };
+    const listener: Options.Listener = .{
+        .bind = bind,
+        .mode = try bindModeOf(listener_json.mode),
+        .tls = tls,
+        .protocol = protocol,
+    };
+    assert(listener.protocol == kind);
+    assert((listener.tls != null) == (listener_json.tls != null));
+    return listener;
+}
+
+/// The `mode` a `unix:` bind asks for its socket file (#303), as the octal
+/// string an operator writes in every other tool.
+///
+/// A string rather than a JSON number, because `0660` in JSON is not valid
+/// and `660` is decimal — the two spellings of the same intent differ by a
+/// factor of eight, and a mode that is silently wider than asked for is
+/// the failure this feature exists to avoid. Which bits a mode may set is
+/// the library's rule (`resolveBindMode`).
+fn bindModeOf(mode_json: ?[]const u8) ParseError!?io_module.FileMode {
+    const text = mode_json orelse return null;
+    if (text.len == 0 or text.len > 4) {
+        return error.ListenerModeInvalid;
+    }
+    var bits: u16 = 0;
+    for (text) |digit| {
+        if (digit < '0' or digit > '7') {
+            return error.ListenerModeInvalid;
+        }
+        bits = bits * 8 + (digit - '0');
+    }
+    // Four octal digits reach exactly the file system's vocabulary.
+    assert(bits <= io_module.FileMode.bits_max);
+    assert(text.len >= 1);
+    return .{ .bits = bits };
+}
+
+/// A listener's TLS block as JSON spells it (§4): the certificate and key
+/// read through the file seam (#417), so a file that is missing, unreadable
+/// or past `tls_pem_bytes_max` fails the load and names the path; the ALPN
+/// tokens parsed; the client CA's verify mode named and its bundle read;
+/// and the further pairs read like the default one.
+fn tlsOf(
+    arena: std.mem.Allocator,
+    tls_json: *const ?TlsJson,
+    files: FileSource,
+) ParseError!?Options.Listener.Tls {
+    const tls = if (tls_json.*) |*tls| tls else return null;
+    const pair = try readCertificatePair(arena, tls.cert, tls.key, files);
+    const stated: Options.Listener.Tls = .{
+        .cert_pem = pair.cert_pem,
+        .key_pem = pair.key_pem,
+        .label = pair.label,
+        .alpn = try alpnOf(arena, tls.alpn),
+        .client_ca = try clientCaOf(arena, &tls.client_ca, files),
+        .certificates = try certificatesOf(arena, tls.certificates, files),
+    };
+    assert(stated.cert_pem.len >= 1);
+    assert(stated.key_pem.len >= 1);
+    return stated;
+}
+
+/// The ALPN offer's tokens, parsed against the closed vocabulary (#271): a
+/// name this proxy does not speak is refused rather than offered to a
+/// client that would then speak it at a parser that cannot.
+fn alpnOf(
+    arena: std.mem.Allocator,
+    alpn_json: ?[]const []const u8,
+) ParseError!?[]const alpn.Protocol {
+    const tokens = alpn_json orelse return null;
+    const offer = try arena.alloc(alpn.Protocol, tokens.len);
+    for (tokens, offer) |token, *named| {
+        named.* = alpn.Protocol.fromToken(token) orelse return error.ListenerTlsAlpnUnknown;
+    }
+    assert(offer.len == tokens.len);
+    return offer;
+}
+
+/// A listener's #304 client CA as JSON spells it: the verify mode named
+/// from a closed set, and the bundle read through the file seam.
+fn clientCaOf(
+    arena: std.mem.Allocator,
+    client_ca_json: *const ?ClientCaJson,
+    files: FileSource,
+) ParseError!?Options.Listener.ClientCa {
+    const client_ca = if (client_ca_json.*) |*client_ca| client_ca else return null;
+    const verify = std.meta.stringToEnum(Config.Listener.ClientVerify, client_ca.verify) orelse
+        return error.ListenerTlsClientVerifyUnknown;
+    if (client_ca.path.len == 0) return error.ListenerTlsClientCaUnreadable;
+    const pem = files.read(files.context, arena, client_ca.path, constants.origin_ca_bytes_max) catch |err| switch (err) {
+        error.FileUnreadable, error.FileTooLarge => return error.ListenerTlsClientCaUnreadable,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    assert(pem.len <= constants.origin_ca_bytes_max);
+    assert(client_ca.path.len >= 1);
+    return .{ .ca_pem = pem, .verify = verify };
+}
+
+/// A listener's #297 further certificates, each read like the default
+/// pair. An explicitly empty list is a mistake rather than "none" —
+/// absence already says that — and a list the ceiling refuses is refused
+/// before its files are read.
+fn certificatesOf(
+    arena: std.mem.Allocator,
+    certificates_json: ?[]const CertificateJson,
+    files: FileSource,
+) ParseError![]const Config.Listener.Certificate {
+    const entries = certificates_json orelse return &.{};
+    if (entries.len == 0) return error.ListenerTlsCertificatesEmpty;
+    if (entries.len >= constants.tls_certificates_max) return error.ListenerTlsCertificatesOverLimit;
+    const certificates = try arena.alloc(Config.Listener.Certificate, entries.len);
+    for (entries, certificates) |entry, *certificate| {
+        certificate.* = try readCertificatePair(arena, entry.cert, entry.key, files);
+    }
+    assert(certificates.len >= 1);
+    assert(certificates.len < constants.tls_certificates_max);
+    return certificates;
+}
+
+/// An http listener's body as JSON spells it: exactly one of `cluster` or
+/// `routes`, and the strings and forks inside the filters.
+fn httpOf(
+    arena: std.mem.Allocator,
+    http_json: *const HttpListenerJson,
+) ParseError!Options.Listener.Http {
+    const has_cluster = http_json.cluster != null;
+    const has_routes = http_json.routes != null;
+    if (has_cluster == has_routes) {
+        return error.ListenerClusterOrRoutes; // Neither, or both.
+    }
+    const target: Options.Listener.Target = if (http_json.cluster) |name|
+        .{ .cluster = name }
+    else
+        .{ .routes = try routesOf(arena, http_json.routes.?) };
+    assert((target == .routes) == has_routes);
+    return .{
+        .target = target,
+        .request_filters = try filtersOf(arena, http_json.request_filters orelse &.{}),
+        .response_filters = try responseFiltersOf(arena, http_json.response_filters orelse &.{}),
+        .forwarded = try forwardedOf(&http_json.forwarded),
+        .upgrades = upgradesOf(http_json.upgrades),
+        .max_body_bytes = http_json.max_body_bytes,
+        .keepalive_requests = http_json.keepalive_requests,
+        .proxy_status = http_json.proxy_status,
+        .h2c = http_json.h2c,
+    };
+}
+
+fn routesOf(
+    arena: std.mem.Allocator,
+    routes_json: []const RouteJson,
+) ParseError![]const Options.Listener.Route {
+    const routes = try arena.alloc(Options.Listener.Route, routes_json.len);
+    for (routes_json, routes) |*route_json, *route| {
+        route.* = .{
+            .host = route_json.host,
+            .prefix = route_json.prefix,
+            .header = if (route_json.header) |*header| try routeHeaderOf(header) else null,
+            .cluster = route_json.cluster,
+        };
+    }
+    assert(routes.len == routes_json.len);
+    return routes;
+}
+
+/// A route's header predicate (#302) as JSON spells it: exactly one of
+/// `present: true` or `equals`.
+fn routeHeaderOf(header_json: *const RouteHeaderJson) ParseError!Options.Listener.RouteHeader {
+    const set: u8 = @as(u8, @intFromBool(header_json.present != null)) +
+        @intFromBool(header_json.equals != null);
+    assert(set <= 2); // The route header has two kind fields.
+    if (set != 1) {
+        return error.RouteHeaderMatchKind;
+    }
+    if (header_json.present) |present| {
+        if (!present) {
+            return error.RouteHeaderMatchKind; // "present: false" is not a predicate.
+        }
+        return .{ .name = header_json.name, .predicate = .present };
+    }
+    return .{ .name = header_json.name, .predicate = .{ .equals = header_json.equals.? } };
+}
+
+fn filtersOf(
+    arena: std.mem.Allocator,
+    filters_json: []const FilterJson,
+) ParseError![]const Options.Listener.Filter {
+    const rules = try arena.alloc(Options.Listener.Filter, filters_json.len);
+    for (filters_json, rules) |*rule_json, *rule| {
+        rule.* = .{
+            .match = try matchOf(arena, &rule_json.match),
+            .actions = try actionsOf(arena, rule_json.actions),
+        };
+    }
+    assert(rules.len == filters_json.len);
+    return rules;
+}
+
+fn matchOf(arena: std.mem.Allocator, match_json: *const MatchJson) ParseError!Options.Listener.Match {
+    const match: Options.Listener.Match = .{
+        .methods = if (match_json.method) |tokens| try methodsOf(tokens) else null,
+        .host = match_json.host,
+        .path_prefix = match_json.path_prefix,
+        .headers = try headerMatchesOf(arena, match_json.headers orelse &.{}),
+        .clients = if (match_json.client) |literals| try clientCidrsOf(arena, literals) else &.{},
+    };
+    assert((match.methods != null) == (match_json.method != null));
+    return match;
+}
+
+/// A filter's method tokens: an explicitly empty list is a mistake, not
+/// "any" — absence already says that, unambiguously — and the vocabulary
+/// is the parser's.
+fn methodsOf(tokens: []const []const u8) ParseError!std.EnumSet(parser.Method) {
+    if (tokens.len == 0) {
+        return error.FilterMethodEmpty;
+    }
+    var methods = std.EnumSet(parser.Method){};
+    for (tokens) |token| {
+        const method = parser.methodFromToken(token) orelse return error.FilterMethodUnknown;
+        methods.insert(method);
+    }
+    assert(methods.count() >= 1);
+    assert(methods.count() <= tokens.len);
+    return methods;
+}
+
+fn headerMatchesOf(
+    arena: std.mem.Allocator,
+    headers_json: []const HeaderMatchJson,
+) ParseError![]const Options.Listener.HeaderMatch {
+    const matches = try arena.alloc(Options.Listener.HeaderMatch, headers_json.len);
+    for (headers_json, matches) |header_json, *match| {
+        // Exactly one predicate kind per header match; which one is
+        // `headerPredicateOf`'s.
+        const set: u8 = @as(u8, @intFromBool(header_json.present != null)) +
+            @intFromBool(header_json.equals != null) +
+            @intFromBool(header_json.contains != null);
+        assert(set <= 3); // The header match has three kind fields.
+        if (set != 1) {
+            return error.FilterHeaderMatchKind;
+        }
+        match.* = .{ .name = header_json.name, .predicate = try headerPredicateOf(&header_json) };
+    }
+    assert(matches.len == headers_json.len);
+    return matches;
+}
+
+/// The one kind a header match names, past the exactly-one count.
+fn headerPredicateOf(header_json: *const HeaderMatchJson) ParseError!Options.Listener.HeaderMatch.Predicate {
+    if (header_json.present) |present| {
+        if (!present) {
+            return error.FilterHeaderMatchKind; // "present: false" is not a predicate.
+        }
+        assert(header_json.equals == null);
+        return .present;
+    }
+    if (header_json.equals) |value| {
+        assert(header_json.contains == null);
+        return .{ .equals = value };
+    }
+    return .{ .contains = header_json.contains.? };
+}
+
+/// A `client` predicate's CIDR literals (#177). An explicitly empty list
+/// is a mistake — absence already says "any client", unambiguously (the
+/// `FilterMethodEmpty` rule).
+fn clientCidrsOf(
+    arena: std.mem.Allocator,
+    literals: []const []const u8,
+) ParseError![]const filter.Cidr {
+    if (literals.len == 0) {
+        return error.FilterClientEmpty;
+    }
+    const cidrs = try arena.alloc(filter.Cidr, literals.len);
+    for (literals, cidrs) |literal, *cidr| {
+        cidr.* = try clientCidrOf(literal);
+    }
+    assert(cidrs.len == literals.len);
+    return cidrs;
+}
+
+/// One CIDR literal, parsed. The `/len` is mandatory — a bare address has
+/// no single meaning across families (an exact IPv4 host is /32, but an
+/// exact IPv6 *client* is its /64), so the spelling that would need
+/// per-family folklore is refused instead. Whether the prefix is one a
+/// client can be matched by is the library's (`validateClientCidr`).
+fn clientCidrOf(literal: []const u8) ParseError!filter.Cidr {
+    const slash = std.mem.indexOfScalar(u8, literal, '/') orelse
+        return error.FilterClientCidrInvalid;
+    const address_text = literal[0..slash];
+    const prefix_text = literal[slash + 1 ..];
+    if (prefix_text.len == 0) {
+        return error.FilterClientPrefixInvalid;
+    }
+    const prefix_len = std.fmt.parseUnsigned(u8, prefix_text, 10) catch
+        return error.FilterClientPrefixInvalid;
+    const address = std.Io.net.IpAddress.parse(address_text, 0) catch
+        return error.FilterClientCidrInvalid;
+    assert(slash < literal.len);
+    assert(prefix_text.len >= 1);
+    return .{ .address = address, .prefix_len = prefix_len };
+}
+
+fn actionsOf(
+    arena: std.mem.Allocator,
+    actions_json: []const ActionJson,
+) ParseError![]const Options.Listener.Action {
+    const actions = try arena.alloc(Options.Listener.Action, actions_json.len);
+    for (actions_json, actions) |*action_json, *action| {
+        action.* = try actionOf(action_json);
+    }
+    assert(actions.len == actions_json.len);
+    return actions;
+}
+
+/// One action as JSON spells it: an object with exactly one kind field.
+fn actionOf(action_json: *const ActionJson) ParseError!Options.Listener.Action {
+    try requireOneActionKind(action_json);
+    if (action_json.reject) |status| return .{ .reject = status };
+    if (action_json.redirect) |redirect_json| return .{ .redirect = try redirectOf(&redirect_json) };
+    if (action_json.respond) |respond_json| {
+        return .{ .respond = .{ .status = respond_json.status, .body = respond_json.body } };
+    }
+    if (action_json.allow) |allow| {
+        // `allow: false` is the same non-predicate `present: false` is: a
+        // key that names an action and then unsays it. Refused rather
+        // than read as "not allow", which is not an action either.
+        if (!allow) {
+            return error.FilterActionKind;
+        }
+        return .allow;
+    }
+    if (action_json.header_set) |edit| return .{ .header_set = .{ .name = edit.name, .value = edit.value } };
+    if (action_json.header_add) |edit| return .{ .header_add = .{ .name = edit.name, .value = edit.value } };
+    if (action_json.header_remove) |name| return .{ .header_remove = name };
+    const rewrite = action_json.rewrite_prefix.?;
+    return .{ .rewrite_prefix = .{ .from = rewrite.from, .to = rewrite.to } };
+}
+
+/// A `redirect` action's target as JSON spells it (#176): exactly one of a
+/// fixed `location` or a composed target, whose `scheme` is required and
+/// named from a closed set.
+fn redirectOf(redirect_json: *const RedirectJson) ParseError!filter.Redirect {
+    const has_location = redirect_json.location != null;
+    const has_composed = redirect_json.scheme != null or redirect_json.host != null;
+    if (has_location == has_composed) {
+        // Neither form, or both at once.
+        return error.FilterRedirectTarget;
+    }
+    if (redirect_json.location) |location| {
+        return .{ .status = redirect_json.status, .target = .{ .location = location } };
+    }
+    const scheme_literal = redirect_json.scheme orelse {
+        // Host without scheme: half a composed target.
+        return error.FilterRedirectTarget;
+    };
+    const scheme = std.meta.stringToEnum(filter.Redirect.Scheme, scheme_literal) orelse
+        return error.FilterRedirectSchemeUnknown;
+    assert(has_composed);
+    assert(!has_location);
+    return .{
+        .status = redirect_json.status,
+        .target = .{ .composed = .{ .scheme = scheme, .host = redirect_json.host } },
+    };
+}
+
+fn responseFiltersOf(
+    arena: std.mem.Allocator,
+    filters_json: []const ResponseFilterJson,
+) ParseError![]const Options.Listener.ResponseFilter {
+    const rules = try arena.alloc(Options.Listener.ResponseFilter, filters_json.len);
+    for (filters_json, rules) |*rule_json, *rule| {
+        rule.* = .{
+            .match = try responseMatchOf(arena, &rule_json.match),
+            .actions = try responseActionsOf(arena, rule_json.actions),
+        };
+    }
+    assert(rules.len == filters_json.len);
+    return rules;
+}
+
+fn responseMatchOf(
+    arena: std.mem.Allocator,
+    match_json: *const ResponseMatchJson,
+) ParseError!Options.Listener.ResponseMatch {
+    var match: Options.Listener.ResponseMatch = .{};
+    if (match_json.status) |statuses| {
+        // An explicitly empty list is a mistake, not "any" — absence
+        // already says that, unambiguously (the `FilterMethodEmpty` rule).
+        if (statuses.len == 0) {
+            return error.ResponseFilterStatusEmpty;
+        }
+        match.statuses = statuses;
+    }
+    if (match_json.status_class) |literal| {
+        match.status_class = std.meta.stringToEnum(filter.StatusClass, literal) orelse
+            return error.ResponseFilterStatusClassUnknown;
+    }
+    match.headers = try headerMatchesOf(arena, match_json.headers orelse &.{});
+    assert((match.status_class != null) == (match_json.status_class != null));
+    return match;
+}
+
+fn responseActionsOf(
+    arena: std.mem.Allocator,
+    actions_json: []const ResponseActionJson,
+) ParseError![]const Options.Listener.ResponseAction {
+    const actions = try arena.alloc(Options.Listener.ResponseAction, actions_json.len);
+    for (actions_json, actions) |*action_json, *action| {
+        action.* = try responseActionOf(action_json);
+    }
+    assert(actions.len == actions_json.len);
+    return actions;
+}
+
+/// One response action as JSON spells it. The kind fork is the whole check
+/// for this table: the request-side actions are not fields here, so a
+/// config naming one is refused by the strict parser rather than by rules
+/// this front-end would have to carry (#305).
+fn responseActionOf(action_json: *const ResponseActionJson) ParseError!Options.Listener.ResponseAction {
+    try requireOneResponseActionKind(action_json);
+    if (action_json.header_set) |edit| return .{ .header_set = .{ .name = edit.name, .value = edit.value } };
+    if (action_json.header_add) |edit| return .{ .header_add = .{ .name = edit.name, .value = edit.value } };
+    return .{ .header_remove = action_json.header_remove.? };
+}
+
+/// Client-address forwarding as JSON spells it (§7): absent is off, and
+/// the mode is named from a closed set.
+fn forwardedOf(forwarded_json: *const ?ForwardedJson) ValidationError!?Config.Listener.Forwarded {
+    const forwarded = if (forwarded_json.*) |*forwarded| forwarded else return null;
+    return std.meta.stringToEnum(Config.Listener.Forwarded, forwarded.mode) orelse
+        error.ListenerForwardedModeUnknown;
+}
+
+/// The #180 upgrade allowlist as JSON spells it: absent allows none, so an
+/// `Upgrade` keeps the `501` it has always got.
+///
+/// The vocabulary is `UpgradesJson`'s own fields, held to the resolved
+/// set's by a comptime check there — so a protocol the proxy can carry and
+/// one an operator may write cannot drift apart. Anything else is refused
+/// by the strict parser rather than by a rule here (#305): a config that
+/// asked to tunnel `h2c` and got silence would believe it had, and after
+/// `101` there is no rule left to catch what came through.
+fn upgradesOf(upgrades_json: ?UpgradesJson) Config.Listener.Upgrades {
+    const asked = upgrades_json orelse return .{};
+    var upgrades: Config.Listener.Upgrades = .{};
+    inline for (@typeInfo(UpgradesJson).@"struct".field_names) |name| {
+        @field(upgrades, name) = @field(asked, name);
+    }
+    return upgrades;
+}
+
+/// An l4 listener's body as JSON spells it: exactly one of `cluster` or
+/// `routes`, and the PROXY protocol mode named from a closed set.
+fn l4Of(arena: std.mem.Allocator, l4_json: *const L4ListenerJson) ParseError!Options.Listener.L4 {
+    const has_cluster = l4_json.cluster != null;
+    const has_routes = l4_json.routes != null;
+    if (has_cluster == has_routes) {
+        return error.ListenerClusterOrRoutes; // Neither, or both.
+    }
+    const target: Options.Listener.L4Target = if (l4_json.cluster) |name|
+        .{ .cluster = name }
+    else
+        .{ .routes = try sniRoutesOf(arena, l4_json.routes.?) };
+    assert((target == .routes) == has_routes);
+    return .{ .target = target, .proxy_protocol = try proxyProtocolOf(&l4_json.proxy_protocol) };
+}
+
+fn sniRoutesOf(
+    arena: std.mem.Allocator,
+    routes_json: []const L4RouteJson,
+) ParseError![]const Options.Listener.SniRoute {
+    const routes = try arena.alloc(Options.Listener.SniRoute, routes_json.len);
+    for (routes_json, routes) |route_json, *route| {
+        route.* = .{ .sni = route_json.sni, .cluster = route_json.cluster };
+    }
+    assert(routes.len == routes_json.len);
+    return routes;
+}
+
+/// A listener's PROXY protocol expectation as JSON spells it (#142):
+/// absent is off, and the mode is named from a closed set. Reachable only
+/// from an `l4` body — the L7 path has no receive phase yet, so an http
+/// listener has nowhere to state a trust boundary nothing enforces, which
+/// the shape now closes rather than a rejection (#305).
+fn proxyProtocolOf(
+    proxy_protocol_json: *const ?ProxyProtocolJson,
+) ValidationError!?Config.Listener.ProxyProtocol {
+    const proxy_protocol = if (proxy_protocol_json.*) |*proxy_protocol| proxy_protocol else return null;
+    return std.meta.stringToEnum(Config.Listener.ProxyProtocol, proxy_protocol.mode) orelse
+        error.ListenerProxyProtocolModeUnknown;
 }
 
 // The strict parser binds JSON to these `*Json` DTOs. Each carries the
@@ -4950,40 +5477,27 @@ fn resolveUnixPath(
     return try arena.dupe(u8, path);
 }
 
-/// The `mode` a `unix:` bind asks for its socket file (#303), as the
-/// octal string an operator writes in every other tool.
-///
-/// A string rather than a JSON number, because `0660` in JSON is not
-/// valid and `660` is decimal — the two spellings of the same intent
-/// differ by a factor of eight, and a mode that is silently wider than
-/// asked for is the failure this feature exists to avoid.
+/// The permission bits a `unix:` bind asks for its socket file (#303).
+/// The octal spelling is the JSON front-end's (`bindModeOf`); what any
+/// mode must satisfy is judged here.
 fn resolveBindMode(
-    mode_json: ?[]const u8,
+    mode: ?io_module.FileMode,
     bind_address: io_module.Address,
 ) ParseError!?io_module.FileMode {
-    const text = mode_json orelse return null;
+    const stated = mode orelse return null;
     // An IP bind creates no file, so a mode on one describes nothing.
     if (bind_address != .unix) {
         return error.ListenerModeWithoutUnixBind;
     }
-    if (text.len == 0 or text.len > 4) {
-        return error.ListenerModeInvalid;
-    }
-    var bits: u16 = 0;
-    for (text) |digit| {
-        if (digit < '0' or digit > '7') {
-            return error.ListenerModeInvalid;
-        }
-        bits = bits * 8 + (digit - '0');
-    }
-    assert(bits <= io_module.FileMode.bits_max);
     // setuid, setgid and sticky mean nothing on a socket and everything
     // on the file it is confused with — refused rather than passed
     // through to a chmod nobody meant to write.
-    if (bits & 0o7000 != 0) {
+    if (stated.bits & ~@as(u16, 0o777) != 0) {
         return error.ListenerModeInvalid;
     }
-    return .{ .bits = bits };
+    assert(stated.bits <= 0o777);
+    assert(bind_address == .unix);
+    return stated;
 }
 
 /// The #303 refusals: what a `unix:` listener may not also ask for,
@@ -5044,18 +5558,20 @@ fn rejectUnixCluster(
 /// which of the two fields the loader meant.
 fn resolveBindAddress(
     arena: std.mem.Allocator,
-    literal: []const u8,
+    address: io_module.Address,
 ) ParseError!io_module.Address {
-    const address = addressOf(literal) orelse return error.ListenerBindInvalid;
     const path = switch (address) {
         .ip => return address,
         .unix => |path| path,
     };
-    return .{ .unix = resolveUnixPath(arena, path) catch |err| switch (err) {
+    const resolved: io_module.Address = .{ .unix = resolveUnixPath(arena, path) catch |err| switch (err) {
         error.Relative => return error.ListenerBindUnixPathRelative,
         error.Invalid => return error.ListenerBindUnixPathInvalid,
         error.OutOfMemory => return error.OutOfMemory,
     } };
+    assert(resolved.unix.len == path.len);
+    assert(resolved.unix[0] == '/');
+    return resolved;
 }
 
 /// A cluster's #396 tiers, materialized only where some endpoint is not a
@@ -5140,33 +5656,31 @@ fn resolveEndpoints(
 
 fn resolveListeners(
     arena: std.mem.Allocator,
-    listeners_json: []const ListenerJson,
+    stated: []const Options.Listener,
     clusters: []const Config.Cluster,
     head_buffer_bytes: u32,
     bodies: []ResolvedBody,
-    files: FileSource,
 ) ParseError![]const Config.Listener {
     assert(clusters.len >= 1);
-    if (listeners_json.len == 0) {
+    if (stated.len == 0) {
         return error.ListenersEmpty;
     }
     // No policy ceiling: a listener costs two ring ops and one fd, and
     // both are checked against this config's own budget — `cqFillFits`
     // for the ring (`LimitConnSlotsOverCqFill`), `ensureFdBudget` for the
     // fds. What is left is the `u16` the listener index is stored in.
-    if (listeners_json.len > std.math.maxInt(u16)) {
+    if (stated.len > std.math.maxInt(u16)) {
         return error.ListenersOverLimit;
     }
 
-    const listeners = try arena.alloc(Config.Listener, listeners_json.len);
-    for (listeners_json, listeners) |listener_json, *listener| {
+    const listeners = try arena.alloc(Config.Listener, stated.len);
+    for (stated, listeners) |*listener_stated, *listener| {
         listener.* = try resolveListener(
             arena,
-            &listener_json,
+            listener_stated,
             clusters,
             head_buffer_bytes,
             bodies,
-            files,
         );
     }
     if (tlsCertificateCount(listeners) > constants.tls_certificates_max) {
@@ -5196,7 +5710,7 @@ fn resolveListeners(
         }
     }
 
-    assert(listeners.len == listeners_json.len);
+    assert(listeners.len == stated.len);
     assert(order.len == listeners.len);
     return listeners;
 }
@@ -5208,34 +5722,28 @@ fn resolveListeners(
 /// entry.
 fn resolveListener(
     arena: std.mem.Allocator,
-    listener_json: *const ListenerJson,
+    stated: *const Options.Listener,
     clusters: []const Config.Cluster,
     head_buffer_bytes: u32,
     bodies: []ResolvedBody,
-    files: FileSource,
 ) ParseError!Config.Listener {
     assert(clusters.len >= 1);
     assert(head_buffer_bytes >= 1);
-    const bind_address = try resolveBindAddress(arena, listener_json.bind);
-    const protocol = try protocolOf(listener_json);
-    const tls = try resolveTls(arena, listener_json.tls, protocol, files);
-    // The tag dispatches, and every field it does not carry is one this
-    // arm cannot be handed (#305): the seven "this key is meaningless on
-    // that protocol" errors this replaced were the loader restating a
-    // shape it now simply has.
-    var listener: Config.Listener = switch (protocol) {
-        .http => try resolveHttpListener(
+    const bind_address = try resolveBindAddress(arena, stated.bind);
+    const tls = try resolveTls(arena, &stated.tls, stated.protocol);
+    var listener: Config.Listener = switch (stated.protocol) {
+        .http => |*http| try resolveHttpListener(
             arena,
             bind_address,
             tls,
-            &listener_json.http.?,
+            http,
             clusters,
             head_buffer_bytes,
             bodies,
         ),
-        .l4 => try resolveL4Listener(arena, bind_address, tls, &listener_json.l4.?, clusters),
+        .l4 => |*l4| try resolveL4Listener(arena, bind_address, tls, l4, clusters),
     };
-    listener.bind_mode = try resolveBindMode(listener_json.mode, bind_address);
+    listener.bind_mode = try resolveBindMode(stated.mode, bind_address);
     if (bind_address == .unix) {
         try rejectUnixClientAddressUsers(&listener, clusters);
     }
@@ -5247,6 +5755,7 @@ fn resolveListener(
         try rejectTlsClusterSend(listener.routes, clusters);
     }
     assert(listener.routes.len >= 1);
+    assert(listener.protocol == stated.protocol);
     return listener;
 }
 
@@ -5256,7 +5765,7 @@ fn resolveHttpListener(
     arena: std.mem.Allocator,
     bind_address: io_module.Address,
     tls: ?Config.Listener.Tls,
-    http_json: *const HttpListenerJson,
+    http: *const Options.Listener.Http,
     clusters: []const Config.Cluster,
     head_buffer_bytes: u32,
     bodies: []ResolvedBody,
@@ -5265,21 +5774,20 @@ fn resolveHttpListener(
     assert(head_buffer_bytes >= 1);
     return .{
         .bind_address = bind_address,
-        // Filled by `resolveListener`, which is where the `mode` field
-        // and the bind it describes are both in scope.
         .bind_mode = null,
-        .routes = try resolveRoutes(arena, http_json, clusters, head_buffer_bytes),
-        .request_filters = try resolveRequestFilters(arena, http_json, head_buffer_bytes, bodies),
-        .response_filters = try resolveResponseFilters(arena, http_json),
+        .routes = try resolveRoutes(arena, &http.target, clusters, head_buffer_bytes),
+        .request_filters = try resolveRequestFilters(arena, http.request_filters, head_buffer_bytes, bodies),
+        .request_policies = http.request_policies,
+        .response_filters = try resolveResponseFilters(arena, http.response_filters),
         .protocol = .http,
-        .forwarded = try resolveForwarded(http_json.forwarded),
+        .forwarded = http.forwarded,
         .proxy_protocol = null,
         .tls = tls,
-        .upgrades = try resolveUpgrades(http_json.upgrades),
-        .max_body_bytes = try resolveMaxBodyBytes(http_json.max_body_bytes),
-        .keepalive_requests = http_json.keepalive_requests,
-        .proxy_status = http_json.proxy_status,
-        .h2c = try resolveH2c(http_json.h2c, tls),
+        .upgrades = http.upgrades,
+        .max_body_bytes = try resolveMaxBodyBytes(http.max_body_bytes),
+        .keepalive_requests = http.keepalive_requests,
+        .proxy_status = http.proxy_status,
+        .h2c = try resolveH2c(http.h2c, tls),
     };
 }
 
@@ -5305,15 +5813,11 @@ fn resolveL4Listener(
     arena: std.mem.Allocator,
     bind_address: io_module.Address,
     tls: ?Config.Listener.Tls,
-    l4_json: *const L4ListenerJson,
+    l4: *const Options.Listener.L4,
     clusters: []const Config.Cluster,
 ) ParseError!Config.Listener {
     assert(clusters.len >= 1);
-    const has_cluster = l4_json.cluster != null;
-    const has_routes = l4_json.routes != null;
-    if (has_cluster == has_routes) {
-        return error.ListenerClusterOrRoutes; // Neither, or both.
-    }
+    const has_routes = l4.target == .routes;
     // Routing by name means reading the client's ClientHello and relaying
     // it on. A listener that *terminates* consumed that hello during its
     // own handshake, so there is nothing left for the peek to read —
@@ -5321,11 +5825,11 @@ fn resolveL4Listener(
     if (has_routes and tls != null) {
         return error.ListenerTlsWithSniRoutes;
     }
-    const sni_routes: []const sni_router.Route = if (has_routes)
-        try resolveSniRoutes(arena, l4_json.routes.?, clusters)
-    else
-        &.{};
-    const routes = try resolveL4Route(arena, admittedCluster(l4_json, sni_routes), clusters);
+    const sni_routes: []const sni_router.Route = switch (l4.target) {
+        .cluster => &.{},
+        .routes => |routes| try resolveSniRoutes(arena, routes, clusters),
+    };
+    const routes = try resolveL4Route(arena, admittedCluster(&l4.target, sni_routes), clusters);
     assert(routes.len == 1);
     const listener: Config.Listener = .{
         .bind_address = bind_address,
@@ -5334,7 +5838,7 @@ fn resolveL4Listener(
         .routes = routes,
         .sni_routes = sni_routes,
         .protocol = .l4,
-        .proxy_protocol = try resolveProxyProtocol(l4_json.proxy_protocol),
+        .proxy_protocol = l4.proxy_protocol,
         .tls = tls,
         // Stated rather than defaulted: an l4 relay never measures a
         // request, so its cap is the absence of one — and the field's
@@ -5342,7 +5846,7 @@ fn resolveL4Listener(
         // policy this listener does not have.
         .max_body_bytes = 0,
     };
-    assert((listener.sni_routes.len >= 1) == (l4_json.routes != null));
+    assert((listener.sni_routes.len >= 1) == has_routes);
     // The four fields this initializer does not name inherit
     // `Config.Listener`'s defaults, and those defaults happen to be the
     // l4 answer too — an l4 listener has always had no filters, no
@@ -5396,20 +5900,23 @@ fn bindOrder(address: std.Io.net.IpAddress) u160 {
 /// not — a listener whose every route is named closes what it cannot
 /// place, so nothing is ever relayed to this choice.
 fn admittedCluster(
-    l4_json: *const L4ListenerJson,
+    target: *const Options.Listener.L4Target,
     sni_routes: []const sni_router.Route,
 ) []const u8 {
-    if (l4_json.cluster) |name| {
-        assert(sni_routes.len == 0);
-        return name;
+    switch (target.*) {
+        .cluster => |name| {
+            assert(sni_routes.len == 0);
+            return name;
+        },
+        .routes => |routes| {
+            assert(sni_routes.len >= 1);
+            assert(routes.len == sni_routes.len);
+            for (routes) |route| {
+                if (route.sni == null) return route.cluster;
+            }
+            return routes[0].cluster;
+        },
     }
-    assert(sni_routes.len >= 1);
-    const routes_json = l4_json.routes.?;
-    assert(routes_json.len >= 1);
-    for (routes_json) |route_json| {
-        if (route_json.sni == null) return route_json.cluster;
-    }
-    return routes_json[0].cluster;
 }
 
 /// An `l4` listener's §6 SNI table (#298), resolved into the immutable
@@ -5422,17 +5929,17 @@ fn admittedCluster(
 /// is what #298 asked to avoid.
 fn resolveSniRoutes(
     arena: std.mem.Allocator,
-    routes_json: []const L4RouteJson,
+    stated: []const Options.Listener.SniRoute,
     clusters: []const Config.Cluster,
 ) ParseError![]const sni_router.Route {
     assert(clusters.len >= 1);
-    if (routes_json.len == 0) {
+    if (stated.len == 0) {
         return error.RoutesEmpty;
     }
-    const routes = try arena.alloc(sni_router.Route, routes_json.len);
-    for (routes_json, 0..) |route_json, index| {
-        const name = if (route_json.sni) |raw| try validateSniName(raw) else null;
-        for (routes_json[0..index]) |previous| {
+    const routes = try arena.alloc(sni_router.Route, stated.len);
+    for (stated, 0..) |route_stated, index| {
+        const name = if (route_stated.sni) |raw| try validateSniName(raw) else null;
+        for (stated[0..index]) |previous| {
             // Earlier names already passed `validateRouteHost`, so their
             // raw form equals their canonical one and a byte compare is
             // sound. Two rules for one name is an operator asking for two
@@ -5447,11 +5954,11 @@ fn resolveSniRoutes(
             // `l4ClusterIndexOf`, not the bare lookup: every cluster this
             // table can reach is reachable from an l4 listener, so every
             // one of them is held to the rule the admitted cluster is.
-            .cluster_index = try l4ClusterIndexOf(clusters, route_json.cluster),
+            .cluster_index = try l4ClusterIndexOf(clusters, route_stated.cluster),
         };
     }
     std.mem.sort(sni_router.Route, routes, {}, sniRouteMoreSpecific);
-    assert(routes.len == routes_json.len);
+    assert(routes.len == stated.len);
     assert(routes.len >= 1);
     return routes;
 }
@@ -5552,26 +6059,25 @@ fn resolveL4Route(
 
 /// Compile a listener's §7 filter rules into immutable arena tables.
 /// Reachable only from an `http` body, so there is no protocol to check:
-/// an l4 listener has no field to put these in (#305). Absent = none.
+/// an l4 listener has no field to put these in (#305). None is none.
 /// Match keys are validated canonical so a filter and the router agree
 /// byte-for-byte, and each action is validated at load, so the request-
 /// time interpreter is bounded loops over trusted data.
 fn resolveRequestFilters(
     arena: std.mem.Allocator,
-    http_json: *const HttpListenerJson,
+    stated: []const Options.Listener.Filter,
     head_buffer_bytes: u32,
     bodies: []ResolvedBody,
 ) ParseError![]const filter.Rule {
-    const filters_json = http_json.request_filters orelse return &.{};
-    if (filters_json.len == 0) {
+    if (stated.len == 0) {
         return &.{};
     }
-    const rules = try arena.alloc(filter.Rule, filters_json.len);
+    const rules = try arena.alloc(filter.Rule, stated.len);
     var header_edits: u32 = 0;
-    for (filters_json, rules) |rule_json, *rule| {
+    for (stated, rules) |*rule_stated, *rule| {
         rule.* = .{
-            .match = try resolveMatch(arena, &rule_json.match, head_buffer_bytes),
-            .actions = try resolveActions(arena, rule_json.actions, head_buffer_bytes, bodies),
+            .match = try resolveMatch(arena, &rule_stated.match, head_buffer_bytes),
+            .actions = try resolveActions(arena, rule_stated.actions, head_buffer_bytes, bodies),
         };
         header_edits += countHeaderEdits(rule.actions);
     }
@@ -5584,7 +6090,7 @@ fn resolveRequestFilters(
     // The one bound left on this table, and the render buffer depends on
     // it — so state it positively rather than trusting the guard above.
     assert(header_edits <= constants.header_edits_max);
-    assert(rules.len == filters_json.len);
+    assert(rules.len == stated.len);
     return rules;
 }
 
@@ -5618,18 +6124,17 @@ fn countHeaderEdits(actions: []const filter.Action) u32 {
 /// every matched rule's edits from a single fixed buffer.
 fn resolveResponseFilters(
     arena: std.mem.Allocator,
-    http_json: *const HttpListenerJson,
+    stated: []const Options.Listener.ResponseFilter,
 ) ParseError![]const filter.ResponseRule {
-    const rules_json = http_json.response_filters orelse return &.{};
-    if (rules_json.len == 0) {
+    if (stated.len == 0) {
         return &.{};
     }
-    const rules = try arena.alloc(filter.ResponseRule, rules_json.len);
+    const rules = try arena.alloc(filter.ResponseRule, stated.len);
     var header_edits: u32 = 0;
-    for (rules_json, rules) |rule_json, *rule| {
+    for (stated, rules) |*rule_stated, *rule| {
         rule.* = .{
-            .match = try resolveResponseMatch(arena, &rule_json.match),
-            .edits = try resolveResponseEdits(arena, rule_json.actions),
+            .match = try resolveResponseMatch(arena, &rule_stated.match),
+            .edits = try resolveResponseEdits(arena, rule_stated.actions),
         };
         header_edits += @intCast(rule.edits.len);
     }
@@ -5637,160 +6142,125 @@ fn resolveResponseFilters(
         return error.ResponseFilterHeaderEditsOverLimit;
     }
     assert(header_edits <= constants.header_edits_max);
-    assert(rules.len == rules_json.len);
+    assert(rules.len == stated.len);
     return rules;
 }
 
 fn resolveResponseMatch(
     arena: std.mem.Allocator,
-    match_json: *const ResponseMatchJson,
+    match: *const Options.Listener.ResponseMatch,
 ) ParseError!filter.ResponseMatch {
-    var match: filter.ResponseMatch = .{};
-    if (match_json.status) |statuses_json| {
-        // An explicitly empty list is a mistake, not "any" — absence
-        // already says that, unambiguously (the `FilterMethodEmpty`
-        // rule).
-        if (statuses_json.len == 0) {
-            return error.ResponseFilterStatusEmpty;
+    var resolved: filter.ResponseMatch = .{};
+    for (match.statuses) |status| {
+        // The parser only ever produces 100..599 (§7), so a value outside
+        // it is a rule that can never fire — a typo, told at load rather
+        // than left silently inert.
+        if (status < 100 or status > 599) {
+            return error.ResponseFilterStatusInvalid;
         }
-        const statuses = try arena.alloc(u16, statuses_json.len);
-        for (statuses_json, statuses) |status, *slot| {
-            // The parser only ever produces 100..599 (§7), so a value
-            // outside it is a rule that can never fire — a typo, told at
-            // load rather than left silently inert.
-            if (status < 100 or status > 599) {
-                return error.ResponseFilterStatusInvalid;
-            }
-            slot.* = status;
-        }
-        match.statuses = statuses;
     }
-    if (match_json.status_class) |literal| {
-        const class = std.meta.stringToEnum(filter.StatusClass, literal) orelse
-            return error.ResponseFilterStatusClassUnknown;
-        match.status_class = @backingInt(class);
-        // The digit contract `responseMatches` asserts on its side of
-        // the seam, proven where it is produced.
-        assert(match.status_class.? >= 1);
-        assert(match.status_class.? <= 5);
+    resolved.statuses = match.statuses;
+    if (match.status_class) |class| {
+        resolved.status_class = @backingInt(class);
+        // The digit contract `responseMatches` asserts on its side of the
+        // seam, proven where it is produced.
+        assert(resolved.status_class.? >= 1);
+        assert(resolved.status_class.? <= 5);
     }
-    if (match_json.headers) |headers_json| {
-        match.headers = try resolveHeaderMatches(arena, headers_json);
-    }
-    return match;
+    resolved.headers = try resolveHeaderMatches(arena, match.headers);
+    return resolved;
 }
 
-/// Resolve a response rule's actions: the same `ActionJson` vocabulary
-/// the request side reads — one muscle memory — with the two arms that
-/// have no meaning on the way out rejected by their own names, so an
-/// operator reaching for `reject` on a response is told which idea does
-/// not transfer rather than handed a generic kind error.
+/// Resolve a response rule's actions: the request side's three header
+/// verbs, which are all a response can be given — there is no reject to
+/// interleave on the way out. The other arms are not a shape the options
+/// can state; JSON's spelling of one is its front-end's refusal.
 fn resolveResponseEdits(
     arena: std.mem.Allocator,
-    actions_json: []const ResponseActionJson,
+    stated: []const Options.Listener.ResponseAction,
 ) ParseError![]const filter.AppliedHeaderEdit {
-    if (actions_json.len == 0) {
+    if (stated.len == 0) {
         return error.FilterActionsEmpty;
     }
-    assert(actions_json.len >= 1); // Past the empty guard.
-    const edits = try arena.alloc(filter.AppliedHeaderEdit, actions_json.len);
-    for (actions_json, edits) |action_json, *edit| {
-        edit.* = try resolveResponseEdit(&action_json);
+    assert(stated.len >= 1); // Past the empty guard.
+    const edits = try arena.alloc(filter.AppliedHeaderEdit, stated.len);
+    for (stated, edits) |*action, *edit| {
+        edit.* = try resolveResponseEdit(action);
     }
-    assert(edits.len == actions_json.len);
+    assert(edits.len == stated.len);
     return edits;
 }
 
-fn resolveResponseEdit(action_json: *const ResponseActionJson) ParseError!filter.AppliedHeaderEdit {
-    // The kind fork, which for this table is now the whole check: the
-    // four request-side actions are not fields here, so a config naming
-    // one is refused by the strict parser rather than by four rules
-    // this function used to carry (#305).
-    try requireOneResponseActionKind(action_json);
-    if (action_json.header_set) |edit| {
-        const resolved = try resolveHeaderEdit(&edit);
-        return .{ .kind = .set, .name = resolved.name, .value = resolved.value };
-    }
-    if (action_json.header_add) |edit| {
-        const resolved = try resolveHeaderEdit(&edit);
-        return .{ .kind = .add, .name = resolved.name, .value = resolved.value };
-    }
-    const name = action_json.header_remove.?;
-    try validateEditableHeaderName(name);
-    return .{ .kind = .remove, .name = name, .value = "" };
+fn resolveResponseEdit(action: *const Options.Listener.ResponseAction) ParseError!filter.AppliedHeaderEdit {
+    const edit: filter.AppliedHeaderEdit = switch (action.*) {
+        .header_set => |*stated| blk: {
+            const resolved = try resolveHeaderEdit(stated);
+            break :blk .{ .kind = .set, .name = resolved.name, .value = resolved.value };
+        },
+        .header_add => |*stated| blk: {
+            const resolved = try resolveHeaderEdit(stated);
+            break :blk .{ .kind = .add, .name = resolved.name, .value = resolved.value };
+        },
+        .header_remove => |name| blk: {
+            try validateEditableHeaderName(name);
+            break :blk .{ .kind = .remove, .name = name, .value = "" };
+        },
+    };
+    assert(edit.name.len >= 1);
+    assert(edit.kind != .remove or edit.value.len == 0);
+    return edit;
 }
 
 fn resolveMatch(
     arena: std.mem.Allocator,
-    match_json: *const MatchJson,
+    match: *const Options.Listener.Match,
     head_buffer_bytes: u32,
 ) ParseError!filter.Match {
-    var match: filter.Match = .{};
-    if (match_json.host) |host| {
-        match.host = try validateRouteHost(host);
+    var resolved: filter.Match = .{};
+    if (match.host) |host| {
+        resolved.host = try validateRouteHost(host);
     }
-    if (match_json.path_prefix) |prefix| {
+    if (match.path_prefix) |prefix| {
         try validateRoutePrefix(prefix, head_buffer_bytes);
-        match.path_prefix = prefix;
+        resolved.path_prefix = prefix;
     }
-    if (match_json.method) |tokens| {
-        if (tokens.len == 0) {
+    if (match.methods) |methods| {
+        // An empty set is a mistake, not "any": absence already says
+        // that, unambiguously.
+        if (methods.count() == 0) {
             return error.FilterMethodEmpty;
         }
-        var methods = std.EnumSet(parser.Method){};
-        for (tokens) |token| {
-            const method = parser.methodFromToken(token) orelse return error.FilterMethodUnknown;
-            methods.insert(method);
+        // An extension method has no single token (§7), so a rule over
+        // it would hold for every method nobody registered — the token
+        // vocabulary refuses it, and so does this.
+        if (methods.contains(.extension)) {
+            return error.FilterMethodUnknown;
         }
-        match.methods = methods;
+        resolved.methods = methods;
     }
-    if (match_json.headers) |headers_json| {
-        match.headers = try resolveHeaderMatches(arena, headers_json);
-    }
-    if (match_json.client) |cidr_literals| {
-        match.clients = try resolveClientCidrs(arena, cidr_literals);
-    }
-    return match;
+    resolved.headers = try resolveHeaderMatches(arena, match.headers);
+    resolved.clients = try resolveClientCidrs(match.clients);
+    assert(resolved.headers.len == match.headers.len);
+    assert(resolved.clients.len == match.clients.len);
+    return resolved;
 }
 
-/// Compile a `client` predicate's CIDR list (#177). An explicitly empty
-/// list is a mistake — absence already says "any client", unambiguously
-/// (the `FilterMethodEmpty` rule).
-fn resolveClientCidrs(
-    arena: std.mem.Allocator,
-    literals: []const []const u8,
-) ParseError![]const filter.Cidr {
-    if (literals.len == 0) {
-        return error.FilterClientEmpty;
+/// A `client` predicate's CIDR list (#177), each prefix held to the rules
+/// `Cidr.contains` leans on. None is any client; the JSON spelling of an
+/// explicitly empty list is its front-end's refusal (`clientCidrsOf`).
+fn resolveClientCidrs(cidrs: []const filter.Cidr) ParseError![]const filter.Cidr {
+    for (cidrs) |*cidr| {
+        try validateClientCidr(cidr);
     }
-    assert(literals.len >= 1); // Past the empty guard.
-    const cidrs = try arena.alloc(filter.Cidr, literals.len);
-    for (literals, cidrs) |literal, *cidr| {
-        cidr.* = try resolveClientCidr(literal);
-    }
-    assert(cidrs.len == literals.len);
     return cidrs;
 }
 
-/// One CIDR literal to its compiled prefix. The `/len` is mandatory — a
-/// bare address has no single meaning across families (an exact IPv4
-/// host is /32, but an exact IPv6 *client* is its /64), so the spelling
-/// that would need per-family folklore is refused instead. Host bits
-/// past the prefix must be zero: `10.0.0.1/8` is a typo for either
-/// `10.0.0.0/8` or `10.0.0.1/32`, and the loader cannot know which.
-fn resolveClientCidr(literal: []const u8) ParseError!filter.Cidr {
-    const slash = std.mem.indexOfScalar(u8, literal, '/') orelse
-        return error.FilterClientCidrInvalid;
-    const address_text = literal[0..slash];
-    const prefix_text = literal[slash + 1 ..];
-    if (prefix_text.len == 0) {
-        return error.FilterClientPrefixInvalid;
-    }
-    const prefix_len = std.fmt.parseUnsigned(u8, prefix_text, 10) catch
-        return error.FilterClientPrefixInvalid;
-    const address = std.Io.net.IpAddress.parse(address_text, 0) catch
-        return error.FilterClientCidrInvalid;
-    switch (address) {
+/// One client prefix, judged. Host bits past the prefix must be zero:
+/// `10.0.0.1/8` is a typo for either `10.0.0.0/8` or `10.0.0.1/32`, and
+/// the loader cannot know which.
+fn validateClientCidr(cidr: *const filter.Cidr) ParseError!void {
+    const prefix_len = cidr.prefix_len;
+    switch (cidr.address) {
         .ip4 => |v4| {
             if (prefix_len > 32) {
                 return error.FilterClientPrefixTooNarrow;
@@ -5823,8 +6293,7 @@ fn resolveClientCidr(literal: []const u8) ParseError!filter.Cidr {
     }
     // The compiled prefix `Cidr.contains` and `clientMatches` assert on
     // their side of the seam, proven where it is produced.
-    assert(prefix_len <= 64 or address == .ip4);
-    return .{ .address = address, .prefix_len = prefix_len };
+    assert(prefix_len <= 64 or cidr.address == .ip4);
 }
 
 /// Whether any bit below the prefix is set — the host half that a
@@ -5854,93 +6323,75 @@ fn hostBitsSet(comptime T: type, bits: T, prefix_len: u8) bool {
 /// there. Only an *edit* target is reserved (§7), because rewriting one
 /// smuggles a framing change past the render — reading one to pick a
 /// backend changes nothing, and routing runs before any edit anyway.
-fn resolveRouteHeader(header_json: RouteHeaderJson) ParseError!router.HeaderMatch {
-    try validateHeaderName(header_json.name);
-    const set: u8 = @as(u8, @intFromBool(header_json.present != null)) +
-        @intFromBool(header_json.equals != null);
-    assert(set <= 2); // The route header has two kind fields.
-    if (set != 1) {
-        return error.RouteHeaderMatchKind;
-    }
-    if (header_json.present) |present| {
-        if (!present) {
-            return error.RouteHeaderMatchKind; // "present: false" is not a predicate.
-        }
-        return .{ .name = header_json.name, .kind = .present, .value = "" };
-    }
-    const value = header_json.equals.?;
-    // An `equals: ""` predicate is meaningful — a header present with an
-    // empty value — so the empty value is legal, as it is for a filter.
-    try validateHeaderValue(value);
+fn resolveRouteHeader(header: *const Options.Listener.RouteHeader) ParseError!router.HeaderMatch {
+    try validateHeaderName(header.name);
+    const match: router.HeaderMatch = switch (header.predicate) {
+        .present => .{ .name = header.name, .kind = .present, .value = "" },
+        .equals => |value| blk: {
+            // An `equals: ""` predicate is meaningful — a header present
+            // with an empty value — so the empty value is legal, as it is
+            // for a filter.
+            try validateHeaderValue(value);
+            break :blk .{ .name = header.name, .kind = .equals, .value = value };
+        },
+    };
     // `headerMatches` asserts this of every predicate it is handed; the
     // name came through `validateHeaderName`, so stating it here is what
     // ties the producer to that precondition.
-    assert(header_json.name.len >= 1);
-    return .{ .name = header_json.name, .kind = .equals, .value = value };
+    assert(match.name.len >= 1);
+    assert(match.kind != .contains);
+    return match;
 }
 
 fn resolveHeaderMatches(
     arena: std.mem.Allocator,
-    headers_json: []const HeaderMatchJson,
+    stated: []const Options.Listener.HeaderMatch,
 ) ParseError![]const filter.HeaderMatch {
-    const matches = try arena.alloc(filter.HeaderMatch, headers_json.len);
-    for (headers_json, matches) |header_json, *match| {
-        try validateHeaderName(header_json.name);
-        // Exactly one predicate kind per header match.
-        const set: u8 = @as(u8, @intFromBool(header_json.present != null)) +
-            @intFromBool(header_json.equals != null) +
-            @intFromBool(header_json.contains != null);
-        assert(set <= 3); // The header match has three kind fields.
-        if (set != 1) {
-            return error.FilterHeaderMatchKind;
-        }
-        if (header_json.present) |present| {
-            if (!present) {
-                return error.FilterHeaderMatchKind; // "present: false" is not a predicate.
-            }
-            match.* = .{ .name = header_json.name, .kind = .present, .value = "" };
-        } else if (header_json.equals) |value| {
-            // An `equals: ""` predicate is meaningful — a header present
-            // with an empty value — so the empty value is legal here.
-            try validateHeaderValue(value);
-            match.* = .{ .name = header_json.name, .kind = .equals, .value = value };
-        } else {
-            const needle = header_json.contains.?;
-            // A `contains: ""` needle would match every present header
-            // (`indexOf(x, "")` is always 0) — a degenerate `present` in
-            // disguise. Reject it so `contains` is always a real substring.
-            if (needle.len == 0) {
-                return error.FilterHeaderContainsEmpty;
-            }
-            try validateHeaderValue(needle);
-            match.* = .{ .name = header_json.name, .kind = .contains, .value = needle };
-        }
+    const matches = try arena.alloc(filter.HeaderMatch, stated.len);
+    for (stated, matches) |header, *match| {
+        try validateHeaderName(header.name);
+        match.* = switch (header.predicate) {
+            .present => .{ .name = header.name, .kind = .present, .value = "" },
+            .equals => |value| blk: {
+                // An `equals: ""` predicate is meaningful — a header present
+                // with an empty value — so the empty value is legal here.
+                try validateHeaderValue(value);
+                break :blk .{ .name = header.name, .kind = .equals, .value = value };
+            },
+            .contains => |needle| blk: {
+                // A `contains: ""` needle would match every present header
+                // (`indexOf(x, "")` is always 0) — a degenerate `present` in
+                // disguise. Reject it so `contains` is always a real substring.
+                if (needle.len == 0) {
+                    return error.FilterHeaderContainsEmpty;
+                }
+                try validateHeaderValue(needle);
+                break :blk .{ .name = header.name, .kind = .contains, .value = needle };
+            },
+        };
     }
-    assert(matches.len == headers_json.len);
+    assert(matches.len == stated.len);
     return matches;
 }
 
 fn resolveActions(
     arena: std.mem.Allocator,
-    actions_json: []const ActionJson,
+    stated: []const Options.Listener.Action,
     head_buffer_bytes: u32,
     bodies: []ResolvedBody,
 ) ParseError![]const filter.Action {
-    if (actions_json.len == 0) {
+    if (stated.len == 0) {
         return error.FilterActionsEmpty;
     }
-    assert(actions_json.len >= 1); // Past the empty guard.
-    const actions = try arena.alloc(filter.Action, actions_json.len);
-    for (actions_json, actions) |action_json, *action| {
-        action.* = try resolveAction(arena, &action_json, head_buffer_bytes, bodies);
+    assert(stated.len >= 1); // Past the empty guard.
+    const actions = try arena.alloc(filter.Action, stated.len);
+    for (stated, actions) |*action_stated, *action| {
+        action.* = try resolveAction(arena, action_stated, head_buffer_bytes, bodies);
     }
-    assert(actions.len == actions_json.len);
+    assert(actions.len == stated.len);
     return actions;
 }
 
-/// Exactly one action field may carry the kind — the "exactly one of"
-/// fork both action resolvers share, so an eighth kind cannot be
-/// counted in one table and forgotten in the other.
 /// The response table's kind fork (#305). Three members rather than the
 /// request's eight, and the same verdict — a rule naming none or two
 /// has no single action to apply.
@@ -5955,6 +6406,9 @@ fn requireOneResponseActionKind(action_json: *const ResponseActionJson) ParseErr
     assert(set == 1);
 }
 
+/// Exactly one action field may carry the kind — the "exactly one of"
+/// fork both action translators share, so an eighth kind cannot be
+/// counted in one table and forgotten in the other.
 fn requireOneActionKind(action_json: *const ActionJson) ParseError!void {
     const set: u8 = @as(u8, @intFromBool(action_json.reject != null)) +
         @intFromBool(action_json.redirect != null) +
@@ -5973,106 +6427,84 @@ fn requireOneActionKind(action_json: *const ActionJson) ParseError!void {
 
 fn resolveAction(
     arena: std.mem.Allocator,
-    action_json: *const ActionJson,
+    action: *const Options.Listener.Action,
     head_buffer_bytes: u32,
     bodies: []ResolvedBody,
 ) ParseError!filter.Action {
-    try requireOneActionKind(action_json);
-    if (action_json.reject) |status| {
-        if (!filter.isRejectStatus(status)) {
-            return error.FilterRejectStatus;
-        }
-        return .{ .reject = status };
+    switch (action.*) {
+        .reject => |status| {
+            if (!filter.isRejectStatus(status)) {
+                return error.FilterRejectStatus;
+            }
+            return .{ .reject = status };
+        },
+        .redirect => |*redirect| return .{ .redirect = try resolveRedirect(redirect) },
+        .respond => |respond| {
+            // The page set, not the reject set: `200` is the point of this
+            // action, and an error status here is a policy page that wants
+            // a body without an `error_pages` entry to match.
+            if (!shed.isPageStatus(respond.status)) {
+                return error.FilterRespondStatus;
+            }
+            const page = try pageFor(arena, bodies, respond.body, respond.status);
+            // The precondition `firstVerdict` asserts on the far side, so
+            // the compiled action and the interpreter agree at load rather
+            // than on the serving path.
+            assert(shed.isPageStatus(page.status));
+            return .{ .respond = page };
+        },
+        .allow => return .allow,
+        .header_set => |*edit| return .{ .header_set = try resolveHeaderEdit(edit) },
+        .header_add => |*edit| return .{ .header_add = try resolveHeaderEdit(edit) },
+        .header_remove => |name| {
+            try validateEditableHeaderName(name);
+            return .{ .header_remove = name };
+        },
+        .rewrite_prefix => |rewrite| {
+            try validateRoutePrefix(rewrite.from, head_buffer_bytes);
+            try validateRoutePrefix(rewrite.to, head_buffer_bytes);
+            return .{ .rewrite_prefix = rewrite };
+        },
     }
-    if (action_json.redirect) |redirect_json| {
-        return .{ .redirect = try resolveRedirect(&redirect_json) };
-    }
-    if (action_json.respond) |respond_json| {
-        // The page set, not the reject set: `200` is the point of this
-        // action, and an error status here is a policy page that wants
-        // a body without an `error_pages` entry to match.
-        if (!shed.isPageStatus(respond_json.status)) {
-            return error.FilterRespondStatus;
-        }
-        const page = try pageFor(arena, bodies, respond_json.body, respond_json.status);
-        // The precondition `firstVerdict` asserts on the far side, so
-        // the compiled action and the interpreter agree at load rather
-        // than on the serving path.
-        assert(shed.isPageStatus(page.status));
-        return .{ .respond = page };
-    }
-    if (action_json.allow) |allow| {
-        // `allow: false` is the same non-predicate `present: false` is:
-        // a key that names an action and then unsays it. Refused rather
-        // than read as "not allow", which is not an action either.
-        if (!allow) {
-            return error.FilterActionKind;
-        }
-        return .allow;
-    }
-    if (action_json.header_set) |edit| {
-        return .{ .header_set = try resolveHeaderEdit(&edit) };
-    }
-    if (action_json.header_add) |edit| {
-        return .{ .header_add = try resolveHeaderEdit(&edit) };
-    }
-    if (action_json.header_remove) |name| {
-        try validateEditableHeaderName(name);
-        return .{ .header_remove = name };
-    }
-    const rewrite = action_json.rewrite_prefix.?;
-    try validateRoutePrefix(rewrite.from, head_buffer_bytes);
-    try validateRoutePrefix(rewrite.to, head_buffer_bytes);
-    return .{ .rewrite_prefix = .{ .from = rewrite.from, .to = rewrite.to } };
 }
 
-/// Resolve a `redirect` action (#176). The target fork is exactly-one:
-/// a fixed `location`, or a composed target whose `scheme` is required
-/// — a host alone would leave the scheme guessed, and behind a TLS
-/// terminator the guess is wrong exactly when it matters.
-fn resolveRedirect(redirect_json: *const RedirectJson) ParseError!filter.Redirect {
-    if (!filter.isRedirectStatus(redirect_json.status)) {
+/// Resolve a `redirect` action (#176). The target is a fixed `location`
+/// or a composed one whose scheme is stated — a host alone would leave the
+/// scheme guessed, and behind a TLS terminator the guess is wrong exactly
+/// when it matters. The union carries that fork; what is left is the
+/// status and the values the render emits.
+fn resolveRedirect(redirect: *const filter.Redirect) ParseError!filter.Redirect {
+    if (!filter.isRedirectStatus(redirect.status)) {
         return error.FilterRedirectStatus;
     }
-    assert(filter.isRedirectStatus(redirect_json.status));
-    const has_location = redirect_json.location != null;
-    const has_composed = redirect_json.scheme != null or redirect_json.host != null;
-    if (has_location == has_composed) {
-        // Neither form, or both at once.
-        return error.FilterRedirectTarget;
+    assert(filter.isRedirectStatus(redirect.status));
+    switch (redirect.target) {
+        .location => |location| {
+            if (location.len == 0) {
+                return error.FilterRedirectTarget;
+            }
+            // A Location is a header value the render emits verbatim: the
+            // same injection-safety the header edits prove at load.
+            try validateHeaderValue(location);
+        },
+        .composed => |composed| {
+            // Canonical like a route host: the Location's authority is a
+            // name the operator writes, and the same validation keeps it
+            // one the render can emit without a second look.
+            if (composed.host) |host| _ = try validateRouteHost(host);
+        },
     }
-    if (redirect_json.location) |location| {
-        if (location.len == 0) {
-            return error.FilterRedirectTarget;
-        }
-        // A Location is a header value the render emits verbatim: the
-        // same injection-safety the header edits prove at load.
-        try validateHeaderValue(location);
-        return .{ .status = redirect_json.status, .target = .{ .location = location } };
-    }
-    const scheme_literal = redirect_json.scheme orelse {
-        // Host without scheme: half a composed target.
-        return error.FilterRedirectTarget;
-    };
-    const scheme = std.meta.stringToEnum(filter.Redirect.Scheme, scheme_literal) orelse
-        return error.FilterRedirectSchemeUnknown;
-    var composed: filter.Redirect.Composed = .{ .scheme = scheme };
-    if (redirect_json.host) |host| {
-        // Canonical like a route host: the Location's authority is a
-        // name the operator writes, and the same validation keeps it
-        // one the render can emit without a second look.
-        composed.host = try validateRouteHost(host);
-    }
-    return .{ .status = redirect_json.status, .target = .{ .composed = composed } };
+    return redirect.*;
 }
 
 /// Validate a name/value header edit shared by `header_set` and
 /// `header_add`: an editable (non-proxy-managed) RFC 9110 token name and an
 /// injection-safe field-value. Both actions carry the identical contract.
-fn resolveHeaderEdit(edit: *const HeaderEditJson) ParseError!filter.HeaderEdit {
+fn resolveHeaderEdit(edit: *const filter.HeaderEdit) ParseError!filter.HeaderEdit {
     try validateEditableHeaderName(edit.name);
     try validateHeaderValue(edit.value);
-    return .{ .name = edit.name, .value = edit.value };
+    assert(edit.name.len >= 1);
+    return edit.*;
 }
 
 /// A header name must be a non-empty RFC 9110 token (no separators or
@@ -6158,63 +6590,60 @@ fn validateHeaderValue(value: []const u8) ParseError!void {
 /// definition there, beside `isForwardableByte`).
 const isTokenByte = parser.isTokenByte;
 
-/// Resolve a listener's route table (§7). `"cluster": "x"` is sugar for a
-/// single catch-all route; `"routes": [...]` is the explicit table.
-/// Exactly one form is required. Prefixes must already be canonical (so
-/// they compare directly against the canonical request path) and unique;
-/// the table is sorted longest-prefix-first for the request-time scan.
-/// `l4` listeners have no path, so they take only the `cluster` form.
+/// Resolve an http listener's route table (§7). A `cluster` target is
+/// sugar for a single catch-all route; `routes` is the explicit table.
+/// Prefixes must already be canonical (so they compare directly against
+/// the canonical request path) and unique; the table is sorted most
+/// specific first for the request-time scan.
 fn resolveRoutes(
     arena: std.mem.Allocator,
-    http_json: *const HttpListenerJson,
+    target: *const Options.Listener.Target,
     clusters: []const Config.Cluster,
     head_buffer_bytes: u32,
 ) ParseError![]const router.Route {
-    const has_cluster = http_json.cluster != null;
-    const has_routes = http_json.routes != null;
-    if (has_cluster == has_routes) {
-        return error.ListenerClusterOrRoutes; // Neither, or both.
-    }
-    if (has_cluster) {
-        const routes = try arena.alloc(router.Route, 1);
-        routes[0] = .{
-            .prefix = "/",
-            .cluster_index = try clusterIndexOf(clusters, http_json.cluster.?),
-        };
-        assert(routes.len == 1); // The sugar is always one catch-all route.
-        return routes;
-    }
-    const routes_json = http_json.routes.?;
-    if (routes_json.len == 0) {
+    const stated = switch (target.*) {
+        .cluster => |name| {
+            const routes = try arena.alloc(router.Route, 1);
+            routes[0] = .{
+                .prefix = "/",
+                .cluster_index = try clusterIndexOf(clusters, name),
+            };
+            assert(routes.len == 1); // The sugar is always one catch-all route.
+            return routes;
+        },
+        .routes => |routes| routes,
+    };
+    if (stated.len == 0) {
         return error.RoutesEmpty;
     }
-    const routes = try arena.alloc(router.Route, routes_json.len);
-    for (routes_json, 0..) |route_json, index| {
-        try validateRoutePrefix(route_json.prefix, head_buffer_bytes);
-        const host = if (route_json.host) |raw| try validateRouteHost(raw) else null;
-        const header = if (route_json.header) |raw|
+    const routes = try arena.alloc(router.Route, stated.len);
+    for (stated, 0..) |route_stated, index| {
+        try validateRoutePrefix(route_stated.prefix, head_buffer_bytes);
+        const host = if (route_stated.host) |raw| try validateRouteHost(raw) else null;
+        const header = if (route_stated.header) |*raw|
             try resolveRouteHeader(raw)
         else
             null;
-        for (routes_json[0..index]) |previous| {
+        for (stated[0..index]) |previous| {
             // Earlier routes already passed validateRouteHost, so their raw
             // host equals its canonical form — a byte compare is sound.
             if (optionalHostEql(previous.host, host) and
-                std.mem.eql(u8, previous.prefix, route_json.prefix) and
+                std.mem.eql(u8, previous.prefix, route_stated.prefix) and
                 // The header is part of what makes a route distinct
                 // (#302): two rules sharing a host and prefix but naming
                 // different headers are different rules, and only the
                 // pair that agrees on all three is the same rule twice.
-                routeHeaderEql(previous.header, route_json.header))
+                routeHeaderEql(&previous.header, &route_stated.header))
             {
                 return error.RouteDuplicate;
             }
         }
         routes[index] = .{
             .host = host,
-            .prefix = route_json.prefix,
+            .prefix = route_stated.prefix,
             .header = header,
-            .cluster_index = try clusterIndexOf(clusters, route_json.cluster),
+            .cluster_index = try clusterIndexOf(clusters, route_stated.cluster),
+            .request_policies = route_stated.request_policies,
         };
     }
     // Host, then header, then prefix (§7, #302): the router's linear scan
@@ -6277,23 +6706,27 @@ fn routeMoreSpecific(_: void, left: router.Route, right: router.Route) bool {
     return left.prefix.len > right.prefix.len;
 }
 
-/// Whether two route header predicates are the same rule. Compared on
-/// the raw DTOs rather than the resolved matches because this runs inside
-/// the resolve loop, before the later route has one — and the name
+/// Whether two route header predicates are the same rule. Compared on the
+/// stated predicates rather than the resolved matches because this runs
+/// inside the resolve loop, before the later route has one — and the name
 /// compare is case-insensitive for the reason the matcher's is: RFC 9110
 /// says `X-Canary` and `x-canary` are one header.
-fn routeHeaderEql(left: ?RouteHeaderJson, right: ?RouteHeaderJson) bool {
-    const left_header = left orelse return right == null;
-    const right_header = right orelse return false;
+fn routeHeaderEql(
+    left: *const ?Options.Listener.RouteHeader,
+    right: *const ?Options.Listener.RouteHeader,
+) bool {
+    const left_header = if (left.*) |*header| header else return right.* == null;
+    const right_header = if (right.*) |*header| header else return false;
     if (!std.ascii.eqlIgnoreCase(left_header.name, right_header.name)) {
         return false;
     }
-    if ((left_header.present != null) != (right_header.present != null)) {
-        return false;
-    }
-    const left_equals = left_header.equals orelse return right_header.equals == null;
-    const right_equals = right_header.equals orelse return false;
-    return std.mem.eql(u8, left_equals, right_equals);
+    return switch (left_header.predicate) {
+        .present => right_header.predicate == .present,
+        .equals => |value| switch (right_header.predicate) {
+            .present => false,
+            .equals => |other| std.mem.eql(u8, value, other),
+        },
+    };
 }
 
 fn optionalHostEql(left: ?[]const u8, right: ?[]const u8) bool {
@@ -6575,99 +7008,38 @@ fn resolveMaxBodyBytes(cap: u64) ValidationError!u64 {
     return cap;
 }
 
-/// Resolve a listener's #180 upgrade allowlist. Absent allows none, so
-/// an `Upgrade` keeps the `501` it has always got.
-///
-/// The vocabulary is `UpgradesJson`'s own fields, held to the resolved
-/// set's by a comptime check there — so a protocol the proxy can carry
-/// and one an operator may write cannot drift apart. Anything else is
-/// refused by the strict parser rather than by a rule here (#305): a
-/// config that asked to tunnel `h2c` and got silence would believe it
-/// had, and after `101` there is no rule left to catch what came
-/// through.
-fn resolveUpgrades(
-    upgrades_json: ?UpgradesJson,
-) ValidationError!Config.Listener.Upgrades {
-    const asked = upgrades_json orelse return .{};
-    var upgrades: Config.Listener.Upgrades = .{};
-    inline for (@typeInfo(UpgradesJson).@"struct".field_names) |name| {
-        @field(upgrades, name) = @field(asked, name);
-    }
-    // No rejection for "every flag false", and the shape is why. An
-    // empty *list* was a meaningless spelling of a set, so it was
-    // refused; a set of flags all false is the ordinary way to write
-    // "not this one" — which a templated config does constantly — and
-    // it already means exactly what omitting the block means. Nothing
-    // §5 rests on it either: the tunnel pool keys off `any()`, so an
-    // all-false block reserves nothing, same as absent.
-    return upgrades;
-}
-
-/// Resolve a listener's §7 client-address forwarding: absent is off, and
-/// a `forwarded` block on an `l4` listener is rejected rather than
-/// ignored — a byte relay has no header to carry an address, so asking
-/// for one there describes a proxy that is not running, exactly like
-/// `request_filters` and `routes` on the same listener.
-fn resolveForwarded(
-    forwarded_json: ?ForwardedJson,
-) ValidationError!?Config.Listener.Forwarded {
-    const forwarded = forwarded_json orelse return null;
-    return std.meta.stringToEnum(Config.Listener.Forwarded, forwarded.mode) orelse
-        error.ListenerForwardedModeUnknown;
-}
-
-/// Resolve a listener's PROXY protocol expectation (#142): absent is
-/// off. Reachable only from an `l4` body — the L7 path has no receive
-/// phase yet, so an http listener has nowhere to state a trust boundary
-/// nothing enforces, which is the silent hole the option exists to close
-/// and is now closed by the shape rather than by a rejection (#305).
-fn resolveProxyProtocol(
-    proxy_protocol_json: ?ProxyProtocolJson,
-) ValidationError!?Config.Listener.ProxyProtocol {
-    const proxy_protocol = proxy_protocol_json orelse return null;
-    return std.meta.stringToEnum(Config.Listener.ProxyProtocol, proxy_protocol.mode) orelse
-        error.ListenerProxyProtocolModeUnknown;
-}
-
-/// A listener's TLS block (§4). The certificate and key are read here,
-/// through the file seam (#417), so a file that is missing, unreadable or
-/// past `tls_pem_bytes_max` fails the load and names the path. Whether the
-/// bytes parse, and carry a key of a type the on-loop handshake can
-/// afford, is found out at startup, which names the pair by its label.
-/// Shared by both protocols rather than living in either body: both
-/// speak over a terminated session (§4, §7). The one key that differs
-/// between them is `alpn`, so the protocol rides along for it.
+/// A listener's TLS block (§4). The pair arrives as bytes; whether they
+/// parse, and carry a key of a type the on-loop handshake can afford, is
+/// found out at startup, which names the pair by its label. Shared by both
+/// protocols rather than living in either body: both speak over a
+/// terminated session (§4, §7). The one key that differs between them is
+/// `alpn`, so the protocol rides along for it.
 fn resolveTls(
     arena: std.mem.Allocator,
-    tls_json: ?TlsJson,
+    tls: *const ?Options.Listener.Tls,
     protocol: Config.Listener.Protocol,
-    files: FileSource,
 ) ParseError!?Config.Listener.Tls {
-    const tls = tls_json orelse return null;
-    const pair = try readCertificatePair(arena, tls.cert, tls.key, files);
-    return .{
-        .cert_pem = pair.cert_pem,
-        .key_pem = pair.key_pem,
-        .label = pair.label,
-        .alpn = try resolveAlpn(arena, tls.alpn, protocol),
-        .client_ca = try resolveClientCa(arena, tls.client_ca, files),
-        .certificates = try resolveCertificates(arena, tls.certificates, files),
+    const stated = if (tls.*) |*stated| stated else return null;
+    const resolved: Config.Listener.Tls = .{
+        .cert_pem = stated.cert_pem,
+        .key_pem = stated.key_pem,
+        .label = stated.label,
+        .alpn = try resolveAlpn(arena, stated.alpn, protocol),
+        .client_ca = try resolveClientCa(arena, &stated.client_ca),
+        .certificates = try resolveCertificates(stated.certificates),
     };
+    assert(resolved.certificates.len < constants.tls_certificates_max);
+    assert(protocol == .http or resolved.alpn.len == 0);
+    return resolved;
 }
 
-/// A listener's #297 further certificates, each read like the default
-/// pair.
+/// A listener's #297 further certificates. The default pair counts
+/// against the same ceiling, so the further ones stay strictly under it.
 fn resolveCertificates(
-    arena: std.mem.Allocator,
-    certificates_json: ?[]const CertificateJson,
-    files: FileSource,
+    certificates: []const Config.Listener.Certificate,
 ) ParseError![]const Config.Listener.Certificate {
-    const entries = certificates_json orelse return &.{};
-    if (entries.len == 0) return error.ListenerTlsCertificatesEmpty;
-    if (entries.len >= constants.tls_certificates_max) return error.ListenerTlsCertificatesOverLimit;
-    const certificates = try arena.alloc(Config.Listener.Certificate, entries.len);
-    for (entries, certificates) |entry, *certificate| {
-        certificate.* = try readCertificatePair(arena, entry.cert, entry.key, files);
+    if (certificates.len >= constants.tls_certificates_max) {
+        return error.ListenerTlsCertificatesOverLimit;
     }
     assert(certificates.len < constants.tls_certificates_max);
     return certificates;
@@ -6720,32 +7092,28 @@ fn tlsCertificateCount(listeners: []const Config.Listener) u64 {
     return count;
 }
 
-/// A listener's #304 client CA, read through the loader's file seam and
-/// parsed into anchors exactly as a cluster's `tls.ca` is (§7): a bundle
-/// that cannot be read, or holds no certificate, fails here at load, not
-/// at the first client's handshake.
+/// A listener's #304 client CA, parsed into anchors exactly as a cluster's
+/// is (§7): a bundle that holds no certificate fails here at load, not at
+/// the first client's handshake.
 fn resolveClientCa(
     arena: std.mem.Allocator,
-    client_ca_json: ?ClientCaJson,
-    files: FileSource,
+    client_ca: *const ?Options.Listener.ClientCa,
 ) ParseError!?Config.Listener.ClientCa {
-    const client_ca = client_ca_json orelse return null;
-    const verify = std.meta.stringToEnum(Config.Listener.ClientVerify, client_ca.verify) orelse
-        return error.ListenerTlsClientVerifyUnknown;
-    if (client_ca.path.len == 0) return error.ListenerTlsClientCaUnreadable;
-    const pem = files.read(files.context, arena, client_ca.path, constants.origin_ca_bytes_max) catch |err| switch (err) {
-        error.FileUnreadable, error.FileTooLarge => return error.ListenerTlsClientCaUnreadable,
-        error.OutOfMemory => return error.OutOfMemory,
-    };
-    const anchors = trust.parseAnchors(arena, pem) catch |err| switch (err) {
+    const stated = if (client_ca.*) |*stated| stated else return null;
+    // The bound the front-end's file read imposes, held for a bundle
+    // written in code too: it is what the startup arena is sized against.
+    if (stated.ca_pem.len > constants.origin_ca_bytes_max) return error.ListenerTlsClientCaInvalid;
+    const anchors = trust.parseAnchors(arena, stated.ca_pem) catch |err| switch (err) {
         error.AnchorsInvalid, error.AnchorsTooMany => return error.ListenerTlsClientCaInvalid,
         error.OutOfMemory => return error.OutOfMemory,
     };
     assert(anchors.len >= 1);
-    return .{ .anchors = anchors, .verify = verify };
+    assert(stated.ca_pem.len <= constants.origin_ca_bytes_max);
+    return .{ .anchors = anchors, .verify = stated.verify };
 }
 
-/// A terminating listener's ALPN offer (#271), as canonical tokens.
+/// A terminating listener's ALPN offer (#271), as canonical tokens. The
+/// spelling of each is its front-end's to parse (`alpnOf`).
 ///
 /// Closed, on #180's upgrade-allowlist precedent: a token is a promise the
 /// serving path keeps, so a name this proxy does not speak — `h2` until
@@ -6757,10 +7125,10 @@ fn resolveClientCa(
 /// outright and offers nothing whatever it says.
 fn resolveAlpn(
     arena: std.mem.Allocator,
-    alpn_json: ?[]const []const u8,
+    offer: ?[]const alpn.Protocol,
     protocol: Config.Listener.Protocol,
 ) ParseError![]const []const u8 {
-    const asked = alpn_json orelse return switch (protocol) {
+    const asked = offer orelse return switch (protocol) {
         .http => alpn.http_default,
         .l4 => &.{},
     };
@@ -6770,16 +7138,15 @@ fn resolveAlpn(
     // vocabulary entry seen — so past `protocols_max` passes the next one
     // must be a duplicate or an unknown, and the list is refused there.
     var seen: [alpn.protocols_max]bool = @splat(false);
-    for (asked) |token| {
-        const named = alpn.Protocol.fromToken(token) orelse return error.ListenerTlsAlpnUnknown;
+    for (asked) |named| {
         if (seen[@backingInt(named)]) return error.ListenerTlsAlpnDuplicate;
         seen[@backingInt(named)] = true;
     }
     assert(asked.len >= 1);
     assert(asked.len <= alpn.protocols_max);
     const tokens = try arena.alloc([]const u8, asked.len);
-    for (asked, tokens) |token, *canonical| {
-        canonical.* = alpn.Protocol.fromToken(token).?.token();
+    for (asked, tokens) |named, *canonical| {
+        canonical.* = named.token();
     }
     return tokens;
 }
@@ -6972,13 +7339,12 @@ fn rejectUpgradeClusters(
 /// `parseWithFiles` for the length limit, and it reads better whole: four
 /// counts taken on one rule.
 ///
-/// `tls`, `upgrades` and `sni` are **presence only**: whether a block is
-/// *usable* is its own resolver's to say, later and per listener.
-/// Counting on usability here would size a pool against blocks that might
-/// yet be refused, and report a limits error for a config whose real
-/// fault is a missing path or a token nobody recognises. `http` is the
-/// exception and is validated, because the tag it reads is what says a
-/// listener declared a protocol at all (#305).
+/// Each count is **presence only**: whether a block is *usable* is its own
+/// resolver's to say, later and per listener. Counting on usability here
+/// would size a pool against blocks that might yet be refused, and report
+/// a limits error for a config whose real fault is a bad name or a
+/// duplicate offer. The one rule judged here is h2c beside TLS, because it
+/// decides whether a pool exists at all.
 const ListenerFeatures = struct {
     http: u32 = 0,
     tls: u32 = 0,
@@ -6991,35 +7357,29 @@ const ListenerFeatures = struct {
     http2: u32 = 0,
 };
 
-fn countListenerFeatures(listeners: []const ListenerJson) ParseError!ListenerFeatures {
+fn countListenerFeatures(listeners: []const Options.Listener) ParseError!ListenerFeatures {
     assert(listeners.len >= 1);
     var features: ListenerFeatures = .{};
-    for (listeners) |listener_json| {
-        // The tag decides the count, so a listener that names neither
-        // body or both is refused here rather than sizing a pool from a
-        // protocol nobody stated (#305).
-        if (try protocolOf(&listener_json) == .http) features.http += 1;
-        if (listener_json.tls != null) features.tls += 1;
-        if (listener_json.http) |http_json| {
-            // What the pool is sized against is a listener that *allows*
-            // an upgrade, not one that mentions the key. Under the list
-            // form those were the same thing, because an empty list was
-            // refused; under the flag object they are not — `{}` and
-            // `{"websocket": false}` mean the same as absent (#305), and
-            // counting them would demand a tunnel pool for a listener
-            // that can never open one.
-            if (http_json.upgrades) |upgrades| {
-                const allowed = try resolveUpgrades(upgrades);
-                if (allowed.any()) features.upgrades += 1;
-            }
-            // h2c is HTTP/2 *without* TLS: refused here, before any pool
-            // is sized from it, so a terminating listener asking for it is
-            // told the specific thing it got wrong first.
-            if (http_json.h2c and listener_json.tls != null) return error.ListenerH2cOnTls;
-            if (speaksHttp2(&listener_json, &http_json)) features.http2 += 1;
-        }
-        if (listener_json.l4) |l4_json| {
-            if (l4_json.routes != null) features.sni += 1;
+    for (listeners) |*listener| {
+        if (listener.tls != null) features.tls += 1;
+        switch (listener.protocol) {
+            .http => |*http| {
+                features.http += 1;
+                // What the pool is sized against is a listener that
+                // *allows* an upgrade, not one that mentions the key:
+                // `{}` and `{"websocket": false}` mean the same as absent
+                // (#305), and counting them would demand a tunnel pool for
+                // a listener that can never open one.
+                if (http.upgrades.any()) features.upgrades += 1;
+                // h2c is HTTP/2 *without* TLS: refused here, before any
+                // pool is sized from it, so a terminating listener asking
+                // for it is told the specific thing it got wrong first.
+                if (http.h2c and listener.tls != null) return error.ListenerH2cOnTls;
+                if (speaksHttp2(listener, http)) features.http2 += 1;
+            },
+            .l4 => |*l4| {
+                if (l4.target == .routes) features.sni += 1;
+            },
         }
     }
     // Every count is bounded here, at the one place that can prove it by
@@ -7035,17 +7395,14 @@ fn countListenerFeatures(listeners: []const ListenerJson) ParseError!ListenerFea
 }
 
 /// An http listener speaks HTTP/2 when it takes h2c, or offers `h2` in
-/// ALPN. The offer is read as written: the token is validated where the
-/// listener resolves, and an unknown one is refused there.
-fn speaksHttp2(listener_json: *const ListenerJson, http_json: *const HttpListenerJson) bool {
-    assert(listener_json.http != null);
-    if (http_json.h2c) return true;
-    const tls_json = listener_json.tls orelse return false;
-    const offer = tls_json.alpn orelse return false;
-    for (offer) |token| {
-        if (std.mem.eql(u8, token, alpn.Protocol.h2.token())) return true;
-    }
-    return false;
+/// ALPN.
+fn speaksHttp2(listener: *const Options.Listener, http: *const Options.Listener.Http) bool {
+    assert(listener.protocol == .http);
+    if (http.h2c) return true;
+    const tls = listener.tls orelse return false;
+    const offer = tls.alpn orelse return false;
+    assert(listener.tls != null);
+    return std.mem.indexOfScalar(alpn.Protocol, offer, .h2) != null;
 }
 
 /// Which protocol a listener's tag names (#305). The vocabulary used to
@@ -7411,6 +7768,103 @@ test "config: an access log written as options (#417)" {
         resolveAccessLogSink(.{ .sink = .{ .file = "" } }),
     );
     try std.testing.expectEqual(@as(?Config.AccessLogSink, null), try resolveAccessLogSink(null));
+}
+
+test "config: listeners written as options meet the loader's rules (#417)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const clusters = try resolveClusters(arena, &[_]Options.Cluster{.{
+        .name = "origin",
+        .endpoints = &.{.{ .address = .{ .ip = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:9000") } }},
+        .pick = .p2c,
+    }});
+    const head_bytes = constants.head_buffer_bytes_min;
+    var instance: u8 = 0;
+    const policy: extension_module.Selection = .{ .index = 0, .instance = &instance };
+    const http: Options.Listener = .{
+        .bind = .{ .ip = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:8080") },
+        .protocol = .{ .http = .{
+            .target = .{ .routes = &.{
+                .{ .prefix = "/", .cluster = "origin" },
+                .{
+                    .prefix = "/api",
+                    .cluster = "origin",
+                    .header = .{ .name = "X-Canary", .predicate = .present },
+                    .request_policies = &.{policy},
+                },
+            } },
+            .request_policies = &.{policy},
+            .max_body_bytes = 1 << 20,
+            .keepalive_requests = 1000,
+        } },
+    };
+    const listeners = try resolveListeners(arena, &[_]Options.Listener{http}, clusters, head_bytes, &.{});
+    try std.testing.expectEqual(@as(usize, 1), listeners[0].request_policies.len);
+    // Sorted most specific first, each route's policies riding with it.
+    try std.testing.expectEqualStrings("/api", listeners[0].routes[0].prefix);
+    try std.testing.expectEqual(@as(usize, 1), listeners[0].routes[0].request_policies.len);
+    try std.testing.expectEqual(@as(usize, 0), listeners[0].routes[1].request_policies.len);
+
+    // Shapes a JSON spelling cannot reach, refused by the rules a file
+    // meets: an empty method set, an empty needle, setuid on a socket,
+    // an empty ALPN offer.
+    var methods_empty = http;
+    methods_empty.protocol.http.request_filters = &.{.{
+        .match = .{ .methods = std.EnumSet(Options.Listener.Method).init(.{}) },
+        .actions = &.{.allow},
+    }};
+    try std.testing.expectError(error.FilterMethodEmpty, resolveListeners(arena, &[_]Options.Listener{methods_empty}, clusters, head_bytes, &.{}));
+    var needle_empty = http;
+    needle_empty.protocol.http.request_filters = &.{.{
+        .match = .{ .headers = &.{.{ .name = "x-tenant", .predicate = .{ .contains = "" } }} },
+        .actions = &.{.allow},
+    }};
+    try std.testing.expectError(error.FilterHeaderContainsEmpty, resolveListeners(arena, &[_]Options.Listener{needle_empty}, clusters, head_bytes, &.{}));
+    var setuid = http;
+    setuid.bind = .{ .unix = "/run/zoxy.sock" };
+    setuid.mode = .{ .bits = 0o4660 };
+    try std.testing.expectError(error.ListenerModeInvalid, resolveListeners(arena, &[_]Options.Listener{setuid}, clusters, head_bytes, &.{}));
+    var alpn_empty = http;
+    alpn_empty.tls = .{ .cert_pem = "cert", .key_pem = "key", .label = "test", .alpn = &.{} };
+    try std.testing.expectError(error.ListenerTlsAlpnEmpty, resolveListeners(arena, &[_]Options.Listener{alpn_empty}, clusters, head_bytes, &.{}));
+    var alpn_twice = http;
+    alpn_twice.tls = .{ .cert_pem = "cert", .key_pem = "key", .label = "test", .alpn = &.{ .h2, .h2 } };
+    try std.testing.expectError(error.ListenerTlsAlpnDuplicate, resolveListeners(arena, &[_]Options.Listener{alpn_twice}, clusters, head_bytes, &.{}));
+
+    // The rules a file's filters meet, met from code: no token names an
+    // extension method, values carry no line break, managed headers stay
+    // the proxy's, and an IPv6 client is no narrower than its /64.
+    const rejected = [_]struct { anyerror, Options.Listener.Filter }{
+        .{ error.FilterMethodUnknown, .{
+            .match = .{ .methods = std.EnumSet(Options.Listener.Method).initMany(&.{.extension}) },
+            .actions = &.{.allow},
+        } },
+        .{ error.FilterHeaderValueInvalid, .{
+            .match = .{ .headers = &.{.{ .name = "x-tenant", .predicate = .{ .equals = "a\r\nb" } }} },
+            .actions = &.{.allow},
+        } },
+        .{ error.FilterHeaderNameReserved, .{ .actions = &.{.{ .header_remove = "Content-Length" }} } },
+        .{ error.FilterClientPrefixTooNarrow, .{
+            .match = .{ .clients = &.{.{ .address = try std.Io.net.IpAddress.parse("2001:db8::", 0), .prefix_len = 96 }} },
+            .actions = &.{.allow},
+        } },
+        .{ error.FilterRejectStatus, .{ .actions = &.{.{ .reject = 200 }} } },
+    };
+    for (rejected) |case| {
+        var filtered = http;
+        filtered.protocol.http.request_filters = &.{case[1]};
+        try std.testing.expectError(case[0], resolveListeners(arena, &[_]Options.Listener{filtered}, clusters, head_bytes, &.{}));
+    }
+
+    // An SNI table on a terminating l4 listener: the hello it would read
+    // was consumed by its own handshake.
+    const sni_tls: Options.Listener = .{
+        .bind = .{ .ip = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:8443") },
+        .tls = .{ .cert_pem = "cert", .key_pem = "key", .label = "test" },
+        .protocol = .{ .l4 = .{ .target = .{ .routes = &.{.{ .cluster = "origin" }} } } },
+    };
+    try std.testing.expectError(error.ListenerTlsWithSniRoutes, resolveListeners(arena, &[_]Options.Listener{sni_tls}, clusters, head_bytes, &.{}));
 }
 
 const example_json = @embedFile("example_config");
