@@ -57,7 +57,6 @@ comptime {
 const pending_ops_max: u32 = constants.inFlightOps(
     constants.conn_slots_max,
     stream_slots_max,
-    constants.upstream_slots_max,
     listeners_max,
     constants.health_probe_concurrency_max,
     h2_origin_connections_max,

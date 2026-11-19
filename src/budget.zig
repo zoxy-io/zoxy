@@ -88,7 +88,6 @@ pub fn Budget(comptime IoType: type) type {
                 .cq_entries = constants.completionQueueDepthFor(
                     config.limits.conn_slots,
                     config.limits.stream_slots,
-                    config.limits.upstream_slots,
                     listeners_count,
                     health_probes,
                     config.limits.h2_origin_connections,
@@ -314,7 +313,6 @@ pub fn Budget(comptime IoType: type) type {
             const in_flight = constants.inFlightOps(
                 limits.conn_slots,
                 limits.stream_slots,
-                limits.upstream_slots,
                 @intCast(config.listeners.len),
                 config.healthProbes(),
                 limits.h2_origin_connections,

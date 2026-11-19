@@ -1801,7 +1801,7 @@ sizes is configured. They are described further down.
 
 The defaults are small: 1386 connection slots, 1386 relay buffer pairs and
 1311 upstream slots, roughly 34 MiB of pools, sized to start under a stock
-4096 `RLIMIT_NOFILE`. The ceiling is 11457 of each. Larger pools demand
+4096 `RLIMIT_NOFILE`. The ceiling is 14321 of each. Larger pools demand
 more file descriptors, which zoxy asserts against `RLIMIT_NOFILE` at
 startup instead of discovering as `EMFILE` later.
 

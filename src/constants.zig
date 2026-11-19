@@ -46,15 +46,17 @@ pub const admin_scrape_deadline_ms: u32 = 5_000;
 pub const admin_drain_scratch_bytes: u32 = 512;
 
 /// Connection slots (`Pool(Conn)`). The io_uring completion queue sets
-/// the ceiling (§5). Each slot costs `conn_ops_max + stream_ops_max`
-/// plus one op for the matching upstream slot. The comptime assertion
-/// below fits both pools in the default ⅞ CQ budget after the fixed
+/// the ceiling (§5). Each slot costs `conn_ops_max + stream_ops_max`.
+/// The upstream slot it may lease costs nothing of its own: a leased
+/// upstream's socket ops ride its stream, and a parked one holds no op,
+/// since one sweep timer reaps them all. The comptime assertion below
+/// fits the pools in the default ⅞ CQ budget after the fixed
 /// reservations, including the maximum health probe concurrency.
 ///
 /// This ceiling assumes zero configured listeners and no shared HTTP/2
 /// streams or HTTP/2 origin connections. `cqFillFits` validates the
 /// effective pool sizes, listener count and fill fraction at load.
-pub const conn_slots_max: u32 = 11457;
+pub const conn_slots_max: u32 = 14321;
 
 /// Relay buffer pairs (`Pool(RelayBuffer)`) — the bound on concurrent L4
 /// connections plus active L7 body relays (§5, §6). Sized to the
@@ -525,11 +527,12 @@ pub const chunked_trailer_bytes_max: u32 = 1024;
 
 /// Shared upstream slots (`Pool(Upstream)`). An exchange leases a slot.
 /// An HTTP/1.1 origin connection keeps its slot while parked on its
-/// endpoint's idle list (§5). One sweep timer reaps parked sockets.
+/// endpoint's idle list (§5). One sweep timer reaps parked sockets, so a
+/// slot costs the fd budget its socket and the ring budget nothing.
 ///
-/// Matching the conn ceiling reserves room in the CQ budget for one
-/// upstream slot per admitted connection. The config chooses the
-/// actual size of each pool.
+/// Matching the conn ceiling gives every admitted connection an upstream
+/// slot to be mid-exchange on. The config chooses the actual size of each
+/// pool.
 pub const upstream_slots_max: u32 = conn_slots_max;
 
 /// Listen backlog for every listener.
@@ -795,8 +798,8 @@ pub const health_probe_ops_max: u32 = 3;
 ///
 /// Sixteen because the cost is a rounding error and the benefit is the
 /// whole gap: it prices 48 ring ops (16 × `health_probe_ops_max`) out of
-/// the ⅞-CQ budget `conn_slots_max` is derived from, which moves that
-/// ceiling from 11466 to 11457 — while turning ten black-holed endpoints
+/// the ⅞-CQ budget `conn_slots_max` is derived from, which costs that
+/// ceiling twelve slots — while turning ten black-holed endpoints
 /// at a 5 s budget from 50 s of added sweep into 5 s.
 pub const health_probe_concurrency_max: u32 = 16;
 
@@ -1246,21 +1249,24 @@ pub const access_log_line_bytes_max: u32 = accessLogLineBytes(access_log_headers
 
 /// Worst-case in-flight ring ops (§8: the ring is pre-budgeted, not shed):
 /// every connection slot at its op peak (L7 slots hold armed ops with or
-/// without a relay buffer, so the term is per slot, not per buffer), one
-/// idle-timer op per parked upstream (§5/§8 — reserved ahead of the
-/// keep-alive slice), two ops per listener — configured *and* admin — (a
-/// draining listener holds its armed accept — or the accept-retry backoff
-/// timer — plus the async cancel that reaps it), `admin_conn_ops_max` ops
-/// per admin client (its send/deadline/teardown peak), the access log's one
-/// in-flight sink write, `health_probe_ops_max` ops for each of the
-/// prober's `health_probes` concurrent probes (§7), the single async
-/// wakeup op for signals, the server's one drain-deadline timer, and
-/// #311's loop-watchdog tick. That last one is reserved whether or not a
-/// config arms it, on the same terms as the admin and access-log
-/// reservations: a budget that moved with a `timeouts` key would make the
-/// ring depth a property of the operator's watchdog policy, and the point
-/// of reserving it here is that turning the backstop on can never be the
-/// thing that refuses a config. Closed form so it can be
+/// without a relay buffer, so the term is per slot, not per buffer),
+/// every stream slot at its own, two ops per listener — configured *and*
+/// admin — (a draining listener holds its armed accept — or the
+/// accept-retry backoff timer — plus the async cancel that reaps it),
+/// `admin_conn_ops_max` ops per admin client (its send/deadline/teardown
+/// peak), the access log's one in-flight sink write,
+/// `health_probe_ops_max` ops for each of the prober's `health_probes`
+/// concurrent probes (§7), the single async wakeup op for signals, the
+/// server's one drain-deadline timer (its stuck-teardown backstop is
+/// armed from that timer's own delivery, so the two never co-arm), the
+/// parked-upstream sweep (one timer for the whole pool: a parked upstream
+/// holds no op of its own), and #311's loop-watchdog tick. The sweep and
+/// the tick are reserved whether or not a config arms them, on the same
+/// terms as the admin and access-log reservations: a budget that moved
+/// with a `timeouts` key would make the ring depth a property of the
+/// operator's watchdog policy, and the point of reserving the tick here
+/// is that turning the backstop on can never be the thing that refuses a
+/// config. Closed form so it can be
 /// evaluated on the *effective* pool sizes too (XevIo's per-deployment CQ),
 /// not only the ceilings; the admin and access-log reservations are fixed
 /// — always covered even when a config leaves them off — and so is the
@@ -1277,14 +1283,12 @@ pub const access_log_line_bytes_max: u32 = accessLogLineBytes(access_log_headers
 pub fn inFlightOps(
     conn_slots: u32,
     stream_slots: u32,
-    upstream_slots: u32,
     listeners: u32,
     health_probes: u32,
     h2_origin_connections: u32,
 ) u32 {
     assert(conn_slots <= conn_slots_max);
     assert(stream_slots <= stream_slots_max);
-    assert(upstream_slots <= upstream_slots_max);
     // No policy ceiling to check against, but the argument is not
     // unbounded either: every caller sources it from a config the
     // loader has already held to the `u16` a listener index is stored in.
@@ -1297,10 +1301,10 @@ pub fn inFlightOps(
     // the one divisor per admitted connection (#274), and each multiplexed
     // exchange adds its own two on top (#275).
     return conn_slots * conn_ops_max +
-        streamSlotsFor(conn_slots, stream_slots) * stream_ops_max + upstream_slots +
+        streamSlotsFor(conn_slots, stream_slots) * stream_ops_max +
         2 * (listeners + admin_listeners) +
         admin_conns * admin_conn_ops_max + access_log_ops_max +
-        health_probes * health_probe_ops_max + 1 + 1 + 1 +
+        health_probes * health_probe_ops_max + 1 + 1 + 1 + 1 +
         // An HTTP/2 origin connection's own ops (§7): its exchanges' legs
         // deliver on their streams' completions, already charged above.
         h2_origin_connections * h2_origin_ops_max;
@@ -1431,7 +1435,6 @@ pub const cq_fill_eighths_min: u32 = 1;
 pub fn completionQueueDepthFor(
     conn_slots: u32,
     stream_slots: u32,
-    upstream_slots: u32,
     listeners: u32,
     health_probes: u32,
     h2_origin_connections: u32,
@@ -1439,7 +1442,7 @@ pub fn completionQueueDepthFor(
 ) u32 {
     assert(cq_fill_eighths >= cq_fill_eighths_min);
     assert(cq_fill_eighths <= cq_fill_eighths_max);
-    const in_flight = inFlightOps(conn_slots, stream_slots, upstream_slots, listeners, health_probes, h2_origin_connections);
+    const in_flight = inFlightOps(conn_slots, stream_slots, listeners, health_probes, h2_origin_connections);
     // The shallowest ring whose fill budget covers every in-flight op;
     // eighths >= 1 is asserted above, so the divide never faults.
     const with_headroom = std.math.divCeil(u32, in_flight * 8, cq_fill_eighths) catch unreachable;
@@ -1465,7 +1468,6 @@ pub fn completionQueueDepthFor(
 pub fn cqFillFits(
     conn_slots: u32,
     stream_slots: u32,
-    upstream_slots: u32,
     listeners: u32,
     health_probes: u32,
     h2_origin_connections: u32,
@@ -1473,7 +1475,7 @@ pub fn cqFillFits(
 ) bool {
     assert(cq_fill_eighths >= cq_fill_eighths_min);
     assert(cq_fill_eighths <= cq_fill_eighths_max);
-    const in_flight = inFlightOps(conn_slots, stream_slots, upstream_slots, listeners, health_probes, h2_origin_connections);
+    const in_flight = inFlightOps(conn_slots, stream_slots, listeners, health_probes, h2_origin_connections);
     // The kernel CQ max is a power of two, so its fill budget is exact.
     return in_flight <= @divExact(completion_queue_entries_max, 8) * cq_fill_eighths;
 }
@@ -1490,7 +1492,7 @@ pub fn cqFillFits(
 /// this number — it only made it look derived from a ceiling that no
 /// longer exists.
 pub const completion_queue_entries: u32 =
-    completionQueueDepthFor(conn_slots_max, 0, upstream_slots_max, 0, health_probe_concurrency_max, 0, cq_fill_eighths_default);
+    completionQueueDepthFor(conn_slots_max, 0, 0, health_probe_concurrency_max, 0, cq_fill_eighths_default);
 
 /// The fds a deployment needs (§8: fds are pre-budgeted, not shed): stdio
 /// + ring + async eventfd + listeners (configured + admin) + two sockets
@@ -1600,7 +1602,7 @@ comptime {
     assert(upstream_slots_default >= 1 and upstream_slots_default <= upstream_slots_max);
     assert(relay_buffers_max <= conn_slots_max);
     assert(relay_buffers_max >= 1);
-    assert(inFlightOps(conn_slots_max, 0, upstream_slots_max, 0, health_probe_concurrency_max, 0) <= completion_queue_entries);
+    assert(inFlightOps(conn_slots_max, 0, 0, health_probe_concurrency_max, 0) <= completion_queue_entries);
     assert(conn_slots_max - 1 <= std.math.maxInt(u16));
     assert(relay_buffer_bytes_min >= 512);
     assert(relay_buffer_bytes_min <= relay_buffer_bytes_default);
@@ -1697,25 +1699,25 @@ comptime {
     assert(poolPressureOn(relay_buffers_max) <= relay_buffers_max);
     // The conn-slot ceiling is derived, not chosen: the largest slot
     // count whose worst-case ops fit the ⅞-CQ budget (at the default =
-    // loosest fill) after the fixed ops — the parked-upstream reservation
-    // and the admin listener plus its one client op — are carved out (§8).
-    // The three bare `- 1`s below are the ones `inFlightOps` spells the
-    // same way and in the same order: the signal wake, the drain timer,
-    // and #311's loop-watchdog tick. They are the terms most easily left
-    // behind when one is added — `@divFloor` will absorb a missing op
-    // until it happens not to, which is a ceiling that is right by luck.
-    // The pair is pinned (`upstream_slots_max = conn_slots_max`), so the
-    // shared CQ line has one divisor — an admitted connection costs
-    // `conn_ops_max` conn ops plus `stream_ops_max` for the one stream it
-    // owns (#274) plus the one op of the upstream slot it may need —
-    // rather than one ceiling subtracting from the other.
+    // loosest fill) after the fixed ops — the admin listener and client,
+    // the access log, the prober — are carved out (§8). The four bare
+    // `- 1`s below are the ones `inFlightOps` spells the same way and in
+    // the same order: the signal wake, the drain timer, the parked-
+    // upstream sweep, and #311's loop-watchdog tick. They are the terms
+    // most easily left behind when one is added — `@divFloor` will absorb
+    // a missing op until it happens not to, which is a ceiling that is
+    // right by luck (the sweep was, until this was written down). The
+    // divisor is what an admitted connection costs: `conn_ops_max` on its
+    // slot plus `stream_ops_max` on the one stream it owns (#274). The
+    // upstream slot it may lease adds nothing, so the pinned pair costs
+    // the ring one divisor without a term for the upstream side.
     assert(upstream_slots_max == conn_slots_max);
     assert(conn_slots_max == @divFloor(
         @divExact(completion_queue_entries, 8) * cq_fill_eighths_default -
             2 * admin_listeners -
             admin_conns * admin_conn_ops_max - access_log_ops_max -
-            health_probe_concurrency_max * health_probe_ops_max - 1 - 1 - 1,
-        conn_ops_max + stream_ops_max + 1,
+            health_probe_concurrency_max * health_probe_ops_max - 1 - 1 - 1 - 1,
+        conn_ops_max + stream_ops_max,
     ));
     assert(admin_listeners >= 1);
     assert(admin_conns >= 1);
@@ -2111,11 +2113,11 @@ fn assertH2Terms(sizes: *const PoolSizes) void {
 }
 
 test "budgets: in-flight ops fit the completion queue with headroom" {
-    try std.testing.expect(inFlightOps(conn_slots_max, 0, upstream_slots_max, 0, health_probe_concurrency_max, 0) <= completion_queue_entries);
+    try std.testing.expect(inFlightOps(conn_slots_max, 0, 0, health_probe_concurrency_max, 0) <= completion_queue_entries);
     // Headroom is deliberate: at least an eighth of the CQ stays free for
     // completion bursts even at the worst-case armed-op count (the default
     // = loosest fill the ceiling is derived at).
-    try std.testing.expect(inFlightOps(conn_slots_max, 0, upstream_slots_max, 0, health_probe_concurrency_max, 0) <= @divExact(completion_queue_entries, 8) * cq_fill_eighths_default);
+    try std.testing.expect(inFlightOps(conn_slots_max, 0, 0, health_probe_concurrency_max, 0) <= @divExact(completion_queue_entries, 8) * cq_fill_eighths_default);
 }
 
 test "pressure: relay watermarks have a hysteresis gap at every capacity" {
@@ -2177,12 +2179,12 @@ test "budgets: HTTP/2 is priced by its own terms, and its shared streams by thei
     // per-connection divisor does not move.
     try std.testing.expectEqual(
         @as(u32, shared_streams) * stream_ops_max,
-        inFlightOps(64, shared_streams, 8, 1, 1, 0) - inFlightOps(64, 0, 8, 1, 1, 0),
+        inFlightOps(64, shared_streams, 1, 1, 0) - inFlightOps(64, 0, 1, 1, 0),
     );
     // And at the conn ceiling there is no room left for a shared pool at
     // the loosest fill: it is the ring that bounds HTTP/2's multiplexing,
     // which `cqFillFits` tells the operator at load.
-    try std.testing.expect(!cqFillFits(conn_slots_max, conn_slots_max, upstream_slots_max, 0, 1, 0, cq_fill_eighths_max));
+    try std.testing.expect(!cqFillFits(conn_slots_max, conn_slots_max, 0, 1, 0, cq_fill_eighths_max));
 }
 
 test "budgets: memory total matches the closed form" {
@@ -2204,7 +2206,7 @@ test "budgets: memory total matches the closed form" {
     // The head-buffer ring's term is count × (unit + 1) — the slab plus
     // one ownership byte per buffer — plus the descriptor table, which is
     // page-granular and next-power-of-two, so a non-power-of-two count
-    // pins the rounding too: 11466 → 16384 entries × 16 B = exactly 64
+    // pins the rounding too: 14321 → 16384 entries × 16 B = exactly 64
     // pages.
     const head_ring: u64 = @as(u64, conn_slots_max) * (head_buffer_bytes_default + 1) +
         bufferGroupDescriptorBytes(conn_slots_max);
@@ -2354,19 +2356,19 @@ test "budgets: memory total matches the closed form" {
 }
 
 test "budgets: c10k ceiling fd count needs a raised NOFILE" {
-    // At the c10k ceiling the fd budget is ~33k — well past the common
+    // At the c10k ceiling the fd budget is ~43k — well past the common
     // 4096 unprivileged hard limit, so a deployment that configures up to
     // the ceiling must raise RLIMIT_NOFILE (systemd LimitNOFILE / ulimit).
     // `ensureFdBudget` checks the *effective* size against the real limit
     // at startup (§8); this pins the ceiling closed form.
     try std.testing.expectEqual(
-        @as(u32, 34395),
+        @as(u32, 42987),
         fdsRequired(conn_slots_max, upstream_slots_max, 0, 0, health_probe_concurrency_max, 0),
     );
     // A file sink is two fds — held plus the SIGHUP-reopen transient —
     // at the ceiling as everywhere.
     try std.testing.expectEqual(
-        @as(u32, 34397),
+        @as(u32, 42989),
         fdsRequired(conn_slots_max, upstream_slots_max, 0, 1, health_probe_concurrency_max, 0),
     );
     try std.testing.expect(fdsRequired(conn_slots_max, upstream_slots_max, 0, 1, health_probe_concurrency_max, 0) <= 65536);
@@ -2382,47 +2384,46 @@ test "budgets: the default deployment is lean" {
     // holds whether or not the access log writes to a file.
     try std.testing.expect(fdsRequired(conn_slots_default, upstream_slots_default, 1, 1, 1, 0) < 4096);
     try std.testing.expect(
-        completionQueueDepthFor(conn_slots_default, 0, upstream_slots_default, 1, 1, 0, cq_fill_eighths_default) <
+        completionQueueDepthFor(conn_slots_default, 0, 1, 1, 0, cq_fill_eighths_default) <
             completion_queue_entries,
     );
     // The effective CQ still covers the default's in-flight ops with the
     // ⅞ headroom, exactly as the ceiling does for its own.
-    const depth = completionQueueDepthFor(conn_slots_default, 0, upstream_slots_default, 1, 1, 0, cq_fill_eighths_default);
-    try std.testing.expect(inFlightOps(conn_slots_default, 0, upstream_slots_default, 1, 1, 0) <= @divExact(depth, 8) * cq_fill_eighths_default);
+    const depth = completionQueueDepthFor(conn_slots_default, 0, 1, 1, 0, cq_fill_eighths_default);
+    try std.testing.expect(inFlightOps(conn_slots_default, 0, 1, 1, 0) <= @divExact(depth, 8) * cq_fill_eighths_default);
 }
 
 test "budgets: conn slots sit at the completion-queue ceiling" {
     // The ⅞-CQ fill rule (at the default = loosest fill) is what actually
     // caps concurrent connections; conn_slots_max is the largest value
-    // that still satisfies it after the parked-upstream reservation, so
-    // one more slot would break the budget.
-    try std.testing.expect(inFlightOps(conn_slots_max, 0, upstream_slots_max, 0, health_probe_concurrency_max, 0) <= @divExact(completion_queue_entries, 8) * cq_fill_eighths_default);
+    // that still satisfies it after the fixed reservations, so one more
+    // slot would break the budget.
+    try std.testing.expect(inFlightOps(conn_slots_max, 0, 0, health_probe_concurrency_max, 0) <= @divExact(completion_queue_entries, 8) * cq_fill_eighths_default);
     // One more connection costs both shares, because the counts are
     // pinned (#274): a conn slot the pool cannot pair a stream with could
     // never run an exchange. Spelled as the sum rather than through
     // `streamSlotsFor`, whose own assert bounds its argument by the very
     // ceiling this line is trying to step past.
     const one_more = (conn_slots_max + 1) * (conn_ops_max + stream_ops_max) +
-        upstream_slots_max +
         2 * admin_listeners +
         admin_conns * admin_conn_ops_max + access_log_ops_max +
-        health_probe_concurrency_max * health_probe_ops_max + 1 + 1;
+        health_probe_concurrency_max * health_probe_ops_max + 1 + 1 + 1 + 1;
     try std.testing.expect(one_more > @divExact(completion_queue_entries, 8) * cq_fill_eighths_default);
 }
 
 test "budgets: a tighter cq fill trades ceiling for burst headroom" {
     // More headroom (fewer eighths) never asks for a shallower ring: at a
     // fixed conn count the requested CQ is monotonic in the fill.
-    const loose = completionQueueDepthFor(conn_slots_default, 0, upstream_slots_default, 1, 1, 0, cq_fill_eighths_max);
-    const tight = completionQueueDepthFor(conn_slots_default, 0, upstream_slots_default, 1, 1, 0, cq_fill_eighths_min);
+    const loose = completionQueueDepthFor(conn_slots_default, 0, 1, 1, 0, cq_fill_eighths_max);
+    const tight = completionQueueDepthFor(conn_slots_default, 0, 1, 1, 0, cq_fill_eighths_min);
     try std.testing.expect(tight >= loose);
     // The conn-slot ceiling fits only at the max fill; one eighth tighter
     // overflows even the deepest kernel CQ — the loader must reject that
     // pairing (`cqFillFits` is the guard).
-    try std.testing.expect(cqFillFits(conn_slots_max, 0, upstream_slots_max, 0, health_probe_concurrency_max, 0, cq_fill_eighths_max));
-    try std.testing.expect(!cqFillFits(conn_slots_max, 0, upstream_slots_max, 0, health_probe_concurrency_max, 0, cq_fill_eighths_max - 1));
+    try std.testing.expect(cqFillFits(conn_slots_max, 0, 0, health_probe_concurrency_max, 0, cq_fill_eighths_max));
+    try std.testing.expect(!cqFillFits(conn_slots_max, 0, 0, health_probe_concurrency_max, 0, cq_fill_eighths_max - 1));
     // The lean default still fits with plenty of room to spare, even at the
     // old ¾ (= 6/8) fill and at the tightest floor.
-    try std.testing.expect(cqFillFits(conn_slots_default, 0, upstream_slots_default, 1, 1, 0, 6));
-    try std.testing.expect(cqFillFits(conn_slots_default, 0, upstream_slots_default, 1, 1, 0, cq_fill_eighths_min));
+    try std.testing.expect(cqFillFits(conn_slots_default, 0, 1, 1, 0, 6));
+    try std.testing.expect(cqFillFits(conn_slots_default, 0, 1, 1, 0, cq_fill_eighths_min));
 }
