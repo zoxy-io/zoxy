@@ -27,7 +27,233 @@ const std = @import("std");
 
 const config = @import("config.zig");
 const extension = @import("extension.zig");
+const filter = @import("http/filter.zig");
+const parser = @import("http/parser.zig");
 const io = @import("io/io.zig");
+const alpn = @import("tls/alpn.zig");
+
+/// One listening socket (§4): where it binds, whether it terminates TLS,
+/// and what it speaks.
+pub const Listener = struct {
+    /// An IP literal and port, or an absolute `unix:` socket path.
+    bind: io.Address,
+    /// A `unix:` socket file's permission bits — no setuid, setgid or
+    /// sticky — or null to leave the umask's.
+    mode: ?io.FileMode = null,
+    /// Terminate TLS on this socket (§4), or null for plaintext.
+    tls: ?Tls = null,
+    protocol: Protocol,
+
+    /// Tagged by the resolved listener's own protocol, so the two cannot
+    /// come to name different sets.
+    pub const Protocol = union(config.Config.Listener.Protocol) {
+        /// A byte relay.
+        l4: L4,
+        /// A reverse proxy for HTTP/1.1, and HTTP/2 where offered.
+        http: Http,
+    };
+
+    pub const Tls = struct {
+        /// The certificate chain, PEM.
+        cert_pem: []const u8,
+        /// Its private key, PEM: ECDSA P-256 or P-384, or RSA of 2048 to
+        /// 4096 bits.
+        key_pem: []const u8,
+        /// What a startup error calls this pair.
+        label: []const u8,
+        /// The ALPN offer, most preferred first; null offers the
+        /// protocol's own — HTTP/1.1 on an http listener, nothing on an
+        /// l4 one, which takes no offer.
+        alpn: ?[]const Alpn = null,
+        /// Mutual TLS (#304), or null to ask no client for a certificate.
+        client_ca: ?ClientCa = null,
+        /// Further pairs, chosen by the server name a client asks for
+        /// (#297); this pair stays the default.
+        certificates: []const Certificate = &.{},
+    };
+
+    pub const Alpn = alpn.Protocol;
+    pub const Certificate = config.Config.Listener.Certificate;
+
+    pub const ClientCa = struct {
+        /// The PEM bundle a client's chain must reach.
+        ca_pem: []const u8,
+        /// Whether a client without a certificate is refused or let on.
+        verify: config.Config.Listener.ClientVerify,
+    };
+
+    pub const Http = struct {
+        /// Where requests go.
+        target: Target,
+        /// #417's request policies, in order, after the request is
+        /// canonicalized and before the filters; the first reject wins.
+        request_policies: []const extension.Selection = &.{},
+        /// The §7 request filters, walked top-down.
+        request_filters: []const Filter = &.{},
+        /// The #175 response filters, walked top-down.
+        response_filters: []const ResponseFilter = &.{},
+        /// Tell the origin the client's address in `X-Forwarded-For`, or
+        /// null to leave the header as it arrived.
+        forwarded: ?Forwarded = null,
+        /// Protocol upgrades carried as tunnels (#180); none by default.
+        upgrades: Upgrades = .{},
+        /// The cap on one request body (#236); 0 accepts any size.
+        max_body_bytes: u64,
+        /// Requests one client connection may serve before the response
+        /// that announces its close (#237); 0 is unlimited.
+        keepalive_requests: u32,
+        /// Say why zoxy refused a request, in an RFC 9209 Proxy-Status
+        /// field (#300). It reveals internal limits to clients.
+        proxy_status: bool = false,
+        /// Also take HTTP/2 by prior knowledge on a plaintext socket
+        /// (#275); a TLS listener offers `h2` in its ALPN instead.
+        h2c: bool = false,
+    };
+
+    pub const Forwarded = config.Config.Listener.Forwarded;
+    pub const Upgrades = config.Config.Listener.Upgrades;
+
+    pub const Target = union(enum) {
+        /// Every request to one cluster, by name.
+        cluster: []const u8,
+        /// A route table, at least one route. Resolving sorts it most
+        /// specific first — host, then header, then prefix length — and
+        /// routes equally specific keep the order given.
+        routes: []const Route,
+    };
+
+    /// One §7 route: every stated key must hold for a request to take it.
+    pub const Route = struct {
+        /// A canonical host, or null for any.
+        host: ?[]const u8 = null,
+        /// A canonical, segment-aware path prefix.
+        prefix: []const u8,
+        /// A header the request must carry (#302), or null.
+        header: ?RouteHeader = null,
+        /// The cluster's name.
+        cluster: []const u8,
+        /// #417's route-phase request policies, run once the route is
+        /// chosen and before any resource is taken; the first reject wins.
+        request_policies: []const extension.Selection = &.{},
+    };
+
+    pub const RouteHeader = struct {
+        name: []const u8,
+        predicate: Predicate,
+
+        pub const Predicate = union(enum) {
+            present,
+            equals: []const u8,
+        };
+    };
+
+    /// One §7 request rule: a match, and what to do when it holds.
+    pub const Filter = struct {
+        match: Match = .{},
+        /// At least one.
+        actions: []const Action,
+    };
+
+    /// Every stated key must hold; the empty match holds for every
+    /// request.
+    pub const Match = struct {
+        /// The methods it holds for, at least one, or null for any.
+        methods: ?std.EnumSet(Method) = null,
+        /// A canonical host.
+        host: ?[]const u8 = null,
+        /// A canonical, segment-aware path prefix.
+        path_prefix: ?[]const u8 = null,
+        headers: []const HeaderMatch = &.{},
+        /// The client addresses it holds for (#177); none is any client.
+        clients: []const Cidr = &.{},
+    };
+
+    pub const Method = parser.Method;
+    /// An address and a prefix length with no host bits past it; an IPv6
+    /// prefix is at most 64 bits, a client's identity there.
+    pub const Cidr = filter.Cidr;
+
+    pub const HeaderMatch = struct {
+        /// Matched without regard to case.
+        name: []const u8,
+        predicate: Predicate,
+
+        pub const Predicate = union(enum) {
+            present,
+            equals: []const u8,
+            /// A non-empty substring.
+            contains: []const u8,
+        };
+    };
+
+    pub const Action = union(enum) {
+        /// Refuse with a status from the static reject set.
+        reject: u16,
+        redirect: filter.Redirect,
+        /// Answer from a named body (#159).
+        respond: Respond,
+        /// Stop walking the filters, and route (#331).
+        allow,
+        header_set: filter.HeaderEdit,
+        header_add: filter.HeaderEdit,
+        header_remove: []const u8,
+        rewrite_prefix: filter.Rewrite,
+    };
+
+    pub const Respond = struct {
+        /// A status zoxy can send a page for.
+        status: u16,
+        /// The name of one of the build's bodies.
+        body: []const u8,
+    };
+
+    /// One #175 response rule: a match over the origin's response, and the
+    /// header edits to make when it holds.
+    pub const ResponseFilter = struct {
+        match: ResponseMatch = .{},
+        /// At least one.
+        actions: []const ResponseAction,
+    };
+
+    pub const ResponseMatch = struct {
+        /// Statuses in 100..599 it holds for; none is any status.
+        statuses: []const u16 = &.{},
+        status_class: ?filter.StatusClass = null,
+        headers: []const HeaderMatch = &.{},
+    };
+
+    pub const ResponseAction = union(enum) {
+        header_set: filter.HeaderEdit,
+        header_add: filter.HeaderEdit,
+        header_remove: []const u8,
+    };
+
+    pub const L4 = struct {
+        /// Where connections go.
+        target: L4Target,
+        /// Require a PROXY protocol header on every connection (#142), or
+        /// null to read none.
+        proxy_protocol: ?ProxyProtocol = null,
+    };
+
+    pub const ProxyProtocol = config.Config.Listener.ProxyProtocol;
+
+    pub const L4Target = union(enum) {
+        /// Every connection to one cluster, by name.
+        cluster: []const u8,
+        /// A table chosen by the ClientHello's server name (#298), at
+        /// least one route; plaintext listeners only, since a terminating
+        /// one has consumed the hello it would read.
+        routes: []const SniRoute,
+    };
+
+    pub const SniRoute = struct {
+        /// A canonical DNS name, or null for every other name and none.
+        sni: ?[]const u8 = null,
+        /// The cluster's name.
+        cluster: []const u8,
+    };
+};
 
 /// One upstream cluster (§7): a named set of endpoints and how traffic
 /// reaches them. Routes and listeners name it.
