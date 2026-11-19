@@ -1620,7 +1620,7 @@ lists do not reach is refused at step zero (`ExtensionUnserved`).
   - the input carries the cluster, the client address (null on a
     `unix:` listener), the request view on L7 (null on L4), whether
     this is a retry, whether health is steering, the loop's `now_ns`,
-    and zoxy's seeded entropy;
+    and zoxy's seeded generator;
   - a slot out of range falls back to p2c over the same set and counts
     `upstream_fallback_picks`, and per cluster
     `cluster_upstream_fallback_picks`;
@@ -1652,8 +1652,8 @@ asserted at the seam wherever zoxy can see them:
 - no allocation after startup. A serving call never receives an
   allocator, while `bind` may use the startup arena;
 - deterministic given its inputs and the instance's own state: no wall
-  clock and no private randomness, since `PickInput.entropy` is zoxy's
-  seeded source;
+  clock and no private randomness, since `PickInput.random` is zoxy's
+  seeded generator, the one the stock policies draw from too;
 - no syscalls and no I/O;
 - views are valid only during the call, so copy what must outlive it.
 

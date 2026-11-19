@@ -594,7 +594,7 @@ pub fn Server(comptime runtime: Runtime) type {
                 @sizeOf(u32) + // UpstreamPool.idle_heads
                 @sizeOf(u16) + // UpstreamPool.leased_counts
                 @sizeOf(u64) + // Balancer.endpoint_hashes
-                @sizeOf(i64) + // Balancer.rr_current
+                @sizeOf(i64) + // Balancer.policiesFor: the round-robin totals
                 @sizeOf(u16) + // Server.l4_inflight
                 @sizeOf(bool) + // Checker.healthy
                 @sizeOf(u8) + // Checker.fail_streaks
@@ -604,8 +604,9 @@ pub fn Server(comptime runtime: Runtime) type {
                 @sizeOf(u8) + // Checker.passive_levels (#394)
                 @sizeOf(u64); // Checker.restored_at_ns (#394)
             const scratch = @as(u64, keys.stride) * @sizeOf(u16);
-            // Server.retry_dials (#393): one count per cluster.
-            const per_cluster = @as(u64, config.clusters.len) * @sizeOf(u16);
+            // Server.retry_dials (#393) and Balancer.policies (#417): one
+            // count and one stock picker per cluster.
+            const per_cluster = @as(u64, config.clusters.len) * (@sizeOf(u16) + @sizeOf(Balancer.Policy));
             const total = count * per_key + scratch + per_cluster;
             assert(total > 0);
             return total;
@@ -4047,16 +4048,13 @@ pub fn Server(comptime runtime: Runtime) type {
             const pick = server.pickEndpoint(
                 cluster_index,
                 if (conn.client_address) |*address| address else null,
-                // L4 parses no head, so there is nothing request-derived
-                // to key on — and the loader keeps request-keyed clusters
-                // off l4 listeners (#178), so `.none` is exact, not a
-                // shrug.
-                .none,
                 // An L4 connection dials once and relays whatever the
                 // dial produced, so there is nothing tried to exclude
                 // (#181): a failed L4 dial has no request to re-send.
                 &.{},
-                // Nor any request for an extension picker to read.
+                // L4 parses no head, so there is no request to read — and
+                // resolving keeps request-keyed clusters off l4 listeners
+                // (#178), so a `hash` here keys on the address alone.
                 null,
             );
             const dial = switch (pick) {
@@ -4464,12 +4462,13 @@ pub fn Server(comptime runtime: Runtime) type {
             server: *Self,
             cluster_index: u16,
             client: ?*const std.Io.net.IpAddress,
-            request_key: Balancer.RequestKey,
             tried: []const u16,
+            /// The request, on the L7 path of a cluster whose pick reads it
+            /// — a build's picker, or `hash` on a header or a cookie.
             request: ?*const extension.Request,
         ) Balancer.Outcome {
             const load = server.endpointLoad();
-            const outcome = server.balancer.pick(cluster_index, &load, server.health.healthy, client, request_key, tried);
+            const outcome = server.balancer.pick(cluster_index, &load, server.health.healthy, client, request, tried);
             const choice = switch (outcome) {
                 .extension => |choice| choice,
                 .dial, .capped, .exhausted, .cluster_capped => return outcome,
@@ -4483,7 +4482,7 @@ pub fn Server(comptime runtime: Runtime) type {
                 .retry = tried.len >= 1,
                 .panicked = choice.panicked,
                 .now_ns = load.now_ns,
-                .entropy = server.balancer.drawEntropy(),
+                .random = &server.balancer.random,
             };
             const selection = server.config.clusters[cluster_index].pick.extension;
             const slot = callPicker(selection, &candidates, &input);
