@@ -331,7 +331,7 @@ pub const TestBed = struct {
         proxy_protocol_send: ?config_module.Config.Cluster.ProxyProtocolSend = null,
         /// Terminate TLS on the one listener (#125). The bed loads the
         /// checked-in fixture credentials and hands them over before
-        /// `start`, standing in for what `main` does — this file is under
+        /// `start`, standing in for what `zoxy.App` does — this file is under
         /// the Io seam, so it embeds the PEMs rather than reading them.
         /// Set `server.tls_engines` alongside; the two are checked against
         /// each other the way a real config's are.
@@ -2302,7 +2302,7 @@ test "tls: what the pool holds is what the budget priced" {
     }
 
     // What the budget charges for it. `memoryBytesTotal`'s TLS term with
-    // the libcrypto heap left out — that one is `main`'s to reserve before
+    // the libcrypto heap left out — that one is `zoxy.App`'s to reserve before
     // the server exists, so a bed that never installs it is not charged.
     const priced = @as(u64, engines) *
         (@sizeOf(TlsEngine) + TlsEngine.plaintextBytesFor(head_bytes));

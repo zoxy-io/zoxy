@@ -170,9 +170,10 @@ pub fn Server(comptime runtime: Runtime) type {
         listeners: []ListenerState,
         listeners_count: u16,
         /// One slot per listener, null where that listener is plaintext
-        /// (§4). Loaded before `start` by whoever can read files — `main`
-        /// in production, the harness in a test — because this file is
-        /// under the Io seam and the loader is not. Empty until then, and
+        /// (§4). Parsed before `start` by whoever holds the process —
+        /// `zoxy.App` in a binary, the harness in a test — because doing
+        /// it takes the libcrypto heap, and that is the process's to
+        /// install. Empty until then, and
         /// empty for the whole process on a deployment with no `tls`
         /// block anywhere.
         tls_credentials: []const ?Credentials,
@@ -1336,7 +1337,7 @@ pub fn Server(comptime runtime: Runtime) type {
                 return;
             }
             // One buffer per slot, sized by the engine's own closed form —
-            // the same call `main`'s banner makes, which is what keeps the
+            // the same call the startup banner makes, which is what keeps the
             // printed §5 total and this reservation the same number.
             // Two destinations per slot: the head (which the response head
             // renders back over) and the request body, which §7 lets run
@@ -1457,9 +1458,9 @@ pub fn Server(comptime runtime: Runtime) type {
         }
 
         /// Hand over the per-listener TLS credentials before `start` (§4).
-        /// A setter rather than an `init` argument because loading them
-        /// reads files, and everything below the Io seam — this file
-        /// included — is written not to: `main` reads, this holds.
+        /// A setter rather than an `init` argument because parsing them
+        /// takes the libcrypto heap, which is the process's to install
+        /// before the first credential: `zoxy.App` parses, this holds.
         ///
         /// The table must outlive the server: every engine on a listener
         /// borrows that listener's entry for the session's life.
@@ -1715,7 +1716,7 @@ pub fn Server(comptime runtime: Runtime) type {
                     .accepting = false,
                 };
                 // A listener the config says terminates TLS must have
-                // credentials by now: `main` loads them before `start`, and
+                // credentials by now: `zoxy.App` parses them before `start`, and
                 // starting without them would bind a socket that answers
                 // every handshake with a teardown.
                 assert((listener_config.tls != null) == (state.credentials != null));
@@ -2158,7 +2159,7 @@ pub fn Server(comptime runtime: Runtime) type {
         /// The two callers left are both past the point a stall can cost
         /// anything, for two *different* reasons:
         ///
-        ///   - `main` prints the final tally after `run` has returned, so
+        ///   - `zoxy.App` prints the final tally after `run` has returned, so
         ///     there is no loop to park and no op that could complete.
         ///   - `reportStuckDrain` runs immediately before an unconditional
         ///     `abort`: the process is already committed to a hard exit,

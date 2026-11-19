@@ -1,6 +1,6 @@
 //! Every static limit in one place. Total memory, fd count, and in-flight
 //! ring ops are closed-form functions of these numbers (DESIGN.md §5, §8):
-//! main.zig prints the budgets at startup, and the comptime asserts below
+//! the startup banner prints the budgets, and the comptime asserts below
 //! keep the relationships true. Pools never grow; exhaustion sheds load.
 
 const std = @import("std");
@@ -454,7 +454,7 @@ pub fn libcryptoHeapBytes(tls_engines: u32, tls_certificates: u32) u32 {
 ///
 /// It has to be comptime. The heap is BSS rather than arena memory because
 /// `OPENSSL_cleanup` frees through our hooks from an atexit handler, after
-/// `main` has returned and the arena with it (see `main.zig`) — so sizing
+/// `main` has returned and the arena with it (see `app.zig`) — so sizing
 /// for the ceiling is what a static reservation costs, and BSS pages a
 /// smaller deployment never touches never become resident.
 pub const libcrypto_heap_bytes: u32 = libcryptoHeapBytes(tls_engines_max, tls_certificates_max);
@@ -1547,8 +1547,8 @@ pub fn fdsRequired(
 /// `conn_slots_default` is tuned to that ~32 MiB target against the current
 /// per-slot sizes (a conn slot + its relay buffer is ~17.7 KiB, plus the
 /// fixed upstream pool); it is not derived because `@sizeOf(Conn)` is not
-/// available here (Conn is generic over the runtime). main.zig prints
-/// the resulting footprint at startup.
+/// available here (Conn is generic over the runtime). The startup banner
+/// prints the resulting footprint.
 pub const conn_slots_default: u32 = 1386;
 pub const relay_buffers_default: u32 = conn_slots_default;
 /// Deliberately *not* `upstream_slots_max`. It used to be, which left the
@@ -1846,7 +1846,7 @@ comptime {
 /// sizes (the config `limits` block may shrink them below the ceilings,
 /// §5). Slot sizes are runtime parameters because `Conn` is generic over
 /// the Io backend; the composition site passes `@sizeOf` of the concrete
-/// types and main.zig prints the result at startup.
+/// types and the startup banner prints the result.
 /// What the pools cost: a count and a slot size per pool. A struct rather
 /// than six positional arguments because three of them are `u64` byte sizes
 /// — transposing two of those compiles, runs, and silently prints the wrong
@@ -1926,7 +1926,7 @@ pub const PoolSizes = struct {
     /// canonicalization scratches (present only where a head can exist)
     /// and the health prober's response buffer (always). A fixed
     /// reservation like the access log's, in the total on the same
-    /// promise; `main.zig` composes it to mirror `Server.init` exactly.
+    /// promise; `budget.zig` composes it to mirror `Server.init` exactly.
     head_scratch_bytes: u64,
     /// The §5 tunnel pool (`limits.tunnels`; zero when no listener
     /// allows an upgrade) and its unit size — the same `RelayBuffer` the

@@ -5,10 +5,15 @@
 const std = @import("std");
 
 pub const access_log = @import("access_log.zig");
+/// zoxy as a process (#417): the startup sequence, `--check`, and the
+/// selection helpers a build's options use. `App(extensions)` is what a
+/// binary built on this library calls once its config exists.
+pub const app = @import("app.zig");
+pub const App = app.App;
 pub const balancer = @import("balancer.zig");
 /// The §5/§8 startup budget: pool sizes, fd and ring demands, the banner.
 /// Generic over the `Runtime` like `Server`, and the reason it is here
-/// rather than in `main` is §13 — the closed form must price exactly what
+/// rather than in an application is §13 — the closed form must price exactly what
 /// `Server.init` reserves, so an embedder inherits it instead of copying it.
 pub const Budget = @import("budget.zig").Budget;
 pub const config = @import("config.zig");
@@ -63,8 +68,8 @@ pub const tls = struct {
     pub const Tickets = @import("tls/Tickets.zig");
     /// A listener's certificates chosen by server name (#297).
     pub const certificate_set = @import("tls/certificate_set.zig");
-    /// Chain verification and a leaf's DNS names — `main` reads the names
-    /// a listener's certificates are chosen by (#297).
+    /// Chain verification and a leaf's DNS names — `zoxy.App` reads the
+    /// names a listener's certificates are chosen by (#297).
     pub const trust = @import("tls/trust.zig");
     pub const TestClient = @import("tls/TestClient.zig").TestClient;
     /// What a client captures from one session to offer on the next. Named
@@ -100,6 +105,7 @@ pub const testing = struct {
 
 test {
     _ = access_log;
+    _ = app;
     _ = balancer;
     _ = @import("budget.zig");
     _ = config;

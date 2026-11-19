@@ -2,13 +2,13 @@
 //! every pool this process holds for its life, the fd and ring demands
 //! the *effective* config makes, and the banner that prints both.
 //!
-//! It lives beside `Server` rather than inside `main` because it is the
-//! one part of startup an embedder (§13) cannot reasonably rewrite: the
+//! It lives beside `Server` rather than in an application because it is
+//! the one part of startup no build (§13) can reasonably rewrite: the
 //! closed form has to price exactly what `Server.init` reserves, and a
 //! second derivation that drifted would break §5's promise — that the
 //! printed total covers everything this process holds — while still
-//! looking correct. `main.zig` keeps what is genuinely the application's:
-//! reading files, raising `RLIMIT_NOFILE`, installing signal handlers.
+//! looking correct. `zoxy.App` runs it as the first step of every start,
+//! the stock binary's and a custom build's alike (#417).
 //!
 //! Generic over the `Runtime` for the same reason `Server` is: a conn
 //! slot's size and an upstream slot's size are properties of the backend
@@ -57,7 +57,7 @@ pub fn Budget(comptime runtime: Runtime) type {
         /// through this.
         pub const Build = struct {
             version: []const u8,
-            /// `main`'s `git describe` suffix, or empty where the build
+            /// The binary's `git describe` suffix, or empty where the build
             /// cannot say what it is. Printed verbatim, separator
             /// included.
             id_suffix: []const u8 = "",
@@ -169,7 +169,7 @@ pub fn Budget(comptime runtime: Runtime) type {
                 // The whole compiled reservation, not this config's
                 // share of it: the storage is one static array sized at
                 // `tls_engines_max` (it must outlive the arena — see
-                // `main.zig`'s `libcrypto_heap_storage`), so that is what
+                // `app.zig`'s `libcrypto_heap_storage`), so that is what
                 // the process holds for its life whatever `tls_engines`
                 // says, and §5 prices what is held.
                 .libcrypto_heap_bytes = if (limits.tls_engines == 0 and !config_module.originTls(config.clusters))

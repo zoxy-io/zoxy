@@ -1433,7 +1433,7 @@ test "xevio: the listener table reserves a slot for the admin listener" {
     // admin listener binds through the same `listen`, so every
     // admin-enabled deployment failed to start with `AddressUnavailable`
     // — a full table reported as a bad address. Nothing caught it:
-    // `Server(.{ .Io = XevIo })` is instantiated only by main.zig, and admin_test
+    // `Server(.{ .Io = XevIo })` is instantiated only by `zoxy.App`, and admin_test
     // runs over SimIo.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
