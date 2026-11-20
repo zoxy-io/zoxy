@@ -111,6 +111,63 @@ pub fn select(comptime list: []const type, instance: anytype) Selection {
 /// process and is measured with the rest of startup (§5).
 pub const Startup = struct {
     arena: std.mem.Allocator,
+    /// zoxy's, filled at bind: what `endpointSet` reads (#428).
+    endpoints_context: ?*anyopaque = null,
+    endpoints_lookup: ?*const fn (context: *anyopaque, cluster_name: []const u8) ?EndpointSet = null,
+
+    /// The endpoint set of the cluster named `cluster_name`, which a build
+    /// changes while it serves (#428) — or null when no cluster has that
+    /// name, or it declared no `endpoint_slots`.
+    pub fn endpointSet(startup: *const Startup, cluster_name: []const u8) ?EndpointSet {
+        if (cluster_name.len == 0) return null;
+        const lookup = startup.endpoints_lookup orelse return null;
+        return lookup(startup.endpoints_context.?, cluster_name);
+    }
+};
+
+/// A cluster's endpoints, as a build changes them while serving (#428):
+/// handed out at startup for a cluster that declared `endpoint_slots`, and
+/// used on the loop thread alone — from a handler, a policy, a picker's
+/// completion; never inside a pick, whose candidates the update would
+/// change under it. Keep the set, not the `Startup` it came from, which
+/// lives only for `bind`.
+pub const EndpointSet = struct {
+    context: *anyopaque,
+    cluster_index: u16,
+    replace_fn: *const fn (context: *anyopaque, cluster_index: u16, endpoints: []const Endpoint) UpdateError!void,
+
+    /// One endpoint of a new set: an IP literal with a nonzero port — the
+    /// address is copied into its slot, and a socket path could not be —
+    /// its weight (0 drains it) and its standby tier, taken as given.
+    pub const Endpoint = struct {
+        address: std.Io.net.IpAddress,
+        weight: u16 = 1,
+        priority: u8 = 0,
+    };
+
+    pub const UpdateError = error{
+        /// No endpoint, or none with a weight: a cluster sent nowhere.
+        EndpointsEmpty,
+        /// More endpoints than the cluster has slots.
+        EndpointsOverSlots,
+        /// A zero port, or a weight or tier past its bound.
+        EndpointInvalid,
+        /// One address twice.
+        EndpointDuplicate,
+        /// More arrivals than free slots: every other slot holds an
+        /// endpoint of the set or one still draining. Nothing changed.
+        SlotsExhausted,
+    };
+
+    /// Make `endpoints` the cluster's set, all at once or not at all: an
+    /// endpoint already in it keeps its slot and its state, its weight
+    /// and tier changed in place; one that leaves drains — never picked
+    /// again, its in-flight work running to its end; one that arrives
+    /// takes a free slot, unhealthy until its first probe passes on a
+    /// checked cluster.
+    pub fn replace(set: EndpointSet, endpoints: []const Endpoint) UpdateError!void {
+        return set.replace_fn(set.context, set.cluster_index, endpoints);
+    }
 };
 
 /// One request, as an extension sees it: the §7 canonical routing keys

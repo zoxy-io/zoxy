@@ -538,6 +538,10 @@ pub const Counters = struct {
     /// produced no response byte — never an origin `5xx`, which is a
     /// software bug rather than an unhealthy endpoint.
     health_endpoint_down_passive: Value = Value.init(0),
+    /// Endpoints an update brought into a checked cluster (#428), out
+    /// until their first probe passes: down from their arrival, so the
+    /// `up` that pass earns has a `down` to answer.
+    health_endpoint_down_arrival: Value = Value.init(0),
     /// Ejected endpoints restored to balancing (§7): after `check.rise`
     /// consecutive successful probes, or — for a passively ejected one —
     /// when its `recovery_ms` cooldown expires and traffic is let back to
@@ -547,6 +551,17 @@ pub const Counters = struct {
     /// ejected (§5): a parked socket to a dead origin is a stale replay
     /// waiting to be spent.
     health_parked_closed: Value = Value.init(0),
+    /// Endpoints a build's update added to a cluster's set (#428): into a
+    /// free slot, or back from draining.
+    endpoints_arrived: Value = Value.init(0),
+    /// Endpoints an update took out of a set: draining, never picked
+    /// again, their in-flight work running to its end.
+    endpoints_departed: Value = Value.init(0),
+    /// Endpoints an update kept whose weight or tier it changed in place.
+    endpoints_reweighted: Value = Value.init(0),
+    /// Parked connections closed because their endpoint left its set —
+    /// the ejection path's obligation, for a departure.
+    endpoints_parked_closed: Value = Value.init(0),
     /// Probe deadlines that fired *after* the verdict was already known —
     /// the §4 race between a timer and its own cancel, where the delivery
     /// is accounting and nothing else. Counts the race only while
@@ -1180,7 +1195,8 @@ pub const Counters = struct {
         // false. Narrowed to the cause it was always about, it still
         // holds — and now says something the total no longer can.
         assert(counters.get("health_endpoint_down_probe") +
-            counters.get("health_endpoint_down_passive") ==
+            counters.get("health_endpoint_down_passive") +
+            counters.get("health_endpoint_down_arrival") ==
             counters.get("health_endpoint_down"));
         assert(counters.get("health_endpoint_down_probe") <=
             counters.get("health_probes_failed"));
@@ -1221,6 +1237,10 @@ pub const Labeled = struct {
     /// Cluster names are escaped (an operator identifier may hold any
     /// byte); the endpoint half is an address literal and cannot need it.
     endpoint_labels: [][]const u8,
+    /// Each slot's reserved label room, on a cluster with endpoint slots
+    /// (#428), where an arriving endpoint's label is written; empty for
+    /// every other key.
+    label_room: [][]u8,
     /// Rendered `{cluster="…"}` per cluster, for the families whose
     /// witness site cannot know an endpoint.
     cluster_labels: [][]const u8,
@@ -1425,6 +1445,8 @@ pub const Labeled = struct {
         labeled.keys = keys;
         const cluster_count = config.clusters.len;
         labeled.endpoint_labels = try arena.alloc([]const u8, keys.count);
+        labeled.label_room = try arena.alloc([]u8, keys.count);
+        @memset(labeled.label_room, &.{});
         labeled.cluster_labels = try arena.alloc([]const u8, cluster_count);
         labeled.endpoint_counts = try arena.alloc(u16, cluster_count);
         labeled.cluster_checked = try arena.alloc(bool, cluster_count);
@@ -1458,10 +1480,12 @@ pub const Labeled = struct {
             labeled.cluster_labels[cluster_index] = try clusterLabel(arena, cluster.name);
             for (cluster.endpoints, 0..) |*address, endpoint_index| {
                 const key = keys.key(@intCast(cluster_index), @intCast(endpoint_index));
-                labeled.endpoint_labels[key] = if (cluster.slots == null)
-                    try endpointLabel(arena, cluster.name, address)
-                else
-                    try slotLabel(arena, cluster, endpoint_index);
+                if (cluster.slots == null) {
+                    labeled.endpoint_labels[key] = try endpointLabel(arena, cluster.name, address);
+                } else {
+                    labeled.label_room[key] = try arena.alloc(u8, label_scratch_bytes);
+                    labeled.endpoint_labels[key] = slotLabel(labeled.label_room[key], cluster, endpoint_index);
+                }
             }
         }
         labeled.render_bytes_max = renderBytesMaxFor(config);
@@ -1541,12 +1565,12 @@ pub const Labeled = struct {
     /// later is labeled in place. A free slot's label is empty, which is
     /// what keeps it out of every render.
     fn slotLabel(
-        arena: std.mem.Allocator,
+        room: []u8,
         cluster: *const config_module.Config.Cluster,
         endpoint_index: usize,
-    ) error{OutOfMemory}![]const u8 {
+    ) []const u8 {
         assert(cluster.slots != null);
-        const room = try arena.alloc(u8, label_scratch_bytes);
+        assert(room.len == label_scratch_bytes);
         if (!cluster.occupiedAt(endpoint_index)) return room[0..0];
         const rendered = renderEndpointLabel(room, cluster.name, &cluster.endpoints[endpoint_index]);
         assert(rendered.ptr == room.ptr);
@@ -1625,6 +1649,7 @@ pub const Labeled = struct {
         const cluster_count: u64 = config.clusters.len;
         var total: u64 = 0;
         total += @as(u64, keys.count) * @sizeOf([]const u8); // endpoint_labels
+        total += @as(u64, keys.count) * @sizeOf([]u8); // label_room
         total += cluster_count * @sizeOf([]const u8); // cluster_labels
         total += cluster_count * @sizeOf(u16); // endpoint_counts
         total += cluster_count * @sizeOf(bool); // cluster_checked
@@ -1669,6 +1694,17 @@ pub const Labeled = struct {
                 else => try writer.writeByte(byte),
             }
         }
+    }
+
+    /// An endpoint arrived in a free slot (#428): its label written into
+    /// the slot's room. Its series are the slot's: a free slot has never
+    /// held an endpoint until reuse, which keeps every family's per-
+    /// endpoint rows summing to its process total.
+    pub fn relabel(labeled: *Labeled, key: u32, cluster: *const config_module.Config.Cluster, endpoint_index: usize) void {
+        assert(key < labeled.keys.count);
+        assert(labeled.label_room[key].len == label_scratch_bytes);
+        labeled.endpoint_labels[key] = slotLabel(labeled.label_room[key], cluster, endpoint_index);
+        assert(labeled.endpoint_labels[key].len >= 1);
     }
 
     /// Loop thread only — the single writer (§8), like `Counters`.

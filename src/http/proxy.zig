@@ -4288,10 +4288,15 @@ pub fn Proxy(comptime runtime: Runtime) type {
                 stream.upstream = null;
                 return;
             }
+            // An endpoint that left its cluster's set while this exchange
+            // ran (#428) parks nothing: no pick reaches it again, and its
+            // slot may come to hold another endpoint.
+            const cluster = &server.config.clusters[upstream.cluster_index];
+            const departed = !cluster.liveAt(upstream.endpoint_index);
             // An HTTPS origin's connection parks only clean (#296): a
             // record or a byte past the response, or the origin's close,
             // would be the next exchange's to misread — so it closes.
-            if (upstream.tls != null and !ServerType.UpstreamTls.parkable(stream)) {
+            if (departed or (upstream.tls != null and !ServerType.UpstreamTls.parkable(stream))) {
                 assert(stream.client_write.pending.len == 0);
                 server.upstreamClose(stream);
                 server.releaseUpstream(upstream);

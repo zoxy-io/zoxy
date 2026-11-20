@@ -277,6 +277,11 @@ pub const TestBed = struct {
     /// fits `SimIo`'s own `blackholed_addresses_max`.
     endpoints: [4]io_module.Address,
     endpoints_count: u16,
+    /// #428's slot table, when a scenario reserves endpoint slots.
+    slot_weights: [4]u16,
+    slot_priorities: [4]u8,
+    slot_states: [4]config_module.Config.EndpointState,
+    slots: config_module.Config.Slots,
     clusters: [1]config_module.Config.Cluster,
     routes: [1]router.Route,
     /// The §6 SNI table (#298); empty unless a scenario asks for one, so
@@ -353,6 +358,9 @@ pub const TestBed = struct {
         /// An extension picker instance the one cluster selects (#417);
         /// null keeps the built-in p2c every other scenario uses.
         picker: ?*ScriptedPicker = null,
+        /// Slots the one cluster reserves for endpoints added while it
+        /// serves (#428), up to the bed's four; null reserves none.
+        endpoint_slots: ?u16 = null,
         /// A connection policy the one listener selects (#425); null
         /// selects none.
         connection_policy: ?*ScriptedConnectionPolicy = null,
@@ -362,6 +370,29 @@ pub const TestBed = struct {
 
     pub fn bindAddress() std.Io.net.IpAddress {
         return std.Io.net.IpAddress.parseLiteral("127.0.0.1:8080") catch unreachable;
+    }
+
+    /// The cluster's slot table (#428), as `config.reserveSlots` builds
+    /// one: the bed's endpoints live first, the rest free. Null with none
+    /// asked for.
+    fn reserveSlots(bed: *TestBed, capacity: ?u16) ?*config_module.Config.Slots {
+        const slots = capacity orelse return null;
+        assert(slots >= bed.endpoints_count);
+        assert(slots <= bed.endpoints.len);
+        for (bed.endpoints_count..slots) |index| bed.endpoints[index] = config_module.free_slot_address;
+        @memset(bed.slot_weights[0..bed.endpoints_count], 1);
+        @memset(bed.slot_weights[bed.endpoints_count..slots], 0);
+        @memset(bed.slot_priorities[0..slots], 0);
+        @memset(bed.slot_states[0..bed.endpoints_count], .live);
+        @memset(bed.slot_states[bed.endpoints_count..slots], .free);
+        bed.slots = .{
+            .addresses = bed.endpoints[0..slots],
+            .weights = bed.slot_weights[0..slots],
+            .priorities = bed.slot_priorities[0..slots],
+            .states = bed.slot_states[0..slots],
+        };
+        bed.endpoints_count = slots;
+        return &bed.slots;
     }
 
     /// The listener's connection-policy list: `policy`, selected, or
@@ -452,9 +483,14 @@ pub const TestBed = struct {
     fn installCluster(bed: *TestBed, options: *const SetUpOptions) void {
         assert(bed.endpoints_count >= 1);
         assert(bed.endpoints_count <= bed.endpoints.len);
+        // Before the slice below: reserving widens the count to the slots.
+        const slots = bed.reserveSlots(options.endpoint_slots);
         bed.clusters = .{.{
             .name = "origin",
             .endpoints = bed.endpoints[0..bed.endpoints_count],
+            .weights = if (slots) |reserved| reserved.weights else null,
+            .priorities = if (slots) |reserved| reserved.priorities else null,
+            .slots = slots,
             .check = options.check,
             .passive_ejection = options.passive_ejection,
             .max_inflight = options.max_inflight,
@@ -3023,5 +3059,124 @@ test "health: a check kind's request past the bound fails the probe, not the pro
     try std.testing.expect(bed.server.counters.get("health_probe_request_oversize") >= 1);
     try std.testing.expectEqual(@as(u32, 0), probe.judgements);
     try std.testing.expect(!bed.server.health.healthy[0]);
+    try bed.expectDrained();
+}
+
+fn slotEndpoint(literal: []const u8) extension.EndpointSet.Endpoint {
+    return .{ .address = std.Io.net.IpAddress.parseLiteral(literal) catch unreachable };
+}
+
+test "endpoints: an update drains an endpoint that leaves, and traffic follows the set (#428)" {
+    // The origin and one black-holed endpoint, room for a third. The
+    // update keeps the origin alone: every client then reaches it, where
+    // without the update p2c would send some into the hole.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 4281 },
+        .blackholed_endpoints = 1,
+        .endpoint_slots = 3,
+    });
+    defer bed.tearDown();
+
+    try bed.server.replaceEndpoints(0, &.{slotEndpoint("127.0.0.1:9000")});
+    const slots = bed.server.config.clusters[0].slots.?;
+    try std.testing.expectEqualSlices(
+        config_module.Config.EndpointState,
+        &.{ .live, .draining, .free },
+        slots.states,
+    );
+    try std.testing.expectEqual(@as(u16, 0), slots.weights[1]);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("endpoints_departed"));
+
+    // The bed's two relay buffers: two clients, each to the origin.
+    bed.startClients(2, true);
+    try bed.sim_io.run();
+    try std.testing.expectEqual(@as(u8, 2), bed.scenario.outcomeCount(.eof));
+    try std.testing.expect(bed.server.reconcile());
+    try bed.expectDrained();
+}
+
+test "endpoints: an arrival takes a free slot, out until its first probe on a checked cluster (#428)" {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 4282 },
+        .check = .{ .timeout_ms = 50 },
+        .endpoint_slots = 3,
+    });
+    defer bed.tearDown();
+
+    try bed.server.replaceEndpoints(0, &.{ slotEndpoint("127.0.0.1:9000"), slotEndpoint("127.0.0.1:9100") });
+    const cluster = &bed.server.config.clusters[0];
+    try std.testing.expect(cluster.liveAt(1));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("endpoints_arrived"));
+    const key = bed.server.upstreams.keys.key(0, 1);
+    // Checked: out until a probe proves it.
+    try std.testing.expect(!bed.server.health.healthy[key]);
+    try std.testing.expect(std.mem.indexOf(u8, bed.server.labeled.endpoint_labels[key], "127.0.0.1:9100") != null);
+
+    // A sweep later, nothing listens at the arrival's address: it stays
+    // out, and the origin stays in.
+    bed.sim_io.scheduleSignal(.terminate, bed.server.health.first_sweep_at_ns + 120 * std.time.ns_per_ms);
+    try bed.sim_io.run();
+    try std.testing.expect(!bed.server.health.healthy[key]);
+    try std.testing.expect(bed.server.health.healthy[bed.server.upstreams.keys.key(0, 0)]);
+    try bed.expectDrained();
+}
+
+test "endpoints: weights change in place, and an update that does not fit changes nothing (#428)" {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 4283 },
+        .blackholed_endpoints = 1,
+        .endpoint_slots = 2,
+    });
+    defer bed.tearDown();
+
+    var heavy = slotEndpoint("127.0.0.1:9000");
+    heavy.weight = 5;
+    var drained = slotEndpoint("127.0.0.1:9001");
+    drained.weight = 0;
+    try bed.server.replaceEndpoints(0, &.{ heavy, drained });
+    const slots = bed.server.config.clusters[0].slots.?;
+    try std.testing.expectEqualSlices(u16, &.{ 5, 0 }, slots.weights);
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("endpoints_reweighted"));
+
+    // A third address needs a free slot, and there is none: refused whole.
+    try std.testing.expectError(
+        error.SlotsExhausted,
+        bed.server.replaceEndpoints(0, &.{ heavy, slotEndpoint("127.0.0.1:9200") }),
+    );
+    try std.testing.expectEqualSlices(config_module.Config.EndpointState, &.{ .live, .live }, slots.states);
+    try std.testing.expectError(error.EndpointDuplicate, bed.server.replaceEndpoints(0, &.{ heavy, heavy }));
+    try std.testing.expectError(error.EndpointsEmpty, bed.server.replaceEndpoints(0, &.{drained}));
+    try std.testing.expectError(error.EndpointInvalid, bed.server.replaceEndpoints(0, &.{slotEndpoint("127.0.0.1:0")}));
+    // A build finds the set by its cluster's name at startup.
+    try std.testing.expect(@TypeOf(bed.server).lookupEndpointSet(&bed.server, "origin") != null);
+    try bed.expectDrained();
+}
+
+test "endpoints: an arrival that passes its first probe is restored, the counts reconciled (#428)" {
+    // The origin leaves for an address nothing listens at, then comes back:
+    // it rejoins its draining slot, out until its first probe passes.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 4284 },
+        .check = .{ .timeout_ms = 50, .rise = 1 },
+        .health_interval_ms = 50,
+        .endpoint_slots = 3,
+    });
+    defer bed.tearDown();
+
+    try bed.server.replaceEndpoints(0, &.{slotEndpoint("127.0.0.1:9100")});
+    try bed.server.replaceEndpoints(0, &.{slotEndpoint("127.0.0.1:9000")});
+    const origin = bed.server.upstreams.keys.key(0, 0);
+    try std.testing.expect(!bed.server.health.healthy[origin]);
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("health_endpoint_down_arrival"));
+
+    bed.sim_io.scheduleSignal(.terminate, bed.server.health.first_sweep_at_ns + 120 * std.time.ns_per_ms);
+    try bed.sim_io.run();
+    try std.testing.expect(bed.server.health.healthy[origin]);
+    try std.testing.expect(bed.server.counters.get("health_endpoint_up") >= 1);
+    try std.testing.expect(bed.server.reconcile());
     try bed.expectDrained();
 }
