@@ -319,12 +319,29 @@ const Peer = struct {
     alpn: []const []const u8,
 
     fn init(peer: *Peer, alpn: []const []const u8) !void {
-        peer.alpn = alpn;
-        peer.credentials = try zssl.Credentials.load(
+        return peer.initServing(
+            alpn,
             @embedFile("testdata/origin-cert.pem"),
             @embedFile("testdata/origin-key.pem"),
-            &peer.chain_storage,
             true,
+        );
+    }
+
+    /// The same, serving a named pair. An RSA key draws a fresh PSS salt
+    /// per signature, so it must be loaded with `deterministic` off.
+    fn initServing(
+        peer: *Peer,
+        alpn: []const []const u8,
+        cert_pem: []const u8,
+        key_pem: []const u8,
+        deterministic: bool,
+    ) !void {
+        peer.alpn = alpn;
+        peer.credentials = try zssl.Credentials.load(
+            cert_pem,
+            key_pem,
+            &peer.chain_storage,
+            deterministic,
         );
         peer.server = zssl.ServerHandshake.init(&.{
             .credentials = &peer.credentials,
@@ -447,6 +464,33 @@ test "origin client: a chain for another name, or from another anchor, aborts th
         try testing.expectError(error.BadCertificate, flushTo(client, peer));
         try testing.expect(!client.connected);
     }
+}
+
+test "origin client: an origin key of 8k+1 bits fails the handshake, not the process (#441)" {
+    // The anchor issued this leaf for this name, so the chain passes
+    // `verifyChain` and zssl goes on to check the origin's
+    // CertificateVerify. Over a 3065-bit modulus, std.crypto's RSA-PSS
+    // verifier asserts; zssl now refuses such a key before calling it
+    // (zoxy-io/zssl#23).
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const anchors_pem = @embedFile("testdata/rsa3065-ca.pem");
+    const anchors = try trust.parseAnchors(arena_state.allocator(), anchors_pem);
+    const peer = try testing.allocator.create(Peer);
+    defer testing.allocator.destroy(peer);
+    try peer.initServing(
+        &.{"h2"},
+        @embedFile("testdata/rsa3065-issued-cert.pem"),
+        @embedFile("testdata/rsa3065-key.pem"),
+        false,
+    );
+    defer peer.deinit();
+    const client = try testing.allocator.create(OriginClient);
+    defer testing.allocator.destroy(client);
+    testClient(client, anchors, "rsa3065.zoxy.test");
+    defer client.finish();
+    try testing.expectError(error.BadCertificate, flushTo(client, peer));
+    try testing.expect(!client.connected);
 }
 
 test "origin client: an origin that selects no protocol is told apart" {

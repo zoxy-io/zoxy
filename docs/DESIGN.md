@@ -271,9 +271,15 @@ listener parses it.
     client makes of a CertificateVerify, so a mismatched pair would
     otherwise fail every handshake. It verifies with the verifiers zssl
     uses for a peer: libcrypto for ECDSA, and `std.crypto` for RSA-PSS.
-  - An RSA modulus of a width `std.crypto` cannot verify at loads
-    unchecked, since real clients accept it. Every 2048-, 3072- and
-    4096-bit key is checked.
+  - A pair whose RSA modulus has a width `std.crypto` cannot verify
+    loads unchecked, since real clients accept it. Every 2048-, 3072-
+    and 4096-bit key is checked.
+  - A *peer* with such a key is refused instead: a client under
+    `client_ca`, or an HTTPS origin. zssl checks a peer's RSA-PSS
+    signature with `std.crypto` too, and refuses a key it cannot verify
+    before trying. One width, a modulus of 8k+1 bits such as 3065, used
+    to reach an assertion there and stop the process
+    (zoxy-io/zssl#23). Now it is a failed handshake like any other.
 - **ALPN** (`tls.alpn`) is a closed list of the protocols this proxy
   speaks, `http/1.1` and `h2`, in preference order.
   - Absent on an `http` listener, it means `["http/1.1"]`. An `l4`

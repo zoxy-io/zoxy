@@ -26,6 +26,12 @@ const origin_cert_pem = @embedFile("testdata/origin-cert.pem");
 const origin_key_pem = @embedFile("testdata/origin-key.pem");
 const rsa_cert_pem = @embedFile("testdata/rsa2048-cert.pem");
 const rsa_key_pem = @embedFile("testdata/rsa2048-key.pem");
+/// A leaf with a 3065-bit RSA key, issued by its own throwaway CA
+/// (#441): a modulus of 8k+1 bits, which std.crypto's RSA-PSS verifier
+/// asserts on.
+const rsa3065_ca_pem = @embedFile("testdata/rsa3065-ca.pem");
+const rsa3065_issued_cert_pem = @embedFile("testdata/rsa3065-issued-cert.pem");
+const rsa3065_key_pem = @embedFile("testdata/rsa3065-key.pem");
 
 /// Room for the largest record on the wire — a max-size plaintext record
 /// plus its header and AEAD tag — with slack for a second alongside it.
@@ -179,6 +185,9 @@ const Client = struct {
     }
 };
 
+/// A certificate chain and its key, as PEM.
+const PemPair = struct { cert: []const u8, key: []const u8 };
+
 /// Everything one test needs, so each test's own body is the story it is
 /// telling rather than six lines of setup.
 const Bed = struct {
@@ -227,10 +236,25 @@ const Bed = struct {
     /// whether the client answers with its certificate; `anchors_pem`
     /// is what the listener trusts.
     fn initMutual(bed: *Bed, require: bool, present: bool, anchors_pem: []const u8) !void {
+        const client_pair: PemPair = .{ .cert = client_cert_pem, .key = client_key_pem };
+        return bed.initMutualPresenting(require, if (present) client_pair else null, anchors_pem);
+    }
+
+    /// The same, with the pair the client presents named; null answers
+    /// with an empty certificate list.
+    fn initMutualPresenting(
+        bed: *Bed,
+        require: bool,
+        presented: ?PemPair,
+        anchors_pem: []const u8,
+    ) !void {
         bed.arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
         const arena = bed.arena_state.allocator();
         bed.credentials = try Credentials.load(arena, cert_pem, key_pem, .{});
-        bed.client_credentials = try Credentials.load(arena, client_cert_pem, client_key_pem, .{});
+        bed.client_credentials = if (presented) |pair|
+            try Credentials.load(arena, pair.cert, pair.key, .{})
+        else
+            null;
         bed.engine.bindPlaintext(&bed.plaintext, &bed.body_plaintext, constants.head_buffer_bytes_default);
         try bed.engine.init(&.{
             .x25519_seed = @splat(0x42),
@@ -239,7 +263,8 @@ const Bed = struct {
             .now_unix = 1_893_456_000,
             .client_auth = .{ .anchors = try trust.parseAnchors(arena, anchors_pem), .require = require },
         });
-        try bed.client.initPresenting(if (present) &bed.client_credentials.?.inner else null);
+        const presenting = if (bed.client_credentials) |*credentials| &credentials.inner else null;
+        try bed.client.initPresenting(presenting);
         bed.to_server = .{};
         bed.to_client = .{};
     }
@@ -590,6 +615,22 @@ test "engine: an optional client CA lets a client without a certificate in, unau
     defer bed.deinit();
     try bed.handshake();
     try std.testing.expect(bed.engine.clientFingerprint() == null);
+    try std.testing.expect(!bed.engine.clientCertRefused());
+}
+
+test "engine: a client key of 8k+1 bits is refused, where it used to stop the process (#441)" {
+    // The listener's CA issued this leaf, so the chain passes
+    // `verifyClientChain` and zssl goes on to check the client's
+    // CertificateVerify. Over a 3065-bit modulus, std.crypto's RSA-PSS
+    // verifier asserts; zssl now refuses such a key before calling it
+    // (zoxy-io/zssl#23).
+    var bed: Bed = undefined;
+    const presented: PemPair = .{ .cert = rsa3065_issued_cert_pem, .key = rsa3065_key_pem };
+    try bed.initMutualPresenting(true, presented, rsa3065_ca_pem);
+    defer bed.deinit();
+    try std.testing.expectError(error.BadCertificate, bed.handshake());
+    try std.testing.expect(!bed.engine.isConnected());
+    // The chain was good: it is the key that failed, not the CA.
     try std.testing.expect(!bed.engine.clientCertRefused());
 }
 
