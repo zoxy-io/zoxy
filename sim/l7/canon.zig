@@ -123,6 +123,13 @@ pub const policy_prefix = "/policy";
 /// under it the route-phase policy refuses: `route_policy_reject` asks for
 /// exactly that, and no other script reaches the route at all.
 pub const guarded_prefix = "/guarded";
+/// The guarded route's name (#430): the listener's policy routes every
+/// request under `guarded_prefix` to it by name, which is where the table
+/// would have sent it — so the outcome is the one it always was, reached
+/// by the policy's choice. The sweep thus holds the name resolving and
+/// the choice being taken, not the choice overriding the table:
+/// src/testing/bed.zig routes a request somewhere the table would not.
+pub const guarded_route_name = "guarded";
 pub const route_policy_path = guarded_prefix ++ "/deny";
 
 /// The #178 cookie name a sticky seed's http cluster is keyed on, and

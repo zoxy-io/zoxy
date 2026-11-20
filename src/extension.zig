@@ -416,6 +416,18 @@ pub const Proceed = struct {
     /// later policy rejects stays the request's, and the rejected line
     /// records it. Zero clears it: zero is no tag, as before any was set.
     tag: ?u64 = null,
+    /// The route the request takes (#430): an index into the listener's
+    /// table, resolved at `bind` with `PolicySite.routeNamed`. It replaces
+    /// the table's match, not the steps before it — the listener's filters
+    /// still run — and the chosen route's own policies run as if the table
+    /// had matched it. Its host, header and prefix are not asked of the
+    /// request: a policy that routes past a host-scoped route, which may
+    /// be a tenant's boundary, answers for that itself. The later choice
+    /// wins. An index the listener has no
+    /// route at, or a choice made at the route phase, when the route is
+    /// already chosen, leaves the table's match standing and is counted
+    /// (`l7_policy_route_fallback`).
+    route: ?u16 = null,
 };
 
 /// How a request a policy let through ended (#429). A policy may declare

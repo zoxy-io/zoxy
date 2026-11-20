@@ -147,6 +147,14 @@ pub const Counters = struct {
     /// a JSON rule from compiled code; answered the same way, so outside
     /// `reconcile`'s shed sum like it.
     l7_policy_rejected: Value = Value.init(0),
+    /// A build's listener policy chose the request's route (#430), and
+    /// the request took it in place of the route table's match.
+    l7_policy_routed: Value = Value.init(0),
+    /// A build's policy chose a route the listener does not have, or
+    /// chose one at the route phase, when the route is already chosen
+    /// (#430): the table's own match stood. A picker's out-of-set slot is
+    /// `upstream_fallback_picks`; this is the same mistake one step up.
+    l7_policy_route_fallback: Value = Value.init(0),
     /// A §7 filter rule answered the request with a redirect (#176):
     /// one of the closed statuses plus a Location rendered per request.
     /// `l7_filtered`'s sibling — admitted and answered, so outside

@@ -638,3 +638,57 @@ test "Bed: a build's picker chooses and its policy refuses, through the serving 
 test "Bed: the gate holds a build's scenario to zero allocations after startup (#417)" {
     try expectNoAllocationAfterStartup(TestBed, &test_options, 7, pickAndRefuse);
 }
+
+var route_policy: ScriptedPolicy = .{ .route_prefix = "/tenant-api", .route_name = "api" };
+
+/// Two clusters behind two named routes: the table sends everything but
+/// `/api` to `web`, and the listener's policy sends `/tenant-api` to the
+/// `api` route by name. A filter refuses one path first.
+const route_options: Options = .{
+    .listeners = &.{.{
+        .bind = .{ .ip = loopback(18081) },
+        .protocol = .{ .http = .{
+            .target = .{ .routes = &.{
+                .{ .prefix = "/api", .cluster = "api", .name = "api" },
+                .{ .prefix = "/", .cluster = "web", .name = "web" },
+            } },
+            .request_policies = &.{extension.select(&.{ScriptedPolicy}, &route_policy)},
+            .request_filters = &.{.{
+                .match = .{ .path_prefix = "/tenant-api/blocked" },
+                .actions = &.{.{ .reject = 404 }},
+            }},
+            .max_body_bytes = defaults.max_body_bytes,
+            .keepalive_requests = defaults.keepalive_requests,
+        } },
+    }},
+    .clusters = &.{
+        .{ .name = "api", .endpoints = &.{.{ .address = .{ .ip = loopback(19201) } }}, .pick = .p2c },
+        .{ .name = "web", .endpoints = &.{.{ .address = .{ .ip = loopback(19202) } }}, .pick = .p2c },
+    },
+    .timeouts = defaults.timeouts,
+    .limits = defaults.limits,
+};
+
+test "Bed: a listener's policy sends a request to a route by name, after its filters (#430)" {
+    const bed = try std.testing.allocator.create(TestBed);
+    defer std.testing.allocator.destroy(bed);
+    try bed.setUp(std.testing.allocator, &route_options, 430);
+    defer bed.tearDown();
+    route_policy.rerouted = 0;
+
+    const chosen = bed.request(0, "GET /tenant-api/reports HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+    const table = bed.request(0, "GET /other HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+    const filtered = bed.request(0, "GET /tenant-api/blocked HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+    try bed.run();
+
+    // The table would have sent it to `web`; the policy's choice sent it
+    // to `api`, resolved at bind from the name.
+    try std.testing.expectEqual(@as(?u16, 200), chosen.status());
+    try std.testing.expectEqualStrings("127.0.0.1:19201", chosen.body());
+    try std.testing.expectEqualStrings("127.0.0.1:19202", table.body());
+    // The filter ran before the chosen route could take the request.
+    try std.testing.expectEqual(@as(?u16, 404), filtered.status());
+    try std.testing.expectEqual(@as(u32, 2), route_policy.rerouted);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_policy_routed"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_policy_route_fallback"));
+}
