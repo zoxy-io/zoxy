@@ -3212,3 +3212,30 @@ test "endpoints: a drained slot nothing holds is freed for the next arrival, a h
     bed.server.l4_inflight[held] = 0;
     try bed.expectDrained();
 }
+
+test "endpoints: a build's picker hears each update with the slots as they stand (#428)" {
+    var picker: ScriptedPicker = .{ .choice = .first };
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 4286 },
+        .endpoint_slots = 3,
+        .picker = &picker,
+    });
+    defer bed.tearDown();
+
+    try bed.server.replaceEndpoints(0, &.{ slotEndpoint("127.0.0.1:9000"), slotEndpoint("127.0.0.1:9100") });
+    try std.testing.expectEqual(@as(u32, 1), picker.changes);
+    try std.testing.expectEqual(@as(u16, 2), picker.live_after_change);
+    try bed.server.replaceEndpoints(0, &.{slotEndpoint("127.0.0.1:9000")});
+    try std.testing.expectEqual(@as(u32, 2), picker.changes);
+    try std.testing.expectEqual(@as(u16, 1), picker.live_after_change);
+    // A refused update changed nothing, and is heard by no one.
+    try std.testing.expectError(error.EndpointsEmpty, bed.server.replaceEndpoints(0, &.{}));
+    try std.testing.expectEqual(@as(u32, 2), picker.changes);
+
+    // Its picks still see only the set: the origin, which echoes.
+    bed.startClients(1, true);
+    try bed.sim_io.run();
+    try std.testing.expectEqual(@as(u8, 1), bed.scenario.outcomeCount(.eof));
+    try bed.expectDrained();
+}
