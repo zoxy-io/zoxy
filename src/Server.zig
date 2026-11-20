@@ -223,6 +223,9 @@ pub fn Server(comptime runtime: Runtime) type {
         /// and metered type, handed into the serving calls made for it.
         /// Empty in a build that meters nothing.
         extension_metrics: ExtensionMetrics,
+        /// The pages a build's request policies answer with (#431); empty
+        /// in a build whose policies declare none.
+        answers: AnswerTable,
         /// Staging for the §8 exit tally: the
         /// full exposition — counters then labeled — no longer fits a
         /// fixed stack buffer once its length is the config's, so it is
@@ -449,6 +452,8 @@ pub fn Server(comptime runtime: Runtime) type {
         pub const ConnType = conn_module.Conn(runtime);
         /// The slots behind a build's own counters and gauges (#435).
         pub const ExtensionMetrics = extension_metrics.Table(runtime.extensions);
+        /// A build's own policy answers, rendered at startup (#431).
+        pub const AnswerTable = @import("extension_answers.zig").Table(runtime.extensions);
         pub const StreamType = ConnType.StreamType;
         pub const AccessLogType = access_log_module.AccessLog(runtime);
         pub const Proxy = proxy.Proxy(runtime);
@@ -704,6 +709,8 @@ pub fn Server(comptime runtime: Runtime) type {
             server.date_second = server.nowUnix();
             shed.formatHttpDate(server.date_second, &server.date_line);
             server.static_sends_inflight = 0;
+            // A build's answer pages (#431) are stamped with zoxy's own.
+            try server.answers.init(arena);
             server.initDateSlots();
             try server.conns.init(arena, options.conn_slots);
             // One stream per connection (#274). The shared HTTP/2 streams
@@ -1649,6 +1656,13 @@ pub fn Server(comptime runtime: Runtime) type {
                             else => {},
                         }
                     }
+                }
+            }
+            // A build's policy answers (#431), every variant.
+            for (server.answers.pages) |*pages| {
+                for ([_]*const shed.StaticPage{ &pages.plain, &pages.denied }) |page| {
+                    @memcpy(page.keep_date, now);
+                    @memcpy(page.close_date, now);
                 }
             }
         }

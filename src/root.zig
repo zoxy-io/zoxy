@@ -137,6 +137,7 @@ test {
     _ = defaults;
     _ = extension;
     _ = @import("extension_metrics.zig");
+    _ = @import("extension_answers.zig");
     _ = pickers;
     _ = constants;
     _ = counters;
