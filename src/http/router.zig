@@ -51,7 +51,12 @@ pub const Route = struct {
     host: ?[]const u8 = null,
     prefix: []const u8,
     header: ?HeaderMatch = null,
+    /// The cluster the route sends to. On a handler route it names none:
+    /// resolving sets it to 0, and nothing that serves the route reads it.
     cluster_index: u16,
+    /// A build's handler that answers the route's requests itself (#434),
+    /// or null for a route that sends them to `cluster_index`.
+    handler: ?extension.Selection = null,
     /// #417's request policies on this route, selected in code: run in
     /// order once the route is chosen, before the request takes any
     /// resource. Never produced by the JSON loader.

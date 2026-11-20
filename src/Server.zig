@@ -281,6 +281,11 @@ pub fn Server(comptime runtime: Runtime) type {
         /// Empty on an L4-only config, which never canonicalizes.
         target_scratch: []u8,
         rewrite_scratch: []u8,
+        /// Where a build's handler writes its answer (#434), before it is
+        /// rendered into the head buffer: `handler_scratch_bytes`, empty in
+        /// a build with no handlers. Lent for one call, on the same terms
+        /// as the two above.
+        handler_scratch: []u8,
         /// The serving path's one header scratch, on the same terms as the
         /// two above and for a sharper reason: a `parser.HeaderStorage`
         /// local is 0xaa-filled on every call under ReleaseSafe, and §9's
@@ -1231,8 +1236,9 @@ pub fn Server(comptime runtime: Runtime) type {
                 try H2Exchange.Scratch.init(arena, options.head_buffer_bytes)
             else
                 .empty;
+            server.handler_scratch = try arena.alloc(u8, handler_scratch_bytes);
             assert(server.target_scratch.len + server.rewrite_scratch.len +
-                probe_scratch_bytes + h2ScratchBytes(options) ==
+                probe_scratch_bytes + h2ScratchBytes(options) + server.handler_scratch.len ==
                 headScratchBytes(options.*, health_probes));
             try server.initLogHeaders(arena, options);
             // #424: every stream slot's scratch for its request's policy
@@ -3068,8 +3074,14 @@ pub fn Server(comptime runtime: Runtime) type {
             assert(health_probes <= constants.health_probe_concurrency_max);
             const serving: u64 = if (options.head_buffers >= 1) 2 else 0;
             return serving * options.head_buffer_bytes +
-                @as(u64, health_probes) * probeBufferBytes(options) + h2ScratchBytes(&options);
+                @as(u64, health_probes) * probeBufferBytes(options) + h2ScratchBytes(&options) +
+                handler_scratch_bytes;
         }
+
+        /// The one scratch a build's handlers answer into (#434): the
+        /// widest any declares, since a handler runs to completion on the
+        /// loop and the next one finds it free. Zero in a build with none.
+        pub const handler_scratch_bytes: u32 = extension.handlerResponseBytesMax(runtime.extensions);
 
         /// One probe's response buffer: a head buffer, so an http probe
         /// accepts exactly the heads the data path does — widened to the
@@ -4538,7 +4550,8 @@ pub fn Server(comptime runtime: Runtime) type {
                     null
                 else
                     cluster.endpoints[stream.log.endpoint_index],
-                .cluster = cluster.name,
+                // A handler route sends to no cluster (#434).
+                .cluster = if (stream.l7.handler_route == null) cluster.name else "",
                 .bytes_in = stream.log.bytes_in,
                 .bytes_out = stream.log.bytes_out,
                 .method = stream.log.methodSlice(),
@@ -4683,24 +4696,31 @@ pub fn Server(comptime runtime: Runtime) type {
                     selects = true;
                 }
                 for (listener.routes) |*route| {
-                    if (route.request_policies.len + route.response_policies.len >= 1) {
+                    if (selectsOnRoute(route)) {
                         assert(listener.protocol == .http);
-                    }
-                    for (route.request_policies) |selection| {
-                        assert(selection.index < runtime.extensions.request_policies.len);
-                        selects = true;
-                    }
-                    for (route.response_policies) |selection| {
-                        assert(selection.index < runtime.extensions.response_policies.len);
                         selects = true;
                     }
                 }
             }
             const lists = runtime.extensions.pickers.len + runtime.extensions.request_policies.len +
                 runtime.extensions.response_policies.len + runtime.extensions.connection_policies.len +
-                runtime.extensions.probes.len;
+                runtime.extensions.probes.len + runtime.extensions.handlers.len;
             if (lists == 0) assert(!selects);
             return selects;
+        }
+
+        /// Whether an http route selects any extension — a policy of
+        /// either kind, or a handler (#434) — each checked against the
+        /// build's list on the way.
+        fn selectsOnRoute(route: *const router.Route) bool {
+            for (route.request_policies) |selection| {
+                assert(selection.index < runtime.extensions.request_policies.len);
+            }
+            for (route.response_policies) |selection| {
+                assert(selection.index < runtime.extensions.response_policies.len);
+            }
+            if (route.handler) |selection| assert(selection.index < runtime.extensions.handlers.len);
+            return route.request_policies.len + route.response_policies.len >= 1 or route.handler != null;
         }
 
         /// Hand every selected extension instance the cluster it serves
@@ -4782,7 +4802,8 @@ pub fn Server(comptime runtime: Runtime) type {
                 const site: extension.PolicySite = .{
                     .listener_index = listener_index,
                     .route_index = @intCast(route_index),
-                    .cluster_index = route.cluster_index,
+                    // A handler route sends to no cluster (#434).
+                    .cluster_index = if (route.handler == null) route.cluster_index else null,
                     .routes = listener.routes,
                 };
                 for (route.request_policies) |selection| {
@@ -4791,6 +4812,7 @@ pub fn Server(comptime runtime: Runtime) type {
                 for (route.response_policies) |selection| {
                     try bindFrom(runtime.extensions.response_policies, selection, &site, startup);
                 }
+                if (route.handler) |selection| try bindFrom(runtime.extensions.handlers, selection, &site, startup);
             }
         }
 
@@ -5235,9 +5257,11 @@ pub fn Server(comptime runtime: Runtime) type {
 
         /// The route and cluster routing chose: for the response policies a
         /// response meets (#424), and the completions a request owes (#429).
-        pub fn noteRouted(server: *Self, stream: *StreamType, route_index: u16, cluster_index: u16) void {
+        pub fn noteRouted(server: *Self, stream: *StreamType, route_index: u16, cluster_index: ?u16) void {
             assert(route_index < stream.conn.routes.len);
-            assert(cluster_index < server.config.clusters.len);
+            // Null exactly on a handler route (#434).
+            assert((cluster_index == null) == (stream.conn.routes[route_index].handler != null));
+            if (cluster_index) |index| assert(index < server.config.clusters.len);
             // #424: whose response policies the response head meets.
             stream.route_index = route_index;
             if (comptime !ConnType.completes_policies) return;
@@ -5286,7 +5310,7 @@ pub fn Server(comptime runtime: Runtime) type {
             var done: extension.RequestCompletion = .{
                 .listener_index = listener_index,
                 .route_index = null,
-                .cluster_index = if (pending.routed) pending.cluster_index else null,
+                .cluster_index = pending.cluster_index,
                 .tag = stream.log.tag,
                 .status = stream.log.status,
                 .outcome = outcome,

@@ -403,6 +403,24 @@ const uncovered = [_]Uncovered{
             "header zoxy writes itself, and splits one with CRLF",
     },
     .{
+        .name = "l7_handled",
+        .why = .unreached,
+        .reason = "no sim route selects a handler yet (#434); " ++
+            "http_proxy_test drives handler routes end to end",
+    },
+    .{
+        .name = "l7_handler_body_too_large",
+        .why = .unreached,
+        .reason = "no sim route selects a handler yet (#434); " ++
+            "http_proxy_test declares a body past the head buffer",
+    },
+    .{
+        .name = "l7_handler_answer_refused",
+        .why = .unreached,
+        .reason = "no sim route selects a handler yet (#434); " ++
+            "http_proxy_test holds a misbehaving handler to a 502",
+    },
+    .{
         .name = "health_probe_request_oversize",
         .why = .unreached,
         .reason = "the harness's check kind sends short, fixed requests " ++

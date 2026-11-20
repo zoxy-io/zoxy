@@ -965,6 +965,9 @@ pub const ValidationError = error{
     /// Two routes of one listener share a name, which a policy could not
     /// route by (#430).
     RouteNameDuplicate,
+    /// A route names both a cluster and a handler (#434), or neither: it
+    /// must send its requests one place.
+    RouteTargetInvalid,
     /// A listener states more routes than a `u16` route index can name.
     RoutesOverLimit,
     ListenerMaxBodyBytesOutOfRange,
@@ -2402,6 +2405,8 @@ fn rejectUnixClientAddressUsers(
         }
     }
     for (listener.routes) |route| {
+        // A handler route reaches no cluster (#434).
+        if (route.handler != null) continue;
         try rejectUnixCluster(route.cluster_index, clusters);
     }
     // The SNI table is a *second* set of reachable clusters (#298), and
@@ -2844,6 +2849,17 @@ fn resolveSniRoutes(
     assert(routes.len == stated.len);
     assert(routes.len >= 1);
     return routes;
+}
+
+/// Where a route sends: its cluster, or — on a handler route (#434),
+/// which names none — 0, which nothing serving the route reads. Exactly
+/// one of the two is stated.
+fn routeClusterIndex(clusters: []const Config.Cluster, stated: *const Options.Listener.Route) ResolveError!u16 {
+    assert(clusters.len >= 1);
+    const names_cluster = stated.cluster.len != 0;
+    if (names_cluster == (stated.handler != null)) return error.RouteTargetInvalid;
+    if (stated.handler != null) return 0;
+    return clusterIndexOf(clusters, stated.cluster);
 }
 
 /// An SNI route's name: §7's canonical host form, minus what RFC 6066
@@ -3463,7 +3479,8 @@ fn resolveRoutes(
             .host = host,
             .prefix = route_stated.prefix,
             .header = header,
-            .cluster_index = try clusterIndexOf(clusters, route_stated.cluster),
+            .cluster_index = try routeClusterIndex(clusters, &route_stated),
+            .handler = route_stated.handler,
             .request_policies = route_stated.request_policies,
             .response_policies = route_stated.response_policies,
             .name = route_stated.name,
@@ -4030,6 +4047,7 @@ fn rejectHttpClusterSend(
 ) ValidationError!void {
     assert(routes.len >= 1);
     for (routes) |route| {
+        if (route.handler != null) continue;
         assert(route.cluster_index < clusters.len);
         if (clusters[route.cluster_index].proxy_protocol_send != null) {
             return error.ClusterProxyProtocolOnHttpListener;
@@ -4050,6 +4068,7 @@ fn rejectTlsClusterSend(
 ) ValidationError!void {
     assert(routes.len >= 1);
     for (routes) |route| {
+        if (route.handler != null) continue;
         assert(route.cluster_index < clusters.len);
         if (clusters[route.cluster_index].proxy_protocol_send != null) {
             return error.ClusterProxyProtocolOnTlsListener;
@@ -4137,6 +4156,7 @@ fn rejectUpgradeClusters(
     assert(listener.routes.len >= 1);
     if (!listener.upgrades.any()) return;
     for (listener.routes) |route| {
+        if (route.handler != null) continue;
         assert(route.cluster_index < clusters.len);
         const cluster = &clusters[route.cluster_index];
         if (cluster.protocol.http2()) return error.ClusterH2cWithUpgrades;

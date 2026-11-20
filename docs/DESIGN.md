@@ -759,6 +759,9 @@ Everything a client or origin says is judged once, in
     `404`.
   - **Only the route table picks a cluster.** No filter action can, so
     there is one precedence rule.
+  - A route sends to a cluster or, in code, to a build's handler (#434,
+    §13), which answers in its place: exactly one of the two, or the
+    load is refused (`RouteTargetInvalid`).
 - **Filters are data, not code.** Rules compile at load into arena
   tables, and evaluating one is a bounded scan.
   - **When they run.** `request_filters` run before routing;
@@ -1630,7 +1633,7 @@ extensions they list.
 
 **Extensions.** A build lists types:
 `Extensions{ .pickers, .request_policies, .response_policies,
-.connection_policies, .probes }`. Dispatch is a comptime
+.connection_policies, .probes, .handlers }`. Dispatch is a comptime
 switch over the list, not a function pointer, and with empty lists
 every extension call compiles out, as in the stock binary. An instance
 carries its parameters and its state. A selection is the type's index
@@ -1750,6 +1753,38 @@ lists do not reach is refused at step zero (`ExtensionUnserved`).
     loop-clock times the request began and ended, and the policy's own
     metrics: what a rate or concurrency limit counts back down by.
 
+- **Handlers** (#434), a route's answer in place of a cluster's,
+  selected with `App.handler` as the route's `handler`:
+  - `handle(*H, *const Request, body, *HandlerResponse) void` runs once
+    the request's body is whole in the head buffer, after the route's
+    request policies, which guard it. It answers with a status (200 to
+    599), headers of its own, then a body, written into a scratch the
+    type's `response_bytes_max` bounds. One scratch serves every
+    handler, the widest declared, priced in the head scratch: a
+    handler runs to completion on the loop. It changes its own state,
+    or instances it was handed at startup — the control plane a build
+    serves itself, beside a status page;
+  - the answer is rendered into the head buffer with zoxy's
+    `Content-Length`, `Date` and `Server` and sent as the #176
+    redirect is, kept alive on the static answers' terms. A `HEAD`
+    gets the length without the body. Startup refuses a head buffer
+    narrower than the widest answer with those lines
+    (`HandlerResponseOverBuffer`);
+  - the body must fit the head buffer beside its head, or the request
+    gets a `413` (`l7_handler_body_too_large`), and its length must be
+    declared: a chunked body is a `501`. It arrives under the head's
+    budget, so a body still arriving at `head_timeout_ms` — one held
+    back for an `Expect: 100-continue` this proxy does not answer
+    included — gets a `408`. Anything pipelined behind it closes the
+    connection, which the answer renders over;
+  - an answer that overflows the declared bound, carries a header zoxy
+    writes itself or one that is not a single field, or gives a `204`
+    or `304` a body is a `502` in its place
+    (`l7_handler_answer_refused`). It is logged `responded`, with no
+    cluster, and counts `l7_handled`;
+  - neither filters nor response policies touch it, as with zoxy's
+    own pages, and a handler declares no metrics yet. An HTTP/2 stream
+    is answered `501` until the next slice.
 - **Probes** (#436), a cluster's check kind, selected with `App.probe`
   as the check's `kind`:
   - the type declares `reply_bytes_max` (1 to 64 KiB) and two calls,

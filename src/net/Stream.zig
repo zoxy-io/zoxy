@@ -369,9 +369,10 @@ pub const PendingPolicies = struct {
     /// The route whose policies ran, and how many of them handed it on.
     route_index: u16 = 0,
     route_proceeded: u16 = 0,
-    /// The cluster routing chose, once it has.
+    /// Whether routing chose a route, and the cluster it sends to —
+    /// null on a handler route (#434), which sends to none.
     routed: bool = false,
-    cluster_index: u16 = 0,
+    cluster_index: ?u16 = null,
 
     pub fn owed(pending: *const PendingPolicies) bool {
         // Each count is bounded by its list, which `evaluatePolicies`
@@ -675,6 +676,13 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
             /// head to budget, so a flag reset to false is inert rather
             /// than a budget silently reissued.
             head_budget_installed: bool = false,
+            /// The handler route this request took (#434), or null for one
+            /// that sends to a cluster — set at routing, so its line names
+            /// no cluster whatever ends it.
+            handler_route: ?u16 = null,
+            /// The body it reads before its handler runs: the length its
+            /// head declared, whole in the head buffer beside it.
+            handler_body_len: u32 = 0,
             /// The endpoint identity this request's stickiness cookie
             /// named (#178), or null when the cluster is not
             /// cookie-keyed or the request carried nothing usable.

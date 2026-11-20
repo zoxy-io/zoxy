@@ -58,6 +58,9 @@ pub const Extensions = struct {
     /// Health-check kinds a cluster may select (#436): they speak an
     /// origin's own protocol over a probe's connection.
     probes: []const type = &.{},
+    /// Handlers a route may select instead of a cluster (#434): they
+    /// answer the route's requests from the build's own code.
+    handlers: []const type = &.{},
 };
 
 /// What a server is built from: the Io backend (§4) and the build's
@@ -585,6 +588,134 @@ pub const ConnectionProceed = struct {
     tag: ?u64 = null,
 };
 
+/// A handler's answer as it writes it (#434): a status, its own headers,
+/// then its body, into bytes zoxy lends for the call — as many as the
+/// handler type declares in `response_bytes_max`. Writes past that, or a
+/// header after the body began, mark the answer overflowed, and zoxy
+/// answers `502` in its place: a handler that cannot say what it meant
+/// has not answered.
+pub const HandlerResponse = struct {
+    /// 200 to 599; never a `1xx`, which is not an answer. A `204` or
+    /// `304` carries no body.
+    status: u16 = 200,
+    headers: [constants.handler_headers_max]Header = undefined,
+    headers_len: u8 = 0,
+    bytes: []u8,
+    used: u32 = 0,
+    /// Where the body starts in `bytes`, once the first body byte is
+    /// written; headers may not follow it.
+    body_start: ?u32 = null,
+    overflowed: bool = false,
+
+    pub const Header = @import("http/render.zig").HandlerHeader;
+
+    /// Add a header line, its name and value copied. Names zoxy writes
+    /// itself — the framing, `Date`, `Server` — and values that would
+    /// not survive as one field are refused when the answer renders.
+    pub fn header(response: *HandlerResponse, name: []const u8, value: []const u8) void {
+        assert(response.used <= response.bytes.len);
+        if (response.body_start != null or response.headers_len == response.headers.len) {
+            response.overflowed = true;
+            return;
+        }
+        const name_at = response.take(name) orelse return;
+        const value_at = response.take(value) orelse return;
+        response.headers[response.headers_len] = .{
+            .name = response.bytes[name_at..][0..name.len],
+            .value = response.bytes[value_at..][0..value.len],
+        };
+        response.headers_len += 1;
+    }
+
+    /// Append to the body.
+    pub fn write(response: *HandlerResponse, bytes: []const u8) void {
+        assert(response.used <= response.bytes.len);
+        if (response.body_start == null) response.body_start = response.used;
+        _ = response.take(bytes);
+    }
+
+    /// Append formatted text to the body.
+    pub fn print(response: *HandlerResponse, comptime format: []const u8, arguments: anytype) void {
+        assert(response.used <= response.bytes.len);
+        if (response.body_start == null) response.body_start = response.used;
+        const printed = std.fmt.bufPrint(response.bytes[response.used..], format, arguments) catch {
+            response.overflowed = true;
+            return;
+        };
+        response.used += @intCast(printed.len);
+    }
+
+    /// The body written so far.
+    pub fn body(response: *const HandlerResponse) []const u8 {
+        const start = response.body_start orelse return &.{};
+        assert(start <= response.used);
+        return response.bytes[start..response.used];
+    }
+
+    /// Where `bytes` now sit, or null — and the answer overflowed — when
+    /// they do not fit.
+    fn take(response: *HandlerResponse, bytes: []const u8) ?u32 {
+        if (bytes.len > response.bytes.len - response.used) {
+            response.overflowed = true;
+            return null;
+        }
+        const at = response.used;
+        @memcpy(response.bytes[at..][0..bytes.len], bytes);
+        response.used += @intCast(bytes.len);
+        return at;
+    }
+};
+
+/// The handler contract (#434). A route selects a handler instead of a
+/// cluster, and the handler answers the route's requests itself:
+///
+///     pub const response_bytes_max: u32 = 4096;
+///     pub fn handle(self: *H, request: *const Request, body: []const u8,
+///         response: *HandlerResponse) void
+///
+/// It runs once the request's body is whole in the head buffer, after the
+/// route's request policies, on the loop like every extension call: a
+/// handler changes its own state, or other instances it was handed at
+/// startup — the control plane a build serves itself. An optional
+/// `bind(*H, *const PolicySite, *const Startup) !void` runs once per route.
+pub fn assertHandler(comptime Handler: type) void {
+    const name = @typeName(Handler);
+    if (!@hasDecl(Handler, "response_bytes_max")) {
+        @compileError(name ++ " is listed as a handler but declares no `pub const response_bytes_max`");
+    }
+    const bound: u32 = Handler.response_bytes_max;
+    if (bound == 0 or bound > constants.handler_response_bytes_max) {
+        @compileError(name ++ ".response_bytes_max must be 1 to handler_response_bytes_max");
+    }
+    if (!@hasDecl(Handler, "handle")) {
+        @compileError(name ++ " is listed as a handler but declares no `pub fn handle`");
+    }
+    const handle_fn = @typeInfo(@TypeOf(Handler.handle)).@"fn";
+    const handle_ok = handle_fn.param_types.len == 4 and
+        handle_fn.param_types[0] == *Handler and
+        handle_fn.param_types[1] == *const Request and
+        handle_fn.param_types[2] == []const u8 and
+        handle_fn.param_types[3] == *HandlerResponse and
+        handle_fn.return_type == void;
+    if (!handle_ok) {
+        @compileError(name ++ ".handle must be `fn (*" ++ name ++
+            ", *const extension.Request, []const u8, *extension.HandlerResponse) void`");
+    }
+    if (@hasDecl(Handler, "bind")) assertBind(Handler, PolicySite);
+    if (isMetered(Handler)) @compileError(name ++ " is a handler, which declares no metrics yet");
+}
+
+/// The widest answer any listed handler declares (#434), or 0: the size
+/// of the one scratch handlers answer into.
+pub fn handlerResponseBytesMax(comptime extensions: Extensions) u32 {
+    comptime {
+        var widest: u32 = 0;
+        for (extensions.handlers) |Handler| widest = @max(widest, Handler.response_bytes_max);
+        assert(widest <= constants.handler_response_bytes_max);
+        return widest;
+    }
+}
+
 /// The health-check contract for a build's own kind (#436). zoxy owns the
 /// dial, the probe's deadline, the bytes on the wire, `fall` and `rise`;
 /// the type owns the protocol, in rounds:
@@ -960,7 +1091,8 @@ pub const PolicySite = struct {
     /// policy on an l4 listener, its SNI table (#425) — or null for the
     /// listener itself.
     route_index: ?u16,
-    /// The cluster the route sends to; null for the listener.
+    /// The cluster the route sends to; null for the listener, and for a
+    /// handler route (#434), which sends to none.
     cluster_index: ?u16,
     /// The listener's route table, as routing reads it — sorted by
     /// specificity, so an index is not the order the options stated the
@@ -1141,6 +1273,13 @@ pub fn assertExtensions(comptime extensions: Extensions) void {
     comptime assert(extensions.response_policies.len <= list_types_max);
     comptime assert(extensions.connection_policies.len <= list_types_max);
     comptime assert(extensions.probes.len <= list_types_max);
+    comptime assert(extensions.handlers.len <= list_types_max);
+    inline for (extensions.handlers, 0..) |Handler, index| {
+        assertHandler(Handler);
+        inline for (extensions.handlers[index + 1 ..]) |Later| {
+            if (Handler == Later) @compileError(@typeName(Handler) ++ " is listed twice as a handler");
+        }
+    }
     inline for (extensions.probes, 0..) |Probe, index| {
         assertProbe(Probe);
         inline for (extensions.probes[index + 1 ..]) |Later| {

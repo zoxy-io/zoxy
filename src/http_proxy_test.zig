@@ -54,6 +54,7 @@ const ScriptedPicker = @import("testing/picker.zig").ScriptedPicker;
 const ScriptedPolicy = @import("testing/policy.zig").ScriptedPolicy;
 const ScriptedResponsePolicy = @import("testing/response_policy.zig").ScriptedResponsePolicy;
 const ScriptedConnectionPolicy = @import("testing/connection_policy.zig").ScriptedConnectionPolicy;
+const ScriptedHandler = @import("testing/handler.zig").ScriptedHandler;
 
 /// The beds' runtime lists one picker and one request policy (#417), so a
 /// scenario can select an instance of either; every scenario that selects
@@ -63,6 +64,7 @@ const runtime: extension.Runtime = .{ .Io = SimIo, .extensions = .{
     .request_policies = &.{ScriptedPolicy},
     .response_policies = &.{ScriptedResponsePolicy},
     .connection_policies = &.{ScriptedConnectionPolicy},
+    .handlers = &.{ScriptedHandler},
 } };
 const ServerSim = Server(runtime);
 
@@ -991,6 +993,8 @@ const Http1Bed = struct {
         request_policies: []const extension.Selection = &.{},
         /// #417's request policies on the bed's one route.
         route_request_policies: []const extension.Selection = &.{},
+        /// #434's handler on the bed's one route, in place of its cluster.
+        route_handler: ?*ScriptedHandler = null,
         /// #425's connection policies on the listener.
         connection_policies: []const extension.Selection = &.{},
         /// #424's response policies on the listener and on its one route.
@@ -1192,6 +1196,7 @@ const Http1Bed = struct {
             .host = options.route_host,
             .prefix = options.route_prefix,
             .cluster_index = 0,
+            .handler = if (options.route_handler) |handler| extension.select(runtime.extensions.handlers, handler) else null,
             .request_policies = options.route_request_policies,
             .response_policies = options.route_response_policies,
         }};
@@ -11039,4 +11044,188 @@ fn sumLineField(sink: []const u8, comptime key: []const u8) u64 {
         total += std.fmt.parseInt(u64, digits[0..end], 10) catch unreachable;
     }
     return total;
+}
+
+/// Set `bed` up, in place, with one route that is `handler`'s (#434).
+fn setUpHandlerBed(bed: *Http1Bed, handler: *ScriptedHandler, seed: u64, partial_io: bool) !void {
+    try bed.setUp(std.testing.allocator, .{
+        .seed = seed,
+        .partial_io = partial_io,
+        .access_log = true,
+        .route_handler = handler,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+}
+
+test "l7: a handler route answers from the build's own code, and no origin hears of it (#434)" {
+    var handler: ScriptedHandler = .{};
+    var bed: Http1Bed = undefined;
+    try setUpHandlerBed(&bed, &handler, 4341, false);
+    defer bed.tearDown();
+
+    try bed.exchange("GET /status HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    const response = bed.client.response();
+    try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, response, "\r\nX-Handled: scripted\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, response, "\r\n\r\n/status flag=false\n"));
+    try std.testing.expectEqual(@as(u32, 1), handler.binds);
+    try std.testing.expectEqual(@as(u32, 1), handler.handled);
+    try std.testing.expectEqual(@as(u32, 0), bed.origin.conns[0].request_len);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_handled"));
+    const line = try onlyAccessLogLine(&bed);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"outcome\":\"responded\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"cluster\":\"\"") != null);
+    try bed.expectDrained();
+}
+
+test "l7: a handler reads a POST body whole, however it arrives, and changes its state (#434)" {
+    var seed: u64 = 1;
+    while (seed <= 8) : (seed += 1) {
+        var handler: ScriptedHandler = .{};
+        var bed: Http1Bed = undefined;
+        try setUpHandlerBed(&bed, &handler, 4342 + seed, true);
+        defer bed.tearDown();
+
+        try bed.exchange("POST /toggle HTTP/1.1\r\nHost: o\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello world");
+
+        try std.testing.expect(std.mem.endsWith(u8, bed.client.response(), "/toggle flag=true\nhello world"));
+        try std.testing.expect(handler.flag);
+        try std.testing.expectEqual(@as(u32, 11), handler.last_body_len);
+        try bed.expectDrained();
+    }
+}
+
+test "l7: a handler's HEAD answer says its length and carries no body (#434)" {
+    var handler: ScriptedHandler = .{};
+    var bed: Http1Bed = undefined;
+    try setUpHandlerBed(&bed, &handler, 4351, false);
+    defer bed.tearDown();
+
+    try bed.exchange("HEAD /status HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    const response = bed.client.response();
+    try std.testing.expect(std.mem.indexOf(u8, response, "\r\nContent-Length: 19\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, response, "\r\n\r\n"));
+    try bed.expectDrained();
+}
+
+test "l7: a handler route refuses a body it cannot hold, and one whose length is unsaid (#434)" {
+    {
+        var handler: ScriptedHandler = .{};
+        var bed: Http1Bed = undefined;
+        try setUpHandlerBed(&bed, &handler, 4352, false);
+        defer bed.tearDown();
+        try bed.exchange("POST /x HTTP/1.1\r\nHost: o\r\nContent-Length: 1000000\r\n\r\n");
+        try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 413 "));
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_handler_body_too_large"));
+        try std.testing.expectEqual(@as(u32, 0), handler.handled);
+        try bed.expectDrained();
+    }
+    {
+        var handler: ScriptedHandler = .{};
+        var bed: Http1Bed = undefined;
+        try setUpHandlerBed(&bed, &handler, 4353, false);
+        defer bed.tearDown();
+        try bed.exchange("POST /x HTTP/1.1\r\nHost: o\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n");
+        try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 501 "));
+        try std.testing.expectEqual(@as(u32, 0), handler.handled);
+        try bed.expectDrained();
+    }
+}
+
+test "l7: a handler answer zoxy cannot send as written is a 502 in its place (#434)" {
+    const misbehaviours = [_]ScriptedHandler{
+        .{ .framing_header = true },
+        .{ .overflow = true },
+        .{ .status = 101 },
+    };
+    for (misbehaviours, 0..) |template, index| {
+        var handler = template;
+        var bed: Http1Bed = undefined;
+        try setUpHandlerBed(&bed, &handler, 4354 + index, false);
+        defer bed.tearDown();
+        try bed.exchange("GET /x HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+        try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 502 "));
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_handler_answer_refused"));
+        try bed.expectDrained();
+    }
+}
+
+test "l7: a handler route's policies guard it, and a pipelined request closes its answer (#434)" {
+    {
+        var handler: ScriptedHandler = .{};
+        var policy: ScriptedPolicy = .{ .reject_prefix = "/admin" };
+        const guard = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &policy)};
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .seed = 4357,
+            .route_handler = &handler,
+            .route_request_policies = &guard,
+            .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        });
+        defer bed.tearDown();
+        try bed.exchange("POST /admin/flag HTTP/1.1\r\nHost: o\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 403 "));
+        try std.testing.expectEqual(@as(u32, 0), handler.handled);
+        try std.testing.expect(!handler.flag);
+        try bed.expectDrained();
+    }
+    {
+        var handler: ScriptedHandler = .{};
+        var bed: Http1Bed = undefined;
+        try setUpHandlerBed(&bed, &handler, 4358, false);
+        defer bed.tearDown();
+        try bed.exchange("GET /a HTTP/1.1\r\nHost: o\r\n\r\nGET /b HTTP/1.1\r\nHost: o\r\n\r\n");
+        const response = bed.client.response();
+        try std.testing.expect(std.mem.indexOf(u8, response, "\r\nConnection: close\r\n") != null);
+        try std.testing.expectEqual(@as(u32, 1), handler.handled);
+        try bed.expectDrained();
+    }
+}
+
+test "h2: a handler route answers an HTTP/2 stream 501 until its slice lands (#434)" {
+    var handler: ScriptedHandler = .{};
+    var options = h2BedOptions(4359);
+    options.route_handler = &handler;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    var wire: H2Wire = .{};
+    wire.preface(&.{});
+    wire.get(1, "GET", "/a");
+    try bed.exchange(wire.written());
+
+    var storage: [2]H2Answer = undefined;
+    const answers = try h2Answers(bed.client.response(), &storage);
+    try std.testing.expectEqual(@as(u16, 501), (try h2AnswerFor(answers, 1)).status);
+    try std.testing.expectEqual(@as(u32, 0), handler.handled);
+    try bed.expectDrained();
+}
+
+test "l7: a handler body that stalls is reaped on the head budget, the handler never run (#434)" {
+    var handler: ScriptedHandler = .{};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 4360,
+        .head_timeout_ms = 100,
+        .route_handler = &handler,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    // The head says twenty body bytes; five come, then nothing.
+    const start_ns = bed.sim_io.nowNs();
+    try bed.exchange("POST /toggle HTTP/1.1\r\nHost: o\r\nContent-Length: 20\r\n\r\nhello");
+    const elapsed_ms = (bed.sim_io.nowNs() - start_ns) / std.time.ns_per_ms;
+
+    try std.testing.expect(elapsed_ms >= 100);
+    try std.testing.expect(elapsed_ms < 500);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
+    try std.testing.expectEqual(@as(u32, 0), handler.handled);
+    try std.testing.expect(!handler.flag);
+    // A head that parsed is answered: the client hears why it was cut.
+    try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 408 "));
+    try bed.expectDrained();
 }

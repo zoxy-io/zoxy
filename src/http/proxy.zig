@@ -621,6 +621,9 @@ pub fn Proxy(comptime runtime: Runtime) type {
         fn parseAndDispatch(server: *ServerType, stream: *StreamType) void {
             const conn = stream.conn;
             assert(stream.phase == .reading_head);
+            // A routed handler request reading its body (#434): the head is
+            // parsed, and what arrived is more of the body.
+            if (stream.l7.handler_route != null) return continueHandlerBody(server, stream);
             const bytes = headBytes(server, stream);
             const head = bytes[0..stream.head_len];
             const head_is_full = stream.head_len == bytes.len;
@@ -669,7 +672,8 @@ pub fn Proxy(comptime runtime: Runtime) type {
             routeRequest(server, stream, &request);
         }
 
-        /// The head is not all here: start its slowloris clock, and read on.
+        /// The head is not all here — or, on a handler route, the body its
+        /// head declared (#434): start its slowloris clock, and read on.
         fn readMoreHead(server: *ServerType, stream: *StreamType) void {
             assert(stream.phase == .reading_head);
             assert(stream.head_len < headBytes(server, stream).len);
@@ -1274,20 +1278,204 @@ pub fn Proxy(comptime runtime: Runtime) type {
                 return respond(server, stream, 404, "l7_no_route");
             };
             const routed = &conn.routes[route_index];
-            stream.cluster_index = routed.cluster_index;
-            server.noteRouted(stream, route_index, routed.cluster_index);
-            // #417: the route's own policies, now that the cluster is
-            // known, and still before the first resource below.
-            if (routed.request_policies.len >= 1) {
-                var view = requestView(stream, request, keys.host, &keys.views, render_scratch, routed.cluster_index);
-                const metrics = server.extension_metrics.routePolicies(conn.listener_index, route_index);
-                if (refusedByPolicies(server, stream, routed.request_policies, metrics, &view, route_index, null)) return;
+            // A handler route (#434) sends to no cluster.
+            const cluster_index: ?u16 = if (routed.handler == null) routed.cluster_index else null;
+            if (cluster_index) |index| stream.cluster_index = index;
+            if (routed.handler != null) stream.l7.handler_route = route_index;
+            server.noteRouted(stream, route_index, cluster_index);
+            if (refusedOnRoute(server, stream, request, keys.host, &keys.views, render_scratch, route_index)) return;
+            if (routed.handler != null) {
+                return beginHandler(server, stream, request, keys.host, &keys.views, render_scratch);
             }
 
             stream.relay_buffer = server.acquireRelayBuffer() orelse {
                 return respond(server, stream, 503, "l7_shed_relay_buffers");
             };
             beginUpstream(server, stream, request, keys.host, &keys.views, render_scratch);
+        }
+
+        /// #417: the route's own policies, now that the route is known,
+        /// and still before the first resource is taken for it. True when
+        /// one refused the request, which is then answered.
+        fn refusedOnRoute(
+            server: *ServerType,
+            stream: *StreamType,
+            request: *const parser.RequestHead,
+            host: ?[]const u8,
+            views: *const TargetViews,
+            render_scratch: *RenderScratch,
+            route_index: u16,
+        ) bool {
+            const conn = stream.conn;
+            assert(route_index < conn.routes.len);
+            const routed = &conn.routes[route_index];
+            if (routed.request_policies.len == 0) return false;
+            const cluster_index: ?u16 = if (routed.handler == null) routed.cluster_index else null;
+            var view = requestView(stream, request, host, views, render_scratch, cluster_index);
+            const metrics = server.extension_metrics.routePolicies(conn.listener_index, route_index);
+            return refusedByPolicies(server, stream, routed.request_policies, metrics, &view, route_index, null);
+        }
+
+        /// A handler route (#434): the request's body, whole in the head
+        /// buffer beside its head, then the handler. A body whose length
+        /// the head does not declare is not read: a handler takes the
+        /// bodies a control API sends, which say how long they are.
+        fn beginHandler(
+            server: *ServerType,
+            stream: *StreamType,
+            request: *const parser.RequestHead,
+            host: ?[]const u8,
+            views: *const TargetViews,
+            render_scratch: *RenderScratch,
+        ) void {
+            assert(stream.phase == .reading_head);
+            assert(stream.l7.handler_route != null);
+            // An HTTP/2 stream's handler answer is the next slice's.
+            if (stream.h2_id != 0) return respond(server, stream, 501, "l7_not_implemented");
+            const body_len: u64 = switch (request.framing) {
+                .none => 0,
+                .content_length => |length| length,
+                .chunked => return respond(server, stream, 501, "l7_not_implemented"),
+                .until_close => unreachable,
+            };
+            const room = headBytes(server, stream).len - request.head_len;
+            if (body_len > room) return respond(server, stream, 413, "l7_handler_body_too_large");
+            stream.l7.handler_body_len = @intCast(body_len);
+            if (stream.head_len - request.head_len >= body_len) {
+                return invokeHandler(server, stream, request, host, views, render_scratch);
+            }
+            // The rest is in flight: read it into the head buffer as the
+            // head was read, under the same budget.
+            readMoreHead(server, stream);
+        }
+
+        /// More of a handler route's body arrived (#434): the handler, once
+        /// the body is whole, or another read. Re-parses the head it routed
+        /// — the views routing built did not outlive that callback.
+        fn continueHandlerBody(server: *ServerType, stream: *StreamType) void {
+            assert(stream.l7.handler_route != null);
+            assert(stream.l7.request_head_len >= 1);
+            const whole = stream.l7.request_head_len + stream.l7.handler_body_len;
+            assert(whole <= headBytes(server, stream).len);
+            if (stream.head_len < whole) return readMoreHead(server, stream);
+            const storage = server.borrowHeaderScratch();
+            defer server.returnHeaderScratch();
+            const head = headBytes(server, stream)[0..stream.l7.request_head_len];
+            // The same bytes parsed at routing, so the same verdict.
+            const request = parser.parseRequestHead(head, false, storage, null) catch unreachable;
+            const render_scratch = server.borrowRenderScratch();
+            defer server.returnRenderScratch();
+            const keys = requestKeys(&request, server.target_scratch, &render_scratch.route_host) catch unreachable;
+            invokeHandler(server, stream, &request, keys.host, &keys.views, render_scratch);
+        }
+
+        /// Run the route's handler over the request and its whole body, and
+        /// send what it answered (#434).
+        fn invokeHandler(
+            server: *ServerType,
+            stream: *StreamType,
+            request: *const parser.RequestHead,
+            host: ?[]const u8,
+            views: *const TargetViews,
+            render_scratch: *RenderScratch,
+        ) void {
+            const conn = stream.conn;
+            const route_index = stream.l7.handler_route.?;
+            assert(route_index < conn.routes.len);
+            assert(request.head_len == stream.l7.request_head_len);
+            const selection = conn.routes[route_index].handler.?;
+            const body = headBytes(server, stream)[request.head_len..][0..stream.l7.handler_body_len];
+            // The body is read: the framing tracker says so, for the
+            // turnaround's resync.
+            if (body.len >= 1) _ = feedFraming(&stream.l7.request_framing, body);
+            assert(framingDoneOf(&stream.l7.request_framing));
+            const view = requestView(stream, request, host, views, render_scratch, null);
+            var response: extension.HandlerResponse = .{
+                .bytes = server.handler_scratch[0..handlerResponseBytes(selection)],
+            };
+            callHandler(selection, &view, body, &response);
+            answerHandler(server, stream, &response, request.method == .head);
+        }
+
+        /// Send a handler's answer, rendered into the head buffer and held
+        /// through the send as the #176 redirect's is — or a `502` in its
+        /// place when it cannot be sent as written.
+        fn answerHandler(
+            server: *ServerType,
+            stream: *StreamType,
+            response: *const extension.HandlerResponse,
+            head_only: bool,
+        ) void {
+            assert(stream.phase == .reading_head);
+            assert(!stream.l7.response_started);
+            assert(stream.relay_buffer == null);
+            assert(stream.upstream == null);
+            if (!handlerAnswerAcceptable(response)) return respond(server, stream, 502, "l7_handler_answer_refused");
+            // Anything past the body is a pipelined request, which the
+            // answer renders over: kept only when there is none.
+            const consumed = stream.l7.request_head_len + stream.l7.handler_body_len;
+            const persistence = persistenceWith(server, stream, true, stream.head_len == consumed);
+            // Startup refuses a head buffer narrower than the widest answer
+            // a handler declares with zoxy's lines around it.
+            const rendered = render.renderHandlerResponse(
+                response.status,
+                response.headers[0..response.headers_len],
+                response.body(),
+                head_only,
+                !persistence.keep,
+                server.currentDate(),
+                headBytes(server, stream),
+            ) catch unreachable;
+            if (persistence.capped) server.counters.increment("l7_keepalive_requests_capped");
+            ServerType.clearRequestDeadline(stream);
+            server.storeExchangeDeadline(stream, server.idleTimeoutMs());
+            server.counters.increment("l7_handled");
+            stream.log.status = response.status;
+            stream.log.outcome = .responded;
+            stream.moveTo(.responding);
+            const then: stream_module.ClientWrite.Then = if (persistence.keep) .redirect_next_request else .redirect_lingering_close;
+            armClientWrite(server, stream, rendered, then);
+        }
+
+        /// Whether a handler's answer can be sent as written (#434).
+        fn handlerAnswerAcceptable(response: *const extension.HandlerResponse) bool {
+            assert(response.used <= response.bytes.len);
+            assert(response.headers_len <= response.headers.len);
+            if (response.overflowed) return false;
+            if (response.status < 200 or response.status > 599) return false;
+            const bodiless = response.status == 204 or response.status == 304;
+            if (bodiless and response.body().len != 0) return false;
+            for (response.headers[0..response.headers_len]) |header| {
+                if (!render.handlerHeaderAcceptable(header)) return false;
+            }
+            return true;
+        }
+
+        /// The selected handler's `handle`, by the comptime list.
+        fn callHandler(
+            selection: extension.Selection,
+            view: *const extension.Request,
+            body: []const u8,
+            response: *extension.HandlerResponse,
+        ) void {
+            assert(selection.index < runtime.extensions.handlers.len);
+            assert(response.used == 0);
+            inline for (runtime.extensions.handlers, 0..) |Handler, index| {
+                if (selection.index == index) {
+                    const handler: *Handler = @ptrCast(@alignCast(selection.instance));
+                    return Handler.handle(handler, view, body, response);
+                }
+            }
+            unreachable;
+        }
+
+        /// The selected handler's declared answer bound.
+        fn handlerResponseBytes(selection: extension.Selection) u32 {
+            assert(selection.index < runtime.extensions.handlers.len);
+            inline for (runtime.extensions.handlers, 0..) |Handler, index| {
+                if (selection.index == index) return Handler.response_bytes_max;
+            }
+            unreachable;
         }
 
         /// The endpoint a sticky cookie names (#178), for the response's
@@ -2807,6 +2995,20 @@ pub fn Proxy(comptime runtime: Runtime) type {
             stream: *const StreamType,
             may_keep: bool,
         ) StaticPersistence {
+            // Asked only when it matters, as before the split: an answer
+            // that may not keep has nothing to resync, and may have no head.
+            const resyncable = stream.h2_id == 0 and may_keep and staticResponseResyncable(stream);
+            return persistenceWith(server, stream, may_keep, resyncable);
+        }
+
+        /// `staticPersistence` with the resync verdict given: a handler's
+        /// answer (#434) has read a body the static rule does not know of.
+        fn persistenceWith(
+            server: *const ServerType,
+            stream: *const StreamType,
+            may_keep: bool,
+            resyncable: bool,
+        ) StaticPersistence {
             // A multiplexed exchange's answer ends its stream, never its
             // connection (#275): HTTP/2 has no persistence to announce, and
             // the mapping drops the `Connection` line either variant would
@@ -2816,7 +3018,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
                 return .{ .keep = stream.l7.request_head_len >= 1, .capped = false };
             }
             const would_keep = may_keep and
-                staticResponseResyncable(stream) and
+                resyncable and
                 stream.l7.client_keep_alive and
                 !server.draining and
                 !server.keepAliveSuppressed();
@@ -5207,6 +5409,12 @@ pub fn Proxy(comptime runtime: Runtime) type {
             // filter's (#236), not a shed: nothing of this proxy's ran
             // out, and the operator wrote the rule that refused it.
             if (std.mem.eql(u8, counter, "l7_body_over_limit")) return .rejected;
+            // A handler route's body past the head buffer (#434): the same
+            // refusal, for the room this route reads its body into.
+            if (std.mem.eql(u8, counter, "l7_handler_body_too_large")) return .rejected;
+            // A handler stands where an origin would: an answer it could
+            // not give reads as one an origin could not (#434).
+            if (std.mem.eql(u8, counter, "l7_handler_answer_refused")) return .upstream_failed;
             // The #240 final-recipient answer is this proxy responding as
             // the origin, which is exactly what `.responded` means — the
             // counter keeps it apart from a configured body, the log does
