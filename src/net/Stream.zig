@@ -263,8 +263,8 @@ pub const LogState = struct {
     /// The status this request was answered with; 0 until one is decided.
     status: u16 = 0,
     /// The request's extension tag (#433): what the last request policy
-    /// to set one left, read by every later view of the request. Zero is
-    /// no tag. Here rather than in `l7`
+    /// to set one left, read by every later view of the request and
+    /// written into its line. Zero is no tag. Here rather than in `l7`
     /// because its life is the request's, as this struct's is: a keep-
     /// alive turnaround clears it, and the §7 replay — which rebuilds
     /// `l7` and evaluates no policy again — leaves it be.

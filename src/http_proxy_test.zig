@@ -10197,3 +10197,54 @@ test "h2: each stream's request carries its own tag (#433)" {
     try std.testing.expectEqual(@as(u64, 7), picker.tag);
     try bed.expectDrained();
 }
+
+test "l7: a request's tag is on its access-log line, and stays on one a later policy rejected (#433)" {
+    var tagger: ScriptedPolicy = .{ .tag = 7 };
+    var guard: ScriptedPolicy = .{ .reject_prefix = "/deny" };
+    const on_listener = [_]extension.Selection{
+        extension.select(runtime.extensions.request_policies, &tagger),
+        extension.select(runtime.extensions.request_policies, &guard),
+    };
+    inline for (.{ "/allow", "/deny" }, 0..) |path, index| {
+        tagger = .{ .tag = 7 };
+        guard = .{ .reject_prefix = "/deny" };
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .seed = 4333 + index,
+            .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+            .request_policies = &on_listener,
+            .access_log = true,
+        });
+        defer bed.tearDown();
+
+        try bed.exchange("GET " ++ path ++ " HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+        const line = try onlyAccessLogLine(&bed);
+        try std.testing.expect(std.mem.indexOf(u8, line, ",\"tag\":7,") != null);
+        const outcome = if (index == 0) "\"outcome\":\"ok\"" else "\"outcome\":\"rejected\"";
+        try std.testing.expect(std.mem.indexOf(u8, line, outcome) != null);
+        try bed.expectDrained();
+    }
+}
+
+test "l7: an untagged request's line has no tag key (#433)" {
+    // A policy that proceeds without tagging, so the line is the one a
+    // build with no tags — and the stock binary — has always written.
+    var policy: ScriptedPolicy = .{};
+    const on_listener = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &policy)};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 4335,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .request_policies = &on_listener,
+        .access_log = true,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /plain HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    const line = try onlyAccessLogLine(&bed);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"tag\"") == null);
+    try std.testing.expectEqual(@as(u32, 1), policy.evaluated);
+    try bed.expectDrained();
+}
