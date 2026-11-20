@@ -32,6 +32,7 @@ const runtime: zoxy.Runtime = .{
         .request_policies = &.{zoxy.testing.ScriptedPolicy},
         .response_policies = &.{zoxy.testing.ScriptedResponsePolicy},
         .connection_policies = &.{zoxy.testing.ScriptedConnectionPolicy},
+        .probes = &.{zoxy.testing.ScriptedProbe},
     },
 };
 const ServerSim = zoxy.Server(runtime);
@@ -419,6 +420,12 @@ picker_http: bool,
 /// tags each one `policy_tag` (#433).
 policy_listener: zoxy.testing.ScriptedPolicy,
 policy_selections: [1]zoxy.extension.Selection,
+/// #436's check kind, on the L4 cluster when `l4Check` draws it: rounds
+/// the echo origin sends back.
+probe_l4: zoxy.testing.ScriptedProbe,
+/// Which check the L4 cluster's draw becomes (#436), from its own stream
+/// so no other draw moves: see `l4Check`.
+probe_l4_coin: u8,
 /// #424's response policy, on every http listener: it adds a header to
 /// every response head and holds each to carrying the listener's tag.
 response_policy: zoxy.testing.ScriptedResponsePolicy,
@@ -490,6 +497,9 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
     harness.scenario_prng = std.Random.DefaultPrng.init(seed ^ 0x5a5a5a5a5a5a5a5a);
     const random = harness.scenario_prng.random();
     harness.drawPickers(seed);
+    // #436: its own stream, as the pickers', so the shared one is unmoved.
+    var probe_prng = std.Random.DefaultPrng.init(seed ^ 0x0436_0436_0436_0436);
+    harness.probe_l4_coin = probe_prng.random().uintLessThan(u8, probe_coin_sides);
     harness.policy_listener = .{
         .reject_prefix = l7.canon.policy_prefix,
         .tag = policy_tag,
@@ -977,8 +987,11 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     // under the adversary's connect fates, parked-close on ejection, and
     // drain from every state — inside the schedule fuzz. Fail-open keeps
     // a single-endpoint topology's routing unchanged whatever the
-    // verdicts, so the L7 golden oracles hold on clean seeds (where
-    // probes always pass) and prefix-legality holds under the adversary.
+    // verdicts, so the L7 golden oracles hold on clean seeds and
+    // prefix-legality holds under the adversary. A dial check passes on a
+    // clean seed; a build's check kind on the L4 cluster (#436) may not,
+    // since the L4 origin draws its modes on every seed — which fail-open
+    // makes harmless.
     const connect_timeout_ms: u32 = 20 + random.uintAtMost(u32, 40);
     const health = deriveHealthChecks(harness.clean, random, connect_timeout_ms);
     harness.http_origin_stop_at_ns = health.http_origin_stop_at_ns;
@@ -1043,6 +1056,43 @@ fn wireClusters(
     assert((harness.retries_http == 0) == (harness.endpoints_http_count == 1));
 }
 
+/// The L4 cluster's check (#436): its drawn dial, or on half the checked
+/// seeds a build's check kind speaking two rounds the echo origin sends
+/// back — and on an eighth of adversarial ones a script past the round
+/// bound, the only way to reach `health_probe_rounds_exhausted`. Never
+/// where the origin is owed a PROXY header (#142): it then requires one
+/// on every connection, and a probe sends none.
+fn l4Check(harness: *Harness, health: HealthDraw) ?Check {
+    assert(harness.probe_l4_coin < probe_coin_sides);
+    harness.probe_l4 = .{};
+    var check = health.check_l4 orelse return null;
+    if (harness.proxy_protocol_send_l4 != null) return check;
+    if (harness.probe_l4_coin < probe_coin_kind) return check;
+    const exhausts = harness.probe_l4_coin == probe_coin_exhausts and !harness.clean;
+    harness.probe_l4 = .{ .rounds = if (exhausts) &probe_rounds_past_bound else &probe_rounds };
+    if (!exhausts) assert(harness.probe_l4.rounds.len <= zoxy.constants.health_check_rounds_max);
+    check.kind = .{ .extension = zoxy.extension.select(runtime.extensions.probes, &harness.probe_l4) };
+    assert(check.kind == .extension);
+    return check;
+}
+
+/// `probe_l4_coin`'s faces: below `probe_coin_kind` the dial stays; the
+/// rest draw the kind, and `probe_coin_exhausts` the script past the bound.
+const probe_coin_sides: u8 = 8;
+const probe_coin_kind: u8 = probe_coin_sides / 2;
+const probe_coin_exhausts: u8 = probe_coin_kind;
+
+/// A greeting and a ping, each echoed.
+const probe_rounds = [_][]const u8{ "zoxy-probe-hello\n", "zoxy-probe-ping\n" };
+/// One round more than `health_check_rounds_max` allows.
+const probe_rounds_past_bound = [_][]const u8{ "1\n", "2\n", "3\n", "4\n", "5\n" };
+
+comptime {
+    assert(probe_rounds_past_bound.len > zoxy.constants.health_check_rounds_max);
+    assert(probe_coin_exhausts >= probe_coin_kind);
+    assert(probe_coin_exhausts < probe_coin_sides);
+}
+
 /// The l4 cluster. Its draws — a weights coin, the panic threshold, slow
 /// start, the cluster cap — come in the order the record always drew
 /// them, so every seed's stream stays where it was.
@@ -1068,7 +1118,7 @@ fn l4Cluster(
         .name = l4_cluster_name,
         .endpoints = &harness.endpoint_options_l4,
         .pick = pick,
-        .check = health.check_l4,
+        .check = harness.l4Check(health),
         .passive_ejection = health.passive_l4,
         .panic_threshold_percent = panic_threshold_percent,
         .max_inflight = max_inflight,
