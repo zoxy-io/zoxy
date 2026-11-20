@@ -409,12 +409,6 @@ const uncovered = [_]Uncovered{
             "(#436); server_test sends one past the bound",
     },
     .{
-        .name = "health_probe_rounds_exhausted",
-        .why = .unreached,
-        .reason = "no sim cluster selects a build's check kind yet (#436); " ++
-            "server_test drives a kind past `health_check_rounds_max`",
-    },
-    .{
         .name = "l7_response_policy_edit_refused",
         .why = .unreached,
         .reason = "the harness's response policy adds a fixed, valid " ++
@@ -670,6 +664,9 @@ const Census = struct {
     /// declares no counters, so the census asks it directly whether the
     /// response phase ever ran.
     responses_policed: u64 = 0,
+    /// Seeds on which a build's check kind (#436) carried a probe past
+    /// its first round: the multi-round path, reached.
+    probes_past_first_round: u64 = 0,
 
     fn add(census: *Census, harness: *const Harness) void {
         inline for (Counters.names, 0..) |name, index| {
@@ -696,6 +693,7 @@ const Census = struct {
             total.* += harness.server.extension_metrics.counterTotal(counter.Family, name);
             assert(total.* >= before);
         }
+        if (harness.probe_l4.furthest_round >= 1) census.probes_past_first_round += 1;
         const policed_before = census.responses_policed;
         census.responses_policed += harness.response_policy.evaluated;
         assert(census.responses_policed >= policed_before);
@@ -753,7 +751,8 @@ const Census = struct {
             assert(fired == Counters.names.len - uncovered.len + allowed_fired);
         }
         const ops_held = census.verifyOps();
-        const extensions_held = census.verifyExtensionCounters() and census.verifyResponsePolicy();
+        const extensions_held = census.verifyExtensionCounters() and census.verifyResponsePolicy() and
+            census.verifyProbeRounds();
         return census.verifyBodies() and ops_held and extensions_held and held;
     }
 
@@ -774,6 +773,14 @@ const Census = struct {
             }
         }
         return held;
+    }
+
+    /// A check kind's probe reached a second round somewhere in the range
+    /// (#436).
+    fn verifyProbeRounds(census: *const Census) bool {
+        if (census.probes_past_first_round >= 1) return true;
+        std.debug.print("sim census: no check-kind probe reached a second round in this sweep\n", .{});
+        return false;
     }
 
     /// The response phase ran somewhere in the range (#424).
