@@ -606,9 +606,38 @@ pub const Config = struct {
         pub const ClientVerify = enum { required, optional };
     };
 
+    /// A slot of a cluster that takes endpoints while it serves (#428).
+    pub const EndpointState = enum(u8) {
+        /// An endpoint of the set, picked and probed.
+        live,
+        /// An endpoint that left the set: never picked or probed again,
+        /// its in-flight work running to its end before the slot is free.
+        draining,
+        /// No endpoint: weight 0, never picked, probed or rendered.
+        free,
+    };
+
+    /// The writable side of a cluster that declared `endpoint_slots`
+    /// (#428): `endpoints`, `weights` and `priorities` alias these, at the
+    /// declared capacity, and `states` says what each slot holds. An
+    /// update writes here, on the loop thread, into slots reserved at
+    /// startup — so a reader holds what it reads for one loop turn, never
+    /// across one, and the `[]const` views are read-only for it alone.
+    pub const Slots = struct {
+        addresses: []io_module.Address,
+        weights: []u16,
+        priorities: []u8,
+        states: []EndpointState,
+    };
+
     pub const Cluster = struct {
         name: []const u8,
+        /// The endpoints, or on a cluster with `slots`, every slot: a free
+        /// one holds a placeholder no pick reaches, since its weight is 0.
         endpoints: []const io_module.Address,
+        /// Room for endpoints added while serving (#428), or null for a
+        /// cluster whose endpoints are fixed at startup.
+        slots: ?*Slots = null,
         /// Per-endpoint §7 pick weights, parallel to `endpoints` — or
         /// null when every endpoint carries the default weight of 1,
         /// which is what the bare-string config form says and what most
@@ -876,6 +905,22 @@ pub const Config = struct {
             /// `recovery_ms` — the rule before the key (§5, #400).
             recovery_ms_max: ?u32 = null,
         };
+
+        /// Whether slot `index` holds an endpoint of the set (#428): every
+        /// slot of a cluster whose endpoints are fixed does.
+        pub fn liveAt(cluster: *const Cluster, index: usize) bool {
+            assert(index < cluster.endpoints.len);
+            const slots = cluster.slots orelse return true;
+            return slots.states[index] == .live;
+        }
+
+        /// Whether slot `index` holds an endpoint at all — of the set, or
+        /// draining out of it (#428).
+        pub fn occupiedAt(cluster: *const Cluster, index: usize) bool {
+            assert(index < cluster.endpoints.len);
+            const slots = cluster.slots orelse return true;
+            return slots.states[index] != .free;
+        }
     };
 };
 
@@ -999,6 +1044,9 @@ pub const ValidationError = error{
     ResponseFilterHeaderEditsOverLimit,
     EndpointsEmpty,
     EndpointsOverLimit,
+    /// `endpoint_slots` below the endpoints a cluster states, or past the
+    /// endpoint index's edge (#428).
+    EndpointSlotsOutOfRange,
     EndpointPortZero,
     /// A `unix:` endpoint whose path is empty, past what a `sockaddr_un`
     /// carries, or carries a byte an address may not — a control byte, a
@@ -2235,11 +2283,12 @@ fn resolveCluster(
     }
     const picked = try resolvePick(&stated.pick);
     const endpoints = try resolveEndpoints(arena, stated.endpoints);
-    const cluster: Config.Cluster = .{
+    const priorities = try resolvePriorities(arena, stated.endpoints);
+    var cluster: Config.Cluster = .{
         .name = stated.name,
         .endpoints = endpoints.addresses,
         .weights = endpoints.weights,
-        .priorities = try resolvePriorities(arena, stated.endpoints),
+        .priorities = priorities,
         .pick = picked.pick,
         .check = try resolveCheck(stated.check),
         .passive_ejection = try resolvePassiveEjection(stated.passive_ejection),
@@ -2255,9 +2304,51 @@ fn resolveCluster(
         .tls = try resolveClusterTls(arena, stated.tls),
     };
     assert(cluster.endpoints.len == stated.endpoints.len);
+    if (stated.endpoint_slots) |capacity| {
+        try reserveSlots(arena, &cluster, capacity);
+    }
     assert(cluster.name.len >= 1);
     return cluster;
 }
+
+/// A cluster's room for endpoints added while serving (#428): every array
+/// at the declared capacity, the stated endpoints live in its first slots
+/// and the rest free — weight 0, a placeholder address no pick reaches.
+fn reserveSlots(arena: std.mem.Allocator, cluster: *Config.Cluster, capacity: u16) ResolveError!void {
+    const stated = cluster.endpoints.len;
+    assert(stated >= 1);
+    if (capacity < stated) return error.EndpointSlotsOutOfRange;
+    if (capacity > @as(u32, constants.endpoint_index_max) + 1) return error.EndpointSlotsOutOfRange;
+    assert(capacity >= stated);
+    const slots = try arena.create(Config.Slots);
+    slots.* = .{
+        .addresses = try arena.alloc(io_module.Address, capacity),
+        .weights = try arena.alloc(u16, capacity),
+        .priorities = try arena.alloc(u8, capacity),
+        .states = try arena.alloc(Config.EndpointState, capacity),
+    };
+    @memcpy(slots.addresses[0..stated], cluster.endpoints);
+    @memset(slots.addresses[stated..], free_slot_address);
+    for (slots.weights[0..stated], 0..) |*weight, index| weight.* = if (cluster.weights) |weights| weights[index] else 1;
+    @memset(slots.weights[stated..], 0);
+    for (slots.priorities[0..stated], 0..) |*priority, index| {
+        priority.* = if (cluster.priorities) |priorities| priorities[index] else 0;
+    }
+    @memset(slots.priorities[stated..], 0);
+    @memset(slots.states[0..stated], .live);
+    @memset(slots.states[stated..], .free);
+    cluster.endpoints = slots.addresses;
+    cluster.weights = slots.weights;
+    cluster.priorities = slots.priorities;
+    cluster.slots = slots;
+    assert(cluster.endpoints.len == capacity);
+    assert(cluster.weights.?.len == capacity);
+    assert(cluster.priorities.?.len == capacity);
+}
+
+/// What a free slot holds (#428): an address nothing dials, since a free
+/// slot's weight keeps every pick off it.
+pub const free_slot_address: io_module.Address = .{ .ip = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } } };
 
 /// Duplicate names in O(n log n), by sorting an index permutation and
 /// comparing neighbours. It was a nested scan over the entries, which
@@ -4698,4 +4789,30 @@ test "config: a route's name rides its route through the sort, and a listener's 
     const too_many = try arena.alloc(Options.Listener.Route, @as(usize, std.math.maxInt(u16)) + 1);
     @memset(too_many, .{ .prefix = "/", .cluster = "origin" });
     try std.testing.expectError(error.RoutesOverLimit, resolveListeners(arena, &[_]Options.Listener{try named.listener(too_many)}, clusters, head_bytes, &.{}));
+}
+
+test "config: endpoint slots reserve room past the stated endpoints, free and weightless (#428)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const stated: Options.Cluster = .{
+        .name = "api",
+        .endpoints = &.{
+            .{ .address = .{ .ip = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:9000") } },
+            .{ .address = .{ .ip = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:9001") }, .weight = 3 },
+        },
+        .pick = .p2c,
+        .endpoint_slots = 4,
+    };
+    const cluster = try resolveCluster(arena, &stated);
+    try std.testing.expectEqual(@as(usize, 4), cluster.endpoints.len);
+    const slots = cluster.slots.?;
+    try std.testing.expectEqualSlices(Config.EndpointState, &.{ .live, .live, .free, .free }, slots.states);
+    try std.testing.expectEqualSlices(u16, &.{ 1, 3, 0, 0 }, cluster.weights.?);
+    try std.testing.expect(cluster.liveAt(1));
+    try std.testing.expect(!cluster.occupiedAt(2));
+
+    var short = stated;
+    short.endpoint_slots = 1;
+    try std.testing.expectError(error.EndpointSlotsOutOfRange, resolveCluster(arena, &short));
 }

@@ -1190,6 +1190,12 @@ pub fn Checker(comptime runtime: Runtime) type {
                     checker.cursor_endpoint = 0;
                     continue;
                 }
+                // A slot with no endpoint of the set — free, or draining
+                // out of it (#428) — has nothing to prove.
+                if (!cluster.liveAt(checker.cursor_endpoint)) {
+                    checker.cursor_endpoint += 1;
+                    continue;
+                }
                 const target: Target = .{
                     .cluster = cluster,
                     .cluster_index = checker.cursor_cluster,

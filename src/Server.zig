@@ -4736,6 +4736,7 @@ pub fn Server(comptime runtime: Runtime) type {
                     .index = @intCast(index),
                     .name = cluster.name,
                     .endpoints = cluster.endpoints,
+                    .states = if (cluster.slots) |slots| slots.states else &.{},
                 };
                 switch (cluster.pick) {
                     .extension => |selection| try bindPicker(selection, &site, startup),
