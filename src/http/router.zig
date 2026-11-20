@@ -99,16 +99,29 @@ pub fn match(
     path: []const u8,
     headers: []const parser.Header,
 ) ?*const Route {
+    const index = matchIndex(routes, host, path, headers) orelse return null;
+    return &routes[index];
+}
+
+/// The matching route's index in `routes`: what names its site to the
+/// #435 slots its policies count into.
+pub fn matchIndex(
+    routes: []const Route,
+    host: ?[]const u8,
+    path: []const u8,
+    headers: []const parser.Header,
+) ?u16 {
     assert(routes.len >= 1);
+    assert(routes.len <= std.math.maxInt(u16));
     assert(path.len >= 1);
     assert(path[0] == '/');
-    for (routes) |*candidate| {
+    for (routes, 0..) |*candidate, index| {
         if (!hostMatches(candidate.host, host)) continue;
         if (candidate.header) |header_match| {
             if (!headerMatches(header_match, headers)) continue;
         }
         if (prefixMatches(candidate.prefix, path)) {
-            return candidate;
+            return @intCast(index);
         }
     }
     return null;

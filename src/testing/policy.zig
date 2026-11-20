@@ -40,6 +40,18 @@ pub const ScriptedPolicy = struct {
 
     pub const path_bytes_max = 64;
 
+    /// Its own series (#435), so the gates reach every metered arm: a
+    /// counter for each way a request leaves it, and a gauge.
+    pub const metrics_prefix = "scripted_policy";
+    pub const counters = .{
+        .evaluated = "Requests the scripted policy evaluated.",
+        .rejected = "Requests it rejected.",
+        .tagged = "Requests it handed on with a tag.",
+    };
+    pub const gauges = .{
+        .path_bytes = "Bytes of the last request's canonical path.",
+    };
+
     pub fn bind(
         policy: *ScriptedPolicy,
         site: *const extension.PolicySite,
@@ -60,18 +72,22 @@ pub const ScriptedPolicy = struct {
         policy.evaluated += 1;
         policy.routed = request.cluster_index != null;
         policy.seen_tag = request.tag;
+        request.metrics.add(ScriptedPolicy, .evaluated, 1);
+        request.metrics.set(ScriptedPolicy, .path_bytes, request.path.len);
         const kept = @min(request.path.len, path_bytes_max);
         @memcpy(policy.path[0..kept], request.path[0..kept]);
         policy.path_len = @intCast(kept);
-        if (policy.reject_prefix.len == 0) return policy.handOn();
-        if (!std.mem.startsWith(u8, request.path, policy.reject_prefix)) return policy.handOn();
+        if (policy.reject_prefix.len == 0) return policy.handOn(request);
+        if (!std.mem.startsWith(u8, request.path, policy.reject_prefix)) return policy.handOn(request);
         policy.rejected += 1;
+        request.metrics.add(ScriptedPolicy, .rejected, 1);
         return .{ .reject = policy.status };
     }
 
     /// Both ways of proceeding, so the gates reach both arms.
-    fn handOn(policy: *const ScriptedPolicy) extension.Verdict {
+    fn handOn(policy: *const ScriptedPolicy, request: *const extension.Request) extension.Verdict {
         const tag = policy.tag orelse return .proceed;
+        request.metrics.add(ScriptedPolicy, .tagged, 1);
         return .{ .proceed_with = .{ .tag = tag } };
     }
 

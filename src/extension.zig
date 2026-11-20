@@ -31,6 +31,7 @@
 const std = @import("std");
 
 const config_module = @import("config.zig");
+const constants = @import("constants.zig");
 const filter = @import("http/filter.zig");
 const io_module = @import("io/io.zig");
 const parser = @import("http/parser.zig");
@@ -129,6 +130,10 @@ pub const Request = struct {
     /// picker's on the first try and on a retry — and the access log
     /// records it as `tag`.
     tag: u64,
+    /// The evaluating policy's own counters and gauges at the site it is
+    /// evaluated for (#435). Empty for a type that declares none, and in
+    /// the request a picker is shown, whose are `PickInput.metrics`.
+    metrics: Metrics = .{},
 };
 
 /// The picker contract (§7). A picker type declares
@@ -239,6 +244,9 @@ pub const PickInput = struct {
     /// it too — p2c twice per pick — so it is one stream, not one per
     /// picker.
     random: *Random,
+    /// The picker's own counters and gauges for this cluster (#435);
+    /// empty for a type that declares none.
+    metrics: Metrics = .{},
 };
 
 /// zoxy's pick generator (§9): xorshift64* (Vigna), the full-period
@@ -404,6 +412,16 @@ fn assertBind(comptime T: type, comptime Site: type) void {
 pub fn assertExtensions(comptime extensions: Extensions) void {
     comptime assert(extensions.pickers.len <= list_types_max);
     comptime assert(extensions.request_policies.len <= list_types_max);
+    const families = metered(extensions);
+    inline for (families, 0..) |Family, index| {
+        assertMetrics(Family);
+        inline for (families[index + 1 ..]) |Later| {
+            if (std.mem.eql(u8, Family.metrics_prefix, Later.metrics_prefix)) {
+                @compileError(@typeName(Family) ++ " and " ++ @typeName(Later) ++
+                    " declare the same metrics_prefix \"" ++ Family.metrics_prefix ++ "\"");
+            }
+        }
+    }
     inline for (extensions.pickers, 0..) |Picker, index| {
         assertPicker(Picker);
         inline for (extensions.pickers[index + 1 ..]) |Later| {
@@ -416,6 +434,214 @@ pub fn assertExtensions(comptime extensions: Extensions) void {
             if (Policy == Later) @compileError(@typeName(Policy) ++ " is listed twice as a request policy");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Metrics (#435)
+// ---------------------------------------------------------------------------
+
+// A build's own counters and gauges. A type may declare
+//
+//     pub const metrics_prefix = "tenant_guard";
+//     pub const counters = .{ .refused = "Requests this guard refused." };
+//     pub const gauges = .{ .tenants = "Tenants in the guard's table." };
+//
+// Each name becomes the series `zoxy_ext_<prefix>_<name>`, rendered on
+// the metrics endpoint beside zoxy's own with its help text, once for
+// every site that selects the type: a picker's cluster, a listener its
+// policies run on, or a route. zoxy reserves the slots at startup and
+// hands a site's into every serving call made for it, as
+// `PickInput.metrics` and `Request.metrics`; every instance of the type
+// at that site shares them. A counter only grows. A gauge is a level the
+// type sets.
+
+/// What every extension series name starts with: reserved, so no name a
+/// build declares can collide with one of zoxy's own.
+pub const metric_prefix = "zoxy_ext_";
+
+pub const metric_name_bytes_max = constants.extension_metric_name_bytes_max;
+pub const metric_help_bytes_max = constants.extension_metric_help_bytes_max;
+pub const metrics_per_type_max = constants.extension_metrics_per_type_max;
+
+/// One serving call's slots: its type's counters and gauges at the site
+/// the call is for, in declaration order. Read and written through the
+/// methods, which name a slot by the type's own declaration.
+pub const Metrics = struct {
+    counters: []u64 = &.{},
+    gauges: []u64 = &.{},
+
+    /// Count `delta` more of `Extension`'s counter `name`.
+    pub fn add(
+        metrics: Metrics,
+        comptime Extension: type,
+        comptime name: CounterName(Extension),
+        delta: u64,
+    ) void {
+        metrics.assertOf(Extension);
+        const cell = &metrics.counters[@backingInt(name)];
+        // A counter that wrapped would read as one that went quiet.
+        assert(cell.* <= std.math.maxInt(u64) - delta);
+        cell.* += delta;
+    }
+
+    /// Set `Extension`'s gauge `name` to `level`.
+    pub fn set(
+        metrics: Metrics,
+        comptime Extension: type,
+        comptime name: GaugeName(Extension),
+        level: u64,
+    ) void {
+        metrics.assertOf(Extension);
+        metrics.gauges[@backingInt(name)] = level;
+    }
+
+    /// A counter's total at this site, for a type that reads its own.
+    pub fn counter(metrics: Metrics, comptime Extension: type, comptime name: CounterName(Extension)) u64 {
+        metrics.assertOf(Extension);
+        return metrics.counters[@backingInt(name)];
+    }
+
+    /// A gauge's level at this site.
+    pub fn gauge(metrics: Metrics, comptime Extension: type, comptime name: GaugeName(Extension)) u64 {
+        metrics.assertOf(Extension);
+        return metrics.gauges[@backingInt(name)];
+    }
+
+    /// The slots are `Extension`'s: one per declared counter and gauge.
+    /// Slots of another site or kind with the same shape cannot be told
+    /// apart here, but zoxy never hands a call any slots but its own.
+    fn assertOf(metrics: Metrics, comptime Extension: type) void {
+        assert(metrics.counters.len == counterCount(Extension));
+        assert(metrics.gauges.len == gaugeCount(Extension));
+    }
+};
+
+/// Whether `Extension` declares counters or gauges.
+pub fn isMetered(comptime Extension: type) bool {
+    return @hasDecl(Extension, "counters") or @hasDecl(Extension, "gauges");
+}
+
+/// `Extension`'s counters, by name.
+pub fn CounterName(comptime Extension: type) type {
+    return std.meta.FieldEnum(@TypeOf(declaredCounters(Extension)));
+}
+
+/// `Extension`'s gauges, by name.
+pub fn GaugeName(comptime Extension: type) type {
+    return std.meta.FieldEnum(@TypeOf(declaredGauges(Extension)));
+}
+
+pub fn counterCount(comptime Extension: type) u32 {
+    return @typeInfo(@TypeOf(declaredCounters(Extension))).@"struct".field_names.len;
+}
+
+pub fn gaugeCount(comptime Extension: type) u32 {
+    return @typeInfo(@TypeOf(declaredGauges(Extension))).@"struct".field_names.len;
+}
+
+/// `Extension.counters`, or the empty declaration.
+pub fn declaredCounters(comptime Extension: type) @TypeOf(if (@hasDecl(Extension, "counters")) Extension.counters else .{}) {
+    return if (@hasDecl(Extension, "counters")) Extension.counters else .{};
+}
+
+/// `Extension.gauges`, or the empty declaration.
+pub fn declaredGauges(comptime Extension: type) @TypeOf(if (@hasDecl(Extension, "gauges")) Extension.gauges else .{}) {
+    return if (@hasDecl(Extension, "gauges")) Extension.gauges else .{};
+}
+
+/// The build's metered types, each once, pickers first: the families the
+/// metrics endpoint renders, in this order. A type listed both as a
+/// picker and as a policy is one family.
+pub fn metered(comptime extensions: Extensions) []const type {
+    comptime {
+        var families: []const type = &.{};
+        for (extensions.pickers ++ extensions.request_policies) |Listed| {
+            if (!isMetered(Listed)) continue;
+            for (families) |Family| {
+                if (Family == Listed) break;
+            } else families = families ++ [_]type{Listed};
+        }
+        assert(families.len <= 2 * list_types_max);
+        return families;
+    }
+}
+
+/// `Extension`'s index in `metered(extensions)`.
+pub fn familyIndex(comptime extensions: Extensions, comptime Extension: type) u16 {
+    comptime {
+        assert(isMetered(Extension));
+        for (metered(extensions), 0..) |Family, index| {
+            if (Family == Extension) return index;
+        }
+        unreachable;
+    }
+}
+
+/// Refuse, at compile time, a metered type whose declarations would not
+/// render as exposition text: a prefix or a name outside
+/// `[a-z][a-z0-9_]*`, one past its bound, help that is not one line, or
+/// a name declared both as a counter and as a gauge.
+pub fn assertMetrics(comptime Extension: type) void {
+    // Every byte of every name and help text is checked once, and each
+    // counter's name is looked up among the gauges: bounded by the limits.
+    @setEvalBranchQuota(4 * metrics_per_type_max * (metric_name_bytes_max + metric_help_bytes_max + metrics_per_type_max) + 1000);
+    const name = @typeName(Extension);
+    if (!@hasDecl(Extension, "metrics_prefix")) {
+        @compileError(name ++ " declares counters or gauges but no `pub const metrics_prefix`");
+    }
+    if (!metricNameValid(Extension.metrics_prefix)) {
+        @compileError(name ++ ".metrics_prefix must match [a-z][a-z0-9_]* and be at most " ++
+            std.fmt.comptimePrint("{d}", .{metric_name_bytes_max}) ++ " bytes");
+    }
+    assertDeclared(Extension, declaredCounters(Extension), "counters");
+    assertDeclared(Extension, declaredGauges(Extension), "gauges");
+    for (@typeInfo(@TypeOf(declaredCounters(Extension))).@"struct".field_names) |counter_name| {
+        if (@hasField(@TypeOf(declaredGauges(Extension)), counter_name)) {
+            @compileError(name ++ " declares " ++ counter_name ++ " both as a counter and as a gauge");
+        }
+    }
+}
+
+fn assertDeclared(comptime Extension: type, comptime declared: anytype, comptime kind: []const u8) void {
+    const name = @typeName(Extension);
+    const info = @typeInfo(@TypeOf(declared));
+    if (info != .@"struct") {
+        @compileError(name ++ "." ++ kind ++ " must be a struct literal of name = \"help\"");
+    }
+    if (info.@"struct".field_names.len > metrics_per_type_max) {
+        @compileError(name ++ " declares more " ++ kind ++ " than metrics_per_type_max");
+    }
+    for (info.@"struct".field_names) |metric_name| {
+        if (!metricNameValid(metric_name)) {
+            @compileError(name ++ "." ++ kind ++ "." ++ metric_name ++ " must match [a-z][a-z0-9_]*");
+        }
+        const help: []const u8 = @field(declared, metric_name);
+        if (!metricHelpValid(help)) {
+            @compileError(name ++ "." ++ kind ++ "." ++ metric_name ++
+                "'s help must be one line, without a backslash, and at most " ++
+                std.fmt.comptimePrint("{d}", .{metric_help_bytes_max}) ++ " bytes");
+        }
+    }
+}
+
+/// `[a-z][a-z0-9_]*`, and short enough: a Prometheus name the exposition
+/// writes as it is, with nothing to escape.
+fn metricNameValid(comptime text: []const u8) bool {
+    if (text.len == 0 or text.len > metric_name_bytes_max) return false;
+    if (!std.ascii.isLower(text[0])) return false;
+    for (text) |byte| {
+        if (!(std.ascii.isLower(byte) or std.ascii.isDigit(byte) or byte == '_')) return false;
+    }
+    return true;
+}
+
+/// One line with nothing a `# HELP` line would have to escape.
+fn metricHelpValid(comptime text: []const u8) bool {
+    if (text.len == 0 or text.len > metric_help_bytes_max) return false;
+    for (text) |byte| {
+        if (byte == '\n' or byte == '\\') return false;
+    }
+    return true;
 }
 
 test "extension: equal runtimes name the same server" {
@@ -467,4 +693,44 @@ test "extension: select names the listed type of the instance it is given" {
     try std.testing.expectEqual(@as(u8, 1), of_second.index);
     try std.testing.expect(of_first.instance == @as(*anyopaque, &first));
     try std.testing.expect(of_second.instance == @as(*anyopaque, &second));
+}
+
+test "extension: each metered type is one family, pickers first (#435)" {
+    const Both = struct {
+        pub const metrics_prefix = "both";
+        pub const counters = .{ .calls = "Calls made." };
+        pub fn pick(_: *@This(), _: *const Candidates, _: *const PickInput) u16 {
+            return 0;
+        }
+        pub fn evaluate(_: *@This(), _: *const Request) Verdict {
+            return .proceed;
+        }
+    };
+    const Quiet = struct {
+        pub fn evaluate(_: *@This(), _: *const Request) Verdict {
+            return .proceed;
+        }
+    };
+    const Gauged = struct {
+        pub const metrics_prefix = "gauged";
+        pub const gauges = .{ .level = "A level." };
+        pub fn evaluate(_: *@This(), _: *const Request) Verdict {
+            return .proceed;
+        }
+    };
+    const extensions: Extensions = .{ .pickers = &.{Both}, .request_policies = &.{ Quiet, Both, Gauged } };
+    comptime assertExtensions(extensions);
+    const families = comptime metered(extensions);
+    comptime assert(families.len == 2);
+    comptime assert(families[0] == Both);
+    comptime assert(families[1] == Gauged);
+    comptime assert(familyIndex(extensions, Gauged) == 1);
+    comptime assert(!isMetered(Quiet));
+    comptime assert(counterCount(Gauged) == 0 and gaugeCount(Gauged) == 1);
+    comptime assert(counterCount(Both) == 1 and gaugeCount(Both) == 0);
+
+    var counters: [1]u64 = @splat(0);
+    const metrics: Metrics = .{ .counters = &counters };
+    metrics.add(Both, .calls, 2);
+    try std.testing.expectEqual(@as(u64, 2), metrics.counter(Both, .calls));
 }

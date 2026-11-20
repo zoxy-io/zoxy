@@ -136,6 +136,7 @@ test {
     _ = Options;
     _ = defaults;
     _ = extension;
+    _ = @import("extension_metrics.zig");
     _ = pickers;
     _ = constants;
     _ = counters;

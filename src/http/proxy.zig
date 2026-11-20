@@ -814,11 +814,12 @@ pub fn Proxy(comptime runtime: Runtime) type {
             server: *ServerType,
             stream: *StreamType,
             selections: []const extension.Selection,
+            metrics: []const extension.Metrics,
             view: *extension.Request,
         ) bool {
             assert(selections.len >= 1);
             assert(view.tag == stream.log.tag);
-            const refused = server.evaluatePolicies(selections, view);
+            const refused = server.evaluatePolicies(selections, metrics, view);
             stream.log.tag = view.tag;
             const status = refused orelse return false;
             respondPolicy(server, stream, status);
@@ -1177,7 +1178,8 @@ pub fn Proxy(comptime runtime: Runtime) type {
             // the way a filter's is — before any resource is taken.
             if (conn.request_policies.len >= 1) {
                 var view = requestView(stream, request, keys.host, &keys.views, render_scratch, null);
-                if (refusedByPolicies(server, stream, conn.request_policies, &view)) return;
+                const metrics = server.extension_metrics.listenerPolicies(conn.listener_index);
+                if (refusedByPolicies(server, stream, conn.request_policies, metrics, &view)) return;
             }
             // §7 filters run before routing: a terminal verdict — reject
             // or redirect (#176) — stops the request whether or not it
@@ -1197,15 +1199,17 @@ pub fn Proxy(comptime runtime: Runtime) type {
                     .respond => |page| return respondWithPage(server, stream, page),
                 }
             }
-            const routed = router.match(conn.routes, keys.host, keys.views.match, request.headers) orelse {
+            const route_index = router.matchIndex(conn.routes, keys.host, keys.views.match, request.headers) orelse {
                 return respond(server, stream, 404, "l7_no_route");
             };
+            const routed = &conn.routes[route_index];
             stream.cluster_index = routed.cluster_index;
             // #417: the route's own policies, now that the cluster is
             // known, and still before the first resource below.
             if (routed.request_policies.len >= 1) {
                 var view = requestView(stream, request, keys.host, &keys.views, render_scratch, routed.cluster_index);
-                if (refusedByPolicies(server, stream, routed.request_policies, &view)) return;
+                const metrics = server.extension_metrics.routePolicies(conn.listener_index, route_index);
+                if (refusedByPolicies(server, stream, routed.request_policies, metrics, &view)) return;
             }
 
             stream.relay_buffer = server.acquireRelayBuffer() orelse {

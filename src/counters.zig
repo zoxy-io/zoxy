@@ -1579,7 +1579,7 @@ pub const Labeled = struct {
     /// loader bounds a cluster name's *length*, not its bytes, and a
     /// label that broke the exposition grammar would corrupt the whole
     /// scrape, not one line.
-    fn writeEscaped(writer: *std.Io.Writer, value: []const u8) std.Io.Writer.Error!void {
+    pub fn writeEscaped(writer: *std.Io.Writer, value: []const u8) std.Io.Writer.Error!void {
         for (value) |byte| {
             switch (byte) {
                 '\\' => try writer.writeAll("\\\\"),
