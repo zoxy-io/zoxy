@@ -766,7 +766,7 @@ pub fn Server(comptime runtime: Runtime) type {
             try server.admin.init(server, config.admin_bind, arena);
             server.access_log.init(server, config.access_log_sink, options.access_log_buffer_bytes);
             try server.access_log.reserve(arena);
-            try server.health.init(arena, server, keys, options.head_buffer_bytes);
+            try server.health.init(arena, server, keys, probeBufferBytes(options));
         }
 
         /// One HTTP/2 session's shape at this config (#275): fields of up
@@ -1226,7 +1226,7 @@ pub fn Server(comptime runtime: Runtime) type {
             // the two cannot disagree.
             const health_probes = server.config.healthProbes();
             const probe_scratch_bytes: u64 =
-                @as(u64, health_probes) * options.head_buffer_bytes;
+                @as(u64, health_probes) * probeBufferBytes(options.*);
             server.h2_scratch = if (options.h2_connections >= 1)
                 try H2Exchange.Scratch.init(arena, options.head_buffer_bytes)
             else
@@ -3067,7 +3067,18 @@ pub fn Server(comptime runtime: Runtime) type {
             assert(health_probes >= 1);
             assert(health_probes <= constants.health_probe_concurrency_max);
             const serving: u64 = if (options.head_buffers >= 1) 2 else 0;
-            return (serving + health_probes) * options.head_buffer_bytes + h2ScratchBytes(&options);
+            return serving * options.head_buffer_bytes +
+                @as(u64, health_probes) * probeBufferBytes(options) + h2ScratchBytes(&options);
+        }
+
+        /// One probe's response buffer: a head buffer, so an http probe
+        /// accepts exactly the heads the data path does — widened to the
+        /// widest reply a build's check kind declares (#436), which is a
+        /// compile-time fact of the build.
+        pub fn probeBufferBytes(options: InitOptions) u32 {
+            const declared = comptime extension.probeReplyBytesMax(runtime.extensions);
+            assert(options.head_buffer_bytes >= constants.head_buffer_bytes_min);
+            return @max(options.head_buffer_bytes, declared);
         }
 
         /// The HTTP/2 mapping scratch's share of the head-sized side
@@ -4639,6 +4650,11 @@ pub fn Server(comptime runtime: Runtime) type {
                     },
                     .rr, .p2c, .hash => {},
                 }
+                const check = cluster.check orelse continue;
+                if (check.probe) |selection| {
+                    assert(selection.index < runtime.extensions.probes.len);
+                    selects = true;
+                }
             }
             for (config.listeners) |*listener| {
                 for (listener.connection_policies) |selection| {
@@ -4680,11 +4696,10 @@ pub fn Server(comptime runtime: Runtime) type {
                     }
                 }
             }
-            if (runtime.extensions.pickers.len == 0 and runtime.extensions.request_policies.len == 0 and
-                runtime.extensions.response_policies.len == 0 and runtime.extensions.connection_policies.len == 0)
-            {
-                assert(!selects);
-            }
+            const lists = runtime.extensions.pickers.len + runtime.extensions.request_policies.len +
+                runtime.extensions.response_policies.len + runtime.extensions.connection_policies.len +
+                runtime.extensions.probes.len;
+            if (lists == 0) assert(!selects);
             return selects;
         }
 
@@ -4697,16 +4712,18 @@ pub fn Server(comptime runtime: Runtime) type {
             assert(!server.extensions_bound);
             assert(server.config.clusters.len >= 1);
             for (server.config.clusters, 0..) |*cluster, index| {
-                const selection = switch (cluster.pick) {
-                    .extension => |selection| selection,
-                    .rr, .p2c, .hash => continue,
-                };
                 const site: extension.ClusterSite = .{
                     .index = @intCast(index),
                     .name = cluster.name,
                     .endpoints = cluster.endpoints,
                 };
-                try bindPicker(selection, &site, startup);
+                switch (cluster.pick) {
+                    .extension => |selection| try bindPicker(selection, &site, startup),
+                    .rr, .p2c, .hash => {},
+                }
+                // #436: a cluster's check kind, bound with the same site.
+                const check = cluster.check orelse continue;
+                if (check.probe) |selection| try bindProbe(selection, &site, startup);
             }
             for (server.config.listeners, 0..) |*listener, index| {
                 const site: extension.PolicySite = .{
@@ -5322,6 +5339,23 @@ pub fn Server(comptime runtime: Runtime) type {
                 if (selection.index == index) {
                     const policy: *Policy = @ptrCast(@alignCast(selection.instance));
                     return Policy.evaluate(policy, request);
+                }
+            }
+            unreachable;
+        }
+
+        fn bindProbe(
+            selection: extension.Selection,
+            site: *const extension.ClusterSite,
+            startup: *const extension.Startup,
+        ) anyerror!void {
+            assert(selection.index < runtime.extensions.probes.len);
+            assert(site.endpoints.len >= 1);
+            inline for (runtime.extensions.probes, 0..) |Probe, index| {
+                if (selection.index == index) {
+                    if (comptime !@hasDecl(Probe, "bind")) return;
+                    const instance: *Probe = @ptrCast(@alignCast(selection.instance));
+                    return Probe.bind(instance, site, startup);
                 }
             }
             unreachable;

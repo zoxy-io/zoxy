@@ -331,6 +331,9 @@ fn checkOf(check_json: ?CheckJson, connect_ms: u32) ParseError!?Options.Cluster.
     const http_fields = check.path != null or check.host != null or check.expect_status != null;
     const stated: Options.Cluster.Check.Kind = switch (kind) {
         .tcp => if (http_fields) return error.ClusterCheckHttpFieldOnTcp else .tcp,
+        // A build's own kind (#436) is selected in code; a file cannot
+        // name one.
+        .extension => return error.ClusterCheckTypeUnknown,
         .http => .{ .http = .{
             .path = check.path orelse return error.ClusterCheckPathMissing,
             .host = check.host,

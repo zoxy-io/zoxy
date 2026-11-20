@@ -1012,6 +1012,26 @@ pub const health_check_grpc_response_bytes_max: u32 = 16;
 pub const health_check_request_bytes_max: u32 =
     64 + health_check_path_bytes_max + health_check_host_bytes_max;
 
+/// The rounds one probe of a build's own check kind may take (#436): each
+/// a request and the reply it is judged by, so a handshake that answers a
+/// greeting — MySQL's, which counts a client that hangs up after the
+/// greeting against the prober's host — fits, and a judge that keeps
+/// asking for another round fails the probe at the bound rather than
+/// looping. A round's request is held to `health_check_request_bytes_max`.
+pub const health_check_rounds_max: u8 = 4;
+
+/// The widest reply a build's check kind may declare for one round
+/// (#436). The prober's per-probe buffer is the wider of the head buffer
+/// and the widest declared, so the bound keeps it a bounded size.
+pub const health_probe_reply_bytes_max: u32 = 64 * 1024;
+
+comptime {
+    // Room for a greeting, an answer to it, and the verdict's round.
+    assert(health_check_rounds_max >= 3);
+    assert(health_probe_reply_bytes_max >= head_buffer_bytes_min);
+    assert(health_probe_reply_bytes_max <= head_buffer_bytes_max);
+}
+
 // Routes and filters carry no ceiling of their own (§7 "filters are
 // data"). They are immutable arena slices allocated at exactly the
 // length the config asked for, so they size nothing that a comptime

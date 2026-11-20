@@ -371,6 +371,10 @@ pub const Cluster = struct {
             http: Http,
             /// `grpc.health.v1`, on an HTTP/2 cluster.
             grpc: Grpc,
+            /// A build's own kind (#436), selected with `App.probe`: zoxy
+            /// dials and holds the deadline, the type speaks the origin's
+            /// protocol. Plaintext: refused on a TLS cluster.
+            extension: extension.Selection,
         };
 
         pub const Http = struct {

@@ -816,11 +816,15 @@ pub const Config = struct {
             /// The service a `grpc` probe asks about; empty asks about the
             /// server as a whole, as the health protocol defines.
             grpc_service: []const u8 = "",
+            /// The build's check kind an `extension` probe runs (#436),
+            /// selected in code; never spelled in JSON.
+            probe: ?extension_module.Selection = null,
 
             pub const Kind = enum(u2) {
                 tcp,
                 http,
                 grpc,
+                extension,
             };
 
             pub const Http = struct {
@@ -1074,6 +1078,9 @@ pub const ValidationError = error{
     /// An `http` check on an HTTPS cluster: the prober speaks plaintext,
     /// so it would probe something the traffic does not reach.
     ClusterTlsHttpCheck,
+    /// A build's own check kind (#436) on a TLS cluster, for the same
+    /// reason: its probe speaks over the prober's plaintext socket.
+    ClusterTlsExtensionCheck,
     ClusterTlsServerNameInvalid,
     /// The bundle holds no certificate, or a block that is not one.
     ClusterTlsCaInvalid,
@@ -3688,8 +3695,10 @@ fn resolveCheck(check: ?Options.Cluster.Check) ResolveError!?Config.Cluster.Chec
             if (!grpcServiceValid(grpc.service)) return error.ClusterCheckServiceInvalid;
             resolved.grpc_service = grpc.service;
         },
+        .extension => |selection| resolved.probe = selection,
     }
     assert((resolved.http != null) == (resolved.kind == .http));
+    assert((resolved.probe != null) == (resolved.kind == .extension));
     assert(resolved.grpc_service.len == 0 or resolved.kind == .grpc);
     return resolved;
 }
@@ -4058,6 +4067,9 @@ fn rejectClusterProtocolShape(cluster: *const Config.Cluster) ValidationError!vo
         if (cluster.protocol.http2() and check.kind == .http) return error.ClusterH2cHttpCheck;
         if (!cluster.protocol.http2() and check.kind == .grpc) return error.ClusterCheckGrpcOnHttp1;
         if (cluster.tls != null and check.kind == .http) return error.ClusterTlsHttpCheck;
+        // #436: a build's kind speaks over the prober's own socket, which
+        // carries no TLS either.
+        if (cluster.tls != null and check.kind == .extension) return error.ClusterTlsExtensionCheck;
     }
     if (cluster.tls != null and cluster.protocol == .h2c) return error.ClusterTlsOnH2c;
     if (cluster.tls == null and cluster.protocol == .h2) return error.ClusterH2WithoutTls;
