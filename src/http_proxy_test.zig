@@ -11184,7 +11184,7 @@ test "l7: a handler route's policies guard it, and a pipelined request closes it
     }
 }
 
-test "h2: a handler route answers an HTTP/2 stream 501 until its slice lands (#434)" {
+test "h2: a handler route answers each HTTP/2 stream, reading its DATA as its body (#434)" {
     var handler: ScriptedHandler = .{};
     var options = h2BedOptions(4359);
     options.route_handler = &handler;
@@ -11192,15 +11192,56 @@ test "h2: a handler route answers an HTTP/2 stream 501 until its slice lands (#4
     try bed.setUp(std.testing.allocator, options);
     defer bed.tearDown();
 
+    // A bodiless GET, and a POST whose undeclared body comes in two
+    // DATA frames — the second carrying END_STREAM.
     var wire: H2Wire = .{};
     wire.preface(&.{});
     wire.get(1, "GET", "/a");
+    wire.headers(3, &.{ .{ ":method", "POST" }, .{ ":scheme", "http" }, .{ ":path", "/b" }, .{ ":authority", "a" } }, false);
+    wire.data(3, "hello ", false);
+    wire.data(3, "world", true);
+    // A declared empty body, ended on its HEADERS: no DATA comes.
+    wire.headers(5, &.{
+        .{ ":method", "POST" }, .{ ":scheme", "http" },     .{ ":path", "/c" },
+        .{ ":authority", "a" }, .{ "content-length", "0" },
+    }, true);
+    try bed.exchange(wire.written());
+
+    var storage: [4]H2Answer = undefined;
+    const answers = try h2Answers(bed.client.response(), &storage);
+    try std.testing.expectEqual(@as(usize, 3), answers.len);
+    try std.testing.expectEqual(@as(u16, 200), (try h2AnswerFor(answers, 5)).status);
+    const got = try h2AnswerFor(answers, 1);
+    try std.testing.expectEqual(@as(u16, 200), got.status);
+    try std.testing.expect(std.mem.startsWith(u8, got.data[0..@min(got.body, got.data.len)], "/a flag=false\n"));
+    const posted = try h2AnswerFor(answers, 3);
+    try std.testing.expectEqual(@as(u16, 200), posted.status);
+    try std.testing.expect(std.mem.startsWith(u8, posted.data[0..@min(posted.body, posted.data.len)], "/b flag=true\n"));
+    try std.testing.expectEqual(@as(u32, 3), handler.handled);
+    try std.testing.expectEqual(@as(u64, 3), bed.server.counters.get("l7_handled"));
+    try bed.expectDrained();
+}
+
+test "h2: a handler route's body past its head buffer's room is a 413 on its stream (#434)" {
+    var handler: ScriptedHandler = .{};
+    var options = h2BedOptions(4370);
+    options.route_handler = &handler;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    const wide: [8 * 1024]u8 = @splat('x');
+    var wire: H2Wire = .{};
+    wire.preface(&.{});
+    wire.headers(1, &.{ .{ ":method", "POST" }, .{ ":scheme", "http" }, .{ ":path", "/b" }, .{ ":authority", "a" } }, false);
+    wire.data(1, &wide, true);
     try bed.exchange(wire.written());
 
     var storage: [2]H2Answer = undefined;
     const answers = try h2Answers(bed.client.response(), &storage);
-    try std.testing.expectEqual(@as(u16, 501), (try h2AnswerFor(answers, 1)).status);
+    try std.testing.expectEqual(@as(u16, 413), (try h2AnswerFor(answers, 1)).status);
     try std.testing.expectEqual(@as(u32, 0), handler.handled);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_handler_body_too_large"));
     try bed.expectDrained();
 }
 
@@ -11227,5 +11268,27 @@ test "l7: a handler body that stalls is reaped on the head budget, the handler n
     try std.testing.expect(!handler.flag);
     // A head that parsed is answered: the client hears why it was cut.
     try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 408 "));
+    try bed.expectDrained();
+}
+
+test "h2: a handler route's stream whose body never comes ends on its deadline (#434)" {
+    var handler: ScriptedHandler = .{};
+    var options = h2BedOptions(4371);
+    options.route_handler = &handler;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    var wire: H2Wire = .{};
+    wire.preface(&.{});
+    wire.headers(1, &.{ .{ ":method", "POST" }, .{ ":scheme", "http" }, .{ ":path", "/b" }, .{ ":authority", "a" } }, false);
+    try bed.exchange(wire.written());
+
+    try std.testing.expectEqual(@as(u32, 0), handler.handled);
+    // The stream's own, then the connection's idle window once it is quiet.
+    try std.testing.expect(bed.server.counters.get("deadline_expired") >= 1);
+    var storage: [2]H2Answer = undefined;
+    const answers = try h2Answers(bed.client.response(), &storage);
+    try std.testing.expectEqual(@as(u16, 408), (try h2AnswerFor(answers, 1)).status);
     try bed.expectDrained();
 }

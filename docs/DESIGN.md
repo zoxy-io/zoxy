@@ -1771,11 +1771,14 @@ lists do not reach is refused at step zero (`ExtensionUnserved`).
     narrower than the widest answer with those lines
     (`HandlerResponseOverBuffer`);
   - the body must fit the head buffer beside its head, or the request
-    gets a `413` (`l7_handler_body_too_large`), and its length must be
-    declared: a chunked body is a `501`. It arrives under the head's
-    budget, so a body still arriving at `head_timeout_ms` — one held
-    back for an `Expect: 100-continue` this proxy does not answer
-    included — gets a `408`. Anything pipelined behind it closes the
+    gets a `413` (`l7_handler_body_too_large`). On HTTP/1.1 its length
+    must be declared: a chunked body is a `501`. On an HTTP/2 stream it
+    is the DATA frames to END_STREAM, copied beside the head as they
+    come and their window credited at once, declared or not. Either way
+    it arrives under the head's budget, so a body still arriving at
+    `head_timeout_ms` — one held back for an `Expect: 100-continue`
+    this proxy does not answer included — gets a `408`, counted as the
+    budget's reap. On HTTP/1.1 anything pipelined behind it closes the
     connection, which the answer renders over;
   - an answer that overflows the declared bound, carries a header zoxy
     writes itself or one that is not a single field, or gives a `204`
@@ -1783,8 +1786,9 @@ lists do not reach is refused at step zero (`ExtensionUnserved`).
     (`l7_handler_answer_refused`). It is logged `responded`, with no
     cluster, and counts `l7_handled`;
   - neither filters nor response policies touch it, as with zoxy's
-    own pages, and a handler declares no metrics yet. An HTTP/2 stream
-    is answered `501` until the next slice.
+    own pages, and a handler declares no metrics yet. On an HTTP/2
+    stream the answer is mapped as the redirect's is, and ends the
+    stream.
 - **Probes** (#436), a cluster's check kind, selected with `App.probe`
   as the check's `kind`:
   - the type declares `reply_bytes_max` (1 to 64 KiB) and two calls,

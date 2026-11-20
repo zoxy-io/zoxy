@@ -1330,8 +1330,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
         ) void {
             assert(stream.phase == .reading_head);
             assert(stream.l7.handler_route != null);
-            // An HTTP/2 stream's handler answer is the next slice's.
-            if (stream.h2_id != 0) return respond(server, stream, 501, "l7_not_implemented");
+            if (stream.h2_id != 0) return beginH2Handler(server, stream, request, host, views, render_scratch);
             const body_len: u64 = switch (request.framing) {
                 .none => 0,
                 .content_length => |length| length,
@@ -1349,15 +1348,82 @@ pub fn Proxy(comptime runtime: Runtime) type {
             readMoreHead(server, stream);
         }
 
-        /// More of a handler route's body arrived (#434): the handler, once
-        /// the body is whole, or another read. Re-parses the head it routed
-        /// — the views routing built did not outlive that callback.
+        /// A handler route on an HTTP/2 stream (#434): its body is the
+        /// DATA frames to END_STREAM — written out as chunked for an origin
+        /// when it declared no length, read raw here — taken beside its head
+        /// in the stream's head buffer as they come (`takeHandlerData`).
+        fn beginH2Handler(
+            server: *ServerType,
+            stream: *StreamType,
+            request: *const parser.RequestHead,
+            host: ?[]const u8,
+            views: *const TargetViews,
+            render_scratch: *RenderScratch,
+        ) void {
+            assert(stream.h2_id != 0);
+            assert(stream.l7.handler_body_len == 0);
+            const room = headBytes(server, stream).len - request.head_len;
+            switch (request.framing) {
+                .none => return invokeHandler(server, stream, request, host, views, render_scratch),
+                // A declared zero is a whole body — HEADERS may end the
+                // stream with no DATA to come (curl's `-d ''`).
+                .content_length => |length| {
+                    if (length == 0) return invokeHandler(server, stream, request, host, views, render_scratch);
+                    if (length > room) return respond(server, stream, 413, "l7_handler_body_too_large");
+                },
+                .chunked => {},
+                .until_close => unreachable,
+            }
+            // The body is bounded in time as a socket's is, by the head's
+            // budget: no other deadline need run while a stream waits.
+            const budget_ms = @min(server.config.head_timeout_ms, server.idleTimeoutMs());
+            assert(budget_ms >= 1);
+            server.storeExchangeDeadline(stream, budget_ms);
+        }
+
+        /// Whether an HTTP/2 stream is reading a handler route's body
+        /// (#434), so its DATA frames are the handler's, not an origin's.
+        pub fn readsHandlerBody(stream: *const StreamType) bool {
+            assert(stream.h2_id != 0);
+            if (stream.ending) return false;
+            if (stream.phase != .reading_head) return false;
+            return stream.l7.handler_route != null;
+        }
+
+        /// Body octets for a handler route's HTTP/2 stream (#434): kept
+        /// beside its head, and the handler run at END_STREAM. A body past
+        /// the head buffer's room is a `413`, its octets dropped.
+        pub fn takeHandlerData(server: *ServerType, stream: *StreamType, bytes: []const u8, end_stream: bool) void {
+            assert(readsHandlerBody(stream));
+            const buffer = headBytes(server, stream);
+            const fill = stream.l7.request_head_len + stream.l7.handler_body_len;
+            assert(fill <= buffer.len);
+            if (bytes.len > buffer.len - fill) return respond(server, stream, 413, "l7_handler_body_too_large");
+            @memcpy(buffer[fill..][0..bytes.len], bytes);
+            stream.l7.handler_body_len += @intCast(bytes.len);
+            assert(stream.l7.request_head_len + stream.l7.handler_body_len <= buffer.len);
+            stream.log.bytes_in += bytes.len;
+            if (end_stream) resumeHandler(server, stream);
+        }
+
+        /// More of a handler route's body arrived on a socket (#434): the
+        /// handler, once the body is whole, or another read.
         fn continueHandlerBody(server: *ServerType, stream: *StreamType) void {
+            assert(stream.h2_id == 0);
             assert(stream.l7.handler_route != null);
             assert(stream.l7.request_head_len >= 1);
             const whole = stream.l7.request_head_len + stream.l7.handler_body_len;
             assert(whole <= headBytes(server, stream).len);
             if (stream.head_len < whole) return readMoreHead(server, stream);
+            resumeHandler(server, stream);
+        }
+
+        /// A handler route's body is whole, after the callback that routed
+        /// it (#434): re-parse the head it routed — the views routing built
+        /// did not outlive that callback — and run the handler.
+        fn resumeHandler(server: *ServerType, stream: *StreamType) void {
+            assert(stream.l7.handler_route != null);
+            assert(stream.l7.request_head_len >= 1);
             const storage = server.borrowHeaderScratch();
             defer server.returnHeaderScratch();
             const head = headBytes(server, stream)[0..stream.l7.request_head_len];
@@ -1385,10 +1451,13 @@ pub fn Proxy(comptime runtime: Runtime) type {
             assert(request.head_len == stream.l7.request_head_len);
             const selection = conn.routes[route_index].handler.?;
             const body = headBytes(server, stream)[request.head_len..][0..stream.l7.handler_body_len];
-            // The body is read: the framing tracker says so, for the
-            // turnaround's resync.
-            if (body.len >= 1) _ = feedFraming(&stream.l7.request_framing, body);
-            assert(framingDoneOf(&stream.l7.request_framing));
+            // The body is read: on a socket the framing tracker says so,
+            // for the turnaround's resync. An HTTP/2 stream's has nothing
+            // to resync, and its DATA octets are no chunked framing.
+            if (stream.h2_id == 0) {
+                if (body.len >= 1) _ = feedFraming(&stream.l7.request_framing, body);
+                assert(framingDoneOf(&stream.l7.request_framing));
+            }
             const view = requestView(stream, request, host, views, render_scratch, null);
             var response: extension.HandlerResponse = .{
                 .bytes = server.handler_scratch[0..handlerResponseBytes(selection)],
@@ -4383,6 +4452,17 @@ pub fn Proxy(comptime runtime: Runtime) type {
             assert(!stream.ending);
             ServerType.clearRequestDeadline(stream);
             stream.deadline_ns = 0;
+            // A handler route's body that never finished (#434): answered
+            // as a socket's is, with nothing armed to force first. The
+            // stream's deadline may be the request cap it was clamped to
+            // rather than the head budget it was given — a 408 either way,
+            // as a socket's head-budget reap conflates them too.
+            if (readsHandlerBody(stream)) {
+                // The head budget's reap, on a stream: counted as one, as
+                // every `408` is.
+                server.counters.increment("l7_head_budget_expired");
+                return respond(server, stream, 408, "l7_request_timeout");
+            }
             // The verdicts' grace, as an admission stream's: the configured
             // idle window, never the pressure-biased one.
             const grace_ms = server.config.idle_timeout_ms;
