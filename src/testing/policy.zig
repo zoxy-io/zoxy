@@ -24,6 +24,8 @@ pub const ScriptedPolicy = struct {
     expect_tag: ?u64 = null,
     /// The tag the last request arrived with.
     seen_tag: u64 = 0,
+    /// The loop clock the last request was evaluated at (#429).
+    seen_now_ns: u64 = 0,
     /// Startup binds received, one per listener or route that selected
     /// the instance.
     binds: u32 = 0,
@@ -63,6 +65,10 @@ pub const ScriptedPolicy = struct {
         assert((site.route_index == null) == (site.cluster_index == null));
         assert(policy.reject_prefix.len <= path_bytes_max);
         policy.binds += 1;
+        // A server's clock starts afresh, and an instance a test reuses
+        // across servers must not hold the last one's reading against it:
+        // the clock runs forward within one server's life, not across two.
+        policy.seen_now_ns = 0;
     }
 
     pub fn evaluate(policy: *ScriptedPolicy, request: *const extension.Request) extension.Verdict {
@@ -72,6 +78,11 @@ pub const ScriptedPolicy = struct {
         policy.evaluated += 1;
         policy.routed = request.cluster_index != null;
         policy.seen_tag = request.tag;
+        // The loop clock runs forward: within one server's life — `bind`
+        // starts each — a later evaluation never reads an earlier time.
+        assert(request.now_ns >= 1);
+        assert(request.now_ns >= policy.seen_now_ns);
+        policy.seen_now_ns = request.now_ns;
         request.metrics.add(ScriptedPolicy, .evaluated, 1);
         request.metrics.set(ScriptedPolicy, .path_bytes, request.path.len);
         const kept = @min(request.path.len, path_bytes_max);

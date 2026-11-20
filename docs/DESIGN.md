@@ -1672,8 +1672,10 @@ lists do not reach is refused at step zero (`ExtensionUnserved`).
     runs once per site;
   - the request view holds the method, the canonical host, path and
     query, the parsed headers, the client address, the verified client
-    certificate's fingerprint when there is one, the listener, and the
-    tag. At the route phase it also holds the chosen cluster;
+    certificate's fingerprint when there is one, the listener, the tag,
+    and the loop's `now_ns` (#429), the clock a picker reads, for a
+    policy that times a window or refills a bucket. At the route phase
+    it also holds the chosen cluster;
   - the tag (#433) is one `u64` per request, zero until a policy sets
     it. The later write wins, and a tag set before a later reject
     stays. Every later view of the request carries it: the next
