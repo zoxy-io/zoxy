@@ -357,6 +357,10 @@ pub const Config = struct {
         /// sink beside it. Unlike the pool sizes it may be raised as well
         /// as lowered: it is plain memory, not a share of a budgeted ring.
         access_log_buffer_bytes: u32 = 0,
+        /// The consults a build's policies may have in flight (#437):
+        /// zero unless the options state some. Each holds an upstream
+        /// slot while it runs, so there are never more than those.
+        consult_slots: u32 = 0,
     };
 
     pub const Listener = struct {
@@ -1098,6 +1102,9 @@ pub const ValidationError = error{
     LimitUpstreamH2ConnectionsWithoutHttp2,
     LimitUpstreamH2StreamsOutOfRange,
     LimitUpstreamH2StreamsOverUpstreamSlots,
+    /// More consult slots (#437) than upstream slots, which every consult
+    /// holds one of: the excess could never be used.
+    LimitConsultSlotsOverUpstreamSlots,
     LimitUpstreamH2StreamsWithoutHttp2,
     /// An `h2c` cluster probed by HTTP/1.1, which its origins may not
     /// speak at all: every probe would fail, and eject every endpoint.
@@ -1781,6 +1788,8 @@ fn resolveLimits(
         log_header_count,
     );
     assertPoolsFitConnSlots(slots, head_pools.head_buffers, feature_pools);
+    const consult_slots = requested.consult_slots orelse 0;
+    if (consult_slots > upstream_slots) return error.LimitConsultSlotsOverUpstreamSlots;
     return .{
         .conn_slots = conn_slots,
         .relay_buffers = relay_buffers,
@@ -1798,6 +1807,7 @@ fn resolveLimits(
         .upstream_tls_sessions = origin_pools.upstream_tls_sessions,
         .cq_fill_eighths = cq_fill_eighths,
         .access_log_buffer_bytes = access_log_buffer_bytes,
+        .consult_slots = consult_slots,
     };
 }
 

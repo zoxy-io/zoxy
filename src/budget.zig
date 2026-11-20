@@ -143,6 +143,7 @@ pub fn Budget(comptime runtime: Runtime) type {
                     config,
                     constants.streamSlotsFor(limits.conn_slots, limits.stream_slots),
                 ),
+                .consult_bytes = ServerType.consultBytes(config),
                 .head_buffers = limits.head_buffers,
                 .head_buffer_bytes = limits.head_buffer_bytes,
                 .upstream_head_buffers = limits.upstream_head_buffers,
@@ -433,6 +434,7 @@ pub fn Budget(comptime runtime: Runtime) type {
                 \\          + labeled metrics {d} B (tables, labels and render buffers)
                 \\          + policy answers {d} B (a build's own pages, four variants each)
                 \\          + policy edits {d} B (a build's request edits, every stream slot)
+                \\          + consult slots {d} B (a build's consult requests and replies)
                 \\          + tunnels {d} x {d} B (their own relay buffers, never HTTP's)
                 \\          + tls engines {d} x {d} B (+ plaintext {d} B each, libcrypto heap {d} KiB)
                 \\
@@ -466,6 +468,7 @@ pub fn Budget(comptime runtime: Runtime) type {
                 // printed on the same terms as the lines around it.
                 sizes.answer_bytes,
                 sizes.policy_edit_bytes,
+                sizes.consult_bytes,
                 // Both read zero unless a listener allows an upgrade —
                 // printed rather than omitted, on the same terms as the
                 // TLS line below.

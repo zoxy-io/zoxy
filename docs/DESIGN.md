@@ -407,6 +407,7 @@ whose feature no config names has count 0 and costs nothing.**
 | HTTP/2 origin connections | pooled | min(2 × HTTP/2 endpoints, 4096) | a client session + buffers |
 | HTTP/2 origin streams | one leg | = upstream slots | staging for one stream |
 | HTTPS origin sessions | with their upstream slot | min(16 × HTTPS endpoints, upstream slots, heap room) | a TLS client |
+| consult slots | one policy consult (#437) | `consult_slots`, code only: required by a selected consulting policy, ≤ upstream slots | max(widest request, `head_buffer_bytes` + widest reply body) |
 
 Why pools have these shapes:
 
@@ -430,6 +431,11 @@ Why pools have these shapes:
   - So a tunnel is refused up front when its pool is full (§8).
   - It costs no extra fds or ring ops, because `tunnels ≤ conn_slots`
     and the socket pair it holds is already budgeted.
+- **A consult adds only its buffer.** A parked request consults on its
+  own stream's ops and a slot of the consulted cluster's upstream pool
+  (§13), so the ring and fd reservations already cover it: the stream
+  arms nothing else while it waits. A consult that finds no slot free
+  takes its type's declared failure.
 - **TLS engines are capped at 1024.** An engine is about ten times the
   size of a default head buffer, so one per conn slot at the ceiling
   would be gigabytes. A deployment past the cap sheds instead.
@@ -1800,8 +1806,31 @@ lists do not reach is refused at step zero (`ExtensionUnserved`).
     proceeding as if the policy had, `closed` answering `503`. Each
     counts `l7_policy_consult_failed`, a `503` also
     `l7_policy_consult_refused`. A type caches what it learned in its
-    own memory, deciding without a consult when it can. Until the
-    consult engine lands every consult takes the declared failure;
+    own memory, deciding without a consult when it can;
+  - a consult parks its request (#437). The run stops at the policy
+    that asked, and the stream, in `.consulting`, runs the consult on
+    its own ops — dial, send, recv, the dial's cancel — over a fresh
+    upstream slot of the consulted cluster, picked by its own policy
+    and health mask. Its request goes out of a consult slot's buffer
+    and its reply comes back into it: a head within `head_buffer_bytes`,
+    a body within the type's bound, framed by its length or by the
+    origin's close — a chunked body is not read, and the reply carries
+    its head alone, `body_truncated`. The connection closes once
+    answered: reuse would need §7's stale-connection replay. Its
+    timeout narrows the request's deadline, never past it. Then the
+    request resumes where its policies stopped, its head parsed again
+    from the bytes that held it, `consulted` deciding at that position.
+    Each policy consults at most once: a `consulted` that asks again
+    takes the failure. A consult that cannot be made — a request past
+    its bound (`l7_policy_consult_oversize`), no consult slot
+    (`_slots_exhausted`), the pick or the pool shedding (`_shed`) — or
+    is not answered in time (`_timed_out`) fails; a request whose own
+    deadline runs out under its consult is answered `504`,
+    `l7_policy_consult_expired`, whatever the type declared. A teardown
+    forces a consult's leg as it forces an exchange's, its slots going
+    back with the stream. A consulted cluster's completing picker (#423)
+    hears how its pick went — the reply's status, a failure, a timeout,
+    or `aborted` — before the request's own pick is made;
   - the tag (#433) is one `u64` per request, zero until a policy sets
     it. The later write wins, and a tag set before a later reject
     stays. Every later view of the request carries it: the next

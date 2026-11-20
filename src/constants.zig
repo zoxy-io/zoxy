@@ -2088,6 +2088,10 @@ pub const PoolSizes = struct {
     /// on this config's worst listener. Zero in a build whose policies
     /// edit nothing.
     policy_edit_bytes: u64,
+    /// A build's consult slots (#437): each one buffer for a consult's
+    /// request and its reply. Zero in a build whose policies consult
+    /// nothing, and in a config that reserves no slots.
+    consult_bytes: u64,
     /// The §5 head-buffer ring: how many buffers the deployment registered
     /// (`limits.head_buffers`; zero on an L4-only config) and the unit
     /// size of each. The total term is `count × (unit + 1)` — the slab
@@ -2256,7 +2260,7 @@ pub fn memoryBytesTotal(sizes: *const PoolSizes) u64 {
         @as(u64, sizes.relay_buffers) * sizes.relay_buffer_pair_bytes +
         @as(u64, sizes.upstream_slots) * sizes.upstream_bytes +
         sizes.access_log_bytes + sizes.log_header_bytes +
-        sizes.endpoint_table_bytes + sizes.metrics_bytes + sizes.answer_bytes + sizes.policy_edit_bytes +
+        sizes.endpoint_table_bytes + sizes.metrics_bytes + sizes.answer_bytes + sizes.policy_edit_bytes + sizes.consult_bytes +
         @as(u64, sizes.tunnels) * sizes.tunnel_buffer_pair_bytes +
         @as(u64, sizes.head_buffers) * (sizes.head_buffer_bytes + 1) +
         bufferGroupDescriptorBytes(sizes.head_buffers) +
@@ -2339,6 +2343,7 @@ test "budgets: HTTP/2 is priced by its own terms, and its shared streams by thei
         .metrics_bytes = metrics,
         .answer_bytes = 0,
         .policy_edit_bytes = 0,
+        .consult_bytes = 0,
         .head_buffers = 0,
         .head_buffer_bytes = head_buffer_bytes_default,
         .upstream_head_buffers = 0,
@@ -2425,6 +2430,7 @@ test "budgets: memory total matches the closed form" {
         .metrics_bytes = metrics,
         .answer_bytes = 0,
         .policy_edit_bytes = 0,
+        .consult_bytes = 0,
         .head_buffers = conn_slots_max,
         .head_buffer_bytes = head_buffer_bytes_default,
         .upstream_head_buffers = upstream_slots_max,
@@ -2450,6 +2456,7 @@ test "budgets: memory total matches the closed form" {
         .metrics_bytes = metrics,
         .answer_bytes = 0,
         .policy_edit_bytes = 0,
+        .consult_bytes = 0,
         // The L4-only shape: no ring, no upstream head pool, no scratch
         // terms — but the prober's buffer is unconditional.
         .head_buffers = 0,
@@ -2480,6 +2487,7 @@ test "budgets: memory total matches the closed form" {
         .metrics_bytes = metrics,
         .answer_bytes = 0,
         .policy_edit_bytes = 0,
+        .consult_bytes = 0,
         .head_buffers = 0,
         .head_buffer_bytes = head_buffer_bytes_default,
         .upstream_head_buffers = 0,
@@ -2520,6 +2528,7 @@ test "budgets: memory total matches the closed form" {
         .metrics_bytes = metrics,
         .answer_bytes = 0,
         .policy_edit_bytes = 0,
+        .consult_bytes = 0,
         .head_buffers = 0,
         .head_buffer_bytes = head_buffer_bytes_default,
         .upstream_head_buffers = 0,

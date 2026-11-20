@@ -1053,17 +1053,26 @@ fn proxyProtocolOf(
         error.ListenerProxyProtocolModeUnknown;
 }
 
+/// The limits a config states only in code: the consult slots (#437),
+/// which only a build's own policies can use.
+const code_only_limits = [_][]const u8{"consult_slots"};
+
 /// The JSON front-end's limits (#417): the same nullable members, copied
 /// across. Absence already means "zoxy's rule" on both sides, so there is
 /// no stock value to apply here — the rule lives in the resolvers below,
 /// where options written in code meet it too.
 fn limitsOf(limits_json: *const LimitsJson) Options.Limits {
-    // One vocabulary in two places. The count pins the two name sets
-    // equal (the loop below fails to compile on a JSON member the options
-    // lack, and the count catches the reverse), and the type check keeps
-    // a member from quietly widening on one side only.
-    comptime assert(@typeInfo(LimitsJson).@"struct".field_names.len ==
+    // One vocabulary in two places, but for the members only code can
+    // state. The count pins the name sets equal less those (the loop
+    // below fails to compile on a JSON member the options lack, and the
+    // count catches the reverse), and the type check keeps a member from
+    // quietly widening on one side only.
+    comptime assert(@typeInfo(LimitsJson).@"struct".field_names.len + code_only_limits.len ==
         @typeInfo(Options.Limits).@"struct".field_names.len);
+    inline for (code_only_limits) |name| {
+        comptime assert(@hasField(Options.Limits, name));
+        comptime assert(!@hasField(LimitsJson, name));
+    }
     var limits: Options.Limits = .{};
     inline for (@typeInfo(LimitsJson).@"struct".field_names) |name| {
         comptime assert(@FieldType(LimitsJson, name) == @FieldType(Options.Limits, name));

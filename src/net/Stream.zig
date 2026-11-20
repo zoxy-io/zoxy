@@ -568,6 +568,11 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
             /// Accumulating the request head and retrying the parse,
             /// resuming the search where the last read left off.
             reading_head,
+            /// Parked on a policy's consult (#437): the head parsed, its
+            /// policies stopped at the one that asked, and the consult
+            /// running on this stream's own upstream leg until its reply
+            /// or its failure resumes them.
+            consulting,
             /// Awaiting the upstream connect.
             dialing,
             /// Running the two legs — request out, response back — each
@@ -680,6 +685,8 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
             /// that sends to a cluster — set at routing, so its line names
             /// no cluster whatever ends it.
             handler_route: ?u16 = null,
+            /// The policy consult this request parks on (#437).
+            consult: Consult = .{},
             /// The body it reads before its handler runs: the length its
             /// head declared, whole in the head buffer beside it.
             handler_body_len: u32 = 0,
@@ -785,6 +792,59 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
                 sending_body_excess,
                 pumping_body,
                 done,
+            };
+
+            /// A policy's consult (#437): the consult slot whose buffer
+            /// holds its request and then its reply, where the policy run
+            /// stopped, and how far its legs have got.
+            pub const Consult = struct {
+                slot: u16 = slot_none,
+                /// The policy that consulted, by its position in the
+                /// listener's list or, at the route phase, its route's.
+                position: u16 = 0,
+                route_phase: bool = false,
+                /// The route a listener policy before it chose (#430).
+                chosen_route: ?u16 = null,
+                request_len: u32 = 0,
+                request_sent: u32 = 0,
+                /// Whether the request asks `HEAD`, whose reply carries no
+                /// body whatever its head frames.
+                head_request: bool = false,
+                /// How much of the buffer the reply may fill — its head
+                /// within the head buffer's size, its body within the
+                /// type's bound — and how much it has.
+                reply_bytes_max: u32 = 0,
+                reply_len: u32 = 0,
+                /// The reply's status, once its head parsed.
+                status: u16 = 0,
+                /// The type's `consult_reply_bytes_max`.
+                body_bytes_max: u32 = 0,
+                /// Where the reply's body starts, zero until its head
+                /// parsed (no head is empty), and how long the body is to
+                /// be — unknown until the origin's close when it frames
+                /// the body by that close.
+                body_start: u32 = 0,
+                body_len: u32 = 0,
+                body_until_close: bool = false,
+                body_truncated: bool = false,
+                outcome: Outcome = .none,
+
+                pub const slot_none: u16 = std.math.maxInt(u16);
+
+                pub const Outcome = enum(u8) {
+                    /// Still running.
+                    none,
+                    /// Its reply is whole, for `consulted` to read.
+                    replied,
+                    /// Not made or not answered: the type's declared
+                    /// failure decides.
+                    failed,
+                    /// Its own `consult_timeout_ms` ran out: a failure.
+                    timed_out,
+                    /// The request's own deadline ran out under it: the
+                    /// request is answered as out of time.
+                    request_expired,
+                };
             };
 
             /// The deferred verdicts: the §8 request-deadline 504 and the
