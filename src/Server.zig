@@ -5286,6 +5286,10 @@ pub fn Server(comptime runtime: Runtime) type {
             assert(extension.consultable(&server.config.clusters[consult.cluster_index]));
             assert(consult.request.len >= 1);
             const declared = declaredConsult(selection);
+            // The tag the run has set so far is the request's (#433): the
+            // consult's pick reads it, and its completion carries it, before
+            // the run's caller would have written it back.
+            stream.log.tag = request.tag;
             if (ConsultEngine.begin(server, stream, consult, declared.bounds, request, park)) return .parked;
             return server.consultFailed(declared.failure);
         }
