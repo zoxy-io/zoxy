@@ -403,58 +403,22 @@ const uncovered = [_]Uncovered{
             "header zoxy writes itself, and splits one with CRLF",
     },
     .{
-        .name = "l7_policy_consult_started",
-        .why = .unreached,
-        .reason = "the harness selects no consulting policy yet (#437); " ++
-            "src/http_proxy_test.zig makes consults that are answered, refused and timed out",
-    },
-    .{
-        .name = "l7_policy_consult_replied",
-        .why = .unreached,
-        .reason = "the harness selects no consulting policy yet (#437); " ++
-            "src/http_proxy_test.zig hands replies of 200 and 401 to `consulted`",
-    },
-    .{
-        .name = "l7_policy_consult_failed",
-        .why = .unreached,
-        .reason = "the harness selects no consulting policy yet (#437); " ++
-            "src/http_proxy_test.zig takes both declared failures",
-    },
-    .{
         .name = "l7_policy_consult_refused",
         .why = .unreached,
-        .reason = "the harness selects no consulting policy yet (#437); " ++
-            "src/http_proxy_test.zig fails one closed",
+        .reason = "the harness's consulting policy fails open, so no consult " ++
+            "of the sweep's refuses (#437); src/http_proxy_test.zig fails one closed",
     },
     .{
         .name = "l7_policy_consult_oversize",
         .why = .unreached,
-        .reason = "the harness selects no consulting policy yet (#437); " ++
-            "src/http_proxy_test.zig sends a question past its type's bound",
+        .reason = "the harness's consulting policy asks one fixed question, " ++
+            "within its bound (#437); src/http_proxy_test.zig sends one past it",
     },
     .{
         .name = "l7_policy_consult_slots_exhausted",
         .why = .unreached,
-        .reason = "the harness selects no consulting policy yet (#437); " ++
-            "src/http_proxy_test.zig has a second consult find the one slot held",
-    },
-    .{
-        .name = "l7_policy_consult_shed",
-        .why = .unreached,
-        .reason = "the harness selects no consulting policy yet (#437); " ++
-            "no directed test yet: the harness's slice brings a capped consulted cluster",
-    },
-    .{
-        .name = "l7_policy_consult_timed_out",
-        .why = .unreached,
-        .reason = "the harness selects no consulting policy yet (#437); " ++
-            "src/http_proxy_test.zig consults a mute origin",
-    },
-    .{
-        .name = "l7_policy_consult_expired",
-        .why = .unreached,
-        .reason = "the harness selects no consulting policy yet (#437); " ++
-            "src/http_proxy_test.zig runs the request's deadline out under a consult",
+        .reason = "the sweep's consults never hold every consult slot at once " ++
+            "(#437); src/http_proxy_test.zig has a second consult find the one slot held",
     },
     .{
         .name = "endpoints_parked_closed",
@@ -489,20 +453,6 @@ const uncovered = [_]Uncovered{
             "the listener's table carries, resolved at bind, so every " ++
             "choice names a route the table has; src/http_proxy_test.zig chooses one the " ++
             "listener lacks, and one at the route phase",
-    },
-    .{
-        .name = "l7_shed_upstream_slots",
-        .why = .unreached,
-        .reason = "the only seeds that starve a pool set relay_buffers and " ++
-            "upstream_slots both to 1, and the L7 path takes the relay " ++
-            "buffer first, so the relay rung answers every request that " ++
-            "would have reached this one. That shadow needs the starved " ++
-            "seeds to stay single-endpoint, which is why the #181 retry " ++
-            "draw suppresses its second endpoint on them: one slot parked " ++
-            "on endpoint 0 cannot serve a request picking endpoint 1, and " ++
-            "the resulting shed is legal but reaches this rung (seed 4316 " ++
-            "of 4097..20480, before `deriveRetries` accounted for it); " ++
-            "src/http_proxy_test.zig exhausts the upstream pool directly",
     },
     .{
         .name = "shed_h2_sessions",

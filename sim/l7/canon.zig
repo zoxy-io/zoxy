@@ -119,6 +119,10 @@ pub const redirect_location = "https://sim/redirect";
 /// the `policy_reject` script asks for.
 pub const policy_prefix = "/policy";
 
+/// The path prefix the harness's consulting listener policy (#437) asks
+/// the http cluster about, which only the `consult_get` script asks for.
+pub const consult_prefix = "/consult";
+
 /// The prefix of the http chain's guarded route (#417), and the one path
 /// under it the route-phase policy refuses: `route_policy_reject` asks for
 /// exactly that, and no other script reaches the route at all.

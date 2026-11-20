@@ -125,6 +125,12 @@ pub const Script = enum(u8) {
     /// upstream slot. The golden outcome is that 403, and the origin must
     /// never see the request.
     route_policy_reject,
+    /// A GET under `/consult`: the listener's consulting policy (#437)
+    /// asks the http cluster before it decides, parking the request on
+    /// its own leg; answered `200` it hands the request on to that same
+    /// cluster. It fails open, so a consult the adversary breaks lets the
+    /// request on as well: every outcome is `get`'s.
+    consult_get,
     /// A GET under `/redirect`: a §7 filter answers 301 with a Location
     /// composed from the request's own host and path (#176), before any
     /// resource is acquired or origin dialed — `filter_reject`'s shape
@@ -707,6 +713,17 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .method = .get,
         .allowed_statuses = &.{ 403, 408, 503 },
     },
+    .consult_get = .{
+        // `get`'s outcomes, reached through a consult: answered, refused
+        // by its failing open, or timed out under the request's deadline.
+        .request = "GET " ++ canon.consult_prefix ++ " HTTP/1.1\r\nHost: sim\r\n\r\n",
+        .expected_responses = 1,
+        .transcript_cap = 1,
+        .golden_status = 200,
+        .method = .get,
+        .allowed_statuses = statuses_routed,
+        .routed_canonical = true,
+    },
     .filter_redirect = .{
         // `filter_reject`'s timing exactly — answered before any
         // post-parse resource — so the same one preemption applies: the
@@ -926,6 +943,7 @@ pub const terminating_scripts = [_]Script{
     .filter_reject,
     .policy_reject,
     .route_policy_reject,
+    .consult_get,
     .filter_redirect,
     .filter_respond,
     .handler_get,

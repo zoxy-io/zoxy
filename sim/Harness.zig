@@ -29,7 +29,7 @@ const runtime: zoxy.Runtime = .{
     .Io = SimIo,
     .extensions = .{
         .pickers = &.{zoxy.testing.ScriptedPicker},
-        .request_policies = &.{zoxy.testing.ScriptedPolicy},
+        .request_policies = &.{ zoxy.testing.ScriptedPolicy, zoxy.testing.ScriptedConsultOpenPolicy },
         .response_policies = &.{zoxy.testing.ScriptedResponsePolicy},
         .connection_policies = &.{zoxy.testing.ScriptedConnectionPolicy},
         .probes = &.{zoxy.testing.ScriptedProbe},
@@ -191,6 +191,9 @@ comptime {
     assert(clean_pool_capacity <= zoxy.constants.conn_slots_max);
     assert(clean_pool_capacity <= zoxy.constants.relay_buffers_max);
     assert(clean_pool_capacity <= zoxy.constants.upstream_slots_max);
+    // A clean seed's consult slots (#437), one per client, within the
+    // upstream slots each consult holds one of.
+    assert(clients_max + tls_clients_max <= clean_pool_capacity);
 }
 
 io: SimIo,
@@ -429,7 +432,11 @@ picker_http: bool,
 /// request — so every L7 exchange of the sweep passes through it. It
 /// tags each one `policy_tag` (#433).
 policy_listener: zoxy.testing.ScriptedPolicy,
-policy_selections: [1]zoxy.extension.Selection,
+/// #437's consulting policy, after it on both http listeners: it asks the
+/// http cluster about the requests `consult_get` sends, and fails open,
+/// so the adversary's breakage leaves those requests `get`'s outcomes.
+policy_consult: zoxy.testing.ScriptedConsultOpenPolicy,
+policy_selections: [2]zoxy.extension.Selection,
 /// #434's handler, on a route of both http chains: it answers what it
 /// is routed, and never flips its flag, so every answer is predictable.
 handler: zoxy.testing.ScriptedHandler,
@@ -538,8 +545,10 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
         // through every render — the first try, a retry and a replay.
         .edits = &.{.{ .add = .{ .name = "X-Scripted-Policy", .value = "listener" } }},
     };
+    harness.policy_consult = .{ .cluster_name = http_cluster_name, .consult_prefix = l7.canon.consult_prefix };
     harness.policy_selections = .{
         zoxy.extension.select(runtime.extensions.request_policies, &harness.policy_listener),
+        zoxy.extension.select(runtime.extensions.request_policies, &harness.policy_consult),
     };
     // The route's policy answers with its own 403 page (#431), where the
     // listener's rejects from the static set: one arm per phase.
@@ -966,7 +975,9 @@ fn randomPick(random: std.Random) zoxy.Options.Cluster.Pick {
 /// parked on endpoint 0 while a request picks endpoint 1, which cannot
 /// reuse it and must dial — a correct shed, and one no single-endpoint
 /// cluster can produce, because there the parked connection is always the
-/// one wanted. Found on seed 4316 of a 16384-seed sweep. The behavior
+/// one wanted. Found on seed 4316 of a 16384-seed sweep. A consult (#437)
+/// reaches that rung by a road of its own: it holds the one slot with no
+/// relay buffer, so a request beside it passes the relay rung. The behavior
 /// itself is covered directly by `src/http_proxy_test.zig`, which
 /// exhausts the upstream pool on purpose; what does not belong here is a
 /// pool-sizing scenario arriving as a side effect of a retry draw.
@@ -2066,6 +2077,9 @@ fn deriveInitOptions(harness: *const Harness, random: std.Random) ServerSim.Init
             .conn_slots = harness.head_buffers + random.uintLessThan(u32, 2),
             .relay_buffers = 1,
             .upstream_slots = 1,
+            // #437: no more than the one upstream slot every consult holds,
+            // which is also what lets a consult meet that slot's wall.
+            .consult_slots = 1,
             .head_buffers = harness.head_buffers,
             // Clamped, because a starved seed's slot count is drawn from
             // the ring and can sit below the pool the upgrade draw asked
@@ -2109,6 +2123,9 @@ fn deriveInitOptions(harness: *const Harness, random: std.Random) ServerSim.Init
             .conn_slots = if (harness.clean) clean_pool_capacity else 2 * clients_max,
             .relay_buffers = if (harness.clean) clean_pool_capacity else clients_max,
             .upstream_slots = if (harness.clean) clean_pool_capacity else 2 * clients_max,
+            // #437: every client's consult on a clean seed, and fewer than
+            // the population on an adversarial one, which meets the wall.
+            .consult_slots = if (harness.clean) clients_max + tls_clients_max else 2,
             .head_buffers = harness.head_buffers,
             .upstream_head_buffers = if (harness.clean)
                 clean_pool_capacity
@@ -3564,6 +3581,10 @@ fn l7OutcomeTotal(counters: *const zoxy.counters.Counters) u64 {
         "l7_no_route",
         "l7_filtered",
         "l7_policy_rejected",
+        // A consult that failed a type closed, and a request whose own
+        // deadline ran out under its consult (#437): both answered.
+        "l7_policy_consult_refused",
+        "l7_policy_consult_expired",
         "l7_redirected",
         "l7_responded",
         // A build's handler answered (#434), or its route refused the

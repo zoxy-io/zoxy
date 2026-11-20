@@ -221,12 +221,15 @@ pub fn Engine(comptime runtime: extension.Runtime) type {
                 .extension => unreachable,
             };
             server.witnessPick(cluster_index, &pick);
+            server.notePick(stream, cluster_index, pick.endpoint_index, false);
             const upstream = server.acquireUpstream(cluster_index, pick.endpoint_index) orelse {
+                // Picked, and nothing left to dial with: the origin never
+                // heard of it.
+                server.completePick(stream, .shed);
                 server.counters.increment("l7_policy_consult_shed");
                 return null;
             };
             assert(upstream.endpoint_index == pick.endpoint_index);
-            server.notePick(stream, cluster_index, pick.endpoint_index, false);
             return .{ .upstream = upstream, .address = pick.address };
         }
 

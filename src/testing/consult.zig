@@ -1,7 +1,8 @@
 //! A consulting policy for the gates (#437): it asks a named cluster
-//! about every request, and once answered proceeds on a `200` and refuses
-//! anything else. Generic over its declared failure, so the gates hold
-//! both. Exported so the simulator, outside this module, can select one.
+//! about every request under its prefix, and once answered proceeds on a
+//! `200` and refuses anything else. Generic over its declared failure, so
+//! the gates hold both. Exported so the simulator, outside this module,
+//! can select one.
 
 const std = @import("std");
 
@@ -18,6 +19,9 @@ pub fn ScriptedConsult(comptime failure: extension.ConsultFailure) type {
         cluster_index: ?u16 = null,
         /// The request it sends; a gate may make it too long.
         question: []const u8 = default_question,
+        /// The paths it consults about, by prefix; empty is every one.
+        /// Any other request it hands on untouched.
+        consult_prefix: []const u8 = "",
         /// Consults it asked for, and replies it heard.
         consults: u32 = 0,
         replies: u32 = 0,
@@ -48,6 +52,7 @@ pub fn ScriptedConsult(comptime failure: extension.ConsultFailure) type {
         pub fn evaluate(policy: *Self, request: *const extension.Request) extension.Verdict {
             assert(request.path.len >= 1);
             assert(policy.question.len >= 1);
+            if (!std.mem.startsWith(u8, request.path, policy.consult_prefix)) return .proceed;
             policy.consults += 1;
             return .{ .consult = .{ .cluster_index = policy.cluster_index.?, .request = policy.question } };
         }
