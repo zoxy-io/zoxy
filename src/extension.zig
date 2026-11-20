@@ -122,6 +122,12 @@ pub const Request = struct {
     listener_index: u16,
     /// The cluster the route chose, or null before routing has run.
     cluster_index: ?u16,
+    /// What an earlier phase worked out about this request (#433): the
+    /// tag the last policy to set one left, or zero while none has. A
+    /// policy sets it with `proceed_with`. Every later view of the same
+    /// request carries it: the next policy's, the route phase's, a
+    /// picker's on the first try and on a retry.
+    tag: u64,
 };
 
 /// The picker contract (§7). A picker type declares
@@ -285,9 +291,23 @@ pub const Verdict = union(enum) {
     /// Hand the request on: to the filters and the route table at the
     /// listener phase, to the dial at the route phase.
     proceed,
+    /// Hand the request on as `proceed` does, with what the policy adds
+    /// to it (#433).
+    proceed_with: Proceed,
     /// Answer with this status from server memory, before any resource
     /// is taken or origin dialed — the filter reject's answer (§8).
     reject: RejectStatus,
+};
+
+/// What a policy adds to a request it hands on.
+pub const Proceed = struct {
+    /// The request's tag from here on (#433), or null to leave the one
+    /// it arrived with. The later write wins: a route's policy may
+    /// overwrite what a listener's set, and reads the current tag in
+    /// `Request.tag` if it would rather keep it. A tag set before a
+    /// later policy rejects stays the request's. Zero clears it: zero is
+    /// no tag, as before any was set.
+    tag: ?u64 = null,
 };
 
 /// The statuses a policy may refuse with: the static reject set a filter

@@ -10093,3 +10093,107 @@ test "h2: a route policy's reject takes no relay buffer or upstream slot (#417)"
         try bed.expectDrained();
     }
 }
+
+test "l7: a policy's tag reaches every later view, the later write wins, and a retry keeps it (#433)" {
+    // The listener's first policy tags the request and its second reads
+    // the tag; the route's policy reads it and overwrites it; the picker
+    // reads the overwrite on the first try and again on the retry, which
+    // evaluates no policy at all.
+    var tagger: ScriptedPolicy = .{ .tag = 7 };
+    var reader: ScriptedPolicy = .{};
+    var retagger: ScriptedPolicy = .{ .tag = 9 };
+    var picker: ScriptedPicker = .{ .choice = .first, .expect_tag = 9 };
+    const on_listener = [_]extension.Selection{
+        extension.select(runtime.extensions.request_policies, &tagger),
+        extension.select(runtime.extensions.request_policies, &reader),
+    };
+    const on_route = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &retagger)};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 4330,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .refusing_endpoint_first = true,
+        .retries = 1,
+        .pick = .{ .extension = extension.select(runtime.extensions.pickers, &picker) },
+        .route_prefix = "/api",
+        .request_policies = &on_listener,
+        .route_request_policies = &on_route,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /api/reports HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 200 "));
+    try std.testing.expectEqual(@as(u64, 0), tagger.seen_tag);
+    try std.testing.expectEqual(@as(u64, 7), reader.seen_tag);
+    try std.testing.expectEqual(@as(u64, 7), retagger.seen_tag);
+    try std.testing.expectEqual(@as(u32, 1), retagger.evaluated);
+    // Both picks saw 9 (`expect_tag`); the second was the retry's.
+    try std.testing.expectEqual(@as(u32, 2), picker.calls);
+    try std.testing.expect(picker.retry);
+    try std.testing.expectEqual(@as(u64, 9), picker.tag);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_retried"));
+    try bed.expectDrained();
+}
+
+test "l7: the next request on a kept-alive connection arrives untagged (#433)" {
+    // The reader runs ahead of the tagger, so it sees each request as it
+    // arrived: zero both times, though the first left tagged.
+    var reader: ScriptedPolicy = .{ .expect_tag = 0 };
+    var tagger: ScriptedPolicy = .{ .tag = 7 };
+    var after: ScriptedPolicy = .{ .expect_tag = 7 };
+    const on_listener = [_]extension.Selection{
+        extension.select(runtime.extensions.request_policies, &reader),
+        extension.select(runtime.extensions.request_policies, &tagger),
+    };
+    const on_route = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &after)};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 4331,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .request_policies = &on_listener,
+        .route_request_policies = &on_route,
+    });
+    defer bed.tearDown();
+
+    bed.client.second_request = "GET /two HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+    try bed.exchange("GET /one HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqual(@as(u32, 2), reader.evaluated);
+    try std.testing.expectEqual(@as(u32, 2), after.evaluated);
+    try std.testing.expectEqual(@as(u64, 7), after.seen_tag);
+    try std.testing.expectEqual(@as(u32, 2), bed.origin.requests_served);
+    try bed.expectDrained();
+}
+
+test "h2: each stream's request carries its own tag (#433)" {
+    var reader: ScriptedPolicy = .{ .expect_tag = 0 };
+    var tagger: ScriptedPolicy = .{ .tag = 7 };
+    var picker: ScriptedPicker = .{ .choice = .first, .expect_tag = 7 };
+    const on_listener = [_]extension.Selection{
+        extension.select(runtime.extensions.request_policies, &reader),
+        extension.select(runtime.extensions.request_policies, &tagger),
+    };
+    var options = h2BedOptions(4332);
+    options.request_policies = &on_listener;
+    options.pick = .{ .extension = extension.select(runtime.extensions.pickers, &picker) };
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    var wire: H2Wire = .{};
+    wire.preface(&.{});
+    wire.get(1, "GET", "/one");
+    wire.get(3, "GET", "/two");
+    try bed.exchange(wire.written());
+
+    var storage: [4]H2Answer = undefined;
+    const answers = try h2Answers(bed.client.response(), &storage);
+    try std.testing.expectEqual(@as(usize, 2), answers.len);
+    try std.testing.expectEqual(@as(u16, 200), (try h2AnswerFor(answers, 1)).status);
+    try std.testing.expectEqual(@as(u16, 200), (try h2AnswerFor(answers, 3)).status);
+    try std.testing.expectEqual(@as(u32, 2), reader.evaluated);
+    try std.testing.expectEqual(@as(u32, 2), picker.calls);
+    try std.testing.expectEqual(@as(u64, 7), picker.tag);
+    try bed.expectDrained();
+}

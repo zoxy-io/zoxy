@@ -262,6 +262,13 @@ pub const LogState = struct {
     endpoint_index: u16 = endpoint_none,
     /// The status this request was answered with; 0 until one is decided.
     status: u16 = 0,
+    /// The request's extension tag (#433): what the last request policy
+    /// to set one left, read by every later view of the request. Zero is
+    /// no tag. Here rather than in `l7`
+    /// because its life is the request's, as this struct's is: a keep-
+    /// alive turnaround clears it, and the §7 replay — which rebuilds
+    /// `l7` and evaluates no policy again — leaves it be.
+    tag: u64 = 0,
     outcome: access_log.Outcome = .aborted,
     /// Set once this request's line has been written, so the teardown
     /// fallback cannot emit a second one for an exchange that already
@@ -299,6 +306,7 @@ pub const LogState = struct {
         state.bytes_out = 0;
         state.endpoint_index = endpoint_none;
         state.status = 0;
+        state.tag = 0;
         state.outcome = .aborted;
         state.emitted = false;
         state.method_len = 0;

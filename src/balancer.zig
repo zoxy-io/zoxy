@@ -2228,6 +2228,7 @@ fn testRequest(headers: []const parser.Header) extension.Request {
         .client_cert_sha256 = null,
         .listener_index = 0,
         .cluster_index = 0,
+        .tag = 0,
     };
 }
 

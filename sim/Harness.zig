@@ -405,12 +405,20 @@ picker_http: bool,
 /// #417's listener policy, on every seed and on every listener that runs
 /// the http filter chain: it refuses `l7.canon.policy_prefix`, which only
 /// the `policy_reject` script asks for, and proceeds with every other
-/// request — so every L7 exchange of the sweep passes through it.
+/// request — so every L7 exchange of the sweep passes through it. It
+/// tags each one `policy_tag` (#433).
 policy_listener: zoxy.testing.ScriptedPolicy,
 policy_selections: [1]zoxy.extension.Selection,
 /// #417's route-phase policy, on the guarded route of both http chains.
+/// It holds every request it sees to carrying the listener's tag.
 policy_route: zoxy.testing.ScriptedPolicy,
 route_policy_selections: [1]zoxy.extension.Selection,
+
+/// The tag the listener policy sets (#433), and which the route policy
+/// and the http cluster's picker require: every L7 exchange of the sweep
+/// passes the listener's policy first, so every later view must carry it
+/// — across a retry and a replay too, which evaluate no policy again.
+const policy_tag: u64 = 0x0433_7a6f_7879_0433;
 
 fn bindAddress() std.Io.net.IpAddress {
     return std.Io.net.IpAddress.parseLiteral("127.0.0.1:8080") catch unreachable;
@@ -459,11 +467,11 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
     harness.scenario_prng = std.Random.DefaultPrng.init(seed ^ 0x5a5a5a5a5a5a5a5a);
     const random = harness.scenario_prng.random();
     harness.drawPickers(seed);
-    harness.policy_listener = .{ .reject_prefix = l7.canon.policy_prefix };
+    harness.policy_listener = .{ .reject_prefix = l7.canon.policy_prefix, .tag = policy_tag };
     harness.policy_selections = .{
         zoxy.extension.select(runtime.extensions.request_policies, &harness.policy_listener),
     };
-    harness.policy_route = .{ .reject_prefix = l7.canon.route_policy_path };
+    harness.policy_route = .{ .reject_prefix = l7.canon.route_policy_path, .expect_tag = policy_tag };
     harness.route_policy_selections = .{
         zoxy.extension.select(runtime.extensions.request_policies, &harness.policy_route),
     };
@@ -747,6 +755,9 @@ fn drawPickers(harness: *Harness, seed: u64) void {
     var picker_prng = std.Random.DefaultPrng.init(seed ^ 0x0417_0417_0417_0417);
     const random = picker_prng.random();
     harness.pickers = @splat(.{ .choice = .by_entropy });
+    // The http cluster's picks all carry a request the listener's policy
+    // tagged; an l4 pick carries none, so its picker requires nothing.
+    harness.pickers[1].expect_tag = policy_tag;
     harness.picker_l4 = random.uintLessThan(u8, 4) == 0;
     harness.picker_http = random.uintLessThan(u8, 4) == 0;
     assert(harness.pickers[0].calls == 0);
