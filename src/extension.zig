@@ -265,6 +265,9 @@ pub const PickInput = struct {
     /// The request on the L7 path; null for an L4 connection, which
     /// has none.
     request: ?*const Request,
+    /// The tag of what is picked for (#433, #425): the request's on the
+    /// L7 path, the connection's on L4; 0 for none.
+    tag: u64,
     /// Whether this pick replaces a dial that failed (#181). The
     /// endpoints it tried are already out of `Candidates`.
     retry: bool,
@@ -542,6 +545,8 @@ pub const Connection = struct {
     listener_index: u16,
     /// The loop clock (#429).
     now_ns: u64,
+    /// The connection's tag so far: an earlier policy's, or 0 for none.
+    tag: u64 = 0,
     /// At an SNI route's phase: the route's index in its listener's SNI
     /// table, the cluster it sends to, and the canonical name the hello
     /// asked for — null when it asked for none. All null at the
@@ -556,11 +561,22 @@ pub const Connection = struct {
 /// `conn_policy_rejected`; the policy chooses how it closes.
 pub const ConnectionVerdict = union(enum) {
     proceed,
+    /// Proceed, and tag the connection: an l4 connection's access-log line
+    /// and its pick carry the tag, and on an http listener every request
+    /// on the connection starts with it, for its own policies to keep or
+    /// replace (#433). A later policy's tag replaces an earlier one's.
+    proceed_with: ConnectionProceed,
     /// An orderly close: the client reads a FIN.
     reject,
     /// An abortive close (SO_LINGER 0): the client reads an RST, and this
     /// proxy keeps no TIME_WAIT for it. Also counts `conn_policy_reset`.
     reset,
+};
+
+/// What a connection policy proceeds with (#425).
+pub const ConnectionProceed = struct {
+    /// The connection's tag; null keeps the one it had.
+    tag: ?u64 = null,
 };
 
 /// How a request a policy let through ended (#429). A policy may declare

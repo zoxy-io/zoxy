@@ -4125,6 +4125,8 @@ pub fn Server(comptime runtime: Runtime) type {
                 // resolving keeps request-keyed clusters off l4 listeners
                 // (#178), so a `hash` here keys on the address alone.
                 null,
+                // #425: the connection's tag, its policies' or none.
+                conn.stream.log.tag,
             );
             const dial = switch (pick) {
                 .dial => |chosen| blk: {
@@ -4415,7 +4417,8 @@ pub fn Server(comptime runtime: Runtime) type {
             server.maybeStopAfterDrain();
         }
 
-        /// Start this log unit's clocks, if it has not started them (§8).
+        /// Start this log unit's clocks, if it has not started them (§8),
+        /// and its tag at its connection's (#425).
         /// The L7 path calls it when a request's first head byte lands —
         /// which is when the request begins, not when its head finishes
         /// parsing, so a slowloris's line reports the whole time it spent
@@ -4446,6 +4449,10 @@ pub fn Server(comptime runtime: Runtime) type {
         /// stopwatch, and §4's tick clock had been one all along.
         pub fn beginRequest(server: *Self, stream: *StreamType) void {
             if (stream.log.started_ns != 0) return;
+            // #425: a request starts with its connection's tag; an L4
+            // line, begun at admission, before any policy set one.
+            assert(stream.log.tag == 0);
+            stream.log.tag = stream.conn.tag;
             // #424: a request begins with no policy edits of its own.
             if (comptime PolicyEdits.enabled) server.policy_edits.reset(server.streamIndex(stream));
             stream.log.started_ns = server.io.nowNs();
@@ -4558,7 +4565,11 @@ pub fn Server(comptime runtime: Runtime) type {
             /// The request, on the L7 path of a cluster whose pick reads it
             /// — a build's picker, or `hash` on a header or a cookie.
             request: ?*const extension.Request,
+            /// The tag of what is picked for (#425): the request's, or on
+            /// L4 the connection's.
+            tag: u64,
         ) Balancer.Outcome {
+            if (request) |view| assert(view.tag == tag);
             const load = server.endpointLoad();
             const outcome = server.balancer.pick(cluster_index, &load, server.health.healthy, client, request, tried);
             const choice = switch (outcome) {
@@ -4571,6 +4582,7 @@ pub fn Server(comptime runtime: Runtime) type {
                 .cluster_index = cluster_index,
                 .client = client,
                 .request = request,
+                .tag = tag,
                 .retry = tried.len >= 1,
                 .panicked = choice.panicked,
                 .now_ns = load.now_ns,
@@ -4769,11 +4781,13 @@ pub fn Server(comptime runtime: Runtime) type {
             assert(conn.isLive());
             assert(conn.listener_index < server.config.listeners.len);
             const selections = server.config.listeners[conn.listener_index].connection_policies;
-            return server.admittedBy(conn, selections, &.{
+            var view: extension.Connection = .{
                 .client = if (conn.client_address) |*address| address else null,
                 .listener_index = conn.listener_index,
                 .now_ns = server.io.nowNs(),
-            });
+                .tag = conn.tag,
+            };
+            return server.admittedBy(conn, selections, &view);
         }
 
         /// The same, at an SNI route's phase (#425): once the hello named
@@ -4788,30 +4802,42 @@ pub fn Server(comptime runtime: Runtime) type {
             assert(conn.state == .l4_peeking_client_hello);
             assert(route_index < conn.sni_routes.len);
             const route = &conn.sni_routes[route_index];
-            return server.admittedBy(conn, route.connection_policies, &.{
+            var view: extension.Connection = .{
                 .client = if (conn.client_address) |*address| address else null,
                 .listener_index = conn.listener_index,
                 .now_ns = server.io.nowNs(),
+                .tag = conn.tag,
                 .route_index = route_index,
                 .cluster_index = route.cluster_index,
                 .server_name = server_name,
-            });
+            };
+            return server.admittedBy(conn, route.connection_policies, &view);
         }
 
         /// One site's connection policies over `view`, in order; the first
-        /// refusal refuses the connection and ends the run.
+        /// refusal refuses the connection and ends the run. A tag lands on
+        /// the connection and in the view the next policy reads.
         fn admittedBy(
             server: *Self,
             conn: *ConnType,
             selections: []const extension.Selection,
-            view: *const extension.Connection,
+            view: *extension.Connection,
         ) bool {
             assert(view.listener_index == conn.listener_index);
+            assert(view.tag == conn.tag);
             assert(view.now_ns >= 1);
             if (selections.len == 0) return true;
             for (selections) |selection| {
                 switch (callConnectionPolicy(selection, view)) {
                     .proceed => {},
+                    .proceed_with => |proceed| if (proceed.tag) |tag| {
+                        view.tag = tag;
+                        conn.tag = tag;
+                        // An L4 connection's line is its whole life, begun
+                        // at admission; an http one's lines begin later,
+                        // each from `conn.tag`.
+                        if (conn.protocol == .l4) conn.stream.log.tag = tag;
+                    },
                     .reject => {
                         server.refuseConnection(conn, .fin);
                         return false;

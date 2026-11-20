@@ -11,6 +11,11 @@ const assert = std.debug.assert;
 pub const ScriptedConnectionPolicy = struct {
     /// What it answers every connection `refuse_network` does not claim.
     verdict: extension.ConnectionVerdict = .proceed,
+    /// The tag it proceeds with (#425), through `proceed_with`, where
+    /// `verdict` proceeds; null proceeds bare.
+    tag: ?u64 = null,
+    /// The tag the last connection arrived with: an earlier phase's.
+    seen_tag: u64 = 0,
     /// An IPv4 /24 it refuses: an RST for an odd host octet, a FIN for an
     /// even one — so one instance reaches both closes. Null claims none.
     refuse_network: ?[3]u8 = null,
@@ -55,13 +60,17 @@ pub const ScriptedConnectionPolicy = struct {
         policy.seen_now_ns = connection.now_ns;
         policy.evaluated += 1;
         policy.last_listener = connection.listener_index;
+        policy.seen_tag = connection.tag;
         if (connection.route_index != null) policy.noteRouted(connection);
         if (connection.client) |client| {
             policy.addressed += 1;
             policy.last_client_port = client.getPort();
         }
         const verdict = policy.verdictFor(connection);
-        if (verdict != .proceed) policy.refused += 1;
+        switch (verdict) {
+            .proceed, .proceed_with => {},
+            .reject, .reset => policy.refused += 1,
+        }
         assert(policy.refused <= policy.evaluated);
         return verdict;
     }
@@ -86,11 +95,22 @@ pub const ScriptedConnectionPolicy = struct {
         policy: *const ScriptedConnectionPolicy,
         connection: *const extension.Connection,
     ) extension.ConnectionVerdict {
-        const network = policy.refuse_network orelse return policy.verdict;
-        const client = connection.client orelse return policy.verdict;
-        if (client.* != .ip4) return policy.verdict;
+        if (policy.refusedNetwork(connection)) |verdict| return verdict;
+        if (policy.verdict != .proceed) return policy.verdict;
+        const tag = policy.tag orelse return .proceed;
+        return .{ .proceed_with = .{ .tag = tag } };
+    }
+
+    /// The refusal `refuse_network` claims this connection for, if any.
+    fn refusedNetwork(
+        policy: *const ScriptedConnectionPolicy,
+        connection: *const extension.Connection,
+    ) ?extension.ConnectionVerdict {
+        const network = policy.refuse_network orelse return null;
+        const client = connection.client orelse return null;
+        if (client.* != .ip4) return null;
         const bytes = client.ip4.bytes;
-        if (!std.mem.eql(u8, bytes[0..3], &network)) return policy.verdict;
+        if (!std.mem.eql(u8, bytes[0..3], &network)) return null;
         return if (bytes[3] % 2 == 1) .reset else .reject;
     }
 };

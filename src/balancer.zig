@@ -569,6 +569,9 @@ pub const Balancer = struct {
             .cluster_index = cluster_index,
             .client = client_address,
             .request = request,
+            // The stock policies read no tag: a build's picker is the one
+            // that does, and `Server.pickEndpoint` hands it the real one.
+            .tag = 0,
             .retry = tried.len >= 1,
             .panicked = set.panicked,
             .now_ns = load.now_ns,

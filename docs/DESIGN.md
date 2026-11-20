@@ -1763,8 +1763,14 @@ lists do not reach is refused at step zero (`ExtensionUnserved`).
     refused connection logs `bytes_in: 0`. Its view adds the route's
     index in the SNI table, its cluster, and the canonical name the
     hello asked for; its `bind` site carries the same index;
-  - `proceed`, or a refusal that closes the connection without a byte
-    written: `reject` with a FIN, `reset` with an RST (SO_LINGER 0, and
+  - `proceed`; `proceed_with`, which may tag the connection (#433's
+    tag, a build's own number): an l4 connection's line, its pick and
+    the pick's completion carry it, and on an http listener every
+    request on the connection — every HTTP/2 stream — starts with it,
+    for request policies to keep or replace. A later policy's tag,
+    the route phase's included, replaces an earlier one's, and the view
+    holds the tag so far. Or a refusal that closes the connection
+    without a byte written: `reject` with a FIN, `reset` with an RST (SO_LINGER 0, and
     no FIN first). Either counts `conn_policy_rejected`, an RST
     `conn_policy_reset` too, and the connection's line is logged
     `rejected` — kind `l4`, or `http` with no request. The first
@@ -1846,7 +1852,7 @@ CI builds, tests and smokes it against a fetched package.
 **Not offered yet:**
 - live endpoint discovery, which needs preallocated slots and endpoint
   identities that survive in-flight work;
-- a connection's tag, completion and metrics (#425's later slices);
+- a connection's completion and metrics (#425's later slices);
 - regex in stock filters and routes, which waits until after v1.0.0.
 
 **Published, not frozen.** HTTP/3 would move the exchange's internal

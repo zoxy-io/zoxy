@@ -101,10 +101,11 @@ pub const ScriptedPicker = struct {
         picker.seen_now_ns = input.now_ns;
         picker.had_request = input.request != null;
         picker.path_len = 0;
-        picker.tag = 0;
+        // The request's tag on L7, the connection's on L4 (#425).
+        if (picker.expect_tag) |expected| assert(input.tag == expected);
+        picker.tag = input.tag;
         if (input.request) |request| {
-            if (picker.expect_tag) |expected| assert(request.tag == expected);
-            picker.tag = request.tag;
+            assert(request.tag == input.tag);
             const kept = @min(request.path.len, path_bytes_max);
             @memcpy(picker.path[0..kept], request.path[0..kept]);
             picker.path_len = @intCast(kept);

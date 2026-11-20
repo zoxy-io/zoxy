@@ -1411,6 +1411,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
                 clientAddressOf(stream),
                 stream.l7.tried[0..stream.l7.tried_count],
                 request,
+                stream.log.tag,
             );
             switch (outcome) {
                 .dial => |chosen| {
