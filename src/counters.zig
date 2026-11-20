@@ -1458,8 +1458,10 @@ pub const Labeled = struct {
             labeled.cluster_labels[cluster_index] = try clusterLabel(arena, cluster.name);
             for (cluster.endpoints, 0..) |*address, endpoint_index| {
                 const key = keys.key(@intCast(cluster_index), @intCast(endpoint_index));
-                labeled.endpoint_labels[key] =
-                    try endpointLabel(arena, cluster.name, address);
+                labeled.endpoint_labels[key] = if (cluster.slots == null)
+                    try endpointLabel(arena, cluster.name, address)
+                else
+                    try slotLabel(arena, cluster, endpoint_index);
             }
         }
         labeled.render_bytes_max = renderBytesMaxFor(config);
@@ -1534,6 +1536,23 @@ pub const Labeled = struct {
         return try arena.dupe(u8, renderClusterLabel(&scratch, name));
     }
 
+    /// A slot of a cluster that takes endpoints while serving (#428): room
+    /// for the widest label, reserved now, so an endpoint that arrives
+    /// later is labeled in place. A free slot's label is empty, which is
+    /// what keeps it out of every render.
+    fn slotLabel(
+        arena: std.mem.Allocator,
+        cluster: *const config_module.Config.Cluster,
+        endpoint_index: usize,
+    ) error{OutOfMemory}![]const u8 {
+        assert(cluster.slots != null);
+        const room = try arena.alloc(u8, label_scratch_bytes);
+        if (!cluster.occupiedAt(endpoint_index)) return room[0..0];
+        const rendered = renderEndpointLabel(room, cluster.name, &cluster.endpoints[endpoint_index]);
+        assert(rendered.ptr == room.ptr);
+        return rendered;
+    }
+
     fn endpointLabel(
         arena: std.mem.Allocator,
         name: []const u8,
@@ -1584,8 +1603,15 @@ pub const Labeled = struct {
         return writer.buffered();
     }
 
+    /// The per-endpoint tables `init` allocates — connects failed,
+    /// responses, no response, health down, health up — and the
+    /// per-cluster ones: the two inflight sheds, the four pick families,
+    /// and the two total-cap sheds.
+    const endpoint_tables: u64 = 5;
+    const cluster_tables: u64 = 8;
+
     /// What `init` takes from the startup arena for this config (§5):
-    /// the six value tables, the label slice headers and the label bytes
+    /// the value tables, the label slice headers and the label bytes
     /// themselves, and the two per-cluster scalars. Closed-form in the
     /// config — it renders the same labels init dupes, through the same
     /// renderer — so the banner's term is a prediction `init` then meets
@@ -1602,8 +1628,11 @@ pub const Labeled = struct {
         total += cluster_count * @sizeOf([]const u8); // cluster_labels
         total += cluster_count * @sizeOf(u16); // endpoint_counts
         total += cluster_count * @sizeOf(bool); // cluster_checked
-        total += 4 * @as(u64, keys.count) * @sizeOf(Value); // endpoint families
-        total += 2 * cluster_count * @sizeOf(Value); // cluster families
+        // Every table `init` allocates, counted one by one: the families
+        // grew past these terms once without the price following, and a
+        // test now holds the two to agree exactly.
+        total += endpoint_tables * @as(u64, keys.count) * @sizeOf(Value);
+        total += cluster_tables * cluster_count * @sizeOf(Value);
         // #299's four tables, priced here because `init` allocates them:
         // §5's promise is that the printed total covers everything this
         // process holds, and a table the banner does not know about is
@@ -1614,6 +1643,11 @@ pub const Labeled = struct {
         var scratch: [label_scratch_bytes]u8 = undefined;
         for (config.clusters) |*cluster| {
             total += renderClusterLabel(&scratch, cluster.name).len;
+            // A slot's room is the widest label, whatever it holds now.
+            if (cluster.slots != null) {
+                total += @as(u64, cluster.endpoints.len) * label_scratch_bytes;
+                continue;
+            }
             for (cluster.endpoints) |*address| {
                 total += renderEndpointLabel(&scratch, cluster.name, address).len;
             }
@@ -1758,6 +1792,8 @@ pub const Labeled = struct {
         for (0..labeled.endpoint_counts.len) |cluster_index| {
             for (0..labeled.endpoint_counts[cluster_index]) |endpoint_index| {
                 const key = labeled.keys.key(@intCast(cluster_index), @intCast(endpoint_index));
+                // A free slot (#428) has no endpoint to report.
+                if (labeled.endpoint_labels[key].len == 0) continue;
                 writer.print("{s}{s}{s} {d}\n", .{
                     metric_prefix,
                     comptime family.name(),
@@ -1889,6 +1925,8 @@ pub const Labeled = struct {
         for (0..labeled.endpoint_counts.len) |cluster_index| {
             for (0..labeled.endpoint_counts[cluster_index]) |endpoint_index| {
                 const key = labeled.keys.key(@intCast(cluster_index), @intCast(endpoint_index));
+                // A free slot (#428) has no endpoint to report.
+                if (labeled.endpoint_labels[key].len == 0) continue;
                 const level = views.load.inFlight(key);
                 assert(level <= inflight_max);
                 writer.print("{s}endpoint_inflight{s} {d}\n", .{
@@ -1922,6 +1960,8 @@ pub const Labeled = struct {
             if (!labeled.cluster_checked[cluster_index]) continue;
             for (0..labeled.endpoint_counts[cluster_index]) |endpoint_index| {
                 const key = labeled.keys.key(@intCast(cluster_index), @intCast(endpoint_index));
+                // A free slot (#428) has no endpoint to report.
+                if (labeled.endpoint_labels[key].len == 0) continue;
                 writer.print("{s}endpoint_healthy{s} {d}\n", .{
                     metric_prefix,
                     labeled.endpoint_labels[key],
@@ -1995,8 +2035,12 @@ pub const Labeled = struct {
             total += rowLen("cluster_duration_seconds_count", cluster_label_len, u64_digits_max);
             if (cluster_checked) checked_clusters += 1;
             for (cluster.endpoints) |*address| {
-                const label_len =
-                    renderEndpointLabel(&scratch, cluster.name, address).len;
+                // A slot may come to hold any endpoint (#428): its rows
+                // are bounded at the widest label.
+                const label_len = if (cluster.slots == null)
+                    renderEndpointLabel(&scratch, cluster.name, address).len
+                else
+                    label_scratch_bytes;
                 inline for (comptime std.enums.values(EndpointFamily)) |family| {
                     total += rowLen(family.name(), label_len, u64_digits_max);
                 }
@@ -2585,4 +2629,63 @@ test "counters: the labeled families partition their process totals" {
     counters.increment("l4_shed_endpoint_inflight");
     labeled.incrementCluster(.l4_shed_inflight, 0);
     labeled.reconciles(&counters);
+}
+
+test "counters: a cluster with endpoint slots labels its occupied slots, priced at the widest (#428)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var addresses = [_]io_module.Address{
+        labeledTestAddress("10.0.0.1:8080"),
+        config_module.free_slot_address,
+        config_module.free_slot_address,
+    };
+    var weights = [_]u16{ 1, 0, 0 };
+    var priorities = [_]u8{ 0, 0, 0 };
+    var states = [_]config_module.Config.EndpointState{ .live, .free, .free };
+    var slots: config_module.Config.Slots = .{
+        .addresses = &addresses,
+        .weights = &weights,
+        .priorities = &priorities,
+        .states = &states,
+    };
+    const clusters = [_]config_module.Config.Cluster{.{
+        .name = "api",
+        .endpoints = &addresses,
+        .weights = &weights,
+        .priorities = &priorities,
+        .slots = &slots,
+    }};
+    const config = labeledTestConfig(&clusters);
+    const keys = upstream_module.EndpointKeys.init(1, 3);
+
+    var counting = std.testing.FailingAllocator.init(arena, .{});
+    var labeled: Labeled = undefined;
+    try labeled.init(counting.allocator(), &config, keys);
+    try std.testing.expectEqual(Labeled.tableBytes(&config, keys), counting.allocated_bytes);
+
+    try std.testing.expectEqualStrings(
+        "{cluster=\"api\",endpoint=\"10.0.0.1:8080\"}",
+        labeled.endpoint_labels[keys.key(0, 0)],
+    );
+    try std.testing.expectEqual(@as(usize, 0), labeled.endpoint_labels[keys.key(0, 1)].len);
+    // The free slots render nothing: one endpoint row per family.
+    const healthy = [_]bool{ true, true, true };
+    var l4 = [_]u16{ 0, 0, 0 };
+    var l7 = [_]u16{ 0, 0, 0 };
+    const views: Labeled.LiveViews = .{ .healthy = &healthy, .load = .{ .l4 = &l4, .l7 = &l7 } };
+    const buffer = try arena.alloc(u8, labeled.render_bytes_max);
+    const text = labeled.render(&views, buffer);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "endpoint_inflight{"));
+}
+
+test "counters: labeled init allocates exactly what the banner prices" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const clusters = labeledTestClusters();
+    const config = labeledTestConfig(&clusters);
+    var counting = std.testing.FailingAllocator.init(arena_state.allocator(), .{});
+    var labeled: Labeled = undefined;
+    try labeled.init(counting.allocator(), &config, labeled_test_keys);
+    try std.testing.expectEqual(Labeled.tableBytes(&config, labeled_test_keys), counting.allocated_bytes);
 }

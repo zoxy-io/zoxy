@@ -411,7 +411,22 @@ pub fn completes(comptime extensions: Extensions) bool {
 pub const ClusterSite = struct {
     index: u16,
     name: []const u8,
+    /// The cluster's endpoints — on a cluster with `endpoint_slots`
+    /// (#428), every slot, a free one holding a placeholder no pick
+    /// reaches. Sizing per-endpoint state to this length sizes it for
+    /// every endpoint the cluster can come to hold.
     endpoints: []const io_module.Address,
+    /// What each slot holds (#428), parallel to `endpoints`; empty for a
+    /// cluster whose endpoints are fixed, every one of which is live.
+    states: []const config_module.Config.EndpointState = &.{},
+
+    /// Whether slot `index` holds an endpoint of the set.
+    pub fn liveAt(site: *const ClusterSite, index: usize) bool {
+        assert(index < site.endpoints.len);
+        if (site.states.len == 0) return true;
+        assert(site.states.len == site.endpoints.len);
+        return site.states[index] == .live;
+    }
 };
 
 /// The request-policy contract (§7). A policy type declares

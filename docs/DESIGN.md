@@ -895,6 +895,21 @@ shed the request. A retry that has tried every routable endpoint answers
 - **Weights** run from 1 to 256. Weight `0` drains an endpoint: it is
   never picked, even on fail-open, but probing continues. A cluster whose
   weights are all zero is refused.
+- **Endpoint slots** (#428), in code only: a cluster may declare
+  `endpoint_slots`, room for endpoints a build adds while it serves. Its
+  arrays and every endpoint-keyed table are sized to that capacity at
+  startup and priced in the banner, so the closed form holds for the
+  capacity rather than the count it started with.
+  - Each slot is `live`, `draining` or `free`. The stated endpoints
+    start live in the first slots; the rest are free, at weight 0 with a
+    placeholder address, which keeps them out of every pick by the same
+    rule a drain is kept out by.
+  - The prober takes only live slots, and the labeled metrics render
+    only occupied ones, each slot's label written into room reserved
+    at the widest label. The checked-endpoints count counts slots.
+  - A picker's `bind` site carries the slots' states, and sizing
+    per-endpoint state to the site's endpoints sizes it for every
+    endpoint the cluster can come to hold.
 - **Rendezvous because it is stateless.**
   - N processes must agree with nothing shared between them, and the
     kernel spreads one client's connections across processes.
@@ -1935,8 +1950,9 @@ cover with the bed. `examples/edge` is a working build:
 CI builds, tests and smokes it against a fetched package.
 
 **Not offered yet:**
-- live endpoint discovery, which needs preallocated slots and endpoint
-  identities that survive in-flight work;
+- changing a cluster's endpoints while serving: the slots are reserved
+  (#428), and the update that fills and drains them is that issue's
+  next slice;
 - regex in stock filters and routes, which waits until after v1.0.0.
 
 **Published, not frozen.** HTTP/3 would move the exchange's internal

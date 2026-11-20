@@ -349,6 +349,12 @@ pub const Balancer = struct {
             // count assertion on its first pick instead of at startup.
             var weight_sum: u32 = 0;
             for (cluster.endpoints, 0..) |*address, endpoint_index| {
+                // A free slot (#428) holds no endpoint, so no identity: its
+                // hash stays 0, and its weight 0 keeps it from every pick.
+                if (!cluster.occupiedAt(endpoint_index)) {
+                    assert(weightOf(cluster, @intCast(endpoint_index)) == 0);
+                    continue;
+                }
                 const key = keys.key(@intCast(cluster_index), @intCast(endpoint_index));
                 balancer.endpoint_hashes[key] = endpointId(address);
                 weight_sum += weightOf(cluster, @intCast(endpoint_index));
@@ -506,8 +512,10 @@ pub const Balancer = struct {
         const steers = healthSteers(balancer.keys, cluster_index, cluster, healthy);
         // An extension picker is called for every pick on its cluster
         // (#417), the forced one included, so it never takes this path.
+        // Not a cluster with endpoint slots (#428): its one slot may hold
+        // no live endpoint, which only the weight-0 rule below keeps out.
         if (cluster.pick != .extension and tried.len == 0 and cluster.endpoints.len == 1 and
-            cluster.max_inflight == null and cluster.max_total_inflight == null)
+            cluster.slots == null and cluster.max_inflight == null and cluster.max_total_inflight == null)
         {
             // Neither a rotation nor a draw: uncapped single-endpoint
             // clusters stay branch-cheap and policy state is untouched.
@@ -2951,4 +2959,44 @@ test "balancer: a one-endpoint extension cluster still asks its picker (#417)" {
     const outcome = balancer.pick(0, &load, &test_healthy_all, &test_client, null, test_untried);
     try std.testing.expect(outcome == .extension);
     try std.testing.expectEqual(@as(u16, 1), outcome.extension.count);
+}
+
+test "balancer: a cluster's free endpoint slots never take a pick (#428)" {
+    var addresses = [_]io_module.Address{
+        ipEndpoint("127.0.0.1:1"),
+        ipEndpoint("127.0.0.1:2"),
+        config_module.free_slot_address,
+        config_module.free_slot_address,
+    };
+    var weights = [_]u16{ 1, 1, 0, 0 };
+    var priorities = [_]u8{ 0, 0, 0, 0 };
+    var states = [_]config_module.Config.EndpointState{ .live, .live, .free, .free };
+    var slots: config_module.Config.Slots = .{
+        .addresses = &addresses,
+        .weights = &weights,
+        .priorities = &priorities,
+        .states = &states,
+    };
+    for ([_]config_module.Config.Cluster.Pick{ .rr, .p2c }) |policy| {
+        const clusters = [_]config_module.Config.Cluster{.{
+            .name = "slots",
+            .endpoints = &addresses,
+            .weights = &weights,
+            .priorities = &priorities,
+            .slots = &slots,
+            .pick = policy,
+        }};
+        const config = testConfig(&clusters);
+        var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer balancer_arena.deinit();
+        var balancer: Balancer = undefined;
+        try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
+
+        var counts: [test_counts_len]u16 = @splat(0);
+        var round: u32 = 0;
+        while (round < 64) : (round += 1) {
+            const picked = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client, null, test_untried).dial;
+            try std.testing.expect(picked.endpoint_index < 2);
+        }
+    }
 }

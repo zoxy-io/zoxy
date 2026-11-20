@@ -308,6 +308,10 @@ pub const Cluster = struct {
     name: []const u8,
     /// At least one.
     endpoints: []const Endpoint,
+    /// Room for endpoints a build adds while it serves (#428): at least
+    /// `endpoints.len`, every endpoint table sized to it and priced at
+    /// startup. Null holds the cluster to the endpoints it starts with.
+    endpoint_slots: ?u16 = null,
     /// How an endpoint is chosen for each connection or request.
     pick: Pick,
     /// What the origins speak. HTTP/2 to the origins is a feature, so
