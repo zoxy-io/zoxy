@@ -385,6 +385,15 @@ drop_kind: ?SimIo.OpKind,
 /// wind-down a scenario can have does not arm it twice.
 drop_latch_armed: bool,
 http_origin_stop_completion: SimIo.Completion,
+/// #428's churn: on seeds whose http cluster carries the refusing
+/// endpoint, two updates mid-run swap it for a second refusing address
+/// and back, reweighting the origin in place. Drawn on its own stream.
+churn_http: bool,
+churn_at_ns: [2]u64,
+/// The two churn steps' timers.
+churn_completions: [2]SimIo.Completion,
+/// Churn steps run so far.
+churn_steps_count: u8,
 /// Virtual instant at which the drain begins, or 0 for "at the
 /// scenario's end like every other seed".
 ///
@@ -495,12 +504,26 @@ fn refusingEndpointAddress() std.Io.net.IpAddress {
     return std.Io.net.IpAddress.parseLiteral("127.0.0.1:9002") catch unreachable;
 }
 
+/// The refusing endpoint's stand-in while the #428 churn has it away:
+/// another address nothing listens at.
+fn churnRefusingAddress() std.Io.net.IpAddress {
+    return std.Io.net.IpAddress.parseLiteral("127.0.0.1:9003") catch unreachable;
+}
+
 pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
     // Scenario shape and Io schedule use *separate* streams from one
     // seed, so harness decisions never perturb delivery order.
     harness.scenario_prng = std.Random.DefaultPrng.init(seed ^ 0x5a5a5a5a5a5a5a5a);
     const random = harness.scenario_prng.random();
     harness.drawPickers(seed);
+    // #428: its own stream, as the pickers', so the shared one is unmoved.
+    var churn_prng = std.Random.DefaultPrng.init(seed ^ 0x0428_0428_0428_0428);
+    const churn = churn_prng.random();
+    harness.churn_http = churn.boolean();
+    harness.churn_at_ns = .{
+        (10 + churn.uintAtMost(u64, 30)) * std.time.ns_per_ms,
+        (50 + churn.uintAtMost(u64, 30)) * std.time.ns_per_ms,
+    };
     // #436: its own stream, as the pickers', so the shared one is unmoved.
     var probe_prng = std.Random.DefaultPrng.init(seed ^ 0x0436_0436_0436_0436);
     harness.probe_l4_coin = probe_prng.random().uintLessThan(u8, probe_coin_sides);
@@ -618,6 +641,7 @@ fn armScenarioTimers(harness: *Harness) void {
             onDrainStart,
         );
     }
+    harness.armChurn();
     harness.http_origin_stop_completion = .{};
     if (harness.http_origin_stop_at_ns != 0) {
         assert(harness.http_origin_stop_at_ns < scenario_end_ns);
@@ -756,6 +780,62 @@ fn onHttpOriginStop(harness: *Harness, result: Io.TimerError!void) void {
     harness.origin_http.stopListening();
 }
 
+/// The #428 churn's two updates, when this seed churns: only a cluster
+/// that carries the refusing endpoint, so the swap is one refusing
+/// address for another, and only one that retries, so any pick that
+/// lands on either falls back to the origin — which is what keeps every
+/// golden outcome what it was, a reweight's moved hash placements
+/// included. A change to `deriveRetries` that let a two-endpoint cluster
+/// go without retries would break that.
+fn armChurn(harness: *Harness) void {
+    harness.churn_completions = .{ .{}, .{} };
+    harness.churn_steps_count = 0;
+    if (!harness.churns()) return;
+    for (&harness.churn_completions, harness.churn_at_ns) |*completion, at_ns| {
+        assert(at_ns < scenario_end_ns);
+        harness.io.timerStart(completion, at_ns, Harness, harness, onChurn);
+    }
+}
+
+/// Whether this seed churns its http cluster's endpoints.
+fn churns(harness: *const Harness) bool {
+    if (harness.endpoints_http_count == 2) assert(harness.retries_http >= 1);
+    return harness.churn_http and harness.endpoints_http_count == 2;
+}
+
+/// One churn step. The first sends the refusing endpoint away for a
+/// second refusing address and reweights the origin; the second brings
+/// the first back — into its own draining slot while anything still
+/// holds it, or a freed one — and the origin's weight with it. A step may
+/// land on a server already draining: an update during shutdown is one a
+/// control plane can send, and the sweep holds it to the same oracles.
+fn onChurn(harness: *Harness, result: Io.TimerError!void) void {
+    result catch return;
+    const step: u8 = harness.churn_steps_count;
+    harness.churn_steps_count += 1;
+    assert(harness.churn_steps_count <= harness.churn_completions.len);
+    const origin = harness.endpoint_options_http[0];
+    const refusing = harness.endpoint_options_http[1];
+    // The harness draws weights from 1, so neither is drained.
+    assert(origin.weight >= 1);
+    assert(refusing.weight >= 1);
+    const away: std.Io.net.IpAddress = if (step == 0) churnRefusingAddress() else refusing.address.ip;
+    const weight_max = zoxy.constants.endpoint_weight_max;
+    const stepped: u16 = if (origin.weight < weight_max) origin.weight + 1 else origin.weight - 1;
+    const origin_weight = if (step == 0) stepped else origin.weight;
+    assert(origin_weight >= 1);
+    const set = [_]zoxy.extension.EndpointSet.Endpoint{
+        .{ .address = origin.address.ip, .weight = origin_weight, .priority = origin.priority },
+        .{ .address = away, .weight = refusing.weight, .priority = refusing.priority },
+    };
+    // Valid by construction: distinct nonzero ports (9000, 9002, 9003),
+    // weights in 1..256, tiers 0 or 1. Room by construction, resting on
+    // `endpoint_slots = 3`: step 0 has one arrival and one free slot; step
+    // 1's arrival either rejoins its draining slot or takes the one
+    // `reclaim` freed — never both short.
+    harness.server.replaceEndpoints(http_cluster_index, &set) catch unreachable;
+}
+
 fn deriveAdversary(random: std.Random, clean: bool) SimIo.Adversary {
     if (clean) {
         return .{ .partial_io = false };
@@ -813,6 +893,8 @@ fn httpRoutes(harness: *Harness) [3]zoxy.Options.Listener.Route {
 
 const l4_cluster_name = "origin-l4";
 const http_cluster_name = "origin-http";
+/// The http cluster's place in the options, after the l4 one.
+const http_cluster_index: u16 = 1;
 
 /// Whether each cluster selects its #417 picker this seed: a quarter of
 /// seeds for the l4 cluster and half for the http one, independently,
@@ -1187,6 +1269,8 @@ fn httpCluster(
         .slow_start_ms = slow_start_ms,
         .max_total_inflight = max_total_inflight,
         .retries = .{ .count = harness.retries_http, .budget = retry_budget },
+        // #428: room for the set and the one endpoint draining out of it.
+        .endpoint_slots = if (harness.churns()) 3 else null,
     };
 }
 

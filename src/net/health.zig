@@ -1390,13 +1390,22 @@ pub fn Checker(comptime runtime: Runtime) type {
         /// (#428): the ejection path's own obligation, for the same reason.
         pub fn closeParkedOf(checker: *Self, cluster_index: u16, endpoint_index: u16) void {
             assert(!checker.server.config.clusters[cluster_index].liveAt(endpoint_index));
+            checker.reapParkedOf(cluster_index, endpoint_index, "endpoints_parked_closed");
+        }
+
+        /// Close and release every parked connection to an endpoint,
+        /// counting each under `counter`: the one loop an ejection and a
+        /// departure share (#428), so the departure's close is the
+        /// ejection's, walked by its tests.
+        fn reapParkedOf(checker: *Self, cluster_index: u16, endpoint_index: u16, comptime counter: []const u8) void {
+            assert(cluster_index < checker.server.config.clusters.len);
             const server = checker.server;
             const capacity = server.upstreams.capacity();
             var reaped: u32 = 0;
             while (server.upstreams.checkout(cluster_index, endpoint_index)) |parked| {
                 server.io.closeNow(parked.socket);
                 server.releaseUpstream(parked);
-                server.counters.increment("endpoints_parked_closed");
+                server.counters.increment(counter);
                 reaped += 1;
                 assert(reaped <= capacity);
             }
@@ -1597,21 +1606,14 @@ pub fn Checker(comptime runtime: Runtime) type {
         /// traffic leases the very connection that would otherwise be
         /// parked), so what makes it true for both causes is that there
         /// is one ejection path and the probe test already walks it.
-        /// A second call site would quietly end that argument.
+        /// A second call site would quietly end that argument. Its loop,
+        /// `reapParkedOf`, is shared with a departure's close (#428),
+        /// which that same walk is what covers.
         fn closeParked(checker: *Self, cluster_index: u16, endpoint_index: u16) void {
             // Only an ejection reaches here: the endpoint was just marked
             // unhealthy by the caller.
             assert(!checker.healthy[checker.server.upstreams.keys.key(cluster_index, endpoint_index)]);
-            const server = checker.server;
-            const capacity = server.upstreams.capacity();
-            var reaped: u32 = 0;
-            while (server.upstreams.checkout(cluster_index, endpoint_index)) |parked| {
-                server.io.closeNow(parked.socket);
-                server.releaseUpstream(parked);
-                server.counters.increment("health_parked_closed");
-                reaped += 1;
-                assert(reaped <= capacity);
-            }
+            checker.reapParkedOf(cluster_index, endpoint_index, "health_parked_closed");
         }
 
         fn rest(checker: *Self) void {
