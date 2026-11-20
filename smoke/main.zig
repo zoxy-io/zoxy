@@ -109,6 +109,21 @@ const oversized_config_log = std.fmt.comptimePrint(
 /// before anything parses them.
 const oversized_pem: [tls_pem_bytes_cap + 1]u8 = @splat('x');
 
+/// A listener whose key is not its certificate's: `cert.pem` beside the
+/// SNI fixture's key, another P-256 key. Both files read and parse, so
+/// the config loads and is priced. The start then refuses the pair,
+/// naming it, rather than serve and fail every handshake on it.
+const mismatched_config_path = work_directory ++ "/mismatched.json";
+const mismatched_config_text = std.fmt.comptimePrint(
+    \\{{"listeners":[{{"bind":"127.0.0.1:1","http":{{"cluster":"a"}},
+    \\"tls":{{"cert":"{s}","key":"{s}"}}}}],
+    \\"clusters":{{"a":{{"endpoints":["127.0.0.1:1"]}}}}}}
+, .{ tls_cert_path, tls_sni_key_path });
+const mismatched_config_log = std.fmt.comptimePrint(
+    "zoxy: listener 0 cannot use '{s}' + '{s}': CertificateKeyMismatch\n",
+    .{ tls_cert_path, tls_sni_key_path },
+);
+
 /// What `--check` must exit with. Spelled here rather than imported from
 /// `main.zig`'s `CheckExit`, on the rule the rest of this file follows:
 /// the gate reads what the binary *did*, so a drift has to fail loudly
@@ -2742,6 +2757,10 @@ fn prepareWorkDirectory(io: Io) !void {
         .data = oversized_config_text,
     });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = oversized_pem_path, .data = &oversized_pem });
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = mismatched_config_path,
+        .data = mismatched_config_text,
+    });
 }
 
 /// One `--check` run's verdict: the code it exited with, whether the
@@ -2764,12 +2783,15 @@ const CheckRun = struct {
 /// the other half — that the mode refuses what the loader refuses, with
 /// the exit code a CI job branches on rather than a bare non-zero, and
 /// with the loader's own verdict. A third pins what a refusal says when
-/// the verdict alone cannot: which file.
+/// the verdict alone cannot: which file. A fourth pins a refusal the
+/// start makes after the config loaded: a certificate whose key is not
+/// its own.
 fn checkPassed(arena: std.mem.Allocator, io: Io, zoxy_path: []const u8) !bool {
     assert(zoxy_path.len >= 1);
     const accepted = try runZoxyCheck(arena, io, zoxy_path, config_path);
     const refused = try runZoxyCheck(arena, io, zoxy_path, invalid_config_path);
     const oversized = try runZoxyCheck(arena, io, zoxy_path, oversized_config_path);
+    const mismatched = try runZoxyCheck(arena, io, zoxy_path, mismatched_config_path);
     var passed = true;
     if (accepted.exit_code != check_exit_ok) {
         std.debug.print(
@@ -2782,31 +2804,58 @@ fn checkPassed(arena: std.mem.Allocator, io: Io, zoxy_path: []const u8) !bool {
         std.debug.print("FAIL: --check wrote no budget to stdout\n", .{});
         passed = false;
     }
-    if (!refusedAsPinned(&refused, invalid_config_log, "a config the loader refuses")) passed = false;
-    if (!refusedAsPinned(&oversized, oversized_config_log, "an oversized certificate")) passed = false;
+    if (!refusedAsPinned(&refused, &.{
+        .log = invalid_config_log,
+        .priced = false,
+        .what = "a config the loader refuses",
+    })) passed = false;
+    if (!refusedAsPinned(&oversized, &.{
+        .log = oversized_config_log,
+        .priced = false,
+        .what = "an oversized certificate",
+    })) passed = false;
+    if (!refusedAsPinned(&mismatched, &.{
+        .log = mismatched_config_log,
+        .priced = true,
+        .what = "a certificate beside another's key",
+    })) passed = false;
     return passed;
 }
 
-/// Whether a check run refused its config exactly as `expected_log`
-/// says: with the exit code a refusal owes, and with no budget — nothing
-/// was loaded, so a number printed beside a refusal would price a config
-/// that does not exist.
-fn refusedAsPinned(refused: *const CheckRun, expected_log: []const u8, what: []const u8) bool {
-    assert(expected_log.len >= 1);
-    assert(what.len >= 1);
+/// What one pinned refusal must look like.
+const Refusal = struct {
+    /// The whole of what the run writes to stderr.
+    log: []const u8,
+    /// Whether the config loaded. One the loader refuses has nothing to
+    /// price, so a budget beside it would price a config that does not
+    /// exist. One that loads and then fails the start's gauntlet is
+    /// priced, and its verdict line says it was refused (#301).
+    priced: bool,
+    /// The config, as the failure lines name it.
+    what: []const u8,
+};
+
+/// Whether a check run refused its config exactly as `expected` says,
+/// with the exit code a refusal owes.
+fn refusedAsPinned(refused: *const CheckRun, expected: *const Refusal) bool {
+    assert(expected.log.len >= 1);
+    assert(expected.what.len >= 1);
     var passed = true;
     if (refused.exit_code != check_exit_invalid_config) {
-        std.debug.print("FAIL: --check did not refuse {s} (exit {d})\n", .{ what, refused.exit_code });
+        std.debug.print("FAIL: --check did not refuse {s} (exit {d})\n", .{ expected.what, refused.exit_code });
         passed = false;
     }
-    if (refused.budget_on_stdout) {
-        std.debug.print("FAIL: --check printed a budget for {s}\n", .{what});
+    if (refused.budget_on_stdout != expected.priced) {
+        std.debug.print("FAIL: --check {s} for {s}\n", .{
+            if (expected.priced) "printed no budget" else "printed a budget",
+            expected.what,
+        });
         passed = false;
     }
-    if (!std.mem.eql(u8, refused.log, expected_log)) {
+    if (!std.mem.eql(u8, refused.log, expected.log)) {
         std.debug.print(
             "FAIL: --check's stderr for {s} was\n{s}rather than\n{s}",
-            .{ what, refused.log, expected_log },
+            .{ expected.what, refused.log, expected.log },
         );
         passed = false;
     }
