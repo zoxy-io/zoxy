@@ -53,6 +53,7 @@ pub const ScriptedPicker = struct {
         .completed_failed = "Picks whose exchange failed on the origin's side.",
         .completed_stale = "Picks whose parked connection had gone stale.",
         .completed_aborted = "Picks whose exchange ended on this side first.",
+        .completed_closed = "L4 picks whose relay ran and closed.",
     };
     pub const gauges = .{
         .offered = "Candidates its last pick was offered.",
@@ -150,6 +151,11 @@ pub const ScriptedPicker = struct {
             // census entry could never fire. http_proxy_test pins it.
             .shed => assert(done.head_ns == null and done.connected_ns == null),
             .aborted => done.metrics.add(ScriptedPicker, .completed_aborted, 1),
+            .closed => {
+                // An L4 relay: it connected, and it has no head.
+                assert(done.connected_ns != null and done.head_ns == null);
+                done.metrics.add(ScriptedPicker, .completed_closed, 1);
+            },
         }
     }
 

@@ -304,8 +304,12 @@ pub const Completion = struct {
     /// When the outcome became final.
     done_ns: u64,
     outcome: Outcome,
-    /// The request's tag (#433), zero when it carried none.
+    /// The request's tag (#433), zero when it carried none and on L4.
     tag: u64,
+    /// An L4 connection's bytes from its client and to it, as its access
+    /// log line counts them — what the relay carried. Zero on L7.
+    bytes_from_client: u64 = 0,
+    bytes_to_client: u64 = 0,
     /// The picker's own counters and gauges for this cluster (#435).
     metrics: Metrics = .{},
 
@@ -313,12 +317,17 @@ pub const Completion = struct {
         /// The origin answered, and the whole response reached the
         /// client: its final status.
         response: u16,
+        /// An L4 connection's relay ran and closed, from either end or
+        /// by its idle deadline: the ordinary end of a connection that
+        /// carried bytes rather than an exchange.
+        closed,
         /// The attempt never had a connection to send on: the dial was
         /// refused, unreachable, or cut short, or an HTTP/2 origin's
         /// connection it waited on failed to open.
         connect_failed,
         /// The deadline ran out before the origin answered (`504`, or the
-        /// client's own gRPC deadline): in the dial, or after it.
+        /// client's own gRPC deadline): in the dial, or after it. On L4,
+        /// the dial's own deadline.
         timed_out,
         /// The exchange failed on the origin's side once connected: a
         /// reset, a hangup, a response cut short.
@@ -332,7 +341,8 @@ pub const Completion = struct {
         shed,
         /// The exchange ended on this proxy's or the client's side
         /// before the origin's answer was whole: the client left, the
-        /// request broke a rule mid-flight, or a drain ended it. Its
+        /// request broke a rule mid-flight, or a drain ended it — on L4,
+        /// a connection torn down before its dial completed. Its
         /// `done_ns` may be when the stream was given back, later than
         /// the attempt really ended: not a latency to steer by.
         aborted,

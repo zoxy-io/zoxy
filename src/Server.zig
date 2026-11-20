@@ -902,7 +902,7 @@ pub fn Server(comptime runtime: Runtime) type {
                 stream.relay_buffer = null;
             }
             // #423: a pick no outcome claimed ended with its stream.
-            server.completePick(stream, .aborted);
+            server.completePickAtRelease(stream);
             server.logExchange(stream);
             server.releaseStaticSend(stream);
             if (stream.h2_head != null) server.returnHeadBuffer(stream);
@@ -4088,6 +4088,7 @@ pub fn Server(comptime runtime: Runtime) type {
             const dial = switch (pick) {
                 .dial => |chosen| blk: {
                     server.witnessPick(cluster_index, &chosen);
+                    server.notePick(conn.stream, cluster_index, chosen.endpoint_index, false); // One dial: no retry.
                     break :blk chosen;
                 },
                 // Unreachable with nothing tried: only a retry can run
@@ -4183,10 +4184,12 @@ pub fn Server(comptime runtime: Runtime) type {
                         conn.charged_endpoint,
                     );
                 }
+                server.completePick(conn.stream, .connect_failed);
                 server.beginTeardown(conn);
                 return;
             };
             conn.stream.upstream_socket = socket;
+            server.notePickConnected(conn.stream);
             server.disableNagle(
                 socket,
                 server.endpointIsUnix(conn.charged_cluster, conn.charged_endpoint),
@@ -4351,7 +4354,7 @@ pub fn Server(comptime runtime: Runtime) type {
             // truncated body, a drain straggler — and every L4 connection,
             // whose whole life is the unit being logged.
             // #423: likewise the last chance to complete a pick.
-            server.completePick(conn.stream, .aborted);
+            server.completePickAtRelease(conn.stream);
             server.logExchange(conn.stream);
             // Which returns the stream with it (§5).
             server.releaseConn(conn);
@@ -4776,6 +4779,7 @@ pub fn Server(comptime runtime: Runtime) type {
             const cluster = &server.config.clusters[pending.cluster_index];
             assert(pending.endpoint_index < cluster.endpoints.len);
             const key = server.balancer.keys.key(pending.cluster_index, pending.endpoint_index);
+            const l4 = stream.conn.protocol == .l4;
             const done: extension.Completion = .{
                 .cluster_index = pending.cluster_index,
                 .endpoint_index = pending.endpoint_index,
@@ -4787,6 +4791,8 @@ pub fn Server(comptime runtime: Runtime) type {
                 .done_ns = now_ns,
                 .outcome = outcome,
                 .tag = stream.log.tag,
+                .bytes_from_client = if (l4) stream.log.bytes_in else 0,
+                .bytes_to_client = if (l4) stream.log.bytes_out else 0,
                 .metrics = server.extension_metrics.picker(pending.cluster_index),
             };
             callComplete(cluster.pick.extension, &done);
@@ -4801,6 +4807,17 @@ pub fn Server(comptime runtime: Runtime) type {
             if (comptime !ConnType.completes_picks) return;
             if (!stream.pick.active) return;
             server.completePick(stream, if (stream.pick.connected_ns == 0) .connect_failed else .failed);
+        }
+
+        /// The last chance to complete a stream's pick (#423), as the
+        /// stream is given back. An L4 relay that connected ends here, and
+        /// `closed` is its ordinary outcome; whatever else is still owed
+        /// here ended before any outcome could claim it.
+        fn completePickAtRelease(server: *Self, stream: *StreamType) void {
+            if (comptime !ConnType.completes_picks) return;
+            if (!stream.pick.active) return;
+            const relayed = stream.conn.protocol == .l4 and stream.pick.connected_ns != 0;
+            server.completePick(stream, if (relayed) .closed else .aborted);
         }
 
         fn selectionCompletes(selection: extension.Selection) bool {
@@ -5590,6 +5607,12 @@ pub fn Server(comptime runtime: Runtime) type {
             // driver looks for which are due (#275).
             if (conn.state == .h2) return H2Driver.expire(server, conn);
             server.counters.increment("deadline_expired");
+            // #423: an L4 dial out of time ends its pick here, the one place
+            // that knows why — the teardown it ends in says nothing.
+            if (conn.state == .connecting) {
+                assert(conn.protocol == .l4);
+                server.completePick(conn.stream, .timed_out);
+            }
             // Before either verdict branch stores its grace window: both
             // grace deadlines run through `storeDeadline`, which would
             // clamp them straight back to this already-expired cap.
@@ -5620,17 +5643,25 @@ pub fn Server(comptime runtime: Runtime) type {
                 server.armConnectCancel(conn.stream);
                 return;
             }
-            // The #235 head budget's own reap, witnessed (#258). Every
-            // path above answers *something*; this one tears down
-            // silently, so without a counter the budget firing and the
-            // idle window firing are the same event to every oracle the
-            // simulator has — which is exactly how two defects in that
-            // budget reached 0.4.0.
-            //
-            // `head_budget_installed` is the discriminator rather than
-            // the state: a connection in `.reading_head` may still be
-            // on the idle window, because the budget is installed at the
-            // first `Incomplete` and not at the first byte.
+            if (server.expireHeadBudget(conn)) return;
+            server.beginTeardown(conn);
+        }
+
+        /// The #235 head budget's own reap, witnessed (#258): true when it
+        /// answered, and the caller stops. Every path in `expireDeadline`
+        /// before it answers *something*; this one would otherwise tear
+        /// down silently, so without a counter the budget firing and the
+        /// idle window firing are the same event to every oracle the
+        /// simulator has — which is exactly how two defects in that
+        /// budget reached 0.4.0.
+        ///
+        /// `head_budget_installed` is the discriminator rather than the
+        /// state: a connection in `.reading_head` may still be on the idle
+        /// window, because the budget is installed at the first
+        /// `Incomplete` and not at the first byte.
+        fn expireHeadBudget(server: *Self, conn: *ConnType) bool {
+            assert(!conn.isTearingDown());
+            assert(conn.state != .h2);
             if (conn.stream.phase == .reading_head and conn.stream.l7.head_budget_installed and
                 conn.stream.l7.pending_verdict == .none)
             {
@@ -5649,10 +5680,10 @@ pub fn Server(comptime runtime: Runtime) type {
                     server.storeDeadline(conn, server.config.idle_timeout_ms);
                     server.armDeadline(conn);
                     Proxy.beginHeadExpiry(server, conn.stream);
-                    return;
+                    return true;
                 }
             }
-            server.beginTeardown(conn);
+            return false;
         }
 
         /// The connect cancel arm+submit shared by teardown and the §8
