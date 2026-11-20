@@ -409,6 +409,12 @@ const uncovered = [_]Uncovered{
             "server_test restores an arrival through its first probe",
     },
     .{
+        .name = "endpoints_reclaimed",
+        .why = .unreached,
+        .reason = "no sim cluster reserves endpoint slots yet (#428); " ++
+            "server_test frees a drained slot and holds a busy one",
+    },
+    .{
         .name = "endpoints_arrived",
         .why = .unreached,
         .reason = "no sim cluster reserves endpoint slots yet (#428); " ++

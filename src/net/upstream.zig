@@ -269,6 +269,12 @@ pub fn UpstreamPool(comptime IoType: type) type {
             assert(pool.idle_count <= pool.slot_pool.acquired_count);
         }
 
+        /// Whether endpoint `key` has a parked connection (#428).
+        pub fn parkedAt(pool: *const Self, key: u32) bool {
+            assert(key < pool.idle_heads.len);
+            return pool.idle_heads[key] != idle_none;
+        }
+
         /// Slots currently serving a request (acquired but not parked).
         pub fn leasedCount(pool: *const Self) u32 {
             assert(pool.idle_count <= pool.slot_pool.acquired_count);

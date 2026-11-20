@@ -557,6 +557,9 @@ pub const Counters = struct {
     /// Endpoints an update took out of a set: draining, never picked
     /// again, their in-flight work running to its end.
     endpoints_departed: Value = Value.init(0),
+    /// Draining slots an update found nothing still holding, and freed for
+    /// endpoints to come (#428).
+    endpoints_reclaimed: Value = Value.init(0),
     /// Endpoints an update kept whose weight or tier it changed in place.
     endpoints_reweighted: Value = Value.init(0),
     /// Parked connections closed because their endpoint left its set —
@@ -1705,6 +1708,15 @@ pub const Labeled = struct {
         assert(labeled.label_room[key].len == label_scratch_bytes);
         labeled.endpoint_labels[key] = slotLabel(labeled.label_room[key], cluster, endpoint_index);
         assert(labeled.endpoint_labels[key].len >= 1);
+    }
+
+    /// A slot freed (#428): its label empty, so no render reaches it. Its
+    /// series stay, for the endpoint that next takes the slot: what keeps
+    /// every family's per-endpoint rows summing to its process total.
+    pub fn vacate(labeled: *Labeled, key: u32) void {
+        assert(key < labeled.keys.count);
+        assert(labeled.label_room[key].len == label_scratch_bytes);
+        labeled.endpoint_labels[key] = labeled.label_room[key][0..0];
     }
 
     /// Loop thread only — the single writer (§8), like `Counters`.

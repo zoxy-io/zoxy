@@ -7,12 +7,13 @@
 //!   and tier in place;
 //! - one that leaves drains: weight 0, never picked or probed again, its
 //!   parked connections closed, its in-flight work running to its end;
-//! - one that arrives takes a free slot, or rejoins the draining slot it
-//!   left, unhealthy until its first probe passes on a checked cluster.
+//! - one that arrives takes a free slot — or, while something still
+//!   holds the draining slot it left, rejoins that slot — unhealthy until
+//!   its first probe passes on a checked cluster.
 //!
-//! A slot that drained stays draining: making one free again, once
-//! nothing references it, is the issue's next slice. Until then a cluster
-//! needs a slot for every endpoint it has ever held.
+//! A slot that drained is freed at a later update, once nothing still
+//! holds it (`Server.endpointReferenced`): a cluster needs room for its
+//! set plus whatever is still draining, not for every endpoint it held.
 //!
 //! An update compares each endpoint it names with every slot: bounded by
 //! the capacity squared, which a control-plane call pays once.
@@ -34,7 +35,8 @@ pub fn replace(server: anytype, cluster_index: u16, wanted: []const Endpoint) Up
     const cluster = &server.config.clusters[cluster_index];
     const slots = cluster.slots.?;
     try validate(wanted, slots.states.len);
-    // Room first: refused before anything is written.
+    reclaim(server, cluster_index);
+    // Room first: refused before the set is changed.
     var arrivals: u32 = 0;
     for (wanted) |*entry| {
         if (slotHolding(slots, &entry.address) == null) arrivals += 1;
@@ -70,6 +72,26 @@ fn validate(wanted: []const Endpoint, capacity: usize) UpdateError!void {
     // A set with no weight anywhere sends the cluster nowhere — refused as
     // the loader refuses `EndpointWeightsAllZero`.
     if (weight_sum == 0) return error.EndpointsEmpty;
+}
+
+/// Every draining slot nothing holds any longer is free again: its
+/// address a placeholder, its identity and label gone, its health already
+/// set aside by `depart`.
+fn reclaim(server: anytype, cluster_index: u16) void {
+    const slots = server.config.clusters[cluster_index].slots.?;
+    assert(slots.states.len == slots.addresses.len);
+    for (slots.states, 0..) |state, index| {
+        if (state != .draining) continue;
+        const endpoint_index: u16 = @intCast(index);
+        assert(!server.config.clusters[cluster_index].liveAt(endpoint_index));
+        if (server.endpointReferenced(cluster_index, endpoint_index)) continue;
+        assert(slots.weights[index] == 0);
+        slots.states[index] = .free;
+        slots.addresses[index] = config_module.free_slot_address;
+        server.balancer.vacate(cluster_index, endpoint_index);
+        server.labeled.vacate(server.upstreams.keys.key(cluster_index, endpoint_index));
+        server.counters.increment("endpoints_reclaimed");
+    }
 }
 
 /// Every live slot the new set does not name drains.
