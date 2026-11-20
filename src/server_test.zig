@@ -2775,3 +2775,58 @@ test "sni routing: a route's connection policy reads the name and refuses before
     try std.testing.expect(bed.server.reconcile());
     try bed.expectDrained();
 }
+
+test "l4: a connection policy's tag rides the connection to its pick and its line (#425)" {
+    var policy: ScriptedConnectionPolicy = .{ .tag = 7 };
+    var picker: ScriptedPicker = .{ .choice = .first, .expect_tag = 7 };
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 4255 },
+        .connection_policy = &policy,
+        .picker = &picker,
+        .access_log = true,
+    });
+    defer bed.tearDown();
+
+    bed.startClients(1, true);
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(Client.Outcome.eof, bed.scenario.clients[0].outcome);
+    try std.testing.expectEqual(@as(u64, 0), policy.seen_tag);
+    try std.testing.expectEqual(@as(u64, 7), picker.tag);
+    // The pick's completion carries it too (#423).
+    try std.testing.expectEqual(@as(u64, 7), picker.last.?.tag);
+    const line = std.mem.trimEnd(u8, bed.sim_io.sinkBytes(), "\n");
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"tag\":7") != null);
+    try bed.expectDrained();
+}
+
+test "sni routing: a route's connection policy reads the listener's tag and may replace it (#425)" {
+    var listener_policy: ScriptedConnectionPolicy = .{ .tag = 7 };
+    var route_policy: ScriptedConnectionPolicy = .{ .tag = 9 };
+    const on_route = [_]extension.Selection{extension.select(runtime.extensions.connection_policies, &route_policy)};
+    const routes = [_]sni_router.Route{.{ .cluster_index = 0, .connection_policies = &on_route }};
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 4256 },
+        .sni_routes = &routes,
+        .connection_policy = &listener_policy,
+        .access_log = true,
+    });
+    defer bed.tearDown();
+    bed.scenario.origin.expect_client_hello = true;
+
+    var hello_buffer: [128]u8 = undefined;
+    bed.scenario.clients_count = 1;
+    const client = &bed.scenario.clients[0];
+    client.exchange = true;
+    client.prefix = sniHello(&hello_buffer, "api.example.com");
+    client.start(&bed.scenario, TestBed.bindAddress());
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(Client.Outcome.eof, client.outcome);
+    try std.testing.expectEqual(@as(u64, 7), route_policy.seen_tag);
+    const line = std.mem.trimEnd(u8, bed.sim_io.sinkBytes(), "\n");
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"tag\":9") != null);
+    try bed.expectDrained();
+}

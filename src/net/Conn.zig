@@ -196,6 +196,9 @@ pub fn Conn(comptime runtime: Runtime) type {
         /// source IP), and the access log states `null` rather than an
         /// address nobody connected from.
         client_address: ?std.Io.net.IpAddress,
+        /// The tag a connection policy set (#425), or 0: every request on
+        /// an http connection starts with it.
+        tag: u64,
         /// A connection policy refused this connection with an RST (#425):
         /// its teardown closes abortively, with no FIN written first.
         close_with_rst: bool,
@@ -384,6 +387,7 @@ pub fn Conn(comptime runtime: Runtime) type {
             conn.protocol = protocol;
             conn.client_address = client_address;
             conn.close_with_rst = false;
+            conn.tag = 0;
             conn.op_deadline = .{};
             conn.op_deadline_cancel = .{};
             assert(conn.state == state);

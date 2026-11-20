@@ -10989,3 +10989,33 @@ test "tls: a connection policy's refusal costs no handshake (#425)" {
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("conn_policy_reset"));
     try bed.expectDrained();
 }
+
+test "h2: every stream on a tagged connection starts with the connection's tag (#425)" {
+    // The listener's request policy holds each request to arriving with
+    // the connection policy's tag, and keeps it: no tag of its own.
+    var connection_policy: ScriptedConnectionPolicy = .{ .tag = 5 };
+    var request_policy: ScriptedPolicy = .{ .expect_tag = 5 };
+    const on_connections = [_]extension.Selection{extension.select(runtime.extensions.connection_policies, &connection_policy)};
+    const on_requests = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &request_policy)};
+    var options = h2BedOptions(4257);
+    options.connection_policies = &on_connections;
+    options.request_policies = &on_requests;
+    options.access_log = true;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    var wire: H2Wire = .{};
+    wire.preface(&.{});
+    wire.get(1, "GET", "/a");
+    wire.get(3, "GET", "/b");
+    try bed.exchange(wire.written());
+
+    var storage: [4]H2Answer = undefined;
+    const answers = try h2Answers(bed.client.response(), &storage);
+    try std.testing.expectEqual(@as(usize, 2), answers.len);
+    try std.testing.expectEqual(@as(u32, 2), request_policy.evaluated);
+    try std.testing.expectEqual(@as(u64, 5), request_policy.seen_tag);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, bed.sim_io.sinkBytes(), "\"tag\":5"));
+    try bed.expectDrained();
+}

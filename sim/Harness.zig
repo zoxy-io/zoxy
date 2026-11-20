@@ -438,6 +438,10 @@ route_policy_selections: [1]zoxy.extension.Selection,
 /// passes the listener's policy first, so every later view must carry it
 /// — across a retry and a replay too, which evaluate no policy again.
 const policy_tag: u64 = 0x0433_7a6f_7879_0433;
+/// The tag the connection policy sets on every connection it lets on
+/// (#425): an l4 connection's pick and line carry it, and every http
+/// request reaches the listener's request policy carrying it.
+const connection_tag: u64 = 0x0425_7a6f_7879_0425;
 
 fn bindAddress() std.Io.net.IpAddress {
     return std.Io.net.IpAddress.parseLiteral("127.0.0.1:8080") catch unreachable;
@@ -489,6 +493,7 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
     harness.policy_listener = .{
         .reject_prefix = l7.canon.policy_prefix,
         .tag = policy_tag,
+        .expect_tag = connection_tag,
         // #430: the guarded route is chosen by name, and tagged as well.
         .route_prefix = l7.canon.guarded_prefix,
         .route_name = l7.canon.guarded_route_name,
@@ -512,7 +517,7 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
     harness.response_policy_selections = .{
         zoxy.extension.select(runtime.extensions.response_policies, &harness.response_policy),
     };
-    harness.connection_policy = .{ .refuse_network = denied_network };
+    harness.connection_policy = .{ .refuse_network = denied_network, .tag = connection_tag };
     harness.connection_policy_selections = .{
         zoxy.extension.select(runtime.extensions.connection_policies, &harness.connection_policy),
     };
@@ -798,7 +803,8 @@ fn drawPickers(harness: *Harness, seed: u64) void {
     const random = picker_prng.random();
     harness.pickers = @splat(.{ .choice = .by_entropy });
     // The http cluster's picks all carry a request the listener's policy
-    // tagged; an l4 pick carries none, so its picker requires nothing.
+    // tagged; an l4 pick, the tag its connection policy set (#425).
+    harness.pickers[0].expect_tag = connection_tag;
     harness.pickers[1].expect_tag = policy_tag;
     harness.picker_l4 = random.uintLessThan(u8, 4) == 0;
     harness.picker_http = random.uintLessThan(u8, 4) == 0;
