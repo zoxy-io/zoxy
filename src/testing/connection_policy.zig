@@ -44,6 +44,21 @@ pub const ScriptedConnectionPolicy = struct {
     /// view's address is valid only for the call.
     last: ?extension.ConnectionCompletion = null,
 
+    /// Its own series (#435), per listener and per SNI route it sits on:
+    /// a counter for each way a connection leaves it, and a gauge its
+    /// completion sets.
+    pub const metrics_prefix = "scripted_connection_policy";
+    pub const counters = .{
+        .evaluated = "Connections the scripted connection policy read.",
+        .refused = "Connections it refused.",
+        .reset = "Connections it refused with an RST.",
+        .tagged = "Connections it let on with a tag.",
+        .completed = "Connections it let on that have since been released.",
+    };
+    pub const gauges = .{
+        .last_bytes_from_client = "Bytes the last connection it completed carried from its client.",
+    };
+
     pub fn bind(
         policy: *ScriptedConnectionPolicy,
         site: *const extension.PolicySite,
@@ -73,9 +88,15 @@ pub const ScriptedConnectionPolicy = struct {
             policy.last_client_port = client.getPort();
         }
         const verdict = policy.verdictFor(connection);
+        connection.metrics.add(ScriptedConnectionPolicy, .evaluated, 1);
         switch (verdict) {
-            .proceed, .proceed_with => {},
-            .reject, .reset => policy.refused += 1,
+            .proceed => {},
+            .proceed_with => connection.metrics.add(ScriptedConnectionPolicy, .tagged, 1),
+            .reject, .reset => {
+                policy.refused += 1;
+                connection.metrics.add(ScriptedConnectionPolicy, .refused, 1);
+                if (verdict == .reset) connection.metrics.add(ScriptedConnectionPolicy, .reset, 1);
+            },
         }
         assert(policy.refused <= policy.evaluated);
         return verdict;
@@ -95,6 +116,9 @@ pub const ScriptedConnectionPolicy = struct {
         assert(policy.completions <= policy.proceeded());
         policy.last = done.*;
         policy.last.?.client = null;
+        policy.last.?.metrics = .{};
+        done.metrics.add(ScriptedConnectionPolicy, .completed, 1);
+        done.metrics.set(ScriptedConnectionPolicy, .last_bytes_from_client, done.bytes_from_client);
     }
 
     fn noteRouted(policy: *ScriptedConnectionPolicy, connection: *const extension.Connection) void {

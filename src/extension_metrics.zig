@@ -4,10 +4,12 @@
 //! made for their site.
 //!
 //! A site is a cluster whose picker is metered, a listener whose policy
-//! list holds a metered type, or a route whose list does. Each site holds
-//! one block per metered type it selects: the series is per site and per
-//! type, so two selections of one type at one site — two instances, or
-//! one named twice — count into the same block.
+//! list holds a metered type — its request policies' or its connection
+//! policies' (#425) — or a route whose list does: an http route's, or an
+//! l4 listener's SNI route's. Each site holds one block per metered type
+//! it selects: the series is per site and per type, so two selections of
+//! one type at one site — two instances, or one named twice — count into
+//! the same block.
 //!
 //! A build that meters nothing, the stock binary among them, has no
 //! table at all: every lookup answers empty slots, and its banner prices
@@ -20,6 +22,7 @@ const counters_module = @import("counters.zig");
 const extension = @import("extension.zig");
 const io_module = @import("io/io.zig");
 const router = @import("http/router.zig");
+const sni_router = @import("net/sni_router.zig");
 
 const assert = std.debug.assert;
 
@@ -31,10 +34,17 @@ pub const Site = union(enum) {
     cluster: []const u8,
     listener: *const io_module.Address,
     route: RouteSite,
+    /// An l4 listener's SNI route (#425), labeled by the name it claims.
+    sni_route: SniRouteSite,
 
     pub const RouteSite = struct {
         listener: *const io_module.Address,
         route: *const router.Route,
+    };
+
+    pub const SniRouteSite = struct {
+        listener: *const io_module.Address,
+        route: *const sni_router.Route,
     };
 };
 
@@ -59,6 +69,10 @@ pub fn Table(comptime extensions: extension.Extensions) type {
         /// Per listener, per route, one entry per selection in the
         /// route's policy list.
         routes: [][][]Metrics = &.{},
+        /// Per listener, one entry per selection in its connection-policy
+        /// list (#425); and per SNI route, one per selection in its list.
+        connection_listeners: [][]Metrics = &.{},
+        sni_routes: [][][]Metrics = &.{},
         /// Whether any site selects each family: a family no site selects
         /// renders nothing, not even its `# HELP`.
         family_used: [families.len]bool = @splat(false),
@@ -84,12 +98,17 @@ pub fn Table(comptime extensions: extension.Extensions) type {
             if (!enabled) return 0;
             var total: u64 = 0;
             total += @as(u64, config.clusters.len) * @sizeOf(Metrics);
-            total += @as(u64, config.listeners.len) * (@sizeOf([]Metrics) + @sizeOf([][]Metrics));
+            total += @as(u64, config.listeners.len) * 2 * (@sizeOf([]Metrics) + @sizeOf([][]Metrics));
             for (config.listeners) |*listener| {
                 total += @as(u64, listener.request_policies.len) * @sizeOf(Metrics);
                 total += @as(u64, listener.routes.len) * @sizeOf([]Metrics);
                 for (listener.routes) |*route| {
                     total += @as(u64, route.request_policies.len) * @sizeOf(Metrics);
+                }
+                total += @as(u64, listener.connection_policies.len) * @sizeOf(Metrics);
+                total += @as(u64, listener.sni_routes.len) * @sizeOf([]Metrics);
+                for (listener.sni_routes) |*route| {
+                    total += @as(u64, route.connection_policies.len) * @sizeOf(Metrics);
                 }
             }
             const Sizer = struct {
@@ -125,16 +144,17 @@ pub fn Table(comptime extensions: extension.Extensions) type {
             table.listeners = try arena.alloc([]Metrics, config.listeners.len);
             table.routes = try arena.alloc([][]Metrics, config.listeners.len);
             for (config.listeners, table.listeners, table.routes) |*listener, *own, *routes| {
-                own.* = try table.buildList(arena, &built, listener.request_policies, .{
+                own.* = try table.buildList(arena, &built, extensions.request_policies, listener.request_policies, .{
                     .listener = &listener.bind_address,
                 });
                 routes.* = try arena.alloc([]Metrics, listener.routes.len);
                 for (listener.routes, routes.*) |*route, *slots| {
-                    slots.* = try table.buildList(arena, &built, route.request_policies, .{
+                    slots.* = try table.buildList(arena, &built, extensions.request_policies, route.request_policies, .{
                         .route = .{ .listener = &listener.bind_address, .route = route },
                     });
                 }
             }
+            try table.initConnectionSites(arena, &built, config);
             assert(built == table.blocks.len);
             table.render_bytes_max = renderBytesMaxFor(config);
         }
@@ -230,20 +250,43 @@ pub fn Table(comptime extensions: extension.Extensions) type {
             }
         }
 
+        /// The connection policies' slots (#425), after every request
+        /// policy's: each listener's list, then its SNI routes' lists —
+        /// `forEachBlock`'s order.
+        fn initConnectionSites(table: *Self, arena: std.mem.Allocator, built: *u32, config: *const Config) error{OutOfMemory}!void {
+            assert(table.listeners.len == config.listeners.len);
+            table.connection_listeners = try arena.alloc([]Metrics, config.listeners.len);
+            table.sni_routes = try arena.alloc([][]Metrics, config.listeners.len);
+            const list = extensions.connection_policies;
+            for (config.listeners, table.connection_listeners, table.sni_routes) |*listener, *own, *routes| {
+                own.* = try table.buildList(arena, built, list, listener.connection_policies, .{
+                    .listener = &listener.bind_address,
+                });
+                routes.* = try arena.alloc([]Metrics, listener.sni_routes.len);
+                for (listener.sni_routes, routes.*) |*route, *slots| {
+                    slots.* = try table.buildList(arena, built, list, route.connection_policies, .{
+                        .sni_route = .{ .listener = &listener.bind_address, .route = route },
+                    });
+                }
+            }
+            assert(built.* <= table.blocks.len);
+        }
+
         /// One list's slots, position by position: a later selection of
         /// a type already met at this site shares its block.
         fn buildList(
             table: *Self,
             arena: std.mem.Allocator,
             built: *u32,
+            comptime list: []const type,
             selections: []const extension.Selection,
             site: Site,
         ) error{OutOfMemory}![]Metrics {
             const slots = try arena.alloc(Metrics, selections.len);
             for (selections, slots, 0..) |selection, *slot, position| {
                 slot.* = .{};
-                const family = policyFamily(selection) orelse continue;
-                const first = firstOf(selections, position, family);
+                const family = familyIn(list, selection) orelse continue;
+                const first = firstOf(list, selections, position, family);
                 assert(first <= position);
                 slot.* = if (first == position)
                     try table.build(arena, built, family, site)
@@ -293,19 +336,34 @@ pub fn Table(comptime extensions: extension.Extensions) type {
                 const family = pickerFamily(cluster) orelse continue;
                 visitor.visit(family, .{ .cluster = cluster.name });
             }
+            const requests = extensions.request_policies;
             for (config.listeners) |*listener| {
-                visitList(listener.request_policies, .{ .listener = &listener.bind_address }, visitor);
+                visitList(requests, listener.request_policies, .{ .listener = &listener.bind_address }, visitor);
                 for (listener.routes) |*route| {
                     const site: Site = .{ .route = .{ .listener = &listener.bind_address, .route = route } };
-                    visitList(route.request_policies, site, visitor);
+                    visitList(requests, route.request_policies, site, visitor);
+                }
+            }
+            // #425: `initConnectionSites`' order.
+            const connections = extensions.connection_policies;
+            for (config.listeners) |*listener| {
+                visitList(connections, listener.connection_policies, .{ .listener = &listener.bind_address }, visitor);
+                for (listener.sni_routes) |*route| {
+                    const site: Site = .{ .sni_route = .{ .listener = &listener.bind_address, .route = route } };
+                    visitList(connections, route.connection_policies, site, visitor);
                 }
             }
         }
 
-        fn visitList(selections: []const extension.Selection, site: Site, visitor: anytype) void {
+        fn visitList(
+            comptime list: []const type,
+            selections: []const extension.Selection,
+            site: Site,
+            visitor: anytype,
+        ) void {
             for (selections, 0..) |selection, position| {
-                const family = policyFamily(selection) orelse continue;
-                if (firstOf(selections, position, family) == position) visitor.visit(family, site);
+                const family = familyIn(list, selection) orelse continue;
+                if (firstOf(list, selections, position, family) == position) visitor.visit(family, site);
             }
         }
 
@@ -313,10 +371,15 @@ pub fn Table(comptime extensions: extension.Extensions) type {
         /// type is `family` — the one that owns the site's block. Quadratic
         /// in a list's length, which is the build's own and short, and run
         /// at startup only: never on the serving path.
-        fn firstOf(selections: []const extension.Selection, position: usize, family: u16) usize {
+        fn firstOf(
+            comptime list: []const type,
+            selections: []const extension.Selection,
+            position: usize,
+            family: u16,
+        ) usize {
             assert(position < selections.len);
             for (selections[0..position], 0..) |earlier, index| {
-                if (policyFamily(earlier) == family) return index;
+                if (familyIn(list, earlier) == family) return index;
             }
             return position;
         }
@@ -362,6 +425,23 @@ pub fn Table(comptime extensions: extension.Extensions) type {
             return table.routes[listener_index][route_index];
         }
 
+        /// A listener's connection-policy slots (#425), parallel to its
+        /// list.
+        pub fn connectionPolicies(table: *const Self, listener_index: u16) []const Metrics {
+            if (!enabled) return &.{};
+            assert(listener_index < table.connection_listeners.len);
+            return table.connection_listeners[listener_index];
+        }
+
+        /// An SNI route's connection-policy slots (#425), parallel to its
+        /// list.
+        pub fn sniRoutePolicies(table: *const Self, listener_index: u16, route_index: u16) []const Metrics {
+            if (!enabled) return &.{};
+            assert(listener_index < table.sni_routes.len);
+            assert(route_index < table.sni_routes[listener_index].len);
+            return table.sni_routes[listener_index][route_index];
+        }
+
         const Shape = struct { counters: u32, gauges: u32 };
 
         /// Each family's declared counter and gauge counts.
@@ -382,10 +462,6 @@ pub fn Table(comptime extensions: extension.Extensions) type {
                 .rr, .p2c, .hash => return null,
             };
             return familyIn(extensions.pickers, selection);
-        }
-
-        fn policyFamily(selection: extension.Selection) ?u16 {
-            return familyIn(extensions.request_policies, selection);
         }
 
         fn familyIn(comptime list: []const type, selection: extension.Selection) ?u16 {
@@ -463,6 +539,14 @@ pub fn writeLabel(writer: *std.Io.Writer, site: Site) std.Io.Writer.Error!void {
             try writeListener(writer, route_site.listener);
             try writer.writeAll(",route=\"");
             try writeRoute(writer, route_site.route);
+            try writer.writeAll("\"}");
+        },
+        .sni_route => |route_site| {
+            try writeListener(writer, route_site.listener);
+            // The any-name route claims every name, and none: `*`, since
+            // an SNI table has no wildcard for it to be mistaken for.
+            try writer.writeAll(",sni=\"");
+            try counters_module.Labeled.writeEscaped(writer, route_site.route.server_name orelse "*");
             try writer.writeAll("\"}");
         },
     }
@@ -743,4 +827,68 @@ test "extension metrics: each selected family renders per site, and the bound is
         @memset(block.gauges, std.math.maxInt(u64));
     }
     try testing.expectEqual(table.render_bytes_max, table.render(buffer).len);
+}
+
+const TestConnectionMetered = struct {
+    pub const metrics_prefix = "conn";
+    pub const counters = .{ .seen = "Connections seen." };
+
+    pub fn evaluate(_: *TestConnectionMetered, _: *const extension.Connection) extension.ConnectionVerdict {
+        return .proceed;
+    }
+};
+
+const connection_extensions: extension.Extensions = .{
+    .connection_policies = &.{TestConnectionMetered},
+};
+
+test "extension metrics: a connection policy's series sit at its listener and its SNI routes (#425)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var instance: TestConnectionMetered = .{};
+    const selected = try arena.dupe(extension.Selection, &.{
+        extension.select(connection_extensions.connection_policies, &instance),
+    });
+    const origin = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:9000");
+    const endpoints = try arena.dupe(Options.Cluster.Endpoint, &.{.{ .address = .{ .ip = origin } }});
+    const sni_routes = try arena.dupe(Options.Listener.SniRoute, &.{
+        .{ .cluster = "relay", .connection_policies = selected },
+        .{ .sni = "api.example.com", .cluster = "relay", .connection_policies = selected },
+    });
+    const listeners = try arena.dupe(Options.Listener, &.{.{
+        .bind = .{ .ip = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:8443") },
+        .connection_policies = selected,
+        .protocol = .{ .l4 = .{ .target = .{ .routes = sni_routes } } },
+    }});
+    const clusters = try arena.dupe(Options.Cluster, &.{.{ .name = "relay", .endpoints = endpoints, .pick = .p2c }});
+    const options: Options = .{
+        .listeners = listeners,
+        .clusters = clusters,
+        .timeouts = .{ .connect_ms = 1_000, .idle_ms = 5_000, .head_ms = 2_000, .tunnel_ms = 60_000, .health_interval_ms = 2_000 },
+        .limits = .{},
+    };
+    const config = try config_module.resolve(arena, &options);
+    const T = Table(connection_extensions);
+    comptime assert(T.enabled);
+
+    var counting = std.testing.FailingAllocator.init(arena, .{});
+    var table: T = undefined;
+    try table.init(counting.allocator(), &config);
+    try testing.expectEqual(T.tableBytes(&config), counting.allocated_bytes);
+
+    // The listener, then its SNI routes as the table sorts them: named
+    // first, the any-name route as `*`.
+    try testing.expectEqual(@as(usize, 3), table.blocks.len);
+    try testing.expectEqualStrings("{listener=\"127.0.0.1:8443\"}", table.blocks[0].label);
+    try testing.expectEqualStrings("{listener=\"127.0.0.1:8443\",sni=\"api.example.com\"}", table.blocks[1].label);
+    try testing.expectEqualStrings("{listener=\"127.0.0.1:8443\",sni=\"*\"}", table.blocks[2].label);
+    try testing.expectEqual(@as(usize, 1), table.connectionPolicies(0).len);
+    table.sniRoutePolicies(0, 1).ptr[0].add(TestConnectionMetered, .seen, 2);
+    try testing.expectEqual(@as(u64, 2), table.counterTotal(TestConnectionMetered, .seen));
+
+    var buffer: [1024]u8 = undefined;
+    assert(table.render_bytes_max <= buffer.len);
+    const text = table.render(&buffer);
+    try testing.expect(std.mem.indexOf(u8, text, "zoxy_ext_conn_seen{listener=\"127.0.0.1:8443\",sni=\"*\"} 2\n") != null);
 }

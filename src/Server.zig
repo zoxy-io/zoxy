@@ -4786,13 +4786,14 @@ pub fn Server(comptime runtime: Runtime) type {
             assert(conn.isLive());
             assert(conn.listener_index < server.config.listeners.len);
             const selections = server.config.listeners[conn.listener_index].connection_policies;
+            const metrics = server.extension_metrics.connectionPolicies(conn.listener_index);
             var view: extension.Connection = .{
                 .client = if (conn.client_address) |*address| address else null,
                 .listener_index = conn.listener_index,
                 .now_ns = server.io.nowNs(),
                 .tag = conn.tag,
             };
-            return server.admittedBy(conn, selections, &view);
+            return server.admittedBy(conn, selections, metrics, &view);
         }
 
         /// The same, at an SNI route's phase (#425): once the hello named
@@ -4816,7 +4817,8 @@ pub fn Server(comptime runtime: Runtime) type {
                 .cluster_index = route.cluster_index,
                 .server_name = server_name,
             };
-            return server.admittedBy(conn, route.connection_policies, &view);
+            const metrics = server.extension_metrics.sniRoutePolicies(conn.listener_index, route_index);
+            return server.admittedBy(conn, route.connection_policies, metrics, &view);
         }
 
         /// One site's connection policies over `view`, in order; the first
@@ -4826,13 +4828,18 @@ pub fn Server(comptime runtime: Runtime) type {
             server: *Self,
             conn: *ConnType,
             selections: []const extension.Selection,
+            /// The site's slots, parallel to `selections`; empty in a build
+            /// that meters nothing (#435).
+            metrics: []const extension.Metrics,
             view: *extension.Connection,
         ) bool {
             assert(view.listener_index == conn.listener_index);
             assert(view.tag == conn.tag);
             assert(view.now_ns >= 1);
+            assert(metrics.len == 0 or metrics.len == selections.len);
             if (selections.len == 0) return true;
-            for (selections) |selection| {
+            for (selections, 0..) |selection, position| {
+                view.metrics = if (metrics.len == 0) .{} else metrics[position];
                 switch (callConnectionPolicy(selection, view)) {
                     .proceed => noteConnectionProceeded(conn, view),
                     .proceed_with => |proceed| {
@@ -4855,6 +4862,7 @@ pub fn Server(comptime runtime: Runtime) type {
                     },
                 }
             }
+            view.metrics = .{};
             return true;
         }
 
@@ -4935,11 +4943,19 @@ pub fn Server(comptime runtime: Runtime) type {
                 assert(pending.route_index < conn.sni_routes.len);
                 const route = &conn.sni_routes[pending.route_index];
                 done.route_index = pending.route_index;
-                completeConnectionList(route.connection_policies[0..pending.route_proceeded], &done);
+                completeConnectionList(
+                    route.connection_policies[0..pending.route_proceeded],
+                    server.extension_metrics.sniRoutePolicies(conn.listener_index, pending.route_index),
+                    &done,
+                );
                 done.route_index = null;
             }
             const listener = &server.config.listeners[conn.listener_index];
-            completeConnectionList(listener.connection_policies[0..pending.listener_proceeded], &done);
+            completeConnectionList(
+                listener.connection_policies[0..pending.listener_proceeded],
+                server.extension_metrics.connectionPolicies(conn.listener_index),
+                &done,
+            );
         }
 
         /// How a connection ended, as its policies hear it (#425).
@@ -4964,13 +4980,21 @@ pub fn Server(comptime runtime: Runtime) type {
         /// same completion.
         fn completeConnectionList(
             selections: []const extension.Selection,
-            done: *const extension.ConnectionCompletion,
+            /// The site's slots, parallel to its whole list, of which
+            /// `selections` is the proceeded prefix.
+            metrics: []const extension.Metrics,
+            done: *extension.ConnectionCompletion,
         ) void {
             assert(done.done_ns >= done.started_ns);
+            assert(metrics.len == 0 or metrics.len >= selections.len);
             // A route's list completes only when one of its policies
             // proceeded; a listener's may be empty, its route's alone owed.
             if (done.route_index != null) assert(selections.len >= 1);
-            for (selections) |selection| callConnectionPolicyComplete(selection, done);
+            for (selections, 0..) |selection, position| {
+                done.metrics = if (metrics.len == 0) .{} else metrics[position];
+                callConnectionPolicyComplete(selection, done);
+            }
+            done.metrics = .{};
         }
 
         /// The selected connection policy's `complete`, by the comptime

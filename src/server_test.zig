@@ -2887,3 +2887,38 @@ test "sni routing: a listener policy hears of the refusal its route's policy mad
     try std.testing.expectEqual(@as(u64, 0), listener_policy.last.?.bytes_from_client);
     try bed.expectDrained();
 }
+
+test "sni routing: connection policies count into their own sites' series (#425)" {
+    var listener_policy: ScriptedConnectionPolicy = .{};
+    var route_policy: ScriptedConnectionPolicy = .{ .verdict = .reset };
+    const on_route = [_]extension.Selection{extension.select(runtime.extensions.connection_policies, &route_policy)};
+    const routes = [_]sni_router.Route{.{ .server_name = "api.example.com", .cluster_index = 0, .connection_policies = &on_route }};
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 4260 },
+        .sni_routes = &routes,
+        .connection_policy = &listener_policy,
+    });
+    defer bed.tearDown();
+
+    var hello_buffer: [128]u8 = undefined;
+    bed.scenario.clients_count = 1;
+    const client = &bed.scenario.clients[0];
+    client.exchange = true;
+    client.prefix = sniHello(&hello_buffer, "api.example.com");
+    client.start(&bed.scenario, TestBed.bindAddress());
+    try bed.sim_io.run();
+    try std.testing.expectEqual(Client.Outcome.reset, client.outcome);
+
+    const table = &bed.server.extension_metrics;
+    try std.testing.expectEqual(@as(u64, 2), table.counterTotal(ScriptedConnectionPolicy, .evaluated));
+    try std.testing.expectEqual(@as(u64, 1), table.counterTotal(ScriptedConnectionPolicy, .reset));
+    // The listener's proceeded and completed; the route's refused.
+    try std.testing.expectEqual(@as(u64, 1), table.counterTotal(ScriptedConnectionPolicy, .completed));
+    const listener_slots = table.connectionPolicies(0);
+    const route_slots = table.sniRoutePolicies(0, 0);
+    try std.testing.expectEqual(@as(u64, 1), listener_slots[0].counter(ScriptedConnectionPolicy, .completed));
+    try std.testing.expectEqual(@as(u64, 0), listener_slots[0].counter(ScriptedConnectionPolicy, .reset));
+    try std.testing.expectEqual(@as(u64, 1), route_slots[0].counter(ScriptedConnectionPolicy, .reset));
+    try bed.expectDrained();
+}
