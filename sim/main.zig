@@ -675,6 +675,9 @@ const Census = struct {
             // quiet, which is the one thing this table exists to notice.
             assert(census.ops[@backingInt(kind)] >= before);
         }
+        // Each counter names its family's enum at comptime: the quota
+        // grows with the list rather than with a guess.
+        @setEvalBranchQuota(1000 * (extension_counters.len + 1));
         inline for (extension_counters, &census.extension_totals) |counter, *total| {
             const before = total.*;
             const name = @field(zoxy.extension.CounterName(counter.Family), counter.name);

@@ -1785,7 +1785,9 @@ lists do not reach is refused at step zero (`ExtensionUnserved`).
     loop clock at admission and release, and the bytes its lines
     count, summed once per exchange whether or not a log is
     configured. With it a policy can count what it let on and still
-    holds: a per-client cap on concurrent connections.
+    holds: a per-client cap on concurrent connections;
+  - a type may declare metrics, as below: a series per listener and
+    per SNI route it sits on.
 - **Response policies** (#424), each an ordered list per http listener
   and per route, selected with `App.responsePolicy`:
   - `evaluate(*P, *const Response) ResponseVerdict` reads the origin's
@@ -1811,12 +1813,15 @@ literal of name and help text.
 - Each name is the series `zoxy_ext_<prefix>_<name>`, rendered after
   zoxy's own with its `# HELP` and `# TYPE`, once per site that selects
   the type. A family no site selects renders nothing.
-- A site is a picker's cluster (`cluster`), a listener its policies run
-  on (`listener`, its bind address), or a route (`listener` and `route`,
-  named by what it matches: `api.example.com/v1 x-canary=1`).
+- A site is a picker's cluster (`cluster`), a listener its request or
+  connection policies run on (`listener`, its bind address), a route
+  (`listener` and `route`, named by what it matches:
+  `api.example.com/v1 x-canary=1`), or an SNI route (`listener` and
+  `sni`, the name it claims, `*` for the any-name route; #425).
 - zoxy reserves the slots at startup and resolves the site for every
-  serving call: `PickInput.metrics` and `Request.metrics` are the call's
-  own, bumped with `add` and `set` by a name the type declared. Every
+  serving call: `PickInput.metrics`, `Request.metrics` and
+  `Connection.metrics` are the call's own, and a completion carries the
+  same, bumped with `add` and `set` by a name the type declared. Every
   instance of one type at one site shares that site's slots, and one
   instance at two sites counts apart at each.
 - The prefix and names are `[a-z][a-z0-9_]*` and the help is one line,
@@ -1863,7 +1868,6 @@ CI builds, tests and smokes it against a fetched package.
 **Not offered yet:**
 - live endpoint discovery, which needs preallocated slots and endpoint
   identities that survive in-flight work;
-- a connection policy's metrics (#425's last slice);
 - regex in stock filters and routes, which waits until after v1.0.0.
 
 **Published, not frozen.** HTTP/3 would move the exchange's internal

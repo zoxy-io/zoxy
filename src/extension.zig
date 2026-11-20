@@ -554,6 +554,9 @@ pub const Connection = struct {
     route_index: ?u16 = null,
     cluster_index: ?u16 = null,
     server_name: ?[]const u8 = null,
+    /// This policy's own counters and gauges at its site (#435): its
+    /// listener's, or its SNI route's.
+    metrics: Metrics = .{},
 };
 
 /// What a connection policy decides (#425). A refusal closes the
@@ -606,6 +609,8 @@ pub const ConnectionCompletion = struct {
     /// requests' (§8's `bytes_in` and `bytes_out`).
     bytes_from_client: u64,
     bytes_to_client: u64,
+    /// This policy's own counters and gauges at its site (#435).
+    metrics: Metrics = .{},
 
     /// How the connection ended. An l4 connection's is its line's; an
     /// http connection's requests have outcomes of their own, so it
@@ -981,7 +986,6 @@ pub fn assertConnectionPolicy(comptime Policy: type) void {
             ", *const extension.Connection) extension.ConnectionVerdict`");
     }
     if (@hasDecl(Policy, "bind")) assertBind(Policy, PolicySite);
-    if (isMetered(Policy)) @compileError(name ++ " is a connection policy, which declares no metrics yet");
     if (connectionPolicyCompletes(Policy)) {
         const complete_fn = @typeInfo(@TypeOf(Policy.complete)).@"fn";
         const complete_ok = complete_fn.param_types.len == 2 and
@@ -1215,13 +1219,13 @@ pub fn declaredGauges(comptime Extension: type) @TypeOf(if (@hasDecl(Extension, 
 pub fn metered(comptime extensions: Extensions) []const type {
     comptime {
         var families: []const type = &.{};
-        for (extensions.pickers ++ extensions.request_policies) |Listed| {
+        for (extensions.pickers ++ extensions.request_policies ++ extensions.connection_policies) |Listed| {
             if (!isMetered(Listed)) continue;
             for (families) |Family| {
                 if (Family == Listed) break;
             } else families = families ++ [_]type{Listed};
         }
-        assert(families.len <= 2 * list_types_max);
+        assert(families.len <= 3 * list_types_max);
         return families;
     }
 }
