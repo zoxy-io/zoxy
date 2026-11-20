@@ -73,10 +73,19 @@ const invalid_config_path = work_directory ++ "/invalid.json";
 /// deliberately: the semantic checks are the ones only the real loader
 /// makes, so refusing this is what says `--check` runs the loader instead
 /// of a second, agreeable validator.
+///
+/// Everything else in it must load, or another check refuses it first.
+/// One did, unseen until the gate began reading stderr: since listeners
+/// were tagged, a `cluster` beside `bind` was an `UnknownField`.
 const invalid_config_text =
-    \\{"listeners":[{"bind":"not-an-address","cluster":"a"}],
+    \\{"listeners":[{"bind":"not-an-address","l4":{"cluster":"a"}}],
     \\"clusters":{"a":{"endpoints":["127.0.0.1:1"]}}}
 ;
+
+/// The whole of what refusing it writes to stderr: the config, and the
+/// loader's verdict. One equality, so a refusal for any other reason
+/// fails here rather than passing as this one.
+const invalid_config_log = "zoxy: invalid config '" ++ invalid_config_path ++ "': ListenerBindInvalid\n";
 
 /// What `--check` must exit with. Spelled here rather than imported from
 /// `main.zig`'s `CheckExit`, on the rule the rest of this file follows:
@@ -91,8 +100,9 @@ const check_exit_invalid_config: u8 = 1;
 const check_banner_needle = "budgets (DESIGN.md";
 const check_verdict_needle = "  check   ";
 
-/// The most of a check run's stdout the gate will read. A banner is about
-/// 1 KiB; anything near this cap is itself the finding.
+/// The most of a check run's stdout, or of its stderr, the gate will
+/// read. A banner is about 1 KiB; anything near this cap is itself the
+/// finding.
 const check_output_bytes_max: usize = 16 * 1024;
 
 /// The §4 fixture the terminating listener serves. Handed in by the build
@@ -2707,14 +2717,15 @@ fn prepareWorkDirectory(io: Io) !void {
     });
 }
 
-/// One `--check` run's verdict: the code it exited with, and whether the
-/// budget reached **stdout**. The placement is the decision #301 made —
-/// a check run's whole output is its result, unlike the startup banner,
-/// which is diagnostics beside a process that goes on to serve — so the
-/// gate pins it rather than trusting it.
+/// One `--check` run's verdict: the code it exited with, whether the
+/// budget reached **stdout**, and what it wrote to stderr. The placement
+/// is the decision #301 made — a check run's whole output is its result,
+/// unlike the startup banner, which is diagnostics beside a process that
+/// goes on to serve — so the gate pins it rather than trusting it.
 const CheckRun = struct {
     exit_code: u8,
     budget_on_stdout: bool,
+    log: []const u8,
 };
 
 /// The #301 pre-flight, over the very config this run is about to serve
@@ -2724,7 +2735,8 @@ const CheckRun = struct {
 /// config would start here, and the only place that can be *checked* is
 /// where the real binary then starts on the same file. The second pins
 /// the other half — that the mode refuses what the loader refuses, with
-/// the exit code a CI job branches on rather than a bare non-zero.
+/// the exit code a CI job branches on rather than a bare non-zero, and
+/// with the loader's own verdict.
 fn checkPassed(arena: std.mem.Allocator, io: Io, zoxy_path: []const u8) !bool {
     assert(zoxy_path.len >= 1);
     const accepted = try runZoxyCheck(arena, io, zoxy_path, config_path);
@@ -2741,18 +2753,31 @@ fn checkPassed(arena: std.mem.Allocator, io: Io, zoxy_path: []const u8) !bool {
         std.debug.print("FAIL: --check wrote no budget to stdout\n", .{});
         passed = false;
     }
+    if (!refusedAsPinned(&refused, invalid_config_log, "a config the loader refuses")) passed = false;
+    return passed;
+}
+
+/// Whether a check run refused its config exactly as `expected_log`
+/// says: with the exit code a refusal owes, and with no budget — nothing
+/// was loaded, so a number printed beside a refusal would price a config
+/// that does not exist.
+fn refusedAsPinned(refused: *const CheckRun, expected_log: []const u8, what: []const u8) bool {
+    assert(expected_log.len >= 1);
+    assert(what.len >= 1);
+    var passed = true;
     if (refused.exit_code != check_exit_invalid_config) {
-        std.debug.print(
-            "FAIL: --check did not refuse a config the loader refuses (exit {d})\n",
-            .{refused.exit_code},
-        );
+        std.debug.print("FAIL: --check did not refuse {s} (exit {d})\n", .{ what, refused.exit_code });
         passed = false;
     }
-    // Nothing was loaded, so there is nothing to price: a budget printed
-    // beside a refusal would be a number for a config that does not
-    // exist.
     if (refused.budget_on_stdout) {
-        std.debug.print("FAIL: --check priced a config it refused\n", .{});
+        std.debug.print("FAIL: --check printed a budget for {s}\n", .{what});
+        passed = false;
+    }
+    if (!std.mem.eql(u8, refused.log, expected_log)) {
+        std.debug.print(
+            "FAIL: --check's stderr for {s} was\n{s}rather than\n{s}",
+            .{ what, refused.log, expected_log },
+        );
         passed = false;
     }
     return passed;
@@ -2784,6 +2809,13 @@ fn runZoxyCheck(
         .limited(check_output_bytes_max),
     );
     assert(text.len <= check_output_bytes_max);
+    const log = try Io.Dir.cwd().readFileAlloc(
+        io,
+        check_log_path,
+        arena,
+        .limited(check_output_bytes_max),
+    );
+    assert(log.len <= check_output_bytes_max);
     return .{
         // A check that died of a signal has no code to report, and the
         // sentinel is outside every code `CheckExit` defines, so it can
@@ -2791,6 +2823,7 @@ fn runZoxyCheck(
         .exit_code = if (term == .exited) term.exited else 255,
         .budget_on_stdout = std.mem.indexOf(u8, text, check_banner_needle) != null and
             std.mem.indexOf(u8, text, check_verdict_needle) != null,
+        .log = log,
     };
 }
 
