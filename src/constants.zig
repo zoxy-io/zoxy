@@ -703,6 +703,10 @@ pub const endpoint_index_max: u16 = std.math.maxInt(u16) - 1;
 /// log line's width closed-form rather than a function of the config file.
 pub const cluster_name_bytes_max: u16 = 64;
 
+/// Upper bound on a route's name (#430): an identifier a build's request
+/// policy routes by, set in code alone, never in JSON.
+pub const route_name_bytes_max: u16 = 64;
+
 /// Upper bound on one endpoint's configured pick weight (#174) —
 /// HAProxy's own `weight` ceiling. 256 steps is a 1-in-257 canary
 /// granularity, finer than any signal an operator could act on, and the
@@ -1804,6 +1808,9 @@ comptime {
     assert(access_log_path_bytes_max >= 16);
     assert(access_log_method_bytes_max >= 7); // "OPTIONS", the longest standard method.
     assert(cluster_name_bytes_max >= 1);
+    // A route's name is an identifier like a cluster's, under one rule.
+    assert(route_name_bytes_max >= 1);
+    assert(route_name_bytes_max == cluster_name_bytes_max);
     // A weight ceiling of zero would make every cluster all-drained and
     // unloadable; one weight step is the degenerate-but-legal minimum.
     assert(endpoint_weight_max >= 1);

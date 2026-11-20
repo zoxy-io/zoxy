@@ -160,6 +160,10 @@ pub const Listener = struct {
         /// #417's route-phase request policies, run once the route is
         /// chosen and before any resource is taken; the first reject wins.
         request_policies: []const extension.Selection = &.{},
+        /// A name a build's request policy routes by (#430), unique on its
+        /// listener, or null. Set in code alone: the JSON front-end has no
+        /// key for it, so a stock config's routes are unnamed.
+        name: ?[]const u8 = null,
     };
 
     pub const RouteHeader = struct {

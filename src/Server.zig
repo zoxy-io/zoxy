@@ -4634,6 +4634,7 @@ pub fn Server(comptime runtime: Runtime) type {
                     .listener_index = @intCast(index),
                     .route_index = null,
                     .cluster_index = null,
+                    .routes = listener.routes,
                 };
                 for (listener.request_policies) |selection| try bindPolicy(selection, &site, startup);
                 try bindRoutePolicies(listener, @intCast(index), startup);
@@ -4655,6 +4656,7 @@ pub fn Server(comptime runtime: Runtime) type {
                     .listener_index = listener_index,
                     .route_index = @intCast(route_index),
                     .cluster_index = route.cluster_index,
+                    .routes = listener.routes,
                 };
                 for (route.request_policies) |selection| try bindPolicy(selection, &site, startup);
             }

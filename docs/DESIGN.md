@@ -1680,7 +1680,11 @@ lists do not reach is refused at step zero (`ExtensionUnserved`).
     compile error;
   - an optional
     `bind(*P, *const extension.PolicySite, *const extension.Startup) !void`
-    runs once per site;
+    runs once per site. The site carries the listener's route table, and
+    `routeNamed` finds a route by the code-only `name` a route may carry
+    (#430), unique on its listener — the index a policy resolves once,
+    here, rather than on every request. It indexes the table as routing
+    sorted it, not the order the options stated the routes in;
   - the request view holds the method, the canonical host, path and
     query, the parsed headers, the client address, the verified client
     certificate's fingerprint when there is one, the listener, the tag,

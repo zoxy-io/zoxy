@@ -33,6 +33,7 @@ const std = @import("std");
 const config_module = @import("config.zig");
 const constants = @import("constants.zig");
 const filter = @import("http/filter.zig");
+const router = @import("http/router.zig");
 const io_module = @import("io/io.zig");
 const parser = @import("http/parser.zig");
 const upstream = @import("net/upstream.zig");
@@ -659,6 +660,25 @@ pub const PolicySite = struct {
     route_index: ?u16,
     /// The cluster the route sends to; null for the listener.
     cluster_index: ?u16,
+    /// The listener's route table, as routing reads it — sorted by
+    /// specificity, so an index is not the order the options stated the
+    /// routes in. Read through `routeNamed`.
+    routes: []const router.Route,
+
+    /// The index of the listener's route named `name` (#430): what a
+    /// policy resolves once, at `bind`, and routes by. Null when no route
+    /// of this listener carries that name. An empty name is the caller's
+    /// bug: no route can carry one (`RouteNameInvalid`).
+    pub fn routeNamed(site: *const PolicySite, name: []const u8) ?u16 {
+        assert(name.len >= 1);
+        // `RoutesOverLimit` holds a listener's table to a `u16` index.
+        assert(site.routes.len <= std.math.maxInt(u16));
+        for (site.routes, 0..) |route, index| {
+            const named = route.name orelse continue;
+            if (std.mem.eql(u8, named, name)) return @intCast(index);
+        }
+        return null;
+    }
 };
 
 /// Refuse, at compile time, a picker type that does not meet `pick`'s
