@@ -129,9 +129,9 @@ pub const ScriptedPolicy = struct {
         startup: *const extension.Startup,
     ) !void {
         _ = startup;
-        // A route is bound with the cluster it sends to; a listener with
-        // neither.
-        assert((site.route_index == null) == (site.cluster_index == null));
+        // A listener is bound with neither a route nor a cluster; a route
+        // with the cluster it sends to — none for a handler route (#434).
+        if (site.route_index == null) assert(site.cluster_index == null);
         assert(policy.reject_prefix.len <= path_bytes_max);
         assert(policy.answer_prefix.len <= path_bytes_max);
         policy.binds += 1;
@@ -210,8 +210,6 @@ pub const ScriptedPolicy = struct {
     pub fn complete(policy: *ScriptedPolicy, done: *const extension.RequestCompletion) void {
         assert(done.done_ns >= done.started_ns);
         assert(done.started_ns >= 1);
-        // A site's routed request names its cluster; a route's always is.
-        if (done.route_index != null) assert(done.cluster_index != null);
         policy.completions += 1;
         assert(policy.completions <= policy.handedOn());
         policy.last = done.*;

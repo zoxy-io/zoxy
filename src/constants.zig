@@ -1012,6 +1012,47 @@ pub const health_check_grpc_response_bytes_max: u32 = 16;
 pub const health_check_request_bytes_max: u32 =
     64 + health_check_path_bytes_max + health_check_host_bytes_max;
 
+/// The widest answer a build's handler may declare (#434): its headers'
+/// and body bytes together. A handler's answer is rendered into the
+/// connection's head buffer, so a declaration past the configured head
+/// buffer is refused at startup; this bounds the one scratch it is built
+/// in.
+pub const handler_response_bytes_max: u32 = 64 * 1024;
+/// The headers one handler answer may carry beside zoxy's own.
+pub const handler_headers_max: u8 = 16;
+/// The longest reason phrase a handler's status line can carry (#434):
+/// the registered phrase of any status from 200 to 599, as the render
+/// writes it, measured off the same table.
+pub const handler_status_phrase_bytes_max: u32 = blk: {
+    @setEvalBranchQuota(20_000);
+    var longest: u32 = 0;
+    for (200..600) |code| {
+        const status: std.http.Status = @fromBackingInt(@as(u10, @intCast(code)));
+        const phrase = status.phrase() orelse "";
+        longest = @max(longest, phrase.len);
+    }
+    break :blk longest;
+};
+
+/// The bytes zoxy renders around a handler's answer (#434): the status
+/// line with its phrase, `Content-Length`, `Date`, `Server` and
+/// `Connection: close`, and the colon, space and line end each of the
+/// handler's headers takes. Startup holds the head buffer to fitting the
+/// widest declared answer with these, so the render cannot run out.
+pub const handler_head_overhead_bytes: u32 =
+    "HTTP/1.1 599 \r\n".len + handler_status_phrase_bytes_max +
+    "Content-Length: 18446744073709551615\r\n".len +
+    "Date: Sun, 06 Nov 1994 08:49:37 GMT\r\n".len + "Server: zoxy\r\n".len +
+    "Connection: close\r\n".len + "\r\n".len + handler_headers_max * ": \r\n".len;
+
+comptime {
+    // The widest declarable answer fits the widest head buffer.
+    assert(handler_response_bytes_max + handler_head_overhead_bytes <= head_buffer_bytes_max);
+    assert(handler_status_phrase_bytes_max >= "Network Authentication Required".len);
+    assert(handler_headers_max >= 1);
+    assert(handler_head_overhead_bytes < head_buffer_bytes_min);
+}
+
 /// The rounds one probe of a build's own check kind may take (#436): each
 /// a request and the reply it is judged by, so a handshake that answers a
 /// greeting — MySQL's, which counts a client that hangs up after the

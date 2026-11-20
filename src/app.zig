@@ -113,6 +113,14 @@ pub fn App(comptime extensions: extension.Extensions) type {
             return selection;
         }
 
+        /// A route's handler (#434): `instance` must point at a handler
+        /// type this build lists. The route names no cluster.
+        pub fn handler(instance: anytype) extension.Selection {
+            const selection = extension.select(extensions.handlers, instance);
+            assert(selection.index < extensions.handlers.len);
+            return selection;
+        }
+
         /// One connection-policy selection for a listener's list (#425):
         /// `instance` must point at a connection-policy type this build
         /// lists.
@@ -137,6 +145,7 @@ pub fn App(comptime extensions: extension.Extensions) type {
             const config = try config_module.resolve(arena, options);
             try refuseUnservedSelections(&config);
             try refuseUnfitAnswers(&config);
+            try refuseUnfitHandlers(&config);
             try refuseOverEditing(&config);
             assert(config.clusters.len == options.clusters.len);
             assert(config.listeners.len >= 1);
@@ -176,6 +185,7 @@ pub fn App(comptime extensions: extension.Extensions) type {
                     try refuseUnserved(selection, extensions.response_policies.len);
                 }
                 for (listener.routes) |*route| {
+                    if (route.handler) |selection| try refuseUnserved(selection, extensions.handlers.len);
                     for (route.request_policies) |selection| {
                         try refuseUnserved(selection, extensions.request_policies.len);
                     }
@@ -195,6 +205,17 @@ pub fn App(comptime extensions: extension.Extensions) type {
             assert(config.limits.head_buffer_bytes >= 1);
             if (!Answers.enabled) return;
             if (Answers.head_bytes_max > config.limits.head_buffer_bytes) return error.AnswerHeadOverBuffer;
+        }
+
+        /// A head buffer smaller than the widest answer this build's
+        /// handlers declare, with zoxy's own lines around it (#434): the
+        /// answer is rendered into the connection's head buffer.
+        fn refuseUnfitHandlers(config: *const Config) error{HandlerResponseOverBuffer}!void {
+            const widest = comptime extension.handlerResponseBytesMax(extensions);
+            assert(config.limits.head_buffer_bytes >= constants.head_buffer_bytes_min);
+            if (widest == 0) return;
+            const rendered = @as(u64, widest) + constants.handler_head_overhead_bytes;
+            if (rendered > config.limits.head_buffer_bytes) return error.HandlerResponseOverBuffer;
         }
 
         /// Policy lists that could edit one request more times than the

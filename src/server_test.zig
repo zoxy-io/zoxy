@@ -2925,10 +2925,9 @@ test "sni routing: connection policies count into their own sites' series (#425)
     try bed.expectDrained();
 }
 
-/// A bed whose one endpoint a build's check kind probes (#436), run past
-/// the first sweep and an interval-paced one.
-fn runProbed(probe: *ScriptedProbe, seed: u64) !TestBed {
-    var bed: TestBed = undefined;
+/// Set `bed` up, in place, with one endpoint a build's check kind probes
+/// (#436), and run it past the first sweep and an interval-paced one.
+fn runProbed(bed: *TestBed, probe: *ScriptedProbe, seed: u64) !void {
     try bed.setUp(std.testing.allocator, .{
         .sim = .{ .seed = seed },
         .check = .{
@@ -2944,12 +2943,12 @@ fn runProbed(probe: *ScriptedProbe, seed: u64) !TestBed {
         bed.tearDown();
         return err;
     };
-    return bed;
 }
 
 test "health: a build's check kind passes over rounds an origin answers (#436)" {
     var probe: ScriptedProbe = .{ .rounds = &.{ "hello\n", "ping\n" } };
-    var bed = try runProbed(&probe, 4361);
+    var bed: TestBed = undefined;
+    try runProbed(&bed, &probe, 4361);
     defer bed.tearDown();
 
     try std.testing.expectEqual(@as(u32, 1), probe.binds);
@@ -2962,7 +2961,8 @@ test "health: a build's check kind passes over rounds an origin answers (#436)" 
 
 test "health: a build's check kind ejects an endpoint whose answer is wrong (#436)" {
     var probe: ScriptedProbe = .{ .expect = "+PONG\r\n" };
-    var bed = try runProbed(&probe, 4362);
+    var bed: TestBed = undefined;
+    try runProbed(&bed, &probe, 4362);
     defer bed.tearDown();
 
     try std.testing.expect(bed.server.counters.get("health_probes_failed") >= 1);
@@ -2973,7 +2973,8 @@ test "health: a build's check kind ejects an endpoint whose answer is wrong (#43
 
 test "health: a check kind that asks for a round past the bound fails, counted (#436)" {
     var probe: ScriptedProbe = .{ .rounds = &.{ "1\n", "2\n", "3\n", "4\n", "5\n" } };
-    var bed = try runProbed(&probe, 4363);
+    var bed: TestBed = undefined;
+    try runProbed(&bed, &probe, 4363);
     defer bed.tearDown();
 
     try std.testing.expectEqual(constants.health_check_rounds_max - 1, probe.furthest_round);
@@ -2985,7 +2986,8 @@ test "health: a check kind that asks for a round past the bound fails, counted (
 test "health: a server-speaks-first round meets a mute origin at the probe's deadline (#436)" {
     // An empty request only reads; the echo origin says nothing first.
     var probe: ScriptedProbe = .{ .rounds = &.{""}, .expect = "220 " };
-    var bed = try runProbed(&probe, 4364);
+    var bed: TestBed = undefined;
+    try runProbed(&bed, &probe, 4364);
     defer bed.tearDown();
 
     try std.testing.expectEqual(@as(u32, 0), probe.judgements);
@@ -3000,7 +3002,8 @@ test "health: a reply that fills the kind's declared bound undecided fails (#436
     const wide: [ScriptedProbe.reply_bytes_max + 16]u8 = @splat('x');
     const rounds = [_][]const u8{&wide};
     var probe: ScriptedProbe = .{ .rounds = &rounds };
-    var bed = try runProbed(&probe, 4365);
+    var bed: TestBed = undefined;
+    try runProbed(&bed, &probe, 4365);
     defer bed.tearDown();
 
     try std.testing.expect(probe.judgements >= 1);
@@ -3013,7 +3016,8 @@ test "health: a check kind's request past the bound fails the probe, not the pro
     const oversize: [constants.health_check_request_bytes_max + 1]u8 = @splat('x');
     const rounds = [_][]const u8{&oversize};
     var probe: ScriptedProbe = .{ .rounds = &rounds };
-    var bed = try runProbed(&probe, 4366);
+    var bed: TestBed = undefined;
+    try runProbed(&bed, &probe, 4366);
     defer bed.tearDown();
 
     try std.testing.expect(bed.server.counters.get("health_probe_request_oversize") >= 1);

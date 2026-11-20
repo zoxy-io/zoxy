@@ -170,6 +170,16 @@ pub const Counters = struct {
     /// asked for an edit zoxy would refuse a request's, and the exchange
     /// failed as an unrenderable origin head does, with a `502`.
     l7_response_policy_edit_refused: Value = Value.init(0),
+    /// A build's handler answered the request (#434), from its own code.
+    l7_handled: Value = Value.init(0),
+    /// A handler route's request declared a body wider than the head
+    /// buffer holds beside its head (#434): a `413`.
+    l7_handler_body_too_large: Value = Value.init(0),
+    /// A handler's answer could not be sent as written — it overflowed
+    /// what the type declared, carried a header zoxy writes itself or a
+    /// value that is not one field, or gave a `204` or `304` a body — and
+    /// zoxy answered `502` in its place (#434).
+    l7_handler_answer_refused: Value = Value.init(0),
     /// A §7 filter rule answered the request with a redirect (#176):
     /// one of the closed statuses plus a Location rendered per request.
     /// `l7_filtered`'s sibling — admitted and answered, so outside

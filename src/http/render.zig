@@ -90,6 +90,75 @@ pub fn isReservedEditName(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(name, max_forwards_name);
 }
 
+/// One header a build's handler answers with (#434).
+pub const HandlerHeader = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+/// Whether a handler's header is one this proxy can send as written: a
+/// token name, a value that stays one field, and a name zoxy does not
+/// write itself — the framing, the hop-by-hop fields, `Date`, `Server`.
+pub fn handlerHeaderAcceptable(header: HandlerHeader) bool {
+    if (header.name.len == 0) return false;
+    for (header.name) |byte| {
+        if (!parser.isTokenByte(byte)) return false;
+    }
+    if (isReservedEditName(header.name)) return false;
+    if (std.ascii.eqlIgnoreCase(header.name, "date")) return false;
+    if (std.ascii.eqlIgnoreCase(header.name, "server")) return false;
+    for (header.value) |byte| {
+        if (!parser.isForwardableByte(byte)) return false;
+    }
+    return true;
+}
+
+/// A build's handler answer (#434), rendered into the connection's head
+/// buffer: the status line, zoxy's framing and stamps, the handler's own
+/// headers, then its body — none for a `HEAD`, whose length still says
+/// what a `GET` carries, nor for a `204` or `304`, which have none.
+pub fn renderHandlerResponse(
+    status: u16,
+    headers: []const HandlerHeader,
+    body: []const u8,
+    head_only: bool,
+    inject_close: bool,
+    date: *const [shed.date_bytes]u8,
+    buffer: []u8,
+) error{Oversize}![]const u8 {
+    assert(status >= 200 and status <= 599);
+    assert(headers.len <= constants.handler_headers_max);
+    const bodiless = status == 204 or status == 304;
+    if (bodiless) assert(body.len == 0);
+    var staging = Staging{ .buffer = buffer };
+    try staging.append("HTTP/1.1 ");
+    try staging.append(&statusDigits(status));
+    try staging.append(" ");
+    const known: std.http.Status = @fromBackingInt(@as(u10, @intCast(status)));
+    try staging.append(known.phrase() orelse "");
+    try staging.append("\r\n");
+    if (!bodiless) {
+        var digits: [20]u8 = undefined;
+        try staging.append("Content-Length: ");
+        try staging.append(std.fmt.bufPrint(&digits, "{d}", .{body.len}) catch unreachable);
+        try staging.append("\r\n");
+    }
+    try staging.append("Date: ");
+    try staging.append(date);
+    try staging.append("\r\n");
+    try staging.append(shed.server_line);
+    if (inject_close) try staging.append("Connection: close\r\n");
+    for (headers) |header| {
+        try staging.append(header.name);
+        try staging.append(": ");
+        try staging.append(header.value);
+        try staging.append("\r\n");
+    }
+    try staging.append("\r\n");
+    if (!head_only) try staging.append(body);
+    return staging.buffer[0..staging.len];
+}
+
 /// The most one chunk-size line takes (RFC 9112 §7.1): a `u64`'s sixteen
 /// hex digits, then CRLF.
 pub const chunk_prefix_bytes_max: u32 = 16 + 2;

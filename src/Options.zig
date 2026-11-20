@@ -162,8 +162,12 @@ pub const Listener = struct {
         prefix: []const u8,
         /// A header the request must carry (#302), or null.
         header: ?RouteHeader = null,
-        /// The cluster's name.
-        cluster: []const u8,
+        /// The cluster's name; empty on a handler route, and required on
+        /// every other.
+        cluster: []const u8 = "",
+        /// A build's handler that answers the route's requests itself
+        /// (#434), selected with `App.handler`, in place of a cluster.
+        handler: ?extension.Selection = null,
         /// #417's route-phase request policies, run once the route is
         /// chosen and before any resource is taken; the first reject wins.
         request_policies: []const extension.Selection = &.{},

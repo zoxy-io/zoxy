@@ -116,6 +116,9 @@ pub const testing = struct {
     /// A request policy that refuses one path prefix and records what it
     /// evaluated (#417).
     pub const ScriptedPolicy = @import("testing/policy.zig").ScriptedPolicy;
+    /// A handler that answers with its path, a flag a `POST` flips, and the
+    /// body it read (#434).
+    pub const ScriptedHandler = @import("testing/handler.zig").ScriptedHandler;
     /// A health-check kind that sends scripted rounds and expects each
     /// echoed (#436).
     pub const ScriptedProbe = @import("testing/probe.zig").ScriptedProbe;
