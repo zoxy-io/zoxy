@@ -129,7 +129,8 @@ pub const Startup = struct {
 /// handed out at startup for a cluster that declared `endpoint_slots`, and
 /// used on the loop thread alone — from a handler, a policy, a picker's
 /// completion; never inside a pick, whose candidates the update would
-/// change under it. Keep the set, not the `Startup` it came from, which
+/// change under it, nor inside `endpointsChanged`, which an update calls
+/// and which would recurse. Keep the set, not the `Startup` it came from, which
 /// lives only for `bind`.
 pub const EndpointSet = struct {
     context: *anyopaque,
@@ -1217,6 +1218,20 @@ pub fn assertPicker(comptime Picker: type) void {
         if (!complete_ok) {
             @compileError(name ++ ".complete must be `fn (*" ++ name ++
                 ", *const extension.Completion) void`");
+        }
+    }
+    // #428: a picker may be told of every update to its cluster's
+    // endpoints, with the slots as they now stand, so per-endpoint state
+    // can follow a slot that changed hands.
+    if (@hasDecl(Picker, "endpointsChanged")) {
+        const changed_fn = @typeInfo(@TypeOf(Picker.endpointsChanged)).@"fn";
+        const changed_ok = changed_fn.param_types.len == 2 and
+            changed_fn.param_types[0] == *Picker and
+            changed_fn.param_types[1] == *const ClusterSite and
+            changed_fn.return_type == void;
+        if (!changed_ok) {
+            @compileError(name ++ ".endpointsChanged must be `fn (*" ++ name ++
+                ", *const extension.ClusterSite) void`");
         }
     }
 }

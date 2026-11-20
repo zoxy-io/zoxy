@@ -53,6 +53,8 @@ pub fn replace(server: anytype, cluster_index: u16, wanted: []const Endpoint) Up
         }
     }
     assert(countState(slots, .live) == wanted.len);
+    // A build's picker hears of it last, with every slot settled.
+    server.notifyEndpointsChanged(cluster_index);
 }
 
 fn validate(wanted: []const Endpoint, capacity: usize) UpdateError!void {

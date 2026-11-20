@@ -13,6 +13,10 @@ pub const ScriptedPicker = struct {
     choice: Choice = .first,
     /// Startup binds received, one per cluster that selected the instance.
     binds: u32 = 0,
+    /// Endpoint updates heard (#428).
+    changes: u32 = 0,
+    /// The live slots the last update left.
+    live_after_change: u16 = 0,
     /// Picks asked of it.
     calls: u32 = 0,
     /// The last pick's candidates, by endpoint index, in the order offered.
@@ -82,6 +86,17 @@ pub const ScriptedPicker = struct {
         assert(cluster.endpoints.len >= 1);
         assert(cluster.name.len >= 1);
         picker.binds += 1;
+    }
+
+    pub fn endpointsChanged(picker: *ScriptedPicker, cluster: *const extension.ClusterSite) void {
+        assert(cluster.states.len == cluster.endpoints.len);
+        picker.changes += 1;
+        var live: u16 = 0;
+        for (0..cluster.endpoints.len) |index| {
+            if (cluster.liveAt(index)) live += 1;
+        }
+        assert(live >= 1);
+        picker.live_after_change = live;
     }
 
     pub fn pick(

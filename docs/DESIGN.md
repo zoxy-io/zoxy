@@ -1698,6 +1698,14 @@ lists do not reach is refused at step zero (`ExtensionUnserved`).
     `bind(*P, *const extension.ClusterSite, *const extension.Startup) !void`
     runs at startup, once per cluster that selects the instance, and
     may refuse;
+  - an optional `endpointsChanged(*P, *const ClusterSite) void` runs
+    on the loop after every update to the cluster's endpoints (#428),
+    never a refused one, with the slots as they now stand: what lets
+    per-endpoint state a picker sized at `bind` follow a slot that
+    changed hands. A picker resets a slot's state when the slot
+    becomes live; a freed slot is not live, so a reclaim alone is not
+    heard. An update from inside it would recurse, and is asserted
+    against;
   - the candidates are what remains after drain, retry exclusion,
     health and panic, ramped caps and standby tiers (§7). A slot indexes
     that set, not the cluster's endpoints, and each slot exposes

@@ -213,6 +213,9 @@ pub fn Server(comptime runtime: Runtime) type {
         /// Set by `bindExtensions`, the startup step that hands each
         /// selected instance the cluster it serves before its first pick.
         extensions_bound: bool,
+        /// A picker's `endpointsChanged` is running (#428): an update from
+        /// inside it would recurse, and is the build's bug.
+        endpoints_notifying: bool,
         counters: counters_module.Counters,
         /// The #179 labeled breakdown beside the process totals: which
         /// backend, per cluster and endpoint. Tables sized by the loaded
@@ -767,6 +770,7 @@ pub fn Server(comptime runtime: Runtime) type {
             try server.balancer.init(arena, config, keys);
             server.selects_extensions = selectsExtensions(config);
             server.extensions_bound = false;
+            server.endpoints_notifying = false;
             try server.initMetrics(arena, config, keys);
             server.resetRuntimeState(&options);
             try server.admin.init(server, config.admin_bind, arena);
@@ -5435,6 +5439,38 @@ pub fn Server(comptime runtime: Runtime) type {
             return false;
         }
 
+        /// Tell cluster `cluster_index`'s picker its endpoints changed
+        /// (#428), when it selects a build's picker that declares
+        /// `endpointsChanged`: the site as `bind` saw it, the slots as they
+        /// now stand.
+        pub fn notifyEndpointsChanged(server: *Self, cluster_index: u16) void {
+            assert(cluster_index < server.config.clusters.len);
+            assert(!server.endpoints_notifying);
+            const cluster = &server.config.clusters[cluster_index];
+            const selection = switch (cluster.pick) {
+                .extension => |selection| selection,
+                .rr, .p2c, .hash => return,
+            };
+            assert(selection.index < runtime.extensions.pickers.len);
+            const site: extension.ClusterSite = .{
+                .index = cluster_index,
+                .name = cluster.name,
+                .endpoints = cluster.endpoints,
+                .states = if (cluster.slots) |slots| slots.states else &.{},
+            };
+            if (site.states.len != 0) assert(site.states.len == site.endpoints.len);
+            inline for (runtime.extensions.pickers, 0..) |Picker, index| {
+                if (selection.index == index) {
+                    if (comptime !@hasDecl(Picker, "endpointsChanged")) return;
+                    const picker: *Picker = @ptrCast(@alignCast(selection.instance));
+                    server.endpoints_notifying = true;
+                    defer server.endpoints_notifying = false;
+                    return Picker.endpointsChanged(picker, &site);
+                }
+            }
+            unreachable;
+        }
+
         /// Make `endpoints` the set of cluster `cluster_index`, which must
         /// have reserved slots (#428): see `endpoint_sets.replace`.
         pub fn replaceEndpoints(
@@ -5444,6 +5480,9 @@ pub fn Server(comptime runtime: Runtime) type {
         ) extension.EndpointSet.UpdateError!void {
             assert(cluster_index < server.config.clusters.len);
             assert(server.config.clusters[cluster_index].slots != null);
+            // Never from inside a picker's `endpointsChanged`: that would
+            // recurse through this very call.
+            assert(!server.endpoints_notifying);
             return endpoint_sets.replace(server, cluster_index, endpoints);
         }
 
