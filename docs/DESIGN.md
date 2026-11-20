@@ -266,10 +266,11 @@ listener parses it.
 - **Keys.** ECDSA, or RSA of 2048–4096 bits signing RSA-PSS, never
   v1.5. Chain and key are parsed once at startup.
   - A key that is not the leaf's is refused there
-    (`CertificateKeyMismatch`). The key signs once, and `std.crypto`
-    must verify that signature against the leaf. That is the check
-    every client makes of a CertificateVerify, so a mismatched pair
-    would otherwise fail every handshake.
+    (`CertificateKeyMismatch`). The key signs once, and the leaf's
+    public key must verify that signature. That is the check every
+    client makes of a CertificateVerify, so a mismatched pair would
+    otherwise fail every handshake. It verifies with the verifiers zssl
+    uses for a peer: libcrypto for ECDSA, and `std.crypto` for RSA-PSS.
   - An RSA modulus of a width `std.crypto` cannot verify at loads
     unchecked, since real clients accept it. Every 2048-, 3072- and
     4096-bit key is checked.
