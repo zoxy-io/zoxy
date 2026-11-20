@@ -18,6 +18,9 @@ pub const ScriptedHandler = struct {
     overflow: bool = false,
     /// The state a `POST` changes: what a control plane is for.
     flag: bool = false,
+    /// Whether a `POST` flips `flag`. Off where concurrent clients each
+    /// need an answer they can predict — the simulator's.
+    toggles: bool = true,
     /// Startup binds received, one per route that selected the instance.
     binds: u32 = 0,
     /// Requests it answered, and the last one's body length.
@@ -49,7 +52,7 @@ pub const ScriptedHandler = struct {
         assert(request.cluster_index == null);
         handler.handled += 1;
         handler.last_body_len = @intCast(body.len);
-        if (request.method == .post) handler.flag = !handler.flag;
+        if (request.method == .post and handler.toggles) handler.flag = !handler.flag;
         response.status = handler.status;
         if (handler.framing_header) response.header("Content-Length", "1");
         response.header("Content-Type", "text/plain");

@@ -164,6 +164,14 @@ pub const sticky_set_cookie_value_secure = sticky_set_cookie_value ++ "; Secure"
 /// that policy answers with carries the same bytes as every other.
 pub const error_page_body = zoxy.testing.ScriptedPolicy.denied_body;
 pub const respond_body = "sim-respond-body\n";
+
+/// The route a build's handler answers (#434), and what it answers: its
+/// path and its flag, then the body it read — fixed, since the
+/// simulator's handler never flips its flag.
+pub const handler_prefix = "/handled";
+pub const handler_post_payload = "zoxy-handler-body";
+pub const handler_get_body = handler_prefix ++ " flag=false\n";
+pub const handler_post_body = handler_get_body ++ handler_post_payload;
 pub const page_content_type = "text/plain";
 
 /// A parseable head that cannot survive the render: 8190 bytes fits the
