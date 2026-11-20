@@ -87,6 +87,28 @@ const invalid_config_text =
 /// fails here rather than passing as this one.
 const invalid_config_log = "zoxy: invalid config '" ++ invalid_config_path ++ "': ListenerBindInvalid\n";
 
+/// A config whose listener certificate is one byte over the PEM cap
+/// (`tls_pem_bytes_max`, spelled here on `check_exit_*`'s rule). Its
+/// verdict, `ListenerTlsFileUnreadable`, holds no path, so the line before
+/// it must say which file and why. 1.0.0 printed only the verdict.
+const oversized_config_path = work_directory ++ "/oversized.json";
+const oversized_pem_path = work_directory ++ "/oversized.pem";
+const tls_pem_bytes_cap: usize = 256 * 1024;
+const oversized_config_text = std.fmt.comptimePrint(
+    \\{{"listeners":[{{"bind":"127.0.0.1:1","http":{{"cluster":"a"}},
+    \\"tls":{{"cert":"{s}","key":"{s}"}}}}],
+    \\"clusters":{{"a":{{"endpoints":["127.0.0.1:1"]}}}}}}
+, .{ oversized_pem_path, tls_key_path });
+const oversized_config_log = std.fmt.comptimePrint(
+    "zoxy: cannot read '{s}': larger than {d} bytes\n" ++
+        "zoxy: invalid config '{s}': ListenerTlsFileUnreadable\n",
+    .{ oversized_pem_path, tls_pem_bytes_cap, oversized_config_path },
+);
+
+/// The oversized certificate's bytes. Not PEM at all: the read is refused
+/// before anything parses them.
+const oversized_pem: [tls_pem_bytes_cap + 1]u8 = @splat('x');
+
 /// What `--check` must exit with. Spelled here rather than imported from
 /// `main.zig`'s `CheckExit`, on the rule the rest of this file follows:
 /// the gate reads what the binary *did*, so a drift has to fail loudly
@@ -2715,6 +2737,11 @@ fn prepareWorkDirectory(io: Io) !void {
         .sub_path = invalid_config_path,
         .data = invalid_config_text,
     });
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = oversized_config_path,
+        .data = oversized_config_text,
+    });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = oversized_pem_path, .data = &oversized_pem });
 }
 
 /// One `--check` run's verdict: the code it exited with, whether the
@@ -2736,11 +2763,13 @@ const CheckRun = struct {
 /// where the real binary then starts on the same file. The second pins
 /// the other half — that the mode refuses what the loader refuses, with
 /// the exit code a CI job branches on rather than a bare non-zero, and
-/// with the loader's own verdict.
+/// with the loader's own verdict. A third pins what a refusal says when
+/// the verdict alone cannot: which file.
 fn checkPassed(arena: std.mem.Allocator, io: Io, zoxy_path: []const u8) !bool {
     assert(zoxy_path.len >= 1);
     const accepted = try runZoxyCheck(arena, io, zoxy_path, config_path);
     const refused = try runZoxyCheck(arena, io, zoxy_path, invalid_config_path);
+    const oversized = try runZoxyCheck(arena, io, zoxy_path, oversized_config_path);
     var passed = true;
     if (accepted.exit_code != check_exit_ok) {
         std.debug.print(
@@ -2754,6 +2783,7 @@ fn checkPassed(arena: std.mem.Allocator, io: Io, zoxy_path: []const u8) !bool {
         passed = false;
     }
     if (!refusedAsPinned(&refused, invalid_config_log, "a config the loader refuses")) passed = false;
+    if (!refusedAsPinned(&oversized, oversized_config_log, "an oversized certificate")) passed = false;
     return passed;
 }
 

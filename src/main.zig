@@ -189,6 +189,12 @@ const BodyFileContext = struct {
 /// The loader's `FileSource.read` against the real filesystem: whole
 /// file into the arena, refused past `limit` — the loader turns that
 /// into the same verdict an oversized inline body earns.
+///
+/// Both refusals a read can earn, unreadable and too large, are named
+/// here with the path and the reason, where both are known: the loader's
+/// error names the verdict, not the file. Bodies, CA bundles and a
+/// listener's certificate pair all come through here (#417), so this is
+/// the one place a refusal can say which.
 fn readBodyFile(
     context: ?*anyopaque,
     arena: std.mem.Allocator,
@@ -205,12 +211,11 @@ fn readBodyFile(
         .limited(limit),
     ) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        error.StreamTooLong => error.FileTooLarge,
+        error.StreamTooLong => blk: {
+            std.debug.print("zoxy: cannot read '{s}': larger than {d} bytes\n", .{ path, limit });
+            break :blk error.FileTooLarge;
+        },
         else => blk: {
-            // Which file and why, here where both are known: the
-            // loader's error names the verdict, not the path. Bodies, CA
-            // bundles and a listener's certificate pair all come through
-            // here (#417).
             std.debug.print("zoxy: cannot read '{s}': {t}\n", .{ path, err });
             break :blk error.FileUnreadable;
         },
