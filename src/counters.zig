@@ -160,6 +160,10 @@ pub const Counters = struct {
     /// refused with a `400` rather than edited — a value from the request
     /// must never become a header of zoxy's, or a second header.
     l7_policy_edit_refused: Value = Value.init(0),
+    /// The same refusal on the way out (#424): a build's response policy
+    /// asked for an edit zoxy would refuse a request's, and the exchange
+    /// failed as an unrenderable origin head does, with a `502`.
+    l7_response_policy_edit_refused: Value = Value.init(0),
     /// A §7 filter rule answered the request with a redirect (#176):
     /// one of the closed statuses plus a Location rendered per request.
     /// `l7_filtered`'s sibling — admitted and answered, so outside

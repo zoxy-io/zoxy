@@ -1048,6 +1048,10 @@ pub const policy_edits_max: u16 = 64;
 /// A request render's edit ceiling: the filters' and the policies'.
 pub const request_edits_max: u16 = header_edits_max + policy_edits_max;
 
+/// A response render's edit ceiling (#424): the response filters', a
+/// build's response policies', and the #178 stamp.
+pub const response_render_edits_max: u16 = response_edits_max + policy_edits_max;
+
 /// Upper bound on one configured body's bytes (#159) — file or inline,
 /// rejected at load. The bound is the scope boundary, not a tuning
 /// knob: below it, holding the bytes in the startup arena is the cheap
@@ -1721,6 +1725,11 @@ comptime {
     assert(policy_edits_per_verdict_max >= 1);
     assert(policy_edits_max >= policy_edits_per_verdict_max);
     assert(request_edits_max == header_edits_max + policy_edits_max);
+    // A response render holds its route's policies' edits, every filter
+    // edit, its listener's and the #178 stamp: `responseEditsWithStamp`
+    // lays them out so.
+    assert(response_render_edits_max == response_edits_max + policy_edits_max);
+    assert(response_render_edits_max > header_edits_max + policy_edits_max);
     assert(policy_edit_bytes_max >= 64);
     assert(body_bytes_max >= 1);
     // A body must fit the u32 lengths the render and the channel carry.

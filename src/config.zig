@@ -393,6 +393,9 @@ pub const Config = struct {
         /// `request_filters` and routing. Http listeners only, and never
         /// spelled in JSON: an extension is selected in code.
         request_policies: []const extension_module.Selection = &.{},
+        /// #424's response policies on this listener, selected in code:
+        /// run on every response head, after the response filters.
+        response_policies: []const extension_module.Selection = &.{},
         /// The #175 response filter rules, same discipline on the way
         /// out: empty on the L4 path and whenever no `"response_filters"`
         /// were given. Compiled by this loader, matched by
@@ -2644,6 +2647,7 @@ fn resolveHttpListener(
         .routes = try resolveRoutes(arena, &http.target, clusters, head_buffer_bytes),
         .request_filters = try resolveRequestFilters(arena, http.request_filters, head_buffer_bytes, bodies),
         .request_policies = http.request_policies,
+        .response_policies = http.response_policies,
         .response_filters = try resolveResponseFilters(arena, http.response_filters),
         .protocol = .http,
         .forwarded = http.forwarded,
@@ -3448,6 +3452,7 @@ fn resolveRoutes(
             .header = header,
             .cluster_index = try clusterIndexOf(clusters, route_stated.cluster),
             .request_policies = route_stated.request_policies,
+            .response_policies = route_stated.response_policies,
             .name = route_stated.name,
         };
     }

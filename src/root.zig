@@ -116,6 +116,9 @@ pub const testing = struct {
     /// A request policy that refuses one path prefix and records what it
     /// evaluated (#417).
     pub const ScriptedPolicy = @import("testing/policy.zig").ScriptedPolicy;
+    /// A response policy that edits every head it reads with a scripted
+    /// list (#424).
+    pub const ScriptedResponsePolicy = @import("testing/response_policy.zig").ScriptedResponsePolicy;
     /// A build's own test bed (#417): its options resolved, a server over
     /// the simulator with its extensions, origins on every endpoint, and
     /// HTTP clients to drive — the serving path zoxy's own gates run.

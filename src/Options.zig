@@ -113,6 +113,9 @@ pub const Listener = struct {
         /// #417's request policies, in order, after the request is
         /// canonicalized and before the filters; the first reject wins.
         request_policies: []const extension.Selection = &.{},
+        /// #424's response policies, in order, on every response head the
+        /// listener's routes relay, after the response filters.
+        response_policies: []const extension.Selection = &.{},
         /// The §7 request filters, walked top-down.
         request_filters: []const Filter = &.{},
         /// The #175 response filters, walked top-down.
@@ -160,6 +163,9 @@ pub const Listener = struct {
         /// #417's route-phase request policies, run once the route is
         /// chosen and before any resource is taken; the first reject wins.
         request_policies: []const extension.Selection = &.{},
+        /// #424's response policies on this route, in order, on every
+        /// response head it relays — before the response filters.
+        response_policies: []const extension.Selection = &.{},
         /// A name a build's request policy routes by (#430), unique on its
         /// listener, or null. Set in code alone: the JSON front-end has no
         /// key for it, so a stock config's routes are unnamed.

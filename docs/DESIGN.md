@@ -1617,7 +1617,8 @@ extensions they list.
   and the JSON front-end.
 
 **Extensions.** A build lists types:
-`Extensions{ .pickers, .request_policies }`. Dispatch is a comptime
+`Extensions{ .pickers, .request_policies, .response_policies }`.
+Dispatch is a comptime
 switch over the list, not a function pointer, and with empty lists
 every extension call compiles out, as in the stock binary. An instance
 carries its parameters and its state. A selection is the type's index
@@ -1736,6 +1737,25 @@ lists do not reach is refused at step zero (`ExtensionUnserved`).
     loop-clock times the request began and ended, and the policy's own
     metrics: what a rate or concurrency limit counts back down by.
 
+- **Response policies** (#424), each an ordered list per http listener
+  and per route, selected with `App.responsePolicy`:
+  - `evaluate(*P, *const Response) ResponseVerdict` reads the origin's
+    final response head — its status and headers, the listener, route
+    and cluster the request took, its tag, and the loop clock — and
+    returns header edits, under a request edit's rules and bounds; an
+    optional `bind` is a request policy's;
+  - the edits apply in the order the deciders run on the way out: the
+    route's policies', the response filters', the listener's
+    policies'. One scratch for the server holds them, since a
+    response's policies run and its head renders in one callback;
+  - a refused edit fails the exchange as an unrenderable origin head
+    does — a `502`, `l7_response_policy_edit_refused`, and a passive
+    failure against the endpoint, as that head's would be;
+  - they see the origin's final response only: interim and upgrade
+    responses divert first, and this proxy's own pages — a refusal, a
+    shed, a `502` — are never shown to them. A response policy declares
+    no metrics yet.
+
 **Metrics** (#435). A listed type may declare its own counters and
 gauges: `metrics_prefix`, then `counters` and `gauges`, each a struct
 literal of name and help text.
@@ -1794,7 +1814,7 @@ CI builds, tests and smokes it against a fetched package.
 **Not offered yet:**
 - live endpoint discovery, which needs preallocated slots and endpoint
   identities that survive in-flight work;
-- further phases: response policies, and L4 connection policies;
+- further phases: L4 connection policies;
 - regex in stock filters and routes, which waits until after v1.0.0.
 
 **Published, not frozen.** HTTP/3 would move the exchange's internal

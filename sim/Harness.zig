@@ -30,6 +30,7 @@ const runtime: zoxy.Runtime = .{
     .extensions = .{
         .pickers = &.{zoxy.testing.ScriptedPicker},
         .request_policies = &.{zoxy.testing.ScriptedPolicy},
+        .response_policies = &.{zoxy.testing.ScriptedResponsePolicy},
     },
 };
 const ServerSim = zoxy.Server(runtime);
@@ -409,6 +410,10 @@ picker_http: bool,
 /// tags each one `policy_tag` (#433).
 policy_listener: zoxy.testing.ScriptedPolicy,
 policy_selections: [1]zoxy.extension.Selection,
+/// #424's response policy, on every http listener: it adds a header to
+/// every response head and holds each to carrying the listener's tag.
+response_policy: zoxy.testing.ScriptedResponsePolicy,
+response_policy_selections: [1]zoxy.extension.Selection,
 /// #417's route-phase policy, on the guarded route of both http chains.
 /// It holds every request it sees to carrying the listener's tag.
 policy_route: zoxy.testing.ScriptedPolicy,
@@ -485,6 +490,13 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
     harness.policy_route = .{ .answer_prefix = l7.canon.route_policy_path, .expect_tag = policy_tag };
     harness.route_policy_selections = .{
         zoxy.extension.select(runtime.extensions.request_policies, &harness.policy_route),
+    };
+    harness.response_policy = .{
+        .edits = &.{.{ .add = .{ .name = "X-Scripted-Response", .value = "listener" } }},
+        .expect_tag = policy_tag,
+    };
+    harness.response_policy_selections = .{
+        zoxy.extension.select(runtime.extensions.response_policies, &harness.response_policy),
     };
 
     // A quarter of seeds run clean: adversary off, origin
@@ -1762,6 +1774,7 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
                 .target = .{ .routes = &harness.routes_http },
                 .request_filters = &harness.request_filters_http,
                 .request_policies = &harness.policy_selections,
+                .response_policies = &harness.response_policy_selections,
                 .response_filters = &harness.response_filters_http,
                 .forwarded = forwarded,
                 .upgrades = .{ .websocket = harness.upgrades_http },
@@ -1804,6 +1817,7 @@ fn terminatingListener(harness: *Harness) zoxy.Options.Listener {
                     .target = .{ .routes = &harness.routes_tls },
                     .request_filters = &harness.request_filters_http,
                     .request_policies = &harness.policy_selections,
+                    .response_policies = &harness.response_policy_selections,
                     .response_filters = &harness.response_filters_http,
                     // No #236 body cap, stated rather than inherited: the cap
                     // is a *plaintext-leg* draw, and a terminated run of a

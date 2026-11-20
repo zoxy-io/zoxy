@@ -403,6 +403,13 @@ const uncovered = [_]Uncovered{
             "header zoxy writes itself, and splits one with CRLF",
     },
     .{
+        .name = "l7_response_policy_edit_refused",
+        .why = .unreached,
+        .reason = "the harness's response policy adds a fixed, valid " ++
+            "header, which zoxy never refuses; src/http_proxy_test.zig " ++
+            "edits a framing header on the way out",
+    },
+    .{
         .name = "l7_policy_route_fallback",
         .why = .unreached,
         .reason = "the harness's listener policy routes only by a name " ++
@@ -647,6 +654,10 @@ const Census = struct {
     /// ever ran. No counter says so, since a body that arrives whole is
     /// the proxy doing nothing a rung would count.
     bodies_verified: u64 = 0,
+    /// Response heads the harness's response policy read (#424): it
+    /// declares no counters, so the census asks it directly whether the
+    /// response phase ever ran.
+    responses_policed: u64 = 0,
 
     fn add(census: *Census, harness: *const Harness) void {
         inline for (Counters.names, 0..) |name, index| {
@@ -670,6 +681,9 @@ const Census = struct {
             total.* += harness.server.extension_metrics.counterTotal(counter.Family, name);
             assert(total.* >= before);
         }
+        const policed_before = census.responses_policed;
+        census.responses_policed += harness.response_policy.evaluated;
+        assert(census.responses_policed >= policed_before);
         const bodies_before = census.bodies_verified;
         census.bodies_verified += harness.origin_http.bodies_verified;
         assert(census.bodies_verified >= bodies_before);
@@ -724,7 +738,7 @@ const Census = struct {
             assert(fired == Counters.names.len - uncovered.len + allowed_fired);
         }
         const ops_held = census.verifyOps();
-        const extensions_held = census.verifyExtensionCounters();
+        const extensions_held = census.verifyExtensionCounters() and census.verifyResponsePolicy();
         return census.verifyBodies() and ops_held and extensions_held and held;
     }
 
@@ -745,6 +759,13 @@ const Census = struct {
             }
         }
         return held;
+    }
+
+    /// The response phase ran somewhere in the range (#424).
+    fn verifyResponsePolicy(census: *const Census) bool {
+        if (census.responses_policed >= 1) return true;
+        std.debug.print("sim census: no response head met the response policy in this sweep\n", .{});
+        return false;
     }
 
     /// Some marked body must reach its origin whole in the range: an

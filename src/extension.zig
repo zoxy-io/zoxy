@@ -49,6 +49,9 @@ pub const Extensions = struct {
     pickers: []const type = &.{},
     /// Request policies a listener or a route may select (§7).
     request_policies: []const type = &.{},
+    /// Response policies a listener or a route may select (#424): they
+    /// read the origin's response head and edit it on its way out.
+    response_policies: []const type = &.{},
 };
 
 /// What a server is built from: the Io backend (§4) and the build's
@@ -476,6 +479,32 @@ pub fn editBytesOf(comptime Policy: type) u32 {
     return Policy.edit_bytes_max;
 }
 
+/// The origin's response head, as a response policy sees it (#424):
+/// valid only for the call, like every view.
+pub const Response = struct {
+    status: u16,
+    /// The parsed header lines, names and values as the origin sent them.
+    headers: []const parser.Header,
+    /// The listener, route and cluster the request took.
+    listener_index: u16,
+    route_index: u16,
+    cluster_index: u16,
+    /// The request's tag (#433), as its policies left it.
+    tag: u64,
+    /// The loop's monotonic clock (§4).
+    now_ns: u64,
+};
+
+/// What a response policy does to the head it read (#424): edits, the
+/// request filters' three, applied with the response filters' in the
+/// order their deciders run on the way out — the route's policies', the
+/// filters', the listener's policies' — under a request edit's rules and
+/// bounds. A refused edit fails the exchange as an unrenderable origin
+/// head does: a `502`.
+pub const ResponseVerdict = struct {
+    edits: []const Edit = &.{},
+};
+
 /// How a request a policy let through ended (#429). A policy may declare
 ///
 ///     pub fn complete(self: *P, done: *const RequestCompletion) void
@@ -773,6 +802,35 @@ pub fn assertPicker(comptime Picker: type) void {
     }
 }
 
+/// Refuse, at compile time, a response-policy type that does not meet its
+/// contract (#424): `evaluate(*P, *const Response) ResponseVerdict`, an
+/// optional `bind` like a request policy's, and an optional
+/// `edit_bytes_max` within its bound.
+pub fn assertResponsePolicy(comptime Policy: type) void {
+    const name = @typeName(Policy);
+    if (!@hasDecl(Policy, "evaluate")) {
+        @compileError(name ++ " is listed as a response policy but declares no `pub fn evaluate`");
+    }
+    const evaluate_fn = @typeInfo(@TypeOf(Policy.evaluate)).@"fn";
+    const evaluate_ok = evaluate_fn.param_types.len == 2 and
+        evaluate_fn.param_types[0] == *Policy and
+        evaluate_fn.param_types[1] == *const Response and
+        evaluate_fn.return_type == ResponseVerdict;
+    if (!evaluate_ok) {
+        @compileError(name ++ ".evaluate must be `fn (*" ++ name ++
+            ", *const extension.Response) extension.ResponseVerdict`");
+    }
+    if (@hasDecl(Policy, "bind")) assertBind(Policy, PolicySite);
+    if (@hasDecl(Policy, "edit_bytes_max")) {
+        const bound: u32 = Policy.edit_bytes_max;
+        if (bound == 0 or bound > constants.policy_edit_bytes_max) {
+            @compileError(name ++ ".edit_bytes_max must be 1 to policy_edit_bytes_max");
+        }
+    }
+    // A response policy's metrics would need sites of their own (#435).
+    if (isMetered(Policy)) @compileError(name ++ " is a response policy, which declares no metrics yet");
+}
+
 /// Refuse, at compile time, a request-policy type that does not meet
 /// `evaluate`'s contract.
 pub fn assertRequestPolicy(comptime Policy: type) void {
@@ -835,6 +893,13 @@ fn assertBind(comptime T: type, comptime Site: type) void {
 pub fn assertExtensions(comptime extensions: Extensions) void {
     comptime assert(extensions.pickers.len <= list_types_max);
     comptime assert(extensions.request_policies.len <= list_types_max);
+    comptime assert(extensions.response_policies.len <= list_types_max);
+    inline for (extensions.response_policies, 0..) |Policy, index| {
+        assertResponsePolicy(Policy);
+        inline for (extensions.response_policies[index + 1 ..]) |Later| {
+            if (Policy == Later) @compileError(@typeName(Policy) ++ " is listed twice as a response policy");
+        }
+    }
     const families = metered(extensions);
     inline for (families, 0..) |Family, index| {
         assertMetrics(Family);

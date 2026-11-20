@@ -60,8 +60,8 @@ pub const client_cert_hex_bytes: u32 = 2 * std.crypto.hash.sha2.Sha256.digest_le
 pub const max_forwards_name = "Max-Forwards";
 
 /// The most edits one render applies: a request's filters' and policies'
-/// (#424), or a response's filters' and the #178 stamp.
-const edits_max = @max(constants.request_edits_max, constants.response_edits_max);
+/// (#424), or a response's filters', policies' and the #178 stamp.
+const edits_max = @max(constants.request_edits_max, constants.response_render_edits_max);
 
 /// Whether an edit may not name this header (§7): a hop-by-hop or framing
 /// header the render decides itself, `Host`, or one of the three this

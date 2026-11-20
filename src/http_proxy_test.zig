@@ -52,6 +52,7 @@ const fixture_host_name = "spike.zoxy.test";
 const extension = @import("extension.zig");
 const ScriptedPicker = @import("testing/picker.zig").ScriptedPicker;
 const ScriptedPolicy = @import("testing/policy.zig").ScriptedPolicy;
+const ScriptedResponsePolicy = @import("testing/response_policy.zig").ScriptedResponsePolicy;
 
 /// The beds' runtime lists one picker and one request policy (#417), so a
 /// scenario can select an instance of either; every scenario that selects
@@ -59,6 +60,7 @@ const ScriptedPolicy = @import("testing/policy.zig").ScriptedPolicy;
 const runtime: extension.Runtime = .{ .Io = SimIo, .extensions = .{
     .pickers = &.{ScriptedPicker},
     .request_policies = &.{ScriptedPolicy},
+    .response_policies = &.{ScriptedResponsePolicy},
 } };
 const ServerSim = Server(runtime);
 
@@ -987,6 +989,9 @@ const Http1Bed = struct {
         request_policies: []const extension.Selection = &.{},
         /// #417's request policies on the bed's one route.
         route_request_policies: []const extension.Selection = &.{},
+        /// #424's response policies on the listener and on its one route.
+        response_policies: []const extension.Selection = &.{},
+        route_response_policies: []const extension.Selection = &.{},
         /// The listener's #175 response filter rules; empty by default
         /// on the same terms.
         response_filters: []const filter.ResponseRule = &.{},
@@ -1111,6 +1116,7 @@ const Http1Bed = struct {
             .routes = &bed.routes,
             .request_filters = options.request_filters,
             .request_policies = options.request_policies,
+            .response_policies = options.response_policies,
             .response_filters = options.response_filters,
             .protocol = .http,
             .upgrades = options.upgrades,
@@ -1182,6 +1188,7 @@ const Http1Bed = struct {
             .prefix = options.route_prefix,
             .cluster_index = 0,
             .request_policies = options.route_request_policies,
+            .response_policies = options.route_response_policies,
         }};
         bed.installListener(options);
         bed.buildConfig(options);
@@ -10744,5 +10751,86 @@ test "l7: a retry renders the head again with the same policy edits (#424)" {
     const heard = bed.origin.conns[0].request_buffer[0..bed.origin.conns[0].request_len];
     try std.testing.expect(std.mem.indexOf(u8, heard, "\r\nX-Tenant: acme\r\n") != null);
     try std.testing.expectEqual(@as(u32, 1), policy.evaluated);
+    try bed.expectDrained();
+}
+
+test "l7: response policies edit the head on its way out, the route's before the filters, the listener's last (#424)" {
+    // The route's policy sets X-Served; the filter sets X-Served too, and
+    // the listener's removes the origin's X-Internal and sets X-Served
+    // last: the last word on the way out is the listener's.
+    var inner: ScriptedResponsePolicy = .{ .edits = &.{.{ .set = .{ .name = "X-Served", .value = "route" } }} };
+    var outer: ScriptedResponsePolicy = .{ .edits = &.{
+        .{ .remove = "X-Internal" },
+        .{ .set = .{ .name = "X-Served", .value = "listener" } },
+    } };
+    const on_listener = [_]extension.Selection{extension.select(runtime.extensions.response_policies, &outer)};
+    const on_route = [_]extension.Selection{extension.select(runtime.extensions.response_policies, &inner)};
+    const rules = [_]filter.ResponseRule{.{ .match = .{}, .edits = &.{.{ .kind = .add, .name = "X-Filter", .value = "1" }} }};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 4245,
+        .origin_response = "HTTP/1.1 200 OK\r\nX-Internal: secret\r\nContent-Length: 2\r\n\r\nok",
+        .response_policies = &on_listener,
+        .route_response_policies = &on_route,
+        .response_filters = &rules,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    const response = bed.client.response();
+    try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 "));
+    try std.testing.expect(std.mem.indexOf(u8, response, "\r\nX-Served: listener\r\n") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, response, "X-Served"));
+    try std.testing.expect(std.mem.indexOf(u8, response, "\r\nX-Filter: 1\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "X-Internal") == null);
+    try std.testing.expectEqual(@as(u32, 1), inner.evaluated);
+    try std.testing.expectEqual(@as(u32, 1), outer.evaluated);
+    try std.testing.expectEqual(@as(u16, 200), outer.last_status);
+    try bed.expectDrained();
+}
+
+test "l7: a response policy's refused edit fails the exchange as a 502 (#424)" {
+    var policy: ScriptedResponsePolicy = .{ .edits = &.{.{ .set = .{ .name = "Content-Length", .value = "0" } }} };
+    const selected = [_]extension.Selection{extension.select(runtime.extensions.response_policies, &policy)};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 4246,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .response_policies = &selected,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 502 "));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_response_policy_edit_refused"));
+    try bed.expectDrained();
+}
+
+test "h2: a response policy edits each stream's head (#424)" {
+    // `Location`, the one field the test client decodes by name.
+    var policy: ScriptedResponsePolicy = .{ .edits = &.{.{ .set = .{ .name = "Location", .value = "/edge" } }} };
+    const selected = [_]extension.Selection{extension.select(runtime.extensions.response_policies, &policy)};
+    var options = h2BedOptions(4247);
+    options.response_policies = &selected;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    var wire: H2Wire = .{};
+    wire.preface(&.{});
+    wire.get(1, "GET", "/a");
+    wire.get(3, "GET", "/b");
+    try bed.exchange(wire.written());
+
+    var storage: [4]H2Answer = undefined;
+    const answers = try h2Answers(bed.client.response(), &storage);
+    try std.testing.expectEqual(@as(usize, 2), answers.len);
+    try std.testing.expectEqual(@as(u32, 2), policy.evaluated);
+    for ([_]u31{ 1, 3 }) |id| {
+        const answer = try h2AnswerFor(answers, id);
+        try std.testing.expectEqualStrings("/edge", answer.location[0..answer.location_len]);
+    }
     try bed.expectDrained();
 }

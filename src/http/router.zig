@@ -56,6 +56,9 @@ pub const Route = struct {
     /// order once the route is chosen, before the request takes any
     /// resource. Never produced by the JSON loader.
     request_policies: []const extension.Selection = &.{},
+    /// #424's response policies on this route, run on every response
+    /// head it relays, before the response filters.
+    response_policies: []const extension.Selection = &.{},
     /// The route's name, which a build's listener policy may route by
     /// (#430); null for an unnamed route, as every JSON one is.
     name: ?[]const u8 = null,
