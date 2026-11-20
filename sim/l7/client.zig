@@ -803,7 +803,9 @@ pub fn Client(comptime IoType: type) type {
         /// status), or null when the response is not one. Two pages are
         /// configured by the harness: `403` — the status a filter
         /// reject earns, so every 403 in the sweep is one — and the
-        /// `200` the `/respond` rule answers, which reaches no origin.
+        /// `200` the `/respond` rule answers, which reaches no origin. A
+        /// third source answers from this proxy's memory too: a build's
+        /// handler's `200` (#434), whose bytes it writes per request.
         ///
         /// This doubles as "answered from memory": a page is a static,
         /// so it bypasses the response render and therefore *both*
@@ -824,6 +826,11 @@ pub fn Client(comptime IoType: type) type {
             if (status == 200 and entry.respond_page) {
                 assert(canon.respond_body.len >= 1);
                 return canon.respond_body;
+            }
+            // A handler's answer (#434): this proxy's own, from the bytes
+            // the handler wrote.
+            if (status == 200) {
+                if (entry.handler_body) |body| return body;
             }
             return null;
         }

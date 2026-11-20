@@ -139,6 +139,16 @@ pub const Script = enum(u8) {
     /// *neither* response-side stamp, which is how the sweep proves
     /// from outside that a page bypasses the response render.
     filter_respond,
+    /// A GET under `/handled`: a build's handler answers it (#434) from
+    /// its own code — this proxy as the origin, as `filter_respond` is,
+    /// with a body the handler writes. Neither response-side stamp.
+    handler_get,
+    /// A POST under `/handled` with a declared body, which the handler
+    /// reads whole and echoes after its own line.
+    handler_post,
+    /// A POST under `/handled` declaring a body no head buffer holds: the
+    /// route refuses it with `413` before the handler runs.
+    handler_post_big,
     /// A GET under `/allow`: a §7 `allow` rule stops the filter walk
     /// before the 403 written beneath it (#331), so the request routes
     /// and the origin answers it like any other. The golden outcome is
@@ -237,6 +247,10 @@ pub const Spec = struct {
     /// pages are blanket by status, but a 200 from memory is
     /// indistinguishable from a proxied one without this.
     respond_page: bool = false,
+    /// This script's 200 is a build's handler's answer (#434), and this
+    /// is its body, byte for byte: like a #159 page it crosses neither
+    /// response-side render, but its bytes are written per request.
+    handler_body: ?[]const u8 = null,
     /// The request already names an endpoint in the #178 grammar, so its
     /// proxied 200 owes *no* re-stamp — idempotence is the contract.
     /// Every other routed request is assigned or repicked and owes the
@@ -706,6 +720,44 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .method = .get,
         .allowed_statuses = &.{ 301, 408, 503 },
     },
+    .handler_get = .{
+        // `filter_respond`'s timing: answered after routing and before any
+        // post-parse resource, so the §5 head ring's 503 is the one
+        // verdict that can arrive instead.
+        .request = "GET " ++ canon.handler_prefix ++ " HTTP/1.1\r\nHost: sim\r\n\r\n",
+        .expected_responses = 1,
+        .transcript_cap = 1,
+        .golden_status = 200,
+        .method = .get,
+        .allowed_statuses = &.{ 200, 408, 503 },
+        .handler_body = canon.handler_get_body,
+    },
+    .handler_post = .{
+        // As `handler_get`, and its body can draw the #236 cap's 413, or
+        // meet the head budget's 408 when the adversary holds it back.
+        .request = "POST " ++ canon.handler_prefix ++ " HTTP/1.1\r\nHost: sim\r\n" ++
+            std.fmt.comptimePrint("Content-Length: {d}\r\n\r\n", .{canon.handler_post_payload.len}) ++
+            canon.handler_post_payload,
+        .expected_responses = 1,
+        .transcript_cap = 1,
+        .golden_status = 200,
+        .method = .post,
+        .allowed_statuses = &.{ 200, 408, 413, 503 },
+        .handler_body = canon.handler_post_body,
+        .carries_body = true,
+    },
+    .handler_post_big = .{
+        // Two MiB declared, past the widest head buffer: refused on its
+        // head alone, the body never sent.
+        .request = "POST " ++ canon.handler_prefix ++ " HTTP/1.1\r\nHost: sim\r\n" ++
+            "Content-Length: 2097152\r\n\r\n",
+        .expected_responses = 1,
+        .transcript_cap = 1,
+        .golden_status = 413,
+        .method = .post,
+        .allowed_statuses = &.{ 408, 413, 503 },
+        .carries_body = true,
+    },
     .filter_respond = .{
         // `filter_reject`'s timing exactly — the answer precedes every
         // post-parse resource — so the §5 head ring's 503 is again the
@@ -876,6 +928,9 @@ pub const terminating_scripts = [_]Script{
     .route_policy_reject,
     .filter_redirect,
     .filter_respond,
+    .handler_get,
+    .handler_post,
+    .handler_post_big,
     .filter_allow,
     .filter_edit,
     .filter_rewrite,
@@ -904,6 +959,9 @@ comptime {
     // covered on the plaintext listener, which is the one the #180 draw
     // configures — and an upgrade over a terminated connection is its
     // own feature, not this script run through a different socket.
+
+    // Quadratic in the table, which grows: the quota follows it.
+    @setEvalBranchQuota(4 * std.enums.values(Script).len * terminating_scripts.len);
     for (std.enums.values(Script)) |script| {
         const excepted = script == .silent or script == .keepalive_pair or
             script == .upgrade_request;
@@ -940,6 +998,13 @@ comptime {
         // the one status the page carries — and a pinned request is one
         // that routes, which a page never does.
         if (entry.respond_page) assert(entry.golden_status == 200);
+        // A handler's answer is its own: neither a page's nor the
+        // bodiless final-recipient one.
+        if (entry.handler_body != null) {
+            assert(entry.golden_status == 200);
+            assert(!entry.respond_page);
+            assert(!entry.answered_here);
+        }
         if (entry.respond_page) assert(!entry.sticky_request_pinned);
         // "Judged exactly as a plain GET is", spelled out: same legal
         // status set, same golden outcome, neither render exception, and

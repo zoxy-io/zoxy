@@ -33,6 +33,7 @@ const runtime: zoxy.Runtime = .{
         .response_policies = &.{zoxy.testing.ScriptedResponsePolicy},
         .connection_policies = &.{zoxy.testing.ScriptedConnectionPolicy},
         .probes = &.{zoxy.testing.ScriptedProbe},
+        .handlers = &.{zoxy.testing.ScriptedHandler},
     },
 };
 const ServerSim = zoxy.Server(runtime);
@@ -214,10 +215,10 @@ priorities_http: [2]u8,
 endpoint_options_l4: [1]zoxy.Options.Cluster.Endpoint,
 endpoint_options_http: [2]zoxy.Options.Cluster.Endpoint,
 clusters: [2]zoxy.Options.Cluster,
-/// The catch-all, behind #417's guarded route: a longer prefix carrying
+/// The catch-all, behind #417's guarded route — a longer prefix carrying
 /// a route-phase policy, which only the `route_policy_reject` script
-/// reaches.
-routes_http: [2]zoxy.Options.Listener.Route,
+/// reaches — and #434's handler route, which answers `/handled` itself.
+routes_http: [3]zoxy.Options.Listener.Route,
 request_filters_http: [7]zoxy.Options.Listener.Filter,
 /// The #175 response rules beside them: the always-on stamp the client
 /// oracle requires on every proxied 200, and the 5xx rule whose edit
@@ -225,7 +226,7 @@ request_filters_http: [7]zoxy.Options.Listener.Filter,
 response_filters_http: [2]zoxy.Options.Listener.ResponseFilter,
 /// On an http draw the plaintext listener's two routes, guarded route
 /// included — a terminator runs the http chain whole.
-routes_tls: [2]zoxy.Options.Listener.Route,
+routes_tls: [3]zoxy.Options.Listener.Route,
 listener_options: [3]zoxy.Options.Listener,
 /// How many of `listener_options` this seed actually binds: two on a
 /// plaintext seed, three when it drew TLS clients (§4).
@@ -420,6 +421,9 @@ picker_http: bool,
 /// tags each one `policy_tag` (#433).
 policy_listener: zoxy.testing.ScriptedPolicy,
 policy_selections: [1]zoxy.extension.Selection,
+/// #434's handler, on a route of both http chains: it answers what it
+/// is routed, and never flips its flag, so every answer is predictable.
+handler: zoxy.testing.ScriptedHandler,
 /// #436's check kind, on the L4 cluster when `l4Check` draws it: rounds
 /// the echo origin sends back.
 probe_l4: zoxy.testing.ScriptedProbe,
@@ -528,6 +532,7 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
         zoxy.extension.select(runtime.extensions.response_policies, &harness.response_policy),
     };
     harness.connection_policy = .{ .refuse_network = denied_network, .tag = connection_tag };
+    harness.handler = .{ .toggles = false };
     harness.connection_policy_selections = .{
         zoxy.extension.select(runtime.extensions.connection_policies, &harness.connection_policy),
     };
@@ -784,10 +789,10 @@ fn deriveAdversary(random: std.Random, clean: bool) SimIo.Adversary {
     };
 }
 
-/// An http chain's route table (#417): the guarded route ahead of the
-/// catch-all — the order resolving sorts them into anyway, the longer
-/// prefix first.
-fn httpRoutes(harness: *const Harness) [2]zoxy.Options.Listener.Route {
+/// An http chain's route table (#417): the guarded route and the #434
+/// handler route ahead of the catch-all — the order resolving sorts them
+/// into anyway, the longer prefixes first.
+fn httpRoutes(harness: *Harness) [3]zoxy.Options.Listener.Route {
     assert(harness.route_policy_selections.len == 1);
     assert(l7.canon.guarded_prefix.len > 1);
     return .{
@@ -797,6 +802,11 @@ fn httpRoutes(harness: *const Harness) [2]zoxy.Options.Listener.Route {
             .request_policies = &harness.route_policy_selections,
             .name = l7.canon.guarded_route_name,
         },
+        // #434: answered by the build's own handler, no cluster at all.
+        .{
+            .prefix = l7.canon.handler_prefix,
+            .handler = zoxy.extension.select(runtime.extensions.handlers, &harness.handler),
+        },
         .{ .prefix = "/", .cluster = http_cluster_name },
     };
 }
@@ -805,7 +815,11 @@ const l4_cluster_name = "origin-l4";
 const http_cluster_name = "origin-http";
 
 /// Whether each cluster selects its #417 picker this seed: a quarter of
-/// seeds each, independently, from a stream apart from the scenario's.
+/// seeds for the l4 cluster and half for the http one, independently,
+/// from a stream apart from the scenario's. The http half is wider
+/// because its rarest completion — a parked connection found stale
+/// (#423) — needs a picker seed that also meets a stale checkout, and a
+/// quarter left it to the luck of one script table's shape (#434).
 /// The picker answers by the entropy zoxy hands it, so across a sweep it
 /// names every slot and, now and then, one past the end — the fallback.
 fn drawPickers(harness: *Harness, seed: u64) void {
@@ -817,7 +831,7 @@ fn drawPickers(harness: *Harness, seed: u64) void {
     harness.pickers[0].expect_tag = connection_tag;
     harness.pickers[1].expect_tag = policy_tag;
     harness.picker_l4 = random.uintLessThan(u8, 4) == 0;
-    harness.picker_http = random.uintLessThan(u8, 4) == 0;
+    harness.picker_http = random.uintLessThan(u8, 4) <= 1;
     assert(harness.pickers[0].calls == 0);
     assert(harness.pickers[1].calls == 0);
 }
@@ -3468,6 +3482,11 @@ fn l7OutcomeTotal(counters: *const zoxy.counters.Counters) u64 {
         "l7_policy_rejected",
         "l7_redirected",
         "l7_responded",
+        // A build's handler answered (#434), or its route refused the
+        // body or the answer: each a line like any answered exchange.
+        "l7_handled",
+        "l7_handler_body_too_large",
+        "l7_handler_answer_refused",
         // The #240 final-recipient answer: served, so it owes a line like
         // every other answered exchange.
         "l7_max_forwards_exhausted",

@@ -403,21 +403,9 @@ const uncovered = [_]Uncovered{
             "header zoxy writes itself, and splits one with CRLF",
     },
     .{
-        .name = "l7_handled",
-        .why = .unreached,
-        .reason = "no sim route selects a handler yet (#434); " ++
-            "http_proxy_test drives handler routes end to end",
-    },
-    .{
-        .name = "l7_handler_body_too_large",
-        .why = .unreached,
-        .reason = "no sim route selects a handler yet (#434); " ++
-            "http_proxy_test declares a body past the head buffer",
-    },
-    .{
         .name = "l7_handler_answer_refused",
         .why = .unreached,
-        .reason = "no sim route selects a handler yet (#434); " ++
+        .reason = "the harness's handler answers within its contract (#434); " ++
             "http_proxy_test holds a misbehaving handler to a 502",
     },
     .{
@@ -776,8 +764,8 @@ const Census = struct {
 
     /// Every counter the scripted extensions declare moved somewhere in
     /// the range — the census a build can hold its own counters to.
-    /// `past_end` rides on the picker's draws, on the quarter of seeds
-    /// that select one; a range of `census_iterations_min` seeds carries
+    /// `past_end` rides on the picker's draws — a quarter of seeds for the
+    /// l4 cluster, half for the http one; a range of `census_iterations_min` seeds carries
     /// thousands of those picks, and a given range always draws the same.
     fn verifyExtensionCounters(census: *const Census) bool {
         var held = true;
