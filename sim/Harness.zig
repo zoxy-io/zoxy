@@ -31,6 +31,7 @@ const runtime: zoxy.Runtime = .{
         .pickers = &.{zoxy.testing.ScriptedPicker},
         .request_policies = &.{zoxy.testing.ScriptedPolicy},
         .response_policies = &.{zoxy.testing.ScriptedResponsePolicy},
+        .connection_policies = &.{zoxy.testing.ScriptedConnectionPolicy},
     },
 };
 const ServerSim = zoxy.Server(runtime);
@@ -117,6 +118,11 @@ const TlsAlpnOffer = enum {
 };
 /// "203.0.113.255:65535" is 19 bytes; the slack is headroom, not hope.
 const announced_bytes_max: u8 = 32;
+/// The /24 an announcing L4 client's header names it from, and the one
+/// the connection policy refuses (#425): TEST-NET-3 and TEST-NET-1 —
+/// not TEST-NET-2, which SimIo's own peers are observed from.
+const announced_network = [3]u8{ 203, 0, 113 };
+const denied_network = [3]u8{ 192, 0, 2 };
 /// Virtual time from scenario start after which stuck work is force-ended.
 const scenario_end_ns: u64 = 2_000_000_000;
 /// How far a #202 seed steps the wall clock: one whole rotation interval
@@ -289,6 +295,9 @@ l4_announced_len: [clients_max]u8,
 /// is nonzero), for the #142 send-identity oracle — text serves the log
 /// needle, this serves `IpAddress.eql`.
 l4_announced_address: [clients_max]std.Io.net.IpAddress,
+/// The L4 clients whose header announced them from `denied_network`
+/// (#425): the connection policy's to refuse, once the header is read.
+l4_denied_count: u8,
 l4_count: u8,
 l7_count: u8,
 clients_count: u8,
@@ -414,6 +423,11 @@ policy_selections: [1]zoxy.extension.Selection,
 /// every response head and holds each to carrying the listener's tag.
 response_policy: zoxy.testing.ScriptedResponsePolicy,
 response_policy_selections: [1]zoxy.extension.Selection,
+/// #425's connection policy, on every listener: it refuses the L4
+/// clients whose PROXY header announces them from `denied_network`, and
+/// lets on every other connection.
+connection_policy: zoxy.testing.ScriptedConnectionPolicy,
+connection_policy_selections: [1]zoxy.extension.Selection,
 /// #417's route-phase policy, on the guarded route of both http chains.
 /// It holds every request it sees to carrying the listener's tag.
 policy_route: zoxy.testing.ScriptedPolicy,
@@ -497,6 +511,10 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
     };
     harness.response_policy_selections = .{
         zoxy.extension.select(runtime.extensions.response_policies, &harness.response_policy),
+    };
+    harness.connection_policy = .{ .refuse_network = denied_network };
+    harness.connection_policy_selections = .{
+        zoxy.extension.select(runtime.extensions.connection_policies, &harness.connection_policy),
     };
 
     // A quarter of seeds run clean: adversary off, origin
@@ -1767,9 +1785,11 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
                 .target = .{ .cluster = l4_cluster_name },
                 .proxy_protocol = harness.proxy_protocol_l4,
             } },
+            .connection_policies = &harness.connection_policy_selections,
         },
         .{
             .bind = .{ .ip = httpBindAddress() },
+            .connection_policies = &harness.connection_policy_selections,
             .protocol = .{ .http = .{
                 .target = .{ .routes = &harness.routes_http },
                 .request_filters = &harness.request_filters_http,
@@ -1805,6 +1825,8 @@ fn terminatingListener(harness: *Harness) zoxy.Options.Listener {
     return .{
         .bind = .{ .ip = tlsBindAddress() },
         .tls = tls,
+        // Ahead of the handshake: a refusal here would cost none.
+        .connection_policies = &harness.connection_policy_selections,
         .protocol = switch (harness.tls_protocol) {
             // The same chain the plaintext http listener runs (#215): the
             // claim termination rests on is that TLS is a phase ahead of
@@ -2099,6 +2121,7 @@ fn populateClients(harness: *Harness, random: std.Random) void {
     harness.l7_clients = @splat(.{});
     harness.h2_clients = @splat(.{});
     harness.l4_announced_len = @splat(0);
+    harness.l4_denied_count = 0;
     var index: u8 = 0;
     while (index < plaintext_count) : (index += 1) {
         if (random.boolean()) {
@@ -2189,7 +2212,7 @@ fn deriveProxyHeader(
     }
     const octet: u8 = l4_index + 1;
     const port: u16 = 40_000 + @as(u16, l4_index);
-    switch (random.uintLessThan(u8, 6)) {
+    switch (random.uintLessThan(u8, 7)) {
         0 => return "",
         1 => return "PROXY UNKNOWN\r\n",
         2 => {
@@ -2204,8 +2227,20 @@ fn deriveProxyHeader(
             buffer[20..24].* = .{ 10, 0, 0, 1 };
             std.mem.writeInt(u16, buffer[24..26], port, .big);
             std.mem.writeInt(u16, buffer[26..28], 443, .big);
-            harness.recordAnnounced(l4_index, octet, port);
+            harness.recordAnnounced(l4_index, announced_network, octet, port);
             return buffer[0..28];
+        },
+        6 => {
+            // v1 TCP4 from the network the connection policy refuses
+            // (#425): logged as announced, never dialed.
+            const line = std.fmt.bufPrint(
+                buffer,
+                "PROXY TCP4 192.0.2.{d} 10.0.0.1 {d} 443\r\n",
+                .{ octet, port },
+            ) catch unreachable; // 44 bytes at most, into 64.
+            harness.recordAnnounced(l4_index, denied_network, octet, port);
+            harness.l4_denied_count += 1;
+            return line;
         },
         else => {
             // v1 TCP4, the same announcement in text.
@@ -2214,26 +2249,26 @@ fn deriveProxyHeader(
                 "PROXY TCP4 203.0.113.{d} 10.0.0.1 {d} 443\r\n",
                 .{ octet, port },
             ) catch unreachable; // 46 bytes at most, into 64.
-            harness.recordAnnounced(l4_index, octet, port);
+            harness.recordAnnounced(l4_index, announced_network, octet, port);
             return line;
         },
     }
 }
 
-fn recordAnnounced(harness: *Harness, l4_index: u8, octet: u8, port: u16) void {
+fn recordAnnounced(harness: *Harness, l4_index: u8, network: [3]u8, octet: u8, port: u16) void {
     assert(l4_index < clients_max);
     const text = std.fmt.bufPrint(
         &harness.l4_announced[l4_index],
-        "203.0.113.{d}:{d}",
-        .{ octet, port },
+        "{d}.{d}.{d}.{d}:{d}",
+        .{ network[0], network[1], network[2], octet, port },
     ) catch unreachable; // 19 bytes at most, into announced_bytes_max.
-    // The shortest form is "203.0.113.1:40000"; anything outside the
-    // template's range means the format string drifted from the record.
-    assert(text.len >= 17);
+    // The shortest form is "192.0.2.1:40000"; anything outside the
+    // templates' range means a format string drifted from the record.
+    assert(text.len >= 15);
     assert(text.len <= 19);
     harness.l4_announced_len[l4_index] = @intCast(text.len);
     harness.l4_announced_address[l4_index] =
-        .{ .ip4 = .{ .bytes = .{ 203, 0, 113, octet }, .port = port } };
+        .{ .ip4 = .{ .bytes = network ++ [1]u8{octet}, .port = port } };
 }
 
 pub fn startClients(harness: *Harness) void {
@@ -2903,6 +2938,12 @@ pub fn verify(harness: *Harness) !void {
     for ([_]*const zoxy.testing.ScriptedPolicy{ &harness.policy_listener, &harness.policy_route }) |policy| {
         if (policy.completions != policy.handedOn()) return error.PolicyNotCompleted;
     }
+    // #425: the connection policy refuses only clients that announced a
+    // denied address — and on a clean seed, whose headers always complete,
+    // every one of them.
+    const refused = harness.connection_policy.refused;
+    if (refused > harness.l4_denied_count) return error.ConnectionPolicyRefusedUnannounced;
+    if (harness.clean and refused != harness.l4_denied_count) return error.ConnectionPolicyMissedDenied;
     if (!harness.io.sockets.isFullyReleased()) return error.SocketLeak;
     // §7: no malformed byte may ever reach an origin.
     if (harness.origin_http.violations != 0) return error.OriginSawMalformedBytes;
@@ -3340,6 +3381,12 @@ fn tallyAccessLog(sink: []const u8) !LineTally {
 
 /// Every L7 outcome that answers a client, summed. Each one runs through
 /// `respond` or `finishExchange`, and both emit a line.
+///
+/// Not `conn_policy_rejected` (#425), though a refused http connection
+/// logs an http line: the counter is shared with l4 refusals, and no sim
+/// http connection is refused — its peers are TEST-NET-2, the policy
+/// refuses TEST-NET-1, and only l4 listeners take a PROXY header. A sweep
+/// that refuses one on an http listener needs its own term here.
 fn l7OutcomeTotal(counters: *const zoxy.counters.Counters) u64 {
     const answered = [_][]const u8{
         "l7_responses",

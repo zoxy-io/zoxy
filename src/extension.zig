@@ -52,6 +52,9 @@ pub const Extensions = struct {
     /// Response policies a listener or a route may select (#424): they
     /// read the origin's response head and edit it on its way out.
     response_policies: []const type = &.{},
+    /// Connection policies a listener may select (#425): they admit or
+    /// refuse each connection before a handshake, a peek or a first head.
+    connection_policies: []const type = &.{},
 };
 
 /// What a server is built from: the Io backend (§4) and the build's
@@ -528,6 +531,31 @@ pub const ResponseVerdict = struct {
     edits: []const Edit = &.{},
 };
 
+/// A connection as a connection policy reads it (#425): once the client's
+/// address is known — after the PROXY header, on a listener that takes
+/// one — and before anything is read for its protocol: no handshake, no
+/// peeked hello, no request head.
+pub const Connection = struct {
+    /// The client's address — the PROXY header's, when the listener
+    /// takes one and it carried one — or null on a `unix:` socket.
+    client: ?*const std.Io.net.IpAddress,
+    listener_index: u16,
+    /// The loop clock (#429).
+    now_ns: u64,
+};
+
+/// What a connection policy decides (#425). A refusal closes the
+/// connection without a byte written to it, logs it `rejected`, and counts
+/// `conn_policy_rejected`; the policy chooses how it closes.
+pub const ConnectionVerdict = union(enum) {
+    proceed,
+    /// An orderly close: the client reads a FIN.
+    reject,
+    /// An abortive close (SO_LINGER 0): the client reads an RST, and this
+    /// proxy keeps no TIME_WAIT for it. Also counts `conn_policy_reset`.
+    reset,
+};
+
 /// How a request a policy let through ended (#429). A policy may declare
 ///
 ///     pub fn complete(self: *P, done: *const RequestCompletion) void
@@ -854,6 +882,29 @@ pub fn assertResponsePolicy(comptime Policy: type) void {
     if (isMetered(Policy)) @compileError(name ++ " is a response policy, which declares no metrics yet");
 }
 
+/// Refuse, at compile time, a connection-policy type that does not meet
+/// `evaluate`'s contract (#425).
+pub fn assertConnectionPolicy(comptime Policy: type) void {
+    const name = @typeName(Policy);
+    if (!@hasDecl(Policy, "evaluate")) {
+        @compileError(name ++ " is listed as a connection policy but declares no `pub fn evaluate`");
+    }
+    const evaluate_fn = @typeInfo(@TypeOf(Policy.evaluate)).@"fn";
+    const evaluate_ok = evaluate_fn.param_types.len == 2 and
+        evaluate_fn.param_types[0] == *Policy and
+        evaluate_fn.param_types[1] == *const Connection and
+        evaluate_fn.return_type == ConnectionVerdict;
+    if (!evaluate_ok) {
+        @compileError(name ++ ".evaluate must be `fn (*" ++ name ++
+            ", *const extension.Connection) extension.ConnectionVerdict`");
+    }
+    if (@hasDecl(Policy, "bind")) assertBind(Policy, PolicySite);
+    if (isMetered(Policy)) @compileError(name ++ " is a connection policy, which declares no metrics yet");
+    if (@hasDecl(Policy, "complete")) {
+        @compileError(name ++ " is a connection policy, which hears no completion yet");
+    }
+}
+
 /// Refuse, at compile time, a request-policy type that does not meet
 /// `evaluate`'s contract.
 pub fn assertRequestPolicy(comptime Policy: type) void {
@@ -917,6 +968,13 @@ pub fn assertExtensions(comptime extensions: Extensions) void {
     comptime assert(extensions.pickers.len <= list_types_max);
     comptime assert(extensions.request_policies.len <= list_types_max);
     comptime assert(extensions.response_policies.len <= list_types_max);
+    comptime assert(extensions.connection_policies.len <= list_types_max);
+    inline for (extensions.connection_policies, 0..) |Policy, index| {
+        assertConnectionPolicy(Policy);
+        inline for (extensions.connection_policies[index + 1 ..]) |Later| {
+            if (Policy == Later) @compileError(@typeName(Policy) ++ " is listed twice as a connection policy");
+        }
+    }
     inline for (extensions.response_policies, 0..) |Policy, index| {
         assertResponsePolicy(Policy);
         inline for (extensions.response_policies[index + 1 ..]) |Later| {

@@ -2522,6 +2522,11 @@ pub fn Server(comptime runtime: Runtime) type {
             // After `prepare`, which clears it: the session the offer the
             // engine makes is a promise of, if it makes one.
             if (tls) |held| conn.h2 = held.h2;
+            // #425: a listener that takes a PROXY header knows its client
+            // once the header is read, and asks its policies then.
+            if (state.proxy_protocol == null) {
+                if (!server.admittedByPolicies(conn)) return;
+            }
             if (state.proxy_protocol != null) {
                 // The loader rejects the block on an http listener, so a
                 // non-null here can only be an l4 one (#142).
@@ -3426,6 +3431,7 @@ pub fn Server(comptime runtime: Runtime) type {
             if (header.client) |client| {
                 conn.client_address = client;
             }
+            if (!server.admittedByPolicies(conn)) return;
             const leftover_len = conn.stream.head_len - header.bytes_len;
             const staging = conn.stream.relay_buffer.?.client_to_upstream;
             const leftover = staging[header.bytes_len..conn.stream.head_len];
@@ -4240,7 +4246,18 @@ pub fn Server(comptime runtime: Runtime) type {
             if (conn.isTearingDown()) return;
             assert(conn.isLive());
             conn.enter(.tearing_down);
-            server.io.shutdown(conn.client_socket, .both);
+            if (conn.close_with_rst) {
+                // #425: refused before anything was read for its protocol,
+                // so nothing is armed on the client socket to force — and a
+                // shutdown would write the FIN the RST is chosen over.
+                assert(conn.stream.armedCount() == 0);
+                // Benign, as `shed.closeWithRst`'s: the refusal must close
+                // either way, and a failed option leaves the client a FIN.
+                // `conn_policy_reset` counts the decision, not the wire.
+                server.io.setLingerRst(conn.client_socket) catch {};
+            } else {
+                server.io.shutdown(conn.client_socket, .both);
+            }
             // A socket, or an HTTP/2 origin leg (§7): either way, what is
             // armed on it is forced.
             server.upstreamShutdown(conn.stream);
@@ -4605,6 +4622,10 @@ pub fn Server(comptime runtime: Runtime) type {
                 }
             }
             for (config.listeners) |*listener| {
+                for (listener.connection_policies) |selection| {
+                    assert(selection.index < runtime.extensions.connection_policies.len);
+                    selects = true;
+                }
                 // A policy reads a request, and an l4 listener has none.
                 if (listener.request_policies.len >= 1) assert(listener.protocol == .http);
                 for (listener.request_policies) |selection| {
@@ -4633,7 +4654,7 @@ pub fn Server(comptime runtime: Runtime) type {
                 }
             }
             if (runtime.extensions.pickers.len == 0 and runtime.extensions.request_policies.len == 0 and
-                runtime.extensions.response_policies.len == 0)
+                runtime.extensions.response_policies.len == 0 and runtime.extensions.connection_policies.len == 0)
             {
                 assert(!selects);
             }
@@ -4667,6 +4688,9 @@ pub fn Server(comptime runtime: Runtime) type {
                     .cluster_index = null,
                     .routes = listener.routes,
                 };
+                for (listener.connection_policies) |selection| {
+                    try bindFrom(runtime.extensions.connection_policies, selection, &site, startup);
+                }
                 for (listener.request_policies) |selection| {
                     try bindFrom(runtime.extensions.request_policies, selection, &site, startup);
                 }
@@ -4701,6 +4725,70 @@ pub fn Server(comptime runtime: Runtime) type {
                     try bindFrom(runtime.extensions.response_policies, selection, &site, startup);
                 }
             }
+        }
+
+        /// Run the listener's connection policies over a connection whose
+        /// client is known (#425), before anything is read for its
+        /// protocol. True lets it on; false has refused it, its teardown
+        /// begun. Nothing at all in a build that lists none.
+        fn admittedByPolicies(server: *Self, conn: *ConnType) bool {
+            if (comptime runtime.extensions.connection_policies.len == 0) return true;
+            assert(conn.isLive());
+            assert(conn.listener_index < server.config.listeners.len);
+            const selections = server.config.listeners[conn.listener_index].connection_policies;
+            if (selections.len == 0) return true;
+            const view: extension.Connection = .{
+                .client = if (conn.client_address) |*address| address else null,
+                .listener_index = conn.listener_index,
+                .now_ns = server.io.nowNs(),
+            };
+            for (selections) |selection| {
+                switch (callConnectionPolicy(selection, &view)) {
+                    .proceed => {},
+                    .reject => {
+                        server.refuseConnection(conn, .fin);
+                        return false;
+                    },
+                    .reset => {
+                        server.refuseConnection(conn, .rst);
+                        return false;
+                    },
+                }
+            }
+            return true;
+        }
+
+        /// A connection a policy refused (#425): counted, its line owed
+        /// `rejected`, and its teardown begun — abortive, for an RST.
+        fn refuseConnection(server: *Self, conn: *ConnType, comptime close: enum { fin, rst }) void {
+            assert(conn.isLive());
+            assert(!conn.close_with_rst);
+            server.counters.increment("conn_policy_rejected");
+            if (close == .rst) server.counters.increment("conn_policy_reset");
+            conn.close_with_rst = close == .rst;
+            // An L4 connection's line began at admission; an http one's
+            // would at its first head byte, which it will never read.
+            server.beginRequest(conn.stream);
+            conn.stream.log.outcome = .rejected;
+            server.beginTeardown(conn);
+            assert(conn.isTearingDown());
+        }
+
+        /// The selected connection policy's `evaluate`, by the comptime
+        /// list.
+        fn callConnectionPolicy(
+            selection: extension.Selection,
+            view: *const extension.Connection,
+        ) extension.ConnectionVerdict {
+            assert(selection.index < runtime.extensions.connection_policies.len);
+            assert(view.listener_index < std.math.maxInt(u16));
+            inline for (runtime.extensions.connection_policies, 0..) |Policy, index| {
+                if (selection.index == index) {
+                    const policy: *Policy = @ptrCast(@alignCast(selection.instance));
+                    return Policy.evaluate(policy, view);
+                }
+            }
+            unreachable;
         }
 
         /// Run the route's and the listener's response policies over a

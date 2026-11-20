@@ -105,6 +105,15 @@ pub fn App(comptime extensions: extension.Extensions) type {
             return selection;
         }
 
+        /// One connection-policy selection for a listener's list (#425):
+        /// `instance` must point at a connection-policy type this build
+        /// lists.
+        pub fn connectionPolicy(instance: anytype) extension.Selection {
+            const selection = extension.select(extensions.connection_policies, instance);
+            assert(selection.index < extensions.connection_policies.len);
+            return selection;
+        }
+
         /// One response-policy selection for a listener's or a route's
         /// list (#424): `instance` must point at a response-policy type
         /// this build lists.
@@ -142,6 +151,9 @@ pub fn App(comptime extensions: extension.Extensions) type {
                 }
             }
             for (config.listeners) |*listener| {
+                for (listener.connection_policies) |selection| {
+                    try refuseUnserved(selection, extensions.connection_policies.len);
+                }
                 for (listener.request_policies) |selection| {
                     try refuseUnserved(selection, extensions.request_policies.len);
                 }

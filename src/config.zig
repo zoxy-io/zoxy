@@ -396,6 +396,10 @@ pub const Config = struct {
         /// #424's response policies on this listener, selected in code:
         /// run on every response head, after the response filters.
         response_policies: []const extension_module.Selection = &.{},
+        /// #425's connection policies, selected in code: run on every
+        /// connection admitted here, either protocol, once its client's
+        /// address is known.
+        connection_policies: []const extension_module.Selection = &.{},
         /// The #175 response filter rules, same discipline on the way
         /// out: empty on the L4 path and whenever no `"response_filters"`
         /// were given. Compiled by this loader, matched by
@@ -2613,6 +2617,7 @@ fn resolveListener(
         .l4 => |*l4| try resolveL4Listener(arena, bind_address, tls, l4, clusters),
     };
     listener.bind_mode = try resolveBindMode(stated.mode, bind_address);
+    listener.connection_policies = stated.connection_policies;
     if (bind_address == .unix) {
         try rejectUnixClientAddressUsers(&listener, clusters);
     }
