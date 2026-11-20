@@ -4620,18 +4620,25 @@ pub fn Server(comptime runtime: Runtime) type {
         }
 
         /// Run `selections` over `request` in order (#417): the first
-        /// reject wins and is returned, and null means every one said
-        /// proceed. Dispatch is the comptime list's, like `callPicker`.
+        /// reject wins and is returned, and null means every one handed
+        /// the request on. Dispatch is the comptime list's, like
+        /// `callPicker`.
         pub fn evaluatePolicies(
             server: *Self,
             selections: []const extension.Selection,
-            request: *const extension.Request,
+            /// The site's view, whose `tag` each `proceed_with` that sets
+            /// one overwrites, so the next policy reads it (#433). The
+            /// caller keeps that tag whatever the verdict.
+            request: *extension.Request,
         ) ?extension.RejectStatus {
             assert(server.extensions_bound);
             assert(selections.len >= 1);
             for (selections) |selection| {
                 switch (callPolicy(selection, request)) {
                     .proceed => {},
+                    .proceed_with => |proceed| {
+                        if (proceed.tag) |tag| request.tag = tag;
+                    },
                     .reject => |status| return status,
                 }
             }

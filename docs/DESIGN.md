@@ -1649,7 +1649,8 @@ lists do not reach is refused at step zero (`ExtensionUnserved`).
     filters and routing;
   - per route, run once the route is chosen and before any resource is
     taken for it;
-  - `evaluate(*P, *const Request) Verdict` returns `proceed`, or
+  - `evaluate(*P, *const Request) Verdict` returns `proceed`;
+    `proceed_with`, which proceeds and may set the request's tag; or
     `reject` with a status from the static reject set: 400, 403, 404 or
     429. The first reject wins;
   - an optional
@@ -1657,8 +1658,13 @@ lists do not reach is refused at step zero (`ExtensionUnserved`).
     runs once per site;
   - the request view holds the method, the canonical host, path and
     query, the parsed headers, the client address, the verified client
-    certificate's fingerprint when there is one, and the listener. At
-    the route phase it also holds the chosen cluster;
+    certificate's fingerprint when there is one, the listener, and the
+    tag. At the route phase it also holds the chosen cluster;
+  - the tag (#433) is one `u64` per request, zero until a policy sets
+    it. The later write wins, and a tag set before a later reject
+    stays. Every later view of the request carries it: the next
+    policy's, the route phase's, and a picker's on every try. Each
+    keep-alive request and each HTTP/2 stream starts at zero;
   - a reject answers with the static response, logs outcome
     `rejected`, carries Proxy-Status `http_request_denied` where the
     listener sends it, and counts `l7_policy_rejected`. A retry or a

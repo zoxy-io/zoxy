@@ -21,6 +21,13 @@ pub const ScriptedPicker = struct {
     /// The last pick's flags, as `PickInput` stated them.
     retry: bool = false,
     had_request: bool = false,
+    /// The last request's tag (#433), zero when it carried none or the
+    /// pick had no request.
+    tag: u64 = 0,
+    /// The tag every request a pick carries must have, when configured:
+    /// a policy's, held to reaching the pick. One that does not stops
+    /// the run, so the simulator replays its seed.
+    expect_tag: ?u64 = null,
     /// The last request's canonical path, copied out: the view is valid
     /// only for the call, so a gate reading it afterwards reads this.
     path: [path_bytes_max]u8 = @splat(0),
@@ -68,7 +75,10 @@ pub const ScriptedPicker = struct {
         picker.retry = input.retry;
         picker.had_request = input.request != null;
         picker.path_len = 0;
+        picker.tag = 0;
         if (input.request) |request| {
+            if (picker.expect_tag) |expected| assert(request.tag == expected);
+            picker.tag = request.tag;
             const kept = @min(request.path.len, path_bytes_max);
             @memcpy(picker.path[0..kept], request.path[0..kept]);
             picker.path_len = @intCast(kept);
