@@ -859,13 +859,19 @@ pub fn Proxy(comptime runtime: Runtime) type {
             /// Where a listener's policies leave the route they chose
             /// (#430); null at the route phase, which chooses none.
             chosen_route: ?*?u16,
+            /// The run a consult parked (#437), resumed from its policy.
+            resumed: ?*const ServerType.PolicyRun.Resumed,
         ) bool {
             assert((route_index == null) == (chosen_route != null));
             assert(selections.len >= 1);
             assert(view.tag == stream.log.tag);
-            const run = server.evaluatePolicies(selections, metrics, view, stream, route_index != null);
+            const resumed_run: ?ServerType.PolicyRun.Resumed = if (resumed) |parked| parked.* else null;
+            const run = server.evaluatePolicies(selections, metrics, view, stream, route_index != null, resumed_run);
             stream.log.tag = view.tag;
-            server.notePoliciesProceeded(stream, route_index, run.proceeded);
+            server.notePoliciesProceeded(stream, route_index, run.proceeded, resumed != null);
+            // Parked (#437): the route chosen so far is the consult's to
+            // carry, and the resumed run judges it.
+            if (run.stop) |stop| if (stop == .parked) return true;
             if (run.route) |index| {
                 if (chosen_route) |out| {
                     out.* = index;
@@ -876,6 +882,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             }
             const stop = run.stop orelse return false;
             switch (stop) {
+                .parked => unreachable,
                 .reject => |status| respondPolicy(server, stream, status),
                 .unavailable => respond(server, stream, 503, "l7_policy_consult_refused"),
                 .respond => |answered| answerWithPage(
@@ -1225,10 +1232,24 @@ pub fn Proxy(comptime runtime: Runtime) type {
         /// §7's `route` phase: canonicalize once, filter, route, then take
         /// the first resource this request has needed.
         fn routeRequest(server: *ServerType, stream: *StreamType, request: *const parser.RequestHead) void {
-            const conn = stream.conn;
             assert(stream.phase == .reading_head);
             assert(request.head_len <= stream.head_len);
             if (!admitRequest(server, stream, request)) return;
+            dispatchHead(server, stream, request, null);
+        }
+
+        /// The request, from its canonical view to its first resource: the
+        /// listener's policies, filters and routes, then the route's
+        /// policies — or, `resumed`, from where a consult parked them
+        /// (#437).
+        fn dispatchHead(
+            server: *ServerType,
+            stream: *StreamType,
+            request: *const parser.RequestHead,
+            resumed: ?*const ServerType.PolicyRun.Resumed,
+        ) void {
+            assert(stream.phase == .reading_head);
+            assert(request.head_len <= stream.head_len);
             // §7: canonicalize the host and path once, then apply filters
             // and routing to that one view before acquiring any resource,
             // so a bad path, a policy reject, or an unrouted host/path is
@@ -1237,17 +1258,132 @@ pub fn Proxy(comptime runtime: Runtime) type {
             // runtime-length stack array is exactly the dynamic allocation
             // §5 forbids. Sound because uses never overlap — the loop is
             // single-threaded, and the window (through routing into the
-            // checkout path's render) neither suspends nor re-enters.
+            // checkout path's render) neither suspends nor re-enters. A
+            // consult that parks ends the window, and its resume opens a
+            // fresh one.
             const scratch = server.target_scratch;
             // Borrowed here rather than in the render it feeds: this frame
             // holds `keys`, which alias `route_host`, across the call.
             const render_scratch = server.borrowRenderScratch();
             defer server.returnRenderScratch();
             const keys = requestKeys(request, scratch, &render_scratch.route_host) catch {
+                // A request that parked had canonicalized before.
+                assert(resumed == null);
                 captureTarget(stream, null, request.target);
                 return respond(server, stream, 400, "l7_bad_request");
             };
-            captureTarget(stream, keys.host, keys.views.match);
+            const at_route = if (resumed) |run| run.route_phase else false;
+            const route_index = if (at_route)
+                stream.route_index
+            else
+                listenerPhase(server, stream, request, &keys, render_scratch, resumed) orelse return;
+            const route_resumed = if (at_route) resumed else null;
+            if (refusedOnRoute(server, stream, request, keys.host, &keys.views, render_scratch, route_index, route_resumed)) return;
+            if (stream.conn.routes[route_index].handler != null) {
+                return beginHandler(server, stream, request, keys.host, &keys.views, render_scratch);
+            }
+            stream.relay_buffer = server.acquireRelayBuffer() orelse {
+                return respond(server, stream, 503, "l7_shed_relay_buffers");
+            };
+            beginUpstream(server, stream, request, keys.host, &keys.views, render_scratch);
+        }
+
+        /// A consult's legs are delivered (#437): its request resumes from
+        /// the policy that asked — out of time when its own deadline ran
+        /// out under the consult, and otherwise on the reply or the
+        /// failure, its head parsed again from the bytes that held it
+        /// while it parked.
+        pub fn resumeConsulted(server: *ServerType, stream: *StreamType) void {
+            assert(stream.phase == .reading_head);
+            assert(stream.upstream == null);
+            const state = &stream.l7.consult;
+            assert(state.outcome != .none);
+            if (state.outcome == .request_expired) {
+                server.releaseConsultSlot(stream);
+                return answerConsultExpired(server, stream);
+            }
+            // The deadline the consult narrowed, back to the exchange's.
+            server.storeExchangeDeadline(stream, server.idleTimeoutMs());
+            const storage = server.borrowHeaderScratch();
+            defer server.returnHeaderScratch();
+            const request = reparsedHead(server, stream, storage);
+            var reply_storage: parser.HeaderStorage = undefined;
+            var reply: extension.ConsultReply = undefined;
+            const replied = state.outcome == .replied;
+            if (replied) reply = replyOf(server, stream, &reply_storage);
+            const resumed: ServerType.PolicyRun.Resumed = .{
+                .position = state.position,
+                .route_phase = state.route_phase,
+                .reply = if (replied) &reply else null,
+                .chosen_route = state.chosen_route,
+            };
+            dispatchHead(server, stream, &request, &resumed);
+        }
+
+        /// The request's own deadline ran out while it consulted (#437):
+        /// the answer its expiry gives a request still dialing — a gRPC
+        /// call's DEADLINE_EXCEEDED, or `504` — counted apart from the
+        /// `504` an origin earns, since no endpoint of the request's was
+        /// asked.
+        fn answerConsultExpired(server: *ServerType, stream: *StreamType) void {
+            assert(stream.phase == .reading_head);
+            assert(stream.l7.request_deadline_ns == 0);
+            if (stream.l7.grpc_deadline) return respondGrpcDeadline(server, stream);
+            respond(server, stream, 504, "l7_policy_consult_expired");
+        }
+
+        /// The request head parsed again (#437), from the bytes that held
+        /// it while it parked: they parsed once and nothing has written
+        /// them since — no read is armed on a parked request — so they
+        /// parse again, to the same head.
+        fn reparsedHead(server: *ServerType, stream: *StreamType, storage: *parser.HeaderStorage) parser.RequestHead {
+            assert(stream.head_len >= 1);
+            assert(stream.l7.consult.outcome != .none);
+            // The bytes hold the whole head, so whether they fill their
+            // buffer is moot: an HTTP/2 stream's head was written whole
+            // and parsed as one, a socket's re-parses as the dial path's do.
+            if (stream.h2_id != 0) {
+                const data = stream.h2_head.?.data;
+                return parser.parseRequestHead(data[0..stream.head_len], true, storage, null) catch unreachable;
+            }
+            const bytes = headBytes(server, stream);
+            return parser.parseRequestHead(bytes[0..stream.head_len], false, storage, null) catch unreachable;
+        }
+
+        /// The consult's reply as `consulted` reads it (#437): its head
+        /// parsed again from the slot's buffer, into the caller's storage,
+        /// and its body as the legs read it.
+        fn replyOf(server: *ServerType, stream: *const StreamType, storage: *parser.HeaderStorage) extension.ConsultReply {
+            const state = &stream.l7.consult;
+            assert(state.outcome == .replied);
+            assert(state.body_start >= 1);
+            const buffer = server.consult_slots.buffer(state.slot);
+            const method: parser.Method = if (state.head_request) .head else .get;
+            const head = parser.parseResponseHead(buffer[0..state.body_start], true, storage, method) catch unreachable;
+            assert(head.head_len == state.body_start);
+            return .{
+                .status = head.status,
+                .headers = head.headers,
+                .body = buffer[state.body_start..][0..state.body_len],
+                .body_truncated = state.body_truncated,
+            };
+        }
+
+        /// The listener's own phase: its policies, its filters and its
+        /// route table. The route the request takes, or null once it is
+        /// answered — or parked on a consult (#437).
+        fn listenerPhase(
+            server: *ServerType,
+            stream: *StreamType,
+            request: *const parser.RequestHead,
+            keys: *const RequestKeys,
+            render_scratch: *RenderScratch,
+            resumed: ?*const ServerType.PolicyRun.Resumed,
+        ) ?u16 {
+            const conn = stream.conn;
+            assert(stream.phase == .reading_head);
+            if (resumed) |run| assert(!run.route_phase);
+            if (resumed == null) captureTarget(stream, keys.host, keys.views.match);
             // #417: the listener's policies run first, on the same
             // canonical view the filters read, and a reject is answered
             // the way a filter's is — before any resource is taken.
@@ -1255,7 +1391,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             if (conn.request_policies.len >= 1) {
                 var view = requestView(stream, request, keys.host, &keys.views, render_scratch, null);
                 const metrics = server.extension_metrics.listenerPolicies(conn.listener_index);
-                if (refusedByPolicies(server, stream, conn.request_policies, metrics, &view, null, &chosen_route)) return;
+                if (refusedByPolicies(server, stream, conn.request_policies, metrics, &view, null, &chosen_route, resumed)) return null;
             }
             // §7 filters run before routing: a terminal verdict — reject
             // or redirect (#176) — stops the request whether or not it
@@ -1268,15 +1404,15 @@ pub fn Proxy(comptime runtime: Runtime) type {
                 .client = clientAddressOf(stream),
             })) |verdict| {
                 switch (verdict) {
-                    .reject => |status| return respondFilter(server, stream, status),
-                    .redirect => |redirect| {
-                        return respondRedirect(server, stream, redirect, keys.host, keys.views.forward);
-                    },
-                    .respond => |page| return respondWithPage(server, stream, page),
+                    .reject => |status| respondFilter(server, stream, status),
+                    .redirect => |redirect| respondRedirect(server, stream, redirect, keys.host, keys.views.forward),
+                    .respond => |page| respondWithPage(server, stream, page),
                 }
+                return null;
             }
             const route_index = routeOf(server, conn.routes, request, keys.host, keys.views.match, chosen_route) orelse {
-                return respond(server, stream, 404, "l7_no_route");
+                respond(server, stream, 404, "l7_no_route");
+                return null;
             };
             const routed = &conn.routes[route_index];
             // A handler route (#434) sends to no cluster.
@@ -1284,15 +1420,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             if (cluster_index) |index| stream.cluster_index = index;
             if (routed.handler != null) stream.l7.handler_route = route_index;
             server.noteRouted(stream, route_index, cluster_index);
-            if (refusedOnRoute(server, stream, request, keys.host, &keys.views, render_scratch, route_index)) return;
-            if (routed.handler != null) {
-                return beginHandler(server, stream, request, keys.host, &keys.views, render_scratch);
-            }
-
-            stream.relay_buffer = server.acquireRelayBuffer() orelse {
-                return respond(server, stream, 503, "l7_shed_relay_buffers");
-            };
-            beginUpstream(server, stream, request, keys.host, &keys.views, render_scratch);
+            return route_index;
         }
 
         /// #417: the route's own policies, now that the route is known,
@@ -1306,15 +1434,18 @@ pub fn Proxy(comptime runtime: Runtime) type {
             views: *const TargetViews,
             render_scratch: *RenderScratch,
             route_index: u16,
+            /// The route's run a consult parked (#437), resumed.
+            resumed: ?*const ServerType.PolicyRun.Resumed,
         ) bool {
             const conn = stream.conn;
             assert(route_index < conn.routes.len);
             const routed = &conn.routes[route_index];
+            if (resumed) |run| assert(run.route_phase);
             if (routed.request_policies.len == 0) return false;
             const cluster_index: ?u16 = if (routed.handler == null) routed.cluster_index else null;
             var view = requestView(stream, request, host, views, render_scratch, cluster_index);
             const metrics = server.extension_metrics.routePolicies(conn.listener_index, route_index);
-            return refusedByPolicies(server, stream, routed.request_policies, metrics, &view, route_index, null);
+            return refusedByPolicies(server, stream, routed.request_policies, metrics, &view, route_index, null, resumed);
         }
 
         /// A handler route (#434): the request's body, whole in the head
@@ -4456,6 +4587,9 @@ pub fn Proxy(comptime runtime: Runtime) type {
         pub fn expireExchange(server: *ServerType, stream: *StreamType) void {
             assert(stream.h2_id != 0);
             assert(!stream.ending);
+            // A consult's timeout, or the request's under it (#437): the
+            // consult takes it, its request deadline still in place.
+            if (stream.phase == .consulting) return ServerType.ConsultEngine.expire(server, stream);
             ServerType.clearRequestDeadline(stream);
             stream.deadline_ns = 0;
             // A handler route's body that never finished (#434): answered
@@ -5529,6 +5663,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             if (std.mem.eql(u8, counter, "l7_shed_tunnels")) return .shed;
             if (std.mem.eql(u8, counter, "l7_bad_gateway")) return .upstream_failed;
             if (std.mem.eql(u8, counter, "l7_gateway_timeout")) return .timed_out;
+            if (std.mem.eql(u8, counter, "l7_policy_consult_expired")) return .timed_out;
             // The client's own gRPC deadline: time ran out, as above,
             // though the status it is answered with is a `200`.
             if (std.mem.eql(u8, counter, "l7_grpc_deadline_exceeded")) return .timed_out;

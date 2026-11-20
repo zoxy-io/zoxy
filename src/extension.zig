@@ -825,6 +825,34 @@ pub fn assertHandler(comptime Handler: type) void {
     if (isMetered(Handler)) @compileError(name ++ " is a handler, which declares no metrics yet");
 }
 
+/// Whether any listed request policy consults (#437): what decides that a
+/// build reserves consult slots at all.
+pub fn listsConsultingPolicy(comptime policies: []const type) bool {
+    inline for (policies) |Policy| {
+        if (comptime policyConsults(Policy)) return true;
+    }
+    return false;
+}
+
+/// The widest request any listed consulting policy declares (#437), or 0.
+pub fn consultRequestBytes(comptime policies: []const type) u32 {
+    comptime var widest: u32 = 0;
+    inline for (policies) |Policy| {
+        if (comptime policyConsults(Policy)) widest = @max(widest, Policy.consult_request_bytes_max);
+    }
+    return widest;
+}
+
+/// The widest reply body any listed consulting policy declares (#437),
+/// or 0.
+pub fn consultReplyBytes(comptime policies: []const type) u32 {
+    comptime var widest: u32 = 0;
+    inline for (policies) |Policy| {
+        if (comptime policyConsults(Policy)) widest = @max(widest, Policy.consult_reply_bytes_max);
+    }
+    return widest;
+}
+
 /// Refuse, at compile time, a consulting policy type (#437) that does not
 /// declare `consulted`'s contract and every consult bound.
 fn assertConsults(comptime Policy: type) void {

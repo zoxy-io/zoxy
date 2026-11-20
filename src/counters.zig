@@ -170,11 +170,28 @@ pub const Counters = struct {
     /// asked for an edit zoxy would refuse a request's, and the exchange
     /// failed as an unrenderable origin head does, with a `502`.
     l7_response_policy_edit_refused: Value = Value.init(0),
-    /// Consults a build's policy asked for that could not be made or
-    /// answered (#437), each then taking the type's declared failure.
+    /// Consults a build's policies began (#437), their requests parked on
+    /// them.
+    l7_policy_consult_started: Value = Value.init(0),
+    /// Of those, the ones answered: their replies read by `consulted`.
+    l7_policy_consult_replied: Value = Value.init(0),
+    /// Consults that could not be made or answered (#437), each then
+    /// taking the type's declared failure — and a `consulted` that asked
+    /// again, once per request being the limit.
     l7_policy_consult_failed: Value = Value.init(0),
     /// Of those, the ones on a type failing closed: answered `503`.
     l7_policy_consult_refused: Value = Value.init(0),
+    /// Why one was not made: a request past its type's bound, no consult
+    /// slot free, or the consulted cluster's pick or upstream pool
+    /// shedding it.
+    l7_policy_consult_oversize: Value = Value.init(0),
+    l7_policy_consult_slots_exhausted: Value = Value.init(0),
+    l7_policy_consult_shed: Value = Value.init(0),
+    /// Why one was not answered: its own `consult_timeout_ms` ran out.
+    l7_policy_consult_timed_out: Value = Value.init(0),
+    /// Requests whose own deadline ran out while they consulted: answered
+    /// `504`, whatever the type declared.
+    l7_policy_consult_expired: Value = Value.init(0),
     /// A build's handler answered the request (#434), from its own code.
     l7_handled: Value = Value.init(0),
     /// A handler route's request declared a body wider than the head
@@ -1162,8 +1179,8 @@ pub const Counters = struct {
         assert(counters.get("conn_policy_rejected") <= admitted);
         // Every 504 verdict rides a deadline expiry (§8) — the verdict
         // path increments both, the teardown path only the expiry.
-        assert(counters.get("l7_gateway_timeout") + counters.get("l7_grpc_deadline_exceeded") <=
-            counters.get("deadline_expired"));
+        assert(counters.get("l7_gateway_timeout") + counters.get("l7_grpc_deadline_exceeded") +
+            counters.get("l7_policy_consult_expired") <= counters.get("deadline_expired"));
         // Every `408` rides a head-budget reap (#247): the verdict is
         // reached from that expiry and nowhere else. The inequality
         // rather than an equality, because a reap that cannot be
@@ -1171,8 +1188,14 @@ pub const Counters = struct {
         // notice if one arrived.
         assert(counters.get("l7_request_timeout") <=
             counters.get("l7_head_budget_expired"));
-        // #437: a type failing closed answers the consults that failed it.
+        // #437: a type failing closed answers the consults that failed it;
+        // a reply answers a consult begun; and the causes of the failures
+        // are among them.
         assert(counters.get("l7_policy_consult_refused") <= counters.get("l7_policy_consult_failed"));
+        assert(counters.get("l7_policy_consult_replied") <= counters.get("l7_policy_consult_started"));
+        assert(counters.get("l7_policy_consult_oversize") + counters.get("l7_policy_consult_slots_exhausted") +
+            counters.get("l7_policy_consult_shed") + counters.get("l7_policy_consult_timed_out") <=
+            counters.get("l7_policy_consult_failed"));
         // Every §7 replay rides a checkout: only a reused connection's
         // early failure is blamed on staleness.
         assert(counters.get("upstream_replayed") <= counters.get("upstream_reused"));

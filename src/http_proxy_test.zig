@@ -995,6 +995,8 @@ const Http1Bed = struct {
         request_policies: []const extension.Selection = &.{},
         /// #417's request policies on the bed's one route.
         route_request_policies: []const extension.Selection = &.{},
+        /// #437's consult slots, for a consulting policy to ask from.
+        consult_slots: u32 = 0,
         /// #434's handler on the bed's one route, in place of its cluster.
         route_handler: ?*ScriptedHandler = null,
         /// #425's connection policies on the listener.
@@ -1223,6 +1225,7 @@ const Http1Bed = struct {
             .h2_origin_connections = if (options.origin_h2) options.h2_origin_connections else 0,
             .h2_origin_streams = if (options.origin_h2) options.h2_origin_streams else 0,
             .upstream_tls_sessions = if (options.origin_https) options.upstream_tls_sessions else 0,
+            .consult_slots = options.consult_slots,
         });
         try bed.server.bindExtensions(&.{ .arena = arena });
         try bed.loadTlsCredentials(arena, options.tls);
@@ -11295,33 +11298,84 @@ test "h2: a handler route's stream whose body never comes ends on its deadline (
     try bed.expectDrained();
 }
 
+test "l7: a policy's consult reply decides its request (#437)" {
+    // The origin answers the consult `200`, so the policy hands the request
+    // on — to that same origin, on a connection of its own.
+    var policy: ScriptedConsultPolicy = .{ .cluster_name = "origin" };
+    const selected = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &policy)};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 4371,
+        .request_policies = &selected,
+        .consult_slots = 1,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+    try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+    try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 200 "));
+    try std.testing.expectEqual(@as(u32, 1), policy.consults);
+    try std.testing.expectEqual(@as(u32, 1), policy.replies);
+    try std.testing.expectEqual(@as(u16, 200), policy.last_status);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_policy_consult_started"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_policy_consult_replied"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_policy_consult_failed"));
+    try std.testing.expectEqual(@as(u32, 0), bed.server.consult_slots.busyCount());
+    try bed.expectDrained();
+}
+
+test "l7: a consult's reply may refuse the request, at the route too (#437)" {
+    // Any answer but `200` refuses: the request is answered `403` and its
+    // origin never asked.
+    var policy: ScriptedConsultPolicy = .{ .cluster_name = "origin" };
+    const selected = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &policy)};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 4372,
+        .route_request_policies = &selected,
+        .consult_slots = 1,
+        .origin_response = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n",
+    });
+    defer bed.tearDown();
+    try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+    try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 403 "));
+    try std.testing.expectEqual(@as(u16, 401), policy.last_status);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_policy_consult_replied"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_policy_rejected"));
+    try bed.expectDrained();
+}
+
 test "l7: a consult that cannot be made takes its type's declared failure (#437)" {
-    // No consult is made yet: a type failing closed answers `503`, and one
-    // failing open lets the request on to its origin.
+    // A question past the type's bound is never sent: a type failing
+    // closed answers `503`, and one failing open lets the request on.
+    const padding: [300]u8 = @splat('a');
+    const long_question = "GET /" ++ padding ++ " HTTP/1.1\r\nHost: authz\r\n\r\n";
     {
-        var policy: ScriptedConsultPolicy = .{ .cluster_name = "origin" };
+        var policy: ScriptedConsultPolicy = .{ .cluster_name = "origin", .question = long_question };
         const selected = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &policy)};
         var bed: Http1Bed = undefined;
         try bed.setUp(std.testing.allocator, .{
-            .seed = 4371,
+            .seed = 4373,
             .request_policies = &selected,
+            .consult_slots = 1,
             .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
         });
         defer bed.tearDown();
         try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
         try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 503 "));
-        try std.testing.expectEqual(@as(u32, 1), policy.consults);
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_policy_consult_oversize"));
         try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_policy_consult_failed"));
         try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_policy_consult_refused"));
+        try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_policy_consult_started"));
         try bed.expectDrained();
     }
     {
-        var policy: ScriptedConsultOpenPolicy = .{ .cluster_name = "origin" };
+        var policy: ScriptedConsultOpenPolicy = .{ .cluster_name = "origin", .question = long_question };
         const selected = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &policy)};
         var bed: Http1Bed = undefined;
         try bed.setUp(std.testing.allocator, .{
-            .seed = 4372,
+            .seed = 4374,
             .request_policies = &selected,
+            .consult_slots = 1,
             .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
         });
         defer bed.tearDown();
@@ -11331,4 +11385,183 @@ test "l7: a consult that cannot be made takes its type's declared failure (#437)
         try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_policy_consult_refused"));
         try bed.expectDrained();
     }
+}
+
+test "l7: a consult no one answers times out, inside the request's own deadline (#437)" {
+    // A mute origin: the consult's own timeout (100 ms) fails it closed.
+    {
+        var policy: ScriptedConsultPolicy = .{ .cluster_name = "origin" };
+        const selected = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &policy)};
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .seed = 4375,
+            .request_policies = &selected,
+            .consult_slots = 1,
+            .origin_mute = true,
+        });
+        defer bed.tearDown();
+        try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+        try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 503 "));
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_policy_consult_timed_out"));
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_policy_consult_refused"));
+        try std.testing.expectEqual(@as(u32, 0), policy.replies);
+        try bed.expectDrained();
+    }
+    // A request deadline tighter than the consult's: the request is out
+    // of time, `504`, whatever the type declares.
+    {
+        var policy: ScriptedConsultOpenPolicy = .{ .cluster_name = "origin" };
+        const selected = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &policy)};
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .seed = 4376,
+            .request_policies = &selected,
+            .consult_slots = 1,
+            .origin_mute = true,
+            .request_timeout_ms = 40,
+        });
+        defer bed.tearDown();
+        try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+        try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 504 "));
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_policy_consult_expired"));
+        try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_gateway_timeout"));
+        try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_policy_consult_failed"));
+        try bed.expectDrained();
+    }
+}
+
+test "l7: a consult reads a body framed by its length or its close, not a chunked one (#437)" {
+    const padding: [300]u8 = @splat('x');
+    const Case = struct { response: []const u8, closes: bool, body_len: u32, truncated: bool };
+    const cases = [_]Case{
+        // Within the type's 256-byte bound, read whole.
+        .{ .response = "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nallowed", .closes = false, .body_len = 7, .truncated = false },
+        // Past it: cut at the bound.
+        .{ .response = "HTTP/1.1 200 OK\r\nContent-Length: 300\r\n\r\n" ++ padding, .closes = false, .body_len = 256, .truncated = true },
+        // Framed by the origin's close, read to it.
+        .{ .response = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nallowed", .closes = true, .body_len = 7, .truncated = false },
+        // Chunked: the head alone, marked cut.
+        .{ .response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n7\r\nallowed\r\n0\r\n\r\n", .closes = false, .body_len = 0, .truncated = true },
+    };
+    for (cases, 0..) |case, index| {
+        var policy: ScriptedConsultPolicy = .{ .cluster_name = "origin" };
+        const selected = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &policy)};
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .seed = 4380 + index,
+            .request_policies = &selected,
+            .consult_slots = 1,
+            .origin_response = case.response,
+            .origin_closes = case.closes,
+        });
+        defer bed.tearDown();
+        try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+        try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 200 "));
+        try std.testing.expectEqual(@as(u32, 1), policy.replies);
+        try std.testing.expectEqual(case.body_len, policy.last_body_len);
+        try std.testing.expectEqual(case.truncated, policy.last_truncated);
+        try bed.expectDrained();
+    }
+}
+
+test "l7: a consult finds no slot while another holds the only one (#437)" {
+    // The first request's consult holds the one slot on a mute origin until
+    // its timeout; the second, arriving meanwhile, finds none. Both fail
+    // closed: one timed out, one never made.
+    var policy: ScriptedConsultPolicy = .{ .cluster_name = "origin" };
+    const selected = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &policy)};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 4385,
+        .request_policies = &selected,
+        .consult_slots = 1,
+        .origin_mute = true,
+    });
+    defer bed.tearDown();
+    bed.client2.request = "GET /r HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+    bed.client2.send_delay_ms = 20;
+    bed.client2.startAt(&bed.sim_io, &bed.server, bed.listeners[0].bind_address);
+    try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+    try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 503 "));
+    try std.testing.expect(std.mem.startsWith(u8, bed.client2.response(), "HTTP/1.1 503 "));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_policy_consult_slots_exhausted"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_policy_consult_timed_out"));
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("l7_policy_consult_refused"));
+    try bed.expectDrained();
+}
+
+test "l7: a request torn down while it consults gives its slots back (#437)" {
+    // A drain whose deadline ends every connection lands while the consult
+    // waits on a mute origin: the consult's leg is forced as an exchange's,
+    // and its consult slot and upstream slot go back with the stream.
+    var policy: ScriptedConsultPolicy = .{ .cluster_name = "origin" };
+    const selected = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &policy)};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 4386,
+        .request_policies = &selected,
+        .consult_slots = 1,
+        .origin_mute = true,
+        .drain_deadline_ms = 20,
+    });
+    defer bed.tearDown();
+    bed.armDrainTimer(10);
+    try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+    try std.testing.expectEqual(@as(usize, 0), bed.client.response().len);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_policy_consult_started"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_policy_consult_replied"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_policy_consult_failed"));
+    try std.testing.expectEqual(@as(u32, 0), bed.server.consult_slots.busyCount());
+    try bed.expectDrained();
+}
+
+test "h2c: a stream's policy consults, and its answer decides the stream (#437)" {
+    var policy: ScriptedConsultPolicy = .{ .cluster_name = "origin" };
+    const selected = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &policy)};
+    var options = h2BedOptions(4387);
+    options.request_policies = &selected;
+    options.consult_slots = 1;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+    try bed.exchange(h2_preface ++ h2_settings ++ h2_get);
+    var storage: [2]H2Answer = undefined;
+    const answers = try h2Answers(bed.client.response(), &storage);
+    try std.testing.expectEqual(@as(usize, 1), answers.len);
+    try std.testing.expectEqual(@as(u16, 200), answers[0].status);
+    try std.testing.expectEqual(@as(u32, 1), policy.replies);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_policy_consult_replied"));
+    try std.testing.expectEqual(@as(u32, 0), bed.server.consult_slots.busyCount());
+    try bed.expectDrained();
+}
+
+test "h2c: a stream's request deadline runs out under its consult (#437)" {
+    var policy: ScriptedConsultPolicy = .{ .cluster_name = "origin" };
+    const selected = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &policy)};
+    var options = h2BedOptions(4388);
+    options.request_policies = &selected;
+    options.consult_slots = 1;
+    options.origin_mute = true;
+    options.request_timeout_ms = 40;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+    try bed.exchange(h2_preface ++ h2_settings ++ h2_get);
+    var storage: [2]H2Answer = undefined;
+    const answers = try h2Answers(bed.client.response(), &storage);
+    try std.testing.expectEqual(@as(usize, 1), answers.len);
+    try std.testing.expectEqual(@as(u16, 504), answers[0].status);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_policy_consult_expired"));
+    try std.testing.expectEqual(@as(u32, 0), bed.server.consult_slots.busyCount());
+    try bed.expectDrained();
+}
+
+test "l7: a build that consults reserves its slots, or does not start (#437)" {
+    var policy: ScriptedConsultPolicy = .{ .cluster_name = "origin" };
+    const selected = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &policy)};
+    var bed: Http1Bed = undefined;
+    try std.testing.expectError(error.ConsultSlotsRequired, bed.setUp(std.testing.allocator, .{
+        .seed = 4377,
+        .request_policies = &selected,
+    }));
 }

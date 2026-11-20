@@ -475,6 +475,11 @@ pub const Limits = struct {
     upstream_tls_sessions: ?u32 = null,
     cq_fill_eighths: ?u32 = null,
     access_log_buffer_bytes: ?u32 = null,
+    /// The consults a build's policies may have in flight at once (#437),
+    /// each holding one buffer for its request and its reply. Code only,
+    /// like the policies that consult: null is none, and a config that
+    /// selects a consulting policy without any is refused at startup.
+    consult_slots: ?u32 = null,
 };
 
 /// A named response body (#159), for an error page or a `respond` action

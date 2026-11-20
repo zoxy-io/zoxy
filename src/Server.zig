@@ -28,6 +28,7 @@ const Io = @import("io/io.zig");
 const Pool = @import("mem/Pool.zig").Pool;
 const parser = @import("http/parser.zig");
 const proxy = @import("http/proxy.zig");
+const consult_module = @import("http/consult.zig");
 const router = @import("http/router.zig");
 const filter = @import("http/filter.zig");
 const proxy_protocol = @import("net/proxy_protocol.zig");
@@ -234,6 +235,10 @@ pub fn Server(comptime runtime: Runtime) type {
         /// policies make (#424); empty in a build whose policies edit
         /// nothing.
         policy_edits: PolicyEdits,
+        /// The buffers a build's policy consults send their requests from
+        /// and read their replies into (#437); empty in a build whose
+        /// policies consult nothing.
+        consult_slots: consult_module.Slots,
         /// Staging for the §8 exit tally: the
         /// full exposition — counters then labeled — no longer fits a
         /// fixed stack buffer once its length is the config's, so it is
@@ -469,6 +474,8 @@ pub fn Server(comptime runtime: Runtime) type {
         pub const AnswerTable = @import("extension_answers.zig").Table(runtime.extensions);
         /// The header edits a build's request policies make (#424).
         pub const PolicyEdits = @import("policy_edits.zig").Table(runtime.extensions);
+        /// A build's policy consults (#437), on their streams' own legs.
+        pub const ConsultEngine = consult_module.Engine(runtime);
         pub const StreamType = ConnType.StreamType;
         pub const AccessLogType = access_log_module.AccessLog(runtime);
         pub const Proxy = proxy.Proxy(runtime);
@@ -921,6 +928,8 @@ pub fn Server(comptime runtime: Runtime) type {
             // An exchange ended mid-flight still holds its upstream half:
             // nothing is armed on it any more, so it closes synchronously.
             server.upstreamClose(stream);
+            // And a consult's slot, ended while it consulted (#437).
+            server.releaseConsultSlot(stream);
             if (stream.upstream) |leased| {
                 server.releaseUpstream(leased);
                 stream.upstream = null;
@@ -1250,6 +1259,18 @@ pub fn Server(comptime runtime: Runtime) type {
             // edits — the bytes the banner prices, asserted at `init`.
             const stream_slots = constants.streamSlotsFor(options.conn_slots, options.stream_slots);
             try server.policy_edits.init(arena, server.config, stream_slots);
+            // #437: the consult slots the banner prices, as `consultBytes`.
+            const policies = runtime.extensions.request_policies;
+            const consult_slots = consult_module.slotsFor(policies, options);
+            const consult_slot_bytes = if (consult_slots == 0) 0 else consult_module.slotBytes(policies, options.head_buffer_bytes);
+            try server.consult_slots.init(arena, consult_slots, consult_slot_bytes);
+            assert(server.consult_slots.buffers.len == consult_module.bytesFor(policies, options));
+        }
+
+        /// Every consult slot's bytes under `config` (#437): §5's
+        /// `consult_bytes` term.
+        pub fn consultBytes(config: *const config_module.Config) u64 {
+            return consult_module.bytesFor(runtime.extensions.request_policies, &config.limits);
         }
 
         /// Lend the serving path's header scratch for one parse and the
@@ -4428,6 +4449,8 @@ pub fn Server(comptime runtime: Runtime) type {
             assert(conn.stream.armedCount() == 0);
             server.io.closeNow(conn.client_socket);
             server.upstreamClose(conn.stream);
+            // A request torn down while it consulted (#437).
+            server.releaseConsultSlot(conn.stream);
             server.releasePooledResources(conn);
             // The last chance to say anything about this connection (§8).
             // An exchange that reached a verdict already spoke and is
@@ -4654,6 +4677,32 @@ pub fn Server(comptime runtime: Runtime) type {
             unreachable;
         }
 
+        /// Whether `config` selects a request policy that consults (#437),
+        /// at a listener or at one of its routes.
+        fn selectsConsultingPolicy(config: *const config_module.Config) bool {
+            if (comptime !extension.listsConsultingPolicy(runtime.extensions.request_policies)) return false;
+            assert(config.listeners.len >= 1);
+            for (config.listeners) |*listener| {
+                if (selectionsConsult(listener.request_policies)) return true;
+                for (listener.routes) |*route| {
+                    if (selectionsConsult(route.request_policies)) return true;
+                }
+            }
+            return false;
+        }
+
+        fn selectionsConsult(selections: []const extension.Selection) bool {
+            for (selections) |selection| {
+                assert(selection.index < runtime.extensions.request_policies.len);
+                inline for (runtime.extensions.request_policies, 0..) |Policy, index| {
+                    if (comptime extension.policyConsults(Policy)) {
+                        if (selection.index == index) return true;
+                    }
+                }
+            }
+            return false;
+        }
+
         /// Whether `config` selects any extension (#417), checking every
         /// selection against the build's list on the way: `select` proves
         /// the index at compile time, but a hand-built config can write one.
@@ -4736,6 +4785,12 @@ pub fn Server(comptime runtime: Runtime) type {
         pub fn bindExtensions(server: *Self, given: *const extension.Startup) anyerror!void {
             assert(!server.extensions_bound);
             assert(server.config.clusters.len >= 1);
+            // #437: a consulting policy with no slot to consult from would
+            // fail every request it sees — refused here, where both the
+            // selections and the reservation are known.
+            if (selectsConsultingPolicy(server.config) and server.consult_slots.free.len == 0) {
+                return error.ConsultSlotsRequired;
+            }
             // #428: what lends a build its clusters' endpoint sets.
             var lent = given.*;
             lent.endpoints_context = server;
@@ -5181,48 +5236,175 @@ pub fn Server(comptime runtime: Runtime) type {
                 /// A consult that could not be made or answered, on a type
                 /// that fails closed (#437): a `503`.
                 unavailable,
+                /// Parked on the stopping policy's consult (#437): its
+                /// reply, or its failure, resumes the run.
+                parked,
             };
 
             pub const Answered = struct {
                 policy_index: u8,
                 answer_index: u16,
             };
+
+            /// The run a consult resumes (#437): from the policy that
+            /// consulted, at the listener's phase or its route's, with its
+            /// reply — null when the consult failed — and the route chosen
+            /// before it.
+            pub const Resumed = struct {
+                position: u16,
+                route_phase: bool,
+                reply: ?*const extension.ConsultReply,
+                chosen_route: ?u16,
+            };
         };
 
-        /// A policy's `consult` (#437), and whether it refused the
-        /// request: no consult is made yet, so every one takes the type's
-        /// declared failure — `open` lets the run go on, `closed` stops it.
-        fn consultRefused(server: *Self, selection: extension.Selection, consult: extension.Consult) bool {
+        /// A run stopped by the policy at `position`, which did not
+        /// proceed, with the route chosen before it.
+        fn stopAt(stop: PolicyRun.Stop, position: usize, route: ?u16) PolicyRun {
+            assert(position <= std.math.maxInt(u16));
+            return .{ .stop = stop, .proceeded = @intCast(position), .route = route };
+        }
+
+        /// What became of a policy's consult (#437): the request parked
+        /// on it, or — not made — its type's declared failure, letting
+        /// the run go on or refusing the request.
+        const ConsultTaken = enum { parked, open, refused };
+
+        /// A policy's `consult` (#437): begun, the stream parked on it, or
+        /// — when it cannot be made — the type's declared failure.
+        fn takeConsult(
+            server: *Self,
+            selection: extension.Selection,
+            consult: extension.Consult,
+            request: *const extension.Request,
+            stream: *StreamType,
+            park: consult_module.Park,
+        ) ConsultTaken {
             // The index came from `clusterNamed`, which finds only a
             // cluster a consult can ask.
             assert(consult.cluster_index < server.config.clusters.len);
             assert(extension.consultable(&server.config.clusters[consult.cluster_index]));
             assert(consult.request.len >= 1);
-            server.counters.increment("l7_policy_consult_failed");
-            // A refusal's own count is the `503` answer's, by `respond`.
-            return consultFailureOf(selection) == .closed;
+            const declared = declaredConsult(selection);
+            if (ConsultEngine.begin(server, stream, consult, declared.bounds, request, park)) return .parked;
+            return server.consultFailed(declared.failure);
         }
 
-        /// The selected policy type's declared consult failure (#437).
-        /// Only a type that declares `consulted` may consult: a consult
-        /// from any other is the build's bug, held to that as a `respond`
-        /// naming no answer is, and named so the panic says whose.
-        fn consultFailureOf(selection: extension.Selection) extension.ConsultFailure {
+        /// A consult that was not made or not answered (#437), decided by
+        /// the type's declared failure: `open` lets the run go on,
+        /// `closed` refuses — that refusal's own count is the `503`
+        /// answer's, by `respond`.
+        fn consultFailed(server: *Self, failure: extension.ConsultFailure) ConsultTaken {
+            server.counters.increment("l7_policy_consult_failed");
+            return switch (failure) {
+                .open => .open,
+                .closed => .refused,
+            };
+        }
+
+        /// The verdict of the policy whose consult the run resumes (#437):
+        /// its `consulted`, on the reply, or its declared failure — null
+        /// for one failing closed. The consult slot goes back here, once
+        /// the reply in it is read, so a later policy may consult in turn.
+        fn resumedVerdict(
+            server: *Self,
+            selection: extension.Selection,
+            request: *const extension.Request,
+            stream: *StreamType,
+            reply: ?*const extension.ConsultReply,
+        ) ?extension.Verdict {
+            assert(stream.l7.consult.slot != StreamType.L7State.Consult.slot_none);
+            const declared = declaredConsult(selection);
+            const decided: ?extension.Verdict = if (reply) |answer| callConsulted(selection, request, answer) else null;
+            server.releaseConsultSlot(stream);
+            if (decided) |verdict| {
+                server.counters.increment("l7_policy_consult_replied");
+                // Once per request: a second consult is the type's failure.
+                if (verdict != .consult) return verdict;
+            }
+            return switch (server.consultFailed(declared.failure)) {
+                .open => .proceed,
+                .refused => null,
+                .parked => unreachable,
+            };
+        }
+
+        /// What the selected type declares of its consults (#437). Only a
+        /// type that declares `consulted` may consult: a consult from any
+        /// other is the build's bug, held to that as a `respond` naming no
+        /// answer is, and named so the panic says whose.
+        fn declaredConsult(selection: extension.Selection) struct {
+            failure: extension.ConsultFailure,
+            bounds: consult_module.Bounds,
+        } {
             assert(selection.index < runtime.extensions.request_policies.len);
             inline for (runtime.extensions.request_policies, 0..) |Policy, index| {
                 if (selection.index == index) {
                     if (comptime !extension.policyConsults(Policy)) {
                         @panic(@typeName(Policy) ++ " returned `consult` but declares no `consulted`");
                     }
-                    return Policy.consult_failure;
+                    return .{ .failure = Policy.consult_failure, .bounds = .{
+                        .request_bytes_max = Policy.consult_request_bytes_max,
+                        .reply_bytes_max = Policy.consult_reply_bytes_max,
+                        .timeout_ms = Policy.consult_timeout_ms,
+                    } };
                 }
             }
             unreachable;
         }
 
+        /// The selected type's `consulted` (#437): only a type that
+        /// consults parked, `declaredConsult` saw to that.
+        fn callConsulted(
+            selection: extension.Selection,
+            request: *const extension.Request,
+            reply: *const extension.ConsultReply,
+        ) extension.Verdict {
+            assert(selection.index < runtime.extensions.request_policies.len);
+            assert(reply.body.len <= constants.consult_reply_bytes_max);
+            inline for (runtime.extensions.request_policies, 0..) |Policy, index| {
+                if (selection.index == index) {
+                    if (comptime !extension.policyConsults(Policy)) unreachable;
+                    const policy: *Policy = @ptrCast(@alignCast(selection.instance));
+                    return Policy.consulted(policy, request, reply);
+                }
+            }
+            unreachable;
+        }
+
+        /// Give back the consult slot `stream` holds (#437), if any: after
+        /// its reply is read, and wherever the stream ends.
+        pub fn releaseConsultSlot(server: *Self, stream: *StreamType) void {
+            const slot = stream.l7.consult.slot;
+            if (slot == StreamType.L7State.Consult.slot_none) return;
+            server.consult_slots.give(slot);
+            stream.l7.consult.slot = StreamType.L7State.Consult.slot_none;
+        }
+
+        /// #424: a `proceed_with`'s edits, copied now — the view behind
+        /// them is gone by the render — or false, the request refused:
+        /// counted here and, through `respondPolicy`, as the policy reject
+        /// it is answered as.
+        fn takeEdits(
+            server: *Self,
+            selection: extension.Selection,
+            edits: []const extension.Edit,
+            stream: *const StreamType,
+            route_phase: bool,
+        ) bool {
+            assert(selection.index < runtime.extensions.request_policies.len);
+            const bound = PolicyEdits.editBytesOfSelection(selection);
+            server.policy_edits.take(server.streamIndex(stream), route_phase, edits, bound) catch {
+                server.counters.increment("l7_policy_edit_refused");
+                return false;
+            };
+            return true;
+        }
+
         /// Run `selections` over `request` in order (#417): the first
         /// reject wins. Dispatch is the comptime list's, like
-        /// `callPicker`.
+        /// `callPicker`. A consult parks the run (#437); its reply or its
+        /// failure resumes it from the policy that asked.
         pub fn evaluatePolicies(
             server: *Self,
             selections: []const extension.Selection,
@@ -5233,45 +5415,51 @@ pub fn Server(comptime runtime: Runtime) type {
             /// one overwrites, so the next policy reads it (#433). The
             /// caller keeps that tag whatever the verdict.
             request: *extension.Request,
-            /// The exchange the policies' edits are for (#424).
-            stream: *const StreamType,
+            /// The exchange the policies' edits are for (#424), and the one
+            /// a consult parks.
+            stream: *StreamType,
             /// Whether these are its route's policies, whose edits follow
             /// its listener's.
             route_phase: bool,
+            resumed: ?PolicyRun.Resumed,
         ) PolicyRun {
             assert(server.extensions_bound);
             assert(selections.len >= 1);
             assert(selections.len <= std.math.maxInt(u16));
             assert(metrics.len == 0 or metrics.len == selections.len);
+            if (resumed) |run| {
+                assert(run.position < selections.len);
+                assert(run.route_phase == route_phase);
+            }
             // Each policy's slots are its own: none outlives its call, so
             // a later view of the request — a picker's — carries none.
             defer request.metrics = .{};
-            var route: ?u16 = null;
-            for (selections, 0..) |selection, position| {
+            const first: u16 = if (resumed) |run| run.position else 0;
+            var route: ?u16 = if (resumed) |run| run.chosen_route else null;
+            for (selections[first..], first..) |selection, position| {
                 request.metrics = if (metrics.len == 0) .{} else metrics[position];
-                switch (callPolicy(selection, request)) {
+                const verdict = if (resumed != null and position == first)
+                    server.resumedVerdict(selection, request, stream, resumed.?.reply) orelse
+                        return stopAt(.unavailable, position, route)
+                else
+                    callPolicy(selection, request);
+                switch (verdict) {
                     .proceed => {},
                     .proceed_with => |proceed| {
                         if (proceed.tag) |tag| request.tag = tag;
                         if (proceed.route) |index| route = index;
-                        // #424: copied now — the view behind them is gone
-                        // by the render — or the request is refused.
-                        const bound = PolicyEdits.editBytesOfSelection(selection);
-                        server.policy_edits.take(server.streamIndex(stream), route_phase, proceed.edits, bound) catch {
-                            // Counted here and, through `respondPolicy`, as
-                            // the policy reject it is answered as: the
-                            // refusal's own reason, and the reject total.
-                            server.counters.increment("l7_policy_edit_refused");
-                            return .{ .stop = .{ .reject = .bad_request }, .proceeded = @intCast(position), .route = route };
-                        };
+                        if (!server.takeEdits(selection, proceed.edits, stream, route_phase)) {
+                            return stopAt(.{ .reject = .bad_request }, position, route);
+                        }
                     },
-                    .reject => |status| return .{
-                        .stop = .{ .reject = status },
-                        .proceeded = @intCast(position),
-                        .route = route,
-                    },
-                    .consult => |consult| if (server.consultRefused(selection, consult)) {
-                        return .{ .stop = .unavailable, .proceeded = @intCast(position), .route = route };
+                    .reject => |status| return stopAt(.{ .reject = status }, position, route),
+                    .consult => |consult| {
+                        const park: consult_module.Park = .{ .position = @intCast(position), .route_phase = route_phase, .chosen_route = route };
+                        switch (server.takeConsult(selection, consult, request, stream, park)) {
+                            .parked => return stopAt(.parked, position, route),
+                            .refused => return stopAt(.unavailable, position, route),
+                            .open => {},
+                        }
                     },
                     .respond => |answer_index| {
                         // `extension.respond` names a declared answer; a
@@ -5281,7 +5469,7 @@ pub fn Server(comptime runtime: Runtime) type {
                             .policy_index = selection.index,
                             .answer_index = answer_index,
                         };
-                        return .{ .stop = .{ .respond = answered }, .proceeded = @intCast(position), .route = route };
+                        return stopAt(.{ .respond = answered }, position, route);
                     },
                 }
             }
@@ -5292,18 +5480,35 @@ pub fn Server(comptime runtime: Runtime) type {
         /// a listener's, or the route's named by `route_index`. A request
         /// owes nothing when its listener phase begins, which is the
         /// exactly-once a policy's `complete` is promised.
-        pub fn notePoliciesProceeded(server: *Self, stream: *StreamType, route_index: ?u16, proceeded: u16) void {
+        pub fn notePoliciesProceeded(
+            server: *Self,
+            stream: *StreamType,
+            route_index: ?u16,
+            proceeded: u16,
+            /// Whether this is a run a consult resumed (#437), which raises
+            /// the count its park noted rather than noting one afresh.
+            resumed: bool,
+        ) void {
             if (comptime !ConnType.completes_policies) return;
             const listener = &server.config.listeners[stream.conn.listener_index];
             if (route_index) |index| {
                 assert(index < listener.routes.len);
                 assert(proceeded <= listener.routes[index].request_policies.len);
-                assert(stream.policies.route_proceeded == 0);
+                if (resumed) {
+                    assert(stream.policies.route_index == index);
+                    assert(proceeded >= stream.policies.route_proceeded);
+                } else {
+                    assert(stream.policies.route_proceeded == 0);
+                }
                 stream.policies.route_index = index;
                 stream.policies.route_proceeded = proceeded;
             } else {
                 assert(proceeded <= listener.request_policies.len);
-                assert(!stream.policies.owed());
+                if (resumed) {
+                    assert(proceeded >= stream.policies.listener_proceeded);
+                } else {
+                    assert(!stream.policies.owed());
+                }
                 stream.policies.listener_proceeded = proceeded;
             }
         }
@@ -6452,6 +6657,9 @@ pub fn Server(comptime runtime: Runtime) type {
             // driver looks for which are due (#275).
             if (conn.state == .h2) return H2Driver.expire(server, conn);
             server.counters.increment("deadline_expired");
+            // A consult's timeout, or the request's under it (#437): the
+            // consult takes it, its request deadline still in place.
+            if (conn.stream.phase == .consulting) return ConsultEngine.expire(server, conn.stream);
             // #423: an L4 dial out of time ends its pick here, the one place
             // that knows why — the teardown it ends in says nothing.
             if (conn.state == .connecting) {
@@ -6553,6 +6761,9 @@ pub fn Server(comptime runtime: Runtime) type {
             const server = stream.conn.server;
             stream.delivered(&stream.op_connect_cancel, "connect_cancel");
             if (server.exchangeOver(stream)) return;
+            // A consult's dial its expiry cancelled (#437): settled once
+            // the dial delivers too, whichever lands second.
+            if (stream.phase == .consulting) return ConsultEngine.settle(server, stream);
             // A §8 dial-timeout cancel: the connect completion itself
             // carries the verdict (it may deliver before or after this
             // one), so there is nothing to do here. The verdict is still

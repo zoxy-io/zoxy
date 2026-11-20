@@ -174,6 +174,8 @@ pub fn proxyStatusCauseFor(comptime rung: []const u8) ProxyStatusCause {
     // A #417 policy refuses for the reason a filter rule does.
     if (std.mem.eql(u8, rung, "l7_policy_rejected")) return .denied;
     if (std.mem.eql(u8, rung, "l7_gateway_timeout")) return .timeout;
+    // A request out of time while it consulted (#437): the same cause.
+    if (std.mem.eql(u8, rung, "l7_policy_consult_expired")) return .timeout;
     return .none;
 }
 

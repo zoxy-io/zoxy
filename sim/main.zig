@@ -403,6 +403,18 @@ const uncovered = [_]Uncovered{
             "header zoxy writes itself, and splits one with CRLF",
     },
     .{
+        .name = "l7_policy_consult_started",
+        .why = .unreached,
+        .reason = "the harness selects no consulting policy yet (#437); " ++
+            "src/http_proxy_test.zig makes consults that are answered, refused and timed out",
+    },
+    .{
+        .name = "l7_policy_consult_replied",
+        .why = .unreached,
+        .reason = "the harness selects no consulting policy yet (#437); " ++
+            "src/http_proxy_test.zig hands replies of 200 and 401 to `consulted`",
+    },
+    .{
         .name = "l7_policy_consult_failed",
         .why = .unreached,
         .reason = "the harness selects no consulting policy yet (#437); " ++
@@ -413,6 +425,36 @@ const uncovered = [_]Uncovered{
         .why = .unreached,
         .reason = "the harness selects no consulting policy yet (#437); " ++
             "src/http_proxy_test.zig fails one closed",
+    },
+    .{
+        .name = "l7_policy_consult_oversize",
+        .why = .unreached,
+        .reason = "the harness selects no consulting policy yet (#437); " ++
+            "src/http_proxy_test.zig sends a question past its type's bound",
+    },
+    .{
+        .name = "l7_policy_consult_slots_exhausted",
+        .why = .unreached,
+        .reason = "the harness selects no consulting policy yet (#437); " ++
+            "src/http_proxy_test.zig has a second consult find the one slot held",
+    },
+    .{
+        .name = "l7_policy_consult_shed",
+        .why = .unreached,
+        .reason = "the harness selects no consulting policy yet (#437); " ++
+            "no directed test yet: the harness's slice brings a capped consulted cluster",
+    },
+    .{
+        .name = "l7_policy_consult_timed_out",
+        .why = .unreached,
+        .reason = "the harness selects no consulting policy yet (#437); " ++
+            "src/http_proxy_test.zig consults a mute origin",
+    },
+    .{
+        .name = "l7_policy_consult_expired",
+        .why = .unreached,
+        .reason = "the harness selects no consulting policy yet (#437); " ++
+            "src/http_proxy_test.zig runs the request's deadline out under a consult",
     },
     .{
         .name = "endpoints_parked_closed",

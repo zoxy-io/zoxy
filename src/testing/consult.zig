@@ -16,19 +16,24 @@ pub fn ScriptedConsult(comptime failure: extension.ConsultFailure) type {
         /// The cluster it asks, by name, resolved at `bind`.
         cluster_name: []const u8 = "",
         cluster_index: ?u16 = null,
+        /// The request it sends; a gate may make it too long.
+        question: []const u8 = default_question,
         /// Consults it asked for, and replies it heard.
         consults: u32 = 0,
         replies: u32 = 0,
-        /// The last reply's status.
+        /// The last reply's status, body length, and whether its body
+        /// was cut.
         last_status: u16 = 0,
+        last_body_len: u32 = 0,
+        last_truncated: bool = false,
 
         pub const consult_failure = failure;
         pub const consult_request_bytes_max = 256;
         pub const consult_reply_bytes_max = 256;
         pub const consult_timeout_ms = 100;
 
-        /// The request it sends: a bare question, framed by its head.
-        pub const question = "GET /authz HTTP/1.1\r\nHost: authz\r\n\r\n";
+        /// A bare question, framed by its head.
+        pub const default_question = "GET /authz HTTP/1.1\r\nHost: authz\r\n\r\n";
 
         pub fn bind(
             policy: *Self,
@@ -42,9 +47,9 @@ pub fn ScriptedConsult(comptime failure: extension.ConsultFailure) type {
 
         pub fn evaluate(policy: *Self, request: *const extension.Request) extension.Verdict {
             assert(request.path.len >= 1);
-            assert(question.len <= consult_request_bytes_max);
+            assert(policy.question.len >= 1);
             policy.consults += 1;
-            return .{ .consult = .{ .cluster_index = policy.cluster_index.?, .request = question } };
+            return .{ .consult = .{ .cluster_index = policy.cluster_index.?, .request = policy.question } };
         }
 
         pub fn consulted(
@@ -57,6 +62,8 @@ pub fn ScriptedConsult(comptime failure: extension.ConsultFailure) type {
             policy.replies += 1;
             assert(policy.replies <= policy.consults);
             policy.last_status = reply.status;
+            policy.last_body_len = @intCast(reply.body.len);
+            policy.last_truncated = reply.body_truncated;
             return if (reply.status == 200) .proceed else .{ .reject = .forbidden };
         }
     };
