@@ -170,6 +170,11 @@ pub const Counters = struct {
     /// asked for an edit zoxy would refuse a request's, and the exchange
     /// failed as an unrenderable origin head does, with a `502`.
     l7_response_policy_edit_refused: Value = Value.init(0),
+    /// Consults a build's policy asked for that could not be made or
+    /// answered (#437), each then taking the type's declared failure.
+    l7_policy_consult_failed: Value = Value.init(0),
+    /// Of those, the ones on a type failing closed: answered `503`.
+    l7_policy_consult_refused: Value = Value.init(0),
     /// A build's handler answered the request (#434), from its own code.
     l7_handled: Value = Value.init(0),
     /// A handler route's request declared a body wider than the head
@@ -1166,6 +1171,8 @@ pub const Counters = struct {
         // notice if one arrived.
         assert(counters.get("l7_request_timeout") <=
             counters.get("l7_head_budget_expired"));
+        // #437: a type failing closed answers the consults that failed it.
+        assert(counters.get("l7_policy_consult_refused") <= counters.get("l7_policy_consult_failed"));
         // Every §7 replay rides a checkout: only a reused connection's
         // early failure is blamed on staleness.
         assert(counters.get("upstream_replayed") <= counters.get("upstream_reused"));

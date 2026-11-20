@@ -877,6 +877,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             const stop = run.stop orelse return false;
             switch (stop) {
                 .reject => |status| respondPolicy(server, stream, status),
+                .unavailable => respond(server, stream, 503, "l7_policy_consult_refused"),
                 .respond => |answered| answerWithPage(
                     server,
                     stream,
@@ -5497,6 +5498,9 @@ pub fn Proxy(comptime runtime: Runtime) type {
             // A handler route's body past the head buffer (#434): the same
             // refusal, for the room this route reads its body into.
             if (std.mem.eql(u8, counter, "l7_handler_body_too_large")) return .rejected;
+            // A consulted service that could not answer a type failing
+            // closed (#437): an upstream the request needed, failed.
+            if (std.mem.eql(u8, counter, "l7_policy_consult_refused")) return .upstream_failed;
             // A handler stands where an origin would: an answer it could
             // not give reads as one an origin could not (#434).
             if (std.mem.eql(u8, counter, "l7_handler_answer_refused")) return .upstream_failed;

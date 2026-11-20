@@ -403,6 +403,18 @@ const uncovered = [_]Uncovered{
             "header zoxy writes itself, and splits one with CRLF",
     },
     .{
+        .name = "l7_policy_consult_failed",
+        .why = .unreached,
+        .reason = "the harness selects no consulting policy yet (#437); " ++
+            "src/http_proxy_test.zig takes both declared failures",
+    },
+    .{
+        .name = "l7_policy_consult_refused",
+        .why = .unreached,
+        .reason = "the harness selects no consulting policy yet (#437); " ++
+            "src/http_proxy_test.zig fails one closed",
+    },
+    .{
         .name = "endpoints_parked_closed",
         .why = .unreached,
         .reason = "while the sim's churn departs only the refusing endpoint, " ++

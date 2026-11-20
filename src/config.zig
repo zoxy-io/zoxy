@@ -4768,6 +4768,7 @@ test "config: a route's name rides its route through the sort, and a listener's 
         .listener_index = 0,
         .route_index = null,
         .cluster_index = null,
+        .clusters = &.{},
         .routes = listeners[0].routes,
     };
     try std.testing.expectEqual(@as(?u16, 0), site.routeNamed("api-v2"));
