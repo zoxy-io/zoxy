@@ -2869,6 +2869,8 @@ pub fn verify(harness: *Harness) !void {
     }
     if (!harness.server.isIdle()) return error.PoolLeak;
     if (!harness.server.reconcile()) return error.CountersDiverged;
+    // #423: every pick the http picker made completed, exactly once.
+    if (harness.pickers[1].completions != harness.pickers[1].calls) return error.PickNotCompleted;
     if (!harness.io.sockets.isFullyReleased()) return error.SocketLeak;
     // §7: no malformed byte may ever reach an origin.
     if (harness.origin_http.violations != 0) return error.OriginSawMalformedBytes;

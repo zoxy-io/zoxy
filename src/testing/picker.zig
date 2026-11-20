@@ -28,6 +28,11 @@ pub const ScriptedPicker = struct {
     /// a policy's, held to reaching the pick. One that does not stops
     /// the run, so the simulator replays its seed.
     expect_tag: ?u64 = null,
+    /// Completions received (#423): exactly one per pick, once each
+    /// pick's outcome is final — `calls` once the server is idle.
+    completions: u32 = 0,
+    /// The last completion, copied out: its times, its tag, its outcome.
+    last: ?extension.Completion = null,
     /// The last request's canonical path, copied out: the view is valid
     /// only for the call, so a gate reading it afterwards reads this.
     path: [path_bytes_max]u8 = @splat(0),
@@ -42,6 +47,12 @@ pub const ScriptedPicker = struct {
     pub const counters = .{
         .picks = "Picks asked of the scripted picker.",
         .past_end = "Picks it answered one past the set.",
+        .completed_response = "Picks completed by the origin's whole response.",
+        .completed_connect_failed = "Picks whose dial failed.",
+        .completed_timed_out = "Picks whose origin said nothing before its deadline.",
+        .completed_failed = "Picks whose exchange failed on the origin's side.",
+        .completed_stale = "Picks whose parked connection had gone stale.",
+        .completed_aborted = "Picks whose exchange ended on this side first.",
     };
     pub const gauges = .{
         .offered = "Candidates its last pick was offered.",
@@ -105,6 +116,41 @@ pub const ScriptedPicker = struct {
         if (slot == count) input.metrics.add(ScriptedPicker, .past_end, 1);
         input.metrics.set(ScriptedPicker, .offered, count);
         return slot;
+    }
+
+    /// One completion per pick (#423), its times in order, and each
+    /// outcome counted in its own series so the census holds every arm.
+    pub fn complete(picker: *ScriptedPicker, done: *const extension.Completion) void {
+        assert(done.done_ns >= done.picked_ns);
+        if (done.connected_ns) |connected| assert(connected >= done.picked_ns and connected <= done.done_ns);
+        if (done.head_ns) |head| {
+            assert(head >= done.picked_ns and head <= done.done_ns);
+            // A head arrives over a connection the attempt took.
+            assert(done.connected_ns != null);
+        }
+        if (picker.expect_tag) |expected| assert(done.tag == expected);
+        picker.completions += 1;
+        assert(picker.completions <= picker.calls);
+        picker.last = done.*;
+        switch (done.outcome) {
+            .response => {
+                assert(done.head_ns != null);
+                done.metrics.add(ScriptedPicker, .completed_response, 1);
+            },
+            .connect_failed => {
+                assert(done.connected_ns == null);
+                assert(done.head_ns == null);
+                done.metrics.add(ScriptedPicker, .completed_connect_failed, 1);
+            },
+            .timed_out => done.metrics.add(ScriptedPicker, .completed_timed_out, 1),
+            .failed => done.metrics.add(ScriptedPicker, .completed_failed, 1),
+            .stale => done.metrics.add(ScriptedPicker, .completed_stale, 1),
+            // No series: the sweep shadows every shed past a pick behind
+            // the relay rung (sim/main.zig, `l7_shed_upstream_slots`), so a
+            // census entry could never fire. http_proxy_test pins it.
+            .shed => assert(done.head_ns == null and done.connected_ns == null),
+            .aborted => done.metrics.add(ScriptedPicker, .completed_aborted, 1),
+        }
     }
 
     /// The last request's path, as recorded.

@@ -792,6 +792,9 @@ pub fn Mux(comptime runtime: Runtime) type {
                 .stream => |id| {
                     leg.id = id;
                     leg.phase = .open;
+                    // #423: the exchange's request can go out now, on a
+                    // connection it found open or one dialed for it.
+                    server.notePickConnected(stream);
                     leg.request_ended = end_stream;
                     leg.bodiless = request.bodiless;
                     leg.body = switch (request.framing) {

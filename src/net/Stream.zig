@@ -339,6 +339,22 @@ pub const LogState = struct {
     }
 };
 
+/// A pick whose `Completion` is still owed (#423): recorded when zoxy
+/// picks for a cluster whose picker completes, filled in as the attempt
+/// connects and its response head arrives, and handed over exactly once.
+pub const PendingPick = struct {
+    /// Whether a completion is owed. Every pick asserts none is.
+    active: bool = false,
+    retry: bool = false,
+    cluster_index: u16 = 0,
+    endpoint_index: u16 = 0,
+    picked_ns: u64 = 0,
+    /// Zero until the attempt's connection is ready, and until its
+    /// response head arrives: the loop clock is never zero once running.
+    connected_ns: u64 = 0,
+    head_ns: u64 = 0,
+};
+
 /// `ConnType` is a parameter rather than an import, and that is load
 /// bearing: `Conn` names this type for its own field, so importing back
 /// would make the two generics mutually re-entrant — Zig memoizes an
@@ -444,6 +460,11 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
         phase: Phase,
         /// L7 exchange bookkeeping (§7); reset per exchange.
         l7: L7State,
+        /// The pick this exchange owes a completion for (#423). Outside
+        /// `l7` because the §7 replay rebuilds that, and on the stream
+        /// rather than the log because an L4 connection owes one too.
+        /// Void in a build whose pickers do not complete.
+        pick: if (ConnType.completes_picks) PendingPick else void,
 
         /// Access-log capture (§8) — and the seam #274 exists to draw.
         ///
@@ -815,6 +836,7 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
             // listener says it is one, and an L7 exchange only when its
             // first head byte lands.
             stream.log = .{};
+            stream.pick = if (ConnType.completes_picks) .{} else {};
             // An admission stream's client is its connection; a shared one
             // is bound to its HTTP/2 stream after this (`Server`'s
             // `acquireSharedStream`).
