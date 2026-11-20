@@ -579,6 +579,64 @@ pub const ConnectionProceed = struct {
     tag: ?u64 = null,
 };
 
+/// How a connection a policy let on ended (#425). A connection policy may
+/// declare
+///
+///     pub fn complete(self: *P, done: *const ConnectionCompletion) void
+///
+/// and hears it once for each connection it proceeded on, when the
+/// connection is released — a later policy's refusal included. With the
+/// connection's identity in hand, a policy can count what it let on and
+/// still holds: a per-client cap on concurrent connections.
+pub const ConnectionCompletion = struct {
+    /// The client the policy read, or null on a `unix:` socket.
+    client: ?*const std.Io.net.IpAddress,
+    /// The site this policy ran at: the listener, and the SNI route when
+    /// it was one of the route's.
+    listener_index: u16,
+    route_index: ?u16,
+    /// The connection's tag as it ended.
+    tag: u64,
+    outcome: Outcome,
+    /// The loop clock at admission and at release.
+    started_ns: u64,
+    done_ns: u64,
+    /// What the connection's access-log lines count, summed whether or not
+    /// a log is configured: an l4 relay's bytes, or an http connection's
+    /// requests' (§8's `bytes_in` and `bytes_out`).
+    bytes_from_client: u64,
+    bytes_to_client: u64,
+
+    /// How the connection ended. An l4 connection's is its line's; an
+    /// http connection's requests have outcomes of their own, so it
+    /// reports `closed`, or `rejected` when a policy refused it.
+    pub const Outcome = enum {
+        /// It ran its course: an l4 relay drained both ways, or an http
+        /// connection closed, however its requests ended.
+        closed,
+        /// A connection policy refused it.
+        rejected,
+        /// An l4 relay that never drained: a dial that failed or found no
+        /// capacity, a deadline, a client gone, a drain. Its line says
+        /// `aborted` too; the counters tell the causes apart.
+        aborted,
+    };
+};
+
+/// Whether connection-policy type `Policy` declares the optional
+/// `complete` (#425).
+pub fn connectionPolicyCompletes(comptime Policy: type) bool {
+    return @hasDecl(Policy, "complete");
+}
+
+/// Whether any connection policy the build lists completes.
+pub fn connectionPoliciesComplete(comptime extensions: Extensions) bool {
+    inline for (extensions.connection_policies) |Policy| {
+        if (comptime connectionPolicyCompletes(Policy)) return true;
+    }
+    return false;
+}
+
 /// How a request a policy let through ended (#429). A policy may declare
 ///
 ///     pub fn complete(self: *P, done: *const RequestCompletion) void
@@ -924,8 +982,16 @@ pub fn assertConnectionPolicy(comptime Policy: type) void {
     }
     if (@hasDecl(Policy, "bind")) assertBind(Policy, PolicySite);
     if (isMetered(Policy)) @compileError(name ++ " is a connection policy, which declares no metrics yet");
-    if (@hasDecl(Policy, "complete")) {
-        @compileError(name ++ " is a connection policy, which hears no completion yet");
+    if (connectionPolicyCompletes(Policy)) {
+        const complete_fn = @typeInfo(@TypeOf(Policy.complete)).@"fn";
+        const complete_ok = complete_fn.param_types.len == 2 and
+            complete_fn.param_types[0] == *Policy and
+            complete_fn.param_types[1] == *const ConnectionCompletion and
+            complete_fn.return_type == void;
+        if (!complete_ok) {
+            @compileError(name ++ ".complete must be `fn (*" ++ name ++
+                ", *const extension.ConnectionCompletion) void`");
+        }
     }
 }
 

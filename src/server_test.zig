@@ -2830,3 +2830,60 @@ test "sni routing: a route's connection policy reads the listener's tag and may 
     try std.testing.expect(std.mem.indexOf(u8, line, "\"tag\":9") != null);
     try bed.expectDrained();
 }
+
+test "l4: a connection policy hears its connection end once, with the relay's bytes (#425)" {
+    var policy: ScriptedConnectionPolicy = .{ .tag = 3 };
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 4258 },
+        .connection_policy = &policy,
+    });
+    defer bed.tearDown();
+
+    bed.startClients(1, true);
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(Client.Outcome.eof, bed.scenario.clients[0].outcome);
+    try std.testing.expectEqual(@as(u32, 1), policy.completions);
+    const done = policy.last.?;
+    try std.testing.expectEqual(extension.ConnectionCompletion.Outcome.closed, done.outcome);
+    try std.testing.expectEqual(@as(u64, echo_token.len), done.bytes_from_client);
+    try std.testing.expectEqual(@as(u64, echo_token.len), done.bytes_to_client);
+    try std.testing.expectEqual(@as(u64, 3), done.tag);
+    try std.testing.expectEqual(@as(?u16, null), done.route_index);
+    try std.testing.expect(done.done_ns >= done.started_ns);
+    try bed.expectDrained();
+}
+
+test "sni routing: a listener policy hears of the refusal its route's policy made (#425)" {
+    var listener_policy: ScriptedConnectionPolicy = .{};
+    var route_policy: ScriptedConnectionPolicy = .{ .verdict = .reject };
+    const on_route = [_]extension.Selection{extension.select(runtime.extensions.connection_policies, &route_policy)};
+    const routes = [_]sni_router.Route{.{ .cluster_index = 0, .connection_policies = &on_route }};
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 4259 },
+        .sni_routes = &routes,
+        .connection_policy = &listener_policy,
+    });
+    defer bed.tearDown();
+
+    var hello_buffer: [128]u8 = undefined;
+    bed.scenario.clients_count = 1;
+    const client = &bed.scenario.clients[0];
+    client.exchange = true;
+    client.prefix = sniHello(&hello_buffer, "api.example.com");
+    client.start(&bed.scenario, TestBed.bindAddress());
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(Client.Outcome.eof, client.outcome);
+    // The listener's proceeded and is owed; the route's refused, and is not.
+    try std.testing.expectEqual(@as(u32, 1), listener_policy.completions);
+    try std.testing.expectEqual(@as(u32, 0), route_policy.completions);
+    try std.testing.expectEqual(
+        extension.ConnectionCompletion.Outcome.rejected,
+        listener_policy.last.?.outcome,
+    );
+    try std.testing.expectEqual(@as(u64, 0), listener_policy.last.?.bytes_from_client);
+    try bed.expectDrained();
+}
