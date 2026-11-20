@@ -10,14 +10,14 @@
 //! each name tier (`certificate_set.zig`), and `tls_rsa_signed` counts
 //! completed handshakes that used RSA.
 //!
-//! Decoding and key loading are zssl's; what this adds is the two
+//! Decoding and key loading are zssl's; what this adds is the three
 //! startup checks zssl has no reason to make — the wire bound the engine
-//! stages against, and parsing every chain entry so a corrupt
-//! intermediate fails here rather than mid-handshake.
+//! stages against, parsing every chain entry so a corrupt intermediate
+//! fails here rather than mid-handshake, and that the key is the leaf's.
 //!
 //! Lives under `src/tls/` because it names zssl (libcrypto); the config
-//! layer stays IO-free and hands only file paths (§1). Reading the files
-//! is the caller's (a startup step); this takes the bytes.
+//! layer stays IO-free (§1). Reading the files is the front-end's, and
+//! this takes the bytes (#417).
 
 const std = @import("std");
 const constants = @import("../constants.zig");
@@ -45,6 +45,11 @@ pub const LoadError = error{
     MalformedPem,
     /// The key is neither ECDSA P-256/P-384 nor RSA of 2048 to 4096 bits.
     UnsupportedCertKey,
+    /// The key is not the leaf certificate's: a signature it makes does
+    /// not verify against the leaf's public key, or the two are not even
+    /// the same kind of key. Every handshake would fail the client's
+    /// CertificateVerify check, so the pair is refused here instead.
+    CertificateKeyMismatch,
 } || std.mem.Allocator.Error || std.crypto.Certificate.ParseError || zssl.Credentials.Error;
 
 pub const Options = struct {
@@ -100,19 +105,152 @@ pub fn load(
     }
     // Parse every chain entry at load so a corrupt intermediate fails
     // here, not mid-handshake against a real client — zssl forwards
-    // non-leaf entries as opaque bytes without validating them.
-    for (decoded) |entry| {
+    // non-leaf entries as opaque bytes without validating them. The leaf
+    // is kept: its public key is the one the key must match.
+    var leaf: ?std.crypto.Certificate.Parsed = null;
+    for (decoded, 0..) |entry, index| {
         const cert: std.crypto.Certificate = .{ .buffer = entry, .index = 0 };
-        _ = try cert.parse();
+        const parsed = try cert.parse();
+        if (index == 0) leaf = parsed;
     }
     assert(chain_bytes > 0);
     assert(chain_bytes <= constants.tls_cert_chain_bytes_max);
+    try expectKeyOfLeaf(&inner.signer, &leaf.?);
 
     // Copied out of `inner` into arena memory so the slice survives the
     // struct being moved into the server's credentials array.
     const chain = try arena.alloc([]const u8, decoded.len);
     @memcpy(chain, decoded);
     return .{ .chain = chain, .inner = inner };
+}
+
+/// What `load` signs to learn whether the key is the leaf's. Any bytes
+/// would do: the question is whether the leaf's public key verifies a
+/// signature the key made, not what was signed.
+const pairing_message = "zoxy: is this the key of this certificate?";
+
+/// What the leaf says about a signature the key made.
+const Pairing = enum {
+    matched,
+    mismatched,
+    /// An RSA modulus `std.crypto` cannot verify at (`rsaPairing`).
+    unverifiable,
+};
+
+/// Refuse a key that is not the leaf's. zssl loads the two apart and
+/// never compares them. Without this a mismatched pair would start, pass
+/// `--check`, and fail every handshake: a client checks the
+/// CertificateVerify against the leaf, and another key's signature fails
+/// that check. So load makes the same check once. The key signs, and
+/// `std.crypto`, the verifier the live gate's client uses, checks the
+/// signature against the leaf, so libcrypto is not the one vouching for
+/// its own signature.
+fn expectKeyOfLeaf(
+    signer: *const zssl.backend.Signer,
+    leaf: *const std.crypto.Certificate.Parsed,
+) LoadError!void {
+    const scheme = signer.supported()[0];
+    var signature_buffer: [zssl.backend.signature_bytes_max]u8 = undefined;
+    const signature = try signer.sign(scheme, pairing_message, &signature_buffer);
+    assert(signature.len >= 8);
+    assert(signature.len <= zssl.backend.signature_bytes_max);
+    const pairing: Pairing = switch (scheme.keyKind()) {
+        .ecdsa => try ecdsaPairing(scheme, leaf, signature),
+        .rsa => rsaPairing(scheme, leaf, signature),
+    };
+    switch (pairing) {
+        .matched, .unverifiable => {},
+        .mismatched => return error.CertificateKeyMismatch,
+    }
+}
+
+/// An ECDSA key against the leaf: the leaf's curve must be the key's,
+/// and its point must verify the signature.
+fn ecdsaPairing(
+    scheme: zssl.backend.SignatureScheme,
+    leaf: *const std.crypto.Certificate.Parsed,
+    signature: []const u8,
+) error{LibcryptoFailed}!Pairing {
+    assert(scheme.keyKind() == .ecdsa);
+    assert(signature.len >= 8);
+    const leaf_curve = switch (leaf.pub_key_algo) {
+        .X9_62_id_ecPublicKey => |named_curve| named_curve,
+        else => return .mismatched, // An ECDSA key beside an RSA leaf.
+    };
+    const key_curve: std.crypto.Certificate.NamedCurve = switch (scheme) {
+        .ecdsa_secp256r1_sha256 => .X9_62_prime256v1,
+        .ecdsa_secp384r1_sha384 => .secp384r1,
+        // `keyKind` admitted only the two ECDSA schemes.
+        .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 => unreachable,
+    };
+    if (leaf_curve != key_curve) return .mismatched;
+    return switch (key_curve) {
+        .X9_62_prime256v1 => ecdsaVerifies(std.crypto.sign.ecdsa.EcdsaP256Sha256, leaf.pubKey(), signature),
+        .secp384r1 => ecdsaVerifies(std.crypto.sign.ecdsa.EcdsaP384Sha384, leaf.pubKey(), signature),
+        .secp521r1 => unreachable, // zssl signs on neither.
+    };
+}
+
+/// Whether the leaf's SEC1 point verifies the key's own DER signature.
+/// A point that does not decode is a leaf that cannot hold this key. A
+/// signature that does not parse is libcrypto's own output failing
+/// `std.crypto`'s strict DER: a disagreement between the two libraries,
+/// not the operator's mistake, so it is reported as libcrypto's failure
+/// rather than as a mismatch.
+fn ecdsaVerifies(
+    comptime Ecdsa: type,
+    public_key_sec1: []const u8,
+    signature_der: []const u8,
+) error{LibcryptoFailed}!Pairing {
+    assert(public_key_sec1.len >= 1);
+    assert(signature_der.len >= 8);
+    const public_key = Ecdsa.PublicKey.fromSec1(public_key_sec1) catch return .mismatched;
+    const signature = Ecdsa.Signature.fromDer(signature_der) catch return error.LibcryptoFailed;
+    signature.verify(pairing_message, public_key) catch return .mismatched;
+    return .matched;
+}
+
+/// An RSA key against the leaf, under RSA-PSS with SHA-256, the scheme
+/// the key signs first.
+///
+/// `std.crypto` verifies PSS at a modulus width fixed at compile time.
+/// This verifies at three: 256, 384 and 512 bytes, the 2048-, 3072- and
+/// 4096-bit moduli operators deploy. The verifier also asserts that the
+/// encoded message fills the width, which a modulus of 8k+1 bits does
+/// not. A pair at any other width, or at 8k+1 bits, loads unchecked: zssl
+/// signs at any width from 2048 to 4096 bits and real clients verify
+/// them, so refusing one would break a pair that works.
+fn rsaPairing(
+    scheme: zssl.backend.SignatureScheme,
+    leaf: *const std.crypto.Certificate.Parsed,
+    signature: []const u8,
+) Pairing {
+    // The verifier below digests with SHA-256. Were zssl to order another
+    // scheme first, every RSA pair would read as a mismatch, so say so.
+    assert(scheme == .rsa_pss_rsae_sha256);
+    assert(signature.len >= 256); // zssl signs with 2048 bits or more.
+    assert(signature.len <= zssl.backend.signature_bytes_max);
+    switch (leaf.pub_key_algo) {
+        .rsaEncryption => {},
+        else => return .mismatched, // An RSA key beside an ECDSA leaf.
+    }
+    const rsa = std.crypto.Certificate.rsa;
+    const components = rsa.PublicKey.parseDer(leaf.pubKey()) catch return .mismatched;
+    // A PSS signature is exactly one modulus wide, so a leaf of another
+    // width holds another key.
+    if (signature.len != components.modulus.len) return .mismatched;
+    const public_key = rsa.PublicKey.fromBytes(components.exponent, components.modulus) catch
+        return .mismatched;
+    if (public_key.n.bits() % 8 == 1) return .unverifiable;
+    switch (components.modulus.len) {
+        inline 256, 384, 512 => |width| {
+            const padded = rsa.PSSSignature.fromBytes(width, signature);
+            rsa.PSSSignature.verify(width, &padded, pairing_message, public_key, std.crypto.hash.sha2.Sha256) catch
+                return .mismatched;
+            return .matched;
+        },
+        else => return .unverifiable,
+    }
 }
 
 pub fn deinit(credentials: *Credentials) void {
@@ -139,8 +277,71 @@ const fixture_key_pem = @embedFile("testdata/key.pem");
 /// An RSA-2048 key and its self-signed certificate (#411).
 const fixture_rsa_key_pem = @embedFile("testdata/rsa2048-key.pem");
 const fixture_rsa_cert_pem = @embedFile("testdata/rsa2048-cert.pem");
+/// The pairing check's fixtures (`testdata/README.md`): a P-384 pair, a
+/// second RSA-2048 key, the RSA-4096 pair, an RSA pair whose 3065-bit
+/// modulus `std.crypto` cannot verify at, and the mutual-TLS client's
+/// P-256 key, which is not `cert.pem`'s.
+const fixture_p384_key_pem = @embedFile("testdata/p384-key.pem");
+const fixture_p384_cert_pem = @embedFile("testdata/p384-cert.pem");
+const fixture_rsa_other_key_pem = @embedFile("testdata/rsa2048-other-key.pem");
+const fixture_rsa4096_key_pem = @embedFile("testdata/rsa4096-key.pem");
+const fixture_rsa4096_cert_pem = @embedFile("testdata/rsa4096-cert.pem");
+const fixture_rsa3065_key_pem = @embedFile("testdata/rsa3065-key.pem");
+const fixture_rsa3065_cert_pem = @embedFile("testdata/rsa3065-cert.pem");
+const fixture_other_p256_key_pem = @embedFile("testdata/client-key.pem");
 const pem_cert_begin = "-----BEGIN CERTIFICATE-----";
 const pem_cert_end = "-----END CERTIFICATE-----";
+const fuzzSeed = @import("../testing/bytes.zig").fuzzSeed;
+
+test "credentials: a key that is not its certificate's is refused at load" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Mismatch = struct { cert: []const u8, key: []const u8 };
+    const mismatches = [_]Mismatch{
+        // The same kind and size, another key: the signature fails.
+        .{ .cert = fixture_cert_pem, .key = fixture_other_p256_key_pem },
+        .{ .cert = fixture_rsa_cert_pem, .key = fixture_rsa_other_key_pem },
+        // The same kind, another size: another curve, another width.
+        .{ .cert = fixture_cert_pem, .key = fixture_p384_key_pem },
+        .{ .cert = fixture_p384_cert_pem, .key = fixture_key_pem },
+        .{ .cert = fixture_rsa_cert_pem, .key = fixture_rsa4096_key_pem },
+        .{ .cert = fixture_rsa4096_cert_pem, .key = fixture_rsa_key_pem },
+        // Another kind altogether.
+        .{ .cert = fixture_cert_pem, .key = fixture_rsa_key_pem },
+        .{ .cert = fixture_rsa_cert_pem, .key = fixture_key_pem },
+        // A width `std.crypto` cannot verify at is still refused when the
+        // key's own width differs from it.
+        .{ .cert = fixture_rsa3065_cert_pem, .key = fixture_rsa_key_pem },
+    };
+    for (mismatches) |mismatch| {
+        try std.testing.expectError(
+            error.CertificateKeyMismatch,
+            Credentials.load(arena, mismatch.cert, mismatch.key, .{}),
+        );
+    }
+}
+
+test "credentials: every key kind and RSA width loads beside its own certificate" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Pair = struct { cert: []const u8, key: []const u8, scheme: zssl.backend.SignatureScheme };
+    const pairs = [_]Pair{
+        .{ .cert = fixture_cert_pem, .key = fixture_key_pem, .scheme = .ecdsa_secp256r1_sha256 },
+        .{ .cert = fixture_p384_cert_pem, .key = fixture_p384_key_pem, .scheme = .ecdsa_secp384r1_sha384 },
+        .{ .cert = fixture_rsa_cert_pem, .key = fixture_rsa_key_pem, .scheme = .rsa_pss_rsae_sha256 },
+        .{ .cert = fixture_rsa4096_cert_pem, .key = fixture_rsa4096_key_pem, .scheme = .rsa_pss_rsae_sha256 },
+        // Loaded unchecked rather than refused: real clients verify a
+        // 3065-bit modulus, and `std.crypto` would assert on it.
+        .{ .cert = fixture_rsa3065_cert_pem, .key = fixture_rsa3065_key_pem, .scheme = .rsa_pss_rsae_sha256 },
+    };
+    for (pairs) |pair| {
+        var credentials = try Credentials.load(arena, pair.cert, pair.key, .{});
+        defer credentials.deinit();
+        try std.testing.expectEqual(pair.scheme, credentials.schemes()[0]);
+    }
+}
 
 test "credentials: an ECDSA P-256 PEM pair loads with the right scheme" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -260,16 +461,31 @@ var fuzz_arena_buffer: [1 << 20]u8 = undefined;
 // The property is that `load` has two outcomes and no third — a decoded
 // chain whose invariants hold, or a named error. Never a panic, and never
 // a chain with an entry the rest of the code would then trust.
+//
+// Seeds go through `fuzzSeed`: `Smith.slice` reads a length before the
+// bytes, so a bare seed lost its first four.
 test "fuzz: a certificate PEM either decodes to a sound chain or is refused" {
-    try std.testing.fuzz({}, fuzzLoad, .{ .corpus = &.{ fixture_cert_pem, pem_cert_begin } });
+    try std.testing.fuzz(@as([]const u8, fixture_key_pem), fuzzLoad, .{
+        .corpus = &.{ fuzzSeed(fixture_cert_pem), fuzzSeed(pem_cert_begin) },
+    });
 }
 
-fn fuzzLoad(context: void, smith: *std.testing.Smith) !void {
-    _ = context;
+// The same property beside an RSA key, so the pairing check's RSA arm
+// sees mutated leaves: a modulus parsed out of fuzzed DER and fed to
+// `std.crypto`'s PSS verifier. A mutation that turns the 2048-bit
+// modulus into 2041 bits, still 256 bytes, reaches the 8k+1 guard.
+test "fuzz: a certificate PEM beside an RSA key decodes to a sound chain or is refused" {
+    try std.testing.fuzz(@as([]const u8, fixture_rsa_key_pem), fuzzLoad, .{
+        .corpus = &.{ fuzzSeed(fixture_rsa_cert_pem), fuzzSeed(fixture_rsa3065_cert_pem) },
+    });
+}
+
+fn fuzzLoad(key_pem: []const u8, smith: *std.testing.Smith) !void {
+    assert(key_pem.len >= 1);
     var input: [8192]u8 = undefined;
     const input_len = smith.slice(&input);
     var fixed = std.heap.FixedBufferAllocator.init(&fuzz_arena_buffer);
-    var credentials = load(fixed.allocator(), input[0..input_len], fixture_key_pem, .{}) catch return;
+    var credentials = load(fixed.allocator(), input[0..input_len], key_pem, .{}) catch return;
     defer credentials.deinit();
     // Whatever came back is a chain the engine could stage.
     assert(credentials.chain.len >= 1);

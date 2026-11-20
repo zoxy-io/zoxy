@@ -265,6 +265,14 @@ listener parses it.
 
 - **Keys.** ECDSA, or RSA of 2048–4096 bits signing RSA-PSS, never
   v1.5. Chain and key are parsed once at startup.
+  - A key that is not the leaf's is refused there
+    (`CertificateKeyMismatch`). The key signs once, and `std.crypto`
+    must verify that signature against the leaf. That is the check
+    every client makes of a CertificateVerify, so a mismatched pair
+    would otherwise fail every handshake.
+  - An RSA modulus of a width `std.crypto` cannot verify at loads
+    unchecked, since real clients accept it. Every 2048-, 3072- and
+    4096-bit key is checked.
 - **ALPN** (`tls.alpn`) is a closed list of the protocols this proxy
   speaks, `http/1.1` and `h2`, in preference order.
   - Absent on an `http` listener, it means `["http/1.1"]`. An `l4`

@@ -39,6 +39,35 @@ openssl req -new -x509 -key rsa4096-key.pem -subj "/CN=rsa4096.zoxy.test" \
   -addext "subjectAltName=DNS:rsa4096.zoxy.test" -days 3650 -out rsa4096-cert.pem
 ```
 
+## Pairing fixtures (a key must be its certificate's)
+
+`Credentials.load` refuses a key that is not its leaf's, and these give
+its tests every path: matched and mismatched, per key kind and size. Same
+warning as above: committed on purpose, trusted by nothing.
+
+- `p384-key.pem` and `p384-cert.pem`: a P-384 pair for
+  `DNS:p384.zoxy.test`, the other curve zssl signs on.
+- `rsa2048-other-key.pem`: a second RSA-2048 key, the same size as
+  `rsa2048-key.pem` but not that certificate's key.
+- `rsa3065-key.pem` and `rsa3065-cert.pem`: an RSA pair whose modulus is
+  exactly 3065 bits, a width `std.crypto`'s PSS verifier asserts on. Such
+  a pair loads unchecked rather than crash or be refused. openssl's
+  two-prime keygen lands on 3064 bits when asked for 3065, so this one
+  has three primes. Keep the count when regenerating, and check that
+  `openssl pkey -text` says 3065.
+
+```sh
+openssl ecparam -name secp384r1 -genkey -noout -out p384-key.pem
+openssl req -new -x509 -key p384-key.pem -subj "/CN=p384.zoxy.test" \
+  -addext "subjectAltName=DNS:p384.zoxy.test" -days 3650 -sha384 -out p384-cert.pem
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+  -out rsa2048-other-key.pem
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3065 \
+  -pkeyopt rsa_keygen_primes:3 -out rsa3065-key.pem
+openssl req -new -x509 -key rsa3065-key.pem -subj "/CN=rsa3065.zoxy.test" \
+  -addext "subjectAltName=DNS:rsa3065.zoxy.test" -days 3650 -sha256 -out rsa3065-cert.pem
+```
+
 ## Origin trust fixtures (§7, TLS to an HTTP/2 origin)
 
 A small PKI for the verifier that checks an origin's chain, valid 2019 to
