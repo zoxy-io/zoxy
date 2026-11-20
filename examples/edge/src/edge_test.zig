@@ -52,8 +52,6 @@ fn isOneOf(body: []const u8, endpoints: []const std.Io.net.IpAddress) bool {
 /// The whole edge, once: both clusters behind the shared picker, the
 /// path-affine one twice on one path, and a refusal at each phase.
 fn exercise(bed: *Bed) !void {
-    const picks_before = instances.least_in_flight.picks;
-    const tenant_refusals_before = instances.tenant_guard.refused;
     const read_only_refusals_before = instances.read_only.refused;
 
     const orders = bed.request(0, "GET /orders HTTP/1.1\r\n" ++ tenant);
@@ -69,7 +67,9 @@ fn exercise(bed: *Bed) !void {
     try std.testing.expect(isOneOf(orders.body(), &app_endpoints));
     try std.testing.expectEqual(@as(?u16, 200), search.status());
     try std.testing.expect(isOneOf(search.body(), &app_endpoints));
-    try std.testing.expectEqual(picks_before + 2, instances.least_in_flight.picks);
+    // Counted by the build's own series (#435), which start at zero with
+    // each run: one pick in each cluster, summed.
+    try std.testing.expectEqual(@as(u64, 2), bed.counter(edge.LeastInFlight, .picks));
 
     // One path, one endpoint, on the cluster `PathAffinity` serves.
     try std.testing.expectEqual(@as(?u16, 200), asset.status());
@@ -82,7 +82,7 @@ fn exercise(bed: *Bed) !void {
     try std.testing.expectEqual(@as(?u16, 403), upload.status());
     try std.testing.expectEqual(read_only_refusals_before + 1, instances.read_only.refused);
     try std.testing.expectEqual(@as(?u16, 403), anonymous.status());
-    try std.testing.expectEqual(tenant_refusals_before + 1, instances.tenant_guard.refused);
+    try std.testing.expectEqual(@as(u64, 1), bed.counter(edge.TenantGuard, .refused));
     try std.testing.expectEqual(@as(u32, 2), answeredBy(bed, &app_endpoints));
     try std.testing.expectEqual(@as(u32, 2), answeredBy(bed, &static_endpoints));
 }

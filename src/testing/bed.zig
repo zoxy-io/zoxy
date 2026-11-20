@@ -161,6 +161,18 @@ pub fn Bed(comptime extensions: extension.Extensions) type {
             return bed.sim_io.trace_hash;
         }
 
+        /// A build's own counter (#435), summed over every site that
+        /// selects its type: the series the metrics endpoint renders, as
+        /// this run left them. Each run starts from zero, so a test reads
+        /// what its own scenario counted.
+        pub fn counter(
+            bed: *const Self,
+            comptime Extension: type,
+            comptime name: extension.CounterName(Extension),
+        ) u64 {
+            return bed.server.extension_metrics.counterTotal(Extension, name);
+        }
+
         /// How many requests the origin at `endpoint` answered.
         pub fn answered(bed: *const Self, endpoint: std.Io.net.IpAddress) u32 {
             for (bed.origins[0..bed.origins_count]) |*origin| {
