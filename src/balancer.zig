@@ -2229,6 +2229,7 @@ fn testRequest(headers: []const parser.Header) extension.Request {
         .listener_index = 0,
         .cluster_index = 0,
         .tag = 0,
+        .now_ns = 1,
     };
 }
 

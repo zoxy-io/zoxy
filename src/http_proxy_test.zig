@@ -10413,3 +10413,26 @@ test "h2: a pick this proxy cannot dial for completes as shed (#423)" {
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_shed_upstream_slots"));
     try bed.expectDrained();
 }
+
+test "l7: a policy reads the loop clock, the one a picker reads in the same tick (#429)" {
+    var policy: ScriptedPolicy = .{};
+    var picker: ScriptedPicker = .{ .choice = .first };
+    const on_listener = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &policy)};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 4290,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .request_policies = &on_listener,
+        .pick = .{ .extension = extension.select(runtime.extensions.pickers, &picker) },
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 200 "));
+    // The policy and the pick run in the one callback the head arrived
+    // in, and the loop's clock is per tick.
+    try std.testing.expect(policy.seen_now_ns >= 1);
+    try std.testing.expectEqual(picker.seen_now_ns, policy.seen_now_ns);
+    try bed.expectDrained();
+}

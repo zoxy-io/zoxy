@@ -130,6 +130,11 @@ pub const Request = struct {
     /// picker's on the first try and on a retry — and the access log
     /// records it as `tag`.
     tag: u64,
+    /// The loop's monotonic clock (§4), the value `PickInput.now_ns`
+    /// would read at the same moment (#429): what a policy times a window
+    /// or refills a token bucket by. Still no wall clock — a seed replays
+    /// every reading.
+    now_ns: u64,
     /// The evaluating policy's own counters and gauges at the site it is
     /// evaluated for (#435). Empty for a type that declares none, and in
     /// the request a picker is shown, whose are `PickInput.metrics`.

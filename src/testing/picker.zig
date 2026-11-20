@@ -24,6 +24,8 @@ pub const ScriptedPicker = struct {
     /// The last request's tag (#433), zero when it carried none or the
     /// pick had no request.
     tag: u64 = 0,
+    /// The loop clock the last pick read.
+    seen_now_ns: u64 = 0,
     /// The tag every request a pick carries must have, when configured:
     /// a policy's, held to reaching the pick. One that does not stops
     /// the run, so the simulator replays its seed.
@@ -96,6 +98,7 @@ pub const ScriptedPicker = struct {
             offered.* = candidates.endpointIndex(@intCast(slot));
         }
         picker.retry = input.retry;
+        picker.seen_now_ns = input.now_ns;
         picker.had_request = input.request != null;
         picker.path_len = 0;
         picker.tag = 0;

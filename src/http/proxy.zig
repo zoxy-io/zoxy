@@ -1427,6 +1427,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
                 .listener_index = stream.conn.listener_index,
                 .cluster_index = cluster_index,
                 .tag = stream.log.tag,
+                .now_ns = stream.conn.server.io.nowNs(),
             };
         }
 
