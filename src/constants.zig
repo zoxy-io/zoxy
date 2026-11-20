@@ -1053,6 +1053,13 @@ comptime {
     assert(handler_head_overhead_bytes < head_buffer_bytes_min);
 }
 
+/// The widest request a build's consulting policy may send (#437): head
+/// and body together, copied into a consult's own buffer.
+pub const consult_request_bytes_max: u32 = 16 * 1024;
+/// The widest reply body a consulting policy may read back. The reply's
+/// head is held to the head buffer, as an origin's is.
+pub const consult_reply_bytes_max: u32 = 64 * 1024;
+
 /// The rounds one probe of a build's own check kind may take (#436): each
 /// a request and the reply it is judged by, so a handshake that answers a
 /// greeting — MySQL's, which counts a client that hangs up after the

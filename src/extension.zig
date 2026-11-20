@@ -516,7 +516,54 @@ pub const Verdict = union(enum) {
     /// index there: built with `respond`, which names it. Served and
     /// counted as a reject is, from the page rendered at startup.
     respond: u16,
+    /// Ask a service before deciding (#437): zoxy sends the request to
+    /// the cluster and calls the type's `consulted` with the reply, which
+    /// decides. Only a type that declares `consulted` may consult, once per
+    /// request; a consult that cannot be made or answered takes the
+    /// type's `consult_failure`.
+    consult: Consult,
 };
+
+/// What a policy asks of a service (#437).
+pub const Consult = struct {
+    /// The cluster asked: resolved once, at `bind`, by
+    /// `PolicySite.clusterNamed`.
+    cluster_index: u16,
+    /// The whole HTTP/1.1 request — its head, and a body that head frames
+    /// by `Content-Length` — within the type's `consult_request_bytes_max`.
+    /// Borrowed: it must stay valid until `evaluate` returns, and may
+    /// point into the policy's own state, because zoxy copies it before
+    /// it reads the next verdict.
+    request: []const u8,
+};
+
+/// What a consult that cannot be made or answered decides (#437): `open`
+/// proceeds as if the policy had, `closed` answers `503`. A type that
+/// consults states one, so the choice is in its code for review.
+pub const ConsultFailure = enum { open, closed };
+
+/// A consulted service's answer, as `consulted` reads it (#437): valid only
+/// for the call.
+pub const ConsultReply = struct {
+    status: u16,
+    headers: []const parser.Header,
+    /// Its body, up to the type's `consult_reply_bytes_max`.
+    body: []const u8,
+    /// The body ran past that bound and was cut.
+    body_truncated: bool,
+};
+
+/// Whether a consult can ask `cluster` (#437): its origins speak
+/// HTTP/1.1 in the clear.
+pub fn consultable(cluster: *const config_module.Config.Cluster) bool {
+    return cluster.protocol == .http1 and cluster.tls == null;
+}
+
+/// Whether request-policy type `Policy` consults (#437): it declares
+/// `consulted`, and with it every consult bound.
+pub fn policyConsults(comptime Policy: type) bool {
+    return @hasDecl(Policy, "consulted");
+}
 
 /// What a policy adds to a request it hands on.
 pub const Proceed = struct {
@@ -776,6 +823,39 @@ pub fn assertHandler(comptime Handler: type) void {
     }
     if (@hasDecl(Handler, "bind")) assertBind(Handler, PolicySite);
     if (isMetered(Handler)) @compileError(name ++ " is a handler, which declares no metrics yet");
+}
+
+/// Refuse, at compile time, a consulting policy type (#437) that does not
+/// declare `consulted`'s contract and every consult bound.
+fn assertConsults(comptime Policy: type) void {
+    const name = @typeName(Policy);
+    const consulted_fn = @typeInfo(@TypeOf(Policy.consulted)).@"fn";
+    const consulted_ok = consulted_fn.param_types.len == 3 and
+        consulted_fn.param_types[0] == *Policy and
+        consulted_fn.param_types[1] == *const Request and
+        consulted_fn.param_types[2] == *const ConsultReply and
+        consulted_fn.return_type == Verdict;
+    if (!consulted_ok) {
+        @compileError(name ++ ".consulted must be `fn (*" ++ name ++
+            ", *const extension.Request, *const extension.ConsultReply) extension.Verdict`");
+    }
+    inline for (.{ "consult_failure", "consult_request_bytes_max", "consult_reply_bytes_max", "consult_timeout_ms" }) |decl| {
+        if (!@hasDecl(Policy, decl)) @compileError(name ++ " consults but declares no `pub const " ++ decl ++ "`");
+    }
+    const failure: ConsultFailure = Policy.consult_failure;
+    _ = failure;
+    const request_bytes: u32 = Policy.consult_request_bytes_max;
+    if (request_bytes == 0 or request_bytes > constants.consult_request_bytes_max) {
+        @compileError(name ++ ".consult_request_bytes_max must be 1 to consult_request_bytes_max");
+    }
+    const reply_bytes: u32 = Policy.consult_reply_bytes_max;
+    if (reply_bytes == 0 or reply_bytes > constants.consult_reply_bytes_max) {
+        @compileError(name ++ ".consult_reply_bytes_max must be 1 to consult_reply_bytes_max");
+    }
+    const timeout_ms: u32 = Policy.consult_timeout_ms;
+    if (timeout_ms == 0 or timeout_ms > constants.timeout_ms_max) {
+        @compileError(name ++ ".consult_timeout_ms must be 1 to timeout_ms_max");
+    }
 }
 
 /// The widest answer any listed handler declares (#434), or 0: the size
@@ -1167,10 +1247,27 @@ pub const PolicySite = struct {
     /// The cluster the route sends to; null for the listener, and for a
     /// handler route (#434), which sends to none.
     cluster_index: ?u16,
+    /// Every cluster, for a policy that consults one (#437) to find by
+    /// name at `bind`.
+    clusters: []const config_module.Config.Cluster,
     /// The listener's route table, as routing reads it — sorted by
     /// specificity, so an index is not the order the options stated the
     /// routes in. Read through `routeNamed`.
     routes: []const router.Route,
+
+    /// The index of the cluster named `name` (#437): what a consulting
+    /// policy resolves once, at `bind`, and consults by. Null when no
+    /// cluster carries the name, and when the one that does is not one a
+    /// consult can ask — its origins speak HTTP/2, or TLS — so a build
+    /// learns that at startup, from its own bind.
+    pub fn clusterNamed(site: *const PolicySite, name: []const u8) ?u16 {
+        assert(site.clusters.len <= std.math.maxInt(u16));
+        for (site.clusters, 0..) |*cluster, index| {
+            if (!std.mem.eql(u8, cluster.name, name)) continue;
+            return if (consultable(cluster)) @intCast(index) else null;
+        }
+        return null;
+    }
 
     /// The index of the listener's route named `name` (#430): what a
     /// policy resolves once, at `bind`, and routes by. Null when no route
@@ -1315,6 +1412,7 @@ pub fn assertRequestPolicy(comptime Policy: type) void {
         assertBind(Policy, PolicySite);
     }
     if (hasAnswers(Policy)) assertAnswers(Policy);
+    if (policyConsults(Policy)) assertConsults(Policy);
     if (@hasDecl(Policy, "edit_bytes_max")) {
         const bound: u32 = Policy.edit_bytes_max;
         if (bound == 0 or bound > constants.policy_edit_bytes_max) {
@@ -1734,4 +1832,24 @@ test "extension: each metered type is one family, pickers first (#435)" {
     const metrics: Metrics = .{ .counters = &counters };
     metrics.add(Both, .calls, 2);
     try std.testing.expectEqual(@as(u64, 2), metrics.counter(Both, .calls));
+}
+
+test "extension: a consult finds only a cluster in the clear on HTTP/1.1 (#437)" {
+    const endpoints = [_]io_module.Address{};
+    const clusters = [_]config_module.Config.Cluster{
+        .{ .name = "authz", .endpoints = &endpoints },
+        .{ .name = "grpc", .endpoints = &endpoints, .protocol = .h2c },
+        .{ .name = "https", .endpoints = &endpoints, .tls = .{ .server_name = "authz", .anchors = &.{} } },
+    };
+    const site: PolicySite = .{
+        .listener_index = 0,
+        .route_index = null,
+        .cluster_index = null,
+        .clusters = &clusters,
+        .routes = &.{},
+    };
+    try std.testing.expectEqual(@as(?u16, 0), site.clusterNamed("authz"));
+    try std.testing.expectEqual(@as(?u16, null), site.clusterNamed("grpc"));
+    try std.testing.expectEqual(@as(?u16, null), site.clusterNamed("https"));
+    try std.testing.expectEqual(@as(?u16, null), site.clusterNamed("absent"));
 }

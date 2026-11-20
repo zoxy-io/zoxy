@@ -1787,6 +1787,21 @@ lists do not reach is refused at step zero (`ExtensionUnserved`).
     name zoxy writes itself, or a value that is not a field value, is
     refused with a `400` and counts `l7_policy_edit_refused`, since a
     value may come from the request;
+  - a policy may ask a service before it decides (#437): the verdict
+    `consult` names a cluster, resolved at `bind` by
+    `PolicySite.clusterNamed`, which finds only one whose origins speak
+    HTTP/1.1 in the clear, and an HTTP/1.1 request the type renders,
+    copied before the call returns. A type that consults declares
+    `consulted(*P, *const Request, *const ConsultReply) Verdict`, which
+    decides from the reply's status, head and bounded body; its bounds
+    (`consult_request_bytes_max`, `consult_reply_bytes_max`,
+    `consult_timeout_ms`); and `consult_failure`, `open` or `closed`:
+    what a consult that cannot be made or answered decides, `open`
+    proceeding as if the policy had, `closed` answering `503`. Each
+    counts `l7_policy_consult_failed`, a `503` also
+    `l7_policy_consult_refused`. A type caches what it learned in its
+    own memory, deciding without a consult when it can. Until the
+    consult engine lands every consult takes the declared failure;
   - the tag (#433) is one `u64` per request, zero until a policy sets
     it. The later write wins, and a tag set before a later reject
     stays. Every later view of the request carries it: the next

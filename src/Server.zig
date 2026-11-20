@@ -4762,6 +4762,7 @@ pub fn Server(comptime runtime: Runtime) type {
                     .route_index = null,
                     .cluster_index = null,
                     .routes = listener.routes,
+                    .clusters = server.config.clusters,
                 };
                 for (listener.connection_policies) |selection| {
                     try bindFrom(runtime.extensions.connection_policies, selection, &site, startup);
@@ -4772,8 +4773,8 @@ pub fn Server(comptime runtime: Runtime) type {
                 for (listener.response_policies) |selection| {
                     try bindFrom(runtime.extensions.response_policies, selection, &site, startup);
                 }
-                try bindRoutePolicies(listener, @intCast(index), startup);
-                try bindSniRoutePolicies(listener, @intCast(index), startup);
+                try bindRoutePolicies(listener, @intCast(index), server.config.clusters, startup);
+                try bindSniRoutePolicies(listener, @intCast(index), server.config.clusters, startup);
             }
             server.extensions_bound = true;
         }
@@ -4783,6 +4784,7 @@ pub fn Server(comptime runtime: Runtime) type {
         fn bindSniRoutePolicies(
             listener: *const config_module.Config.Listener,
             listener_index: u16,
+            clusters: []const config_module.Config.Cluster,
             startup: *const extension.Startup,
         ) anyerror!void {
             assert(listener.sni_routes.len <= std.math.maxInt(u16));
@@ -4793,6 +4795,7 @@ pub fn Server(comptime runtime: Runtime) type {
                     .route_index = @intCast(route_index),
                     .cluster_index = route.cluster_index,
                     .routes = listener.routes,
+                    .clusters = clusters,
                 };
                 for (route.connection_policies) |selection| {
                     try bindFrom(runtime.extensions.connection_policies, selection, &site, startup);
@@ -4805,6 +4808,7 @@ pub fn Server(comptime runtime: Runtime) type {
         fn bindRoutePolicies(
             listener: *const config_module.Config.Listener,
             listener_index: u16,
+            clusters: []const config_module.Config.Cluster,
             startup: *const extension.Startup,
         ) anyerror!void {
             assert(listener.routes.len >= 1);
@@ -4816,6 +4820,7 @@ pub fn Server(comptime runtime: Runtime) type {
                     // A handler route sends to no cluster (#434).
                     .cluster_index = if (route.handler == null) route.cluster_index else null,
                     .routes = listener.routes,
+                    .clusters = clusters,
                 };
                 for (route.request_policies) |selection| {
                     try bindFrom(runtime.extensions.request_policies, selection, &site, startup);
@@ -5173,6 +5178,9 @@ pub fn Server(comptime runtime: Runtime) type {
             pub const Stop = union(enum) {
                 reject: extension.RejectStatus,
                 respond: Answered,
+                /// A consult that could not be made or answered, on a type
+                /// that fails closed (#437): a `503`.
+                unavailable,
             };
 
             pub const Answered = struct {
@@ -5180,6 +5188,37 @@ pub fn Server(comptime runtime: Runtime) type {
                 answer_index: u16,
             };
         };
+
+        /// A policy's `consult` (#437), and whether it refused the
+        /// request: no consult is made yet, so every one takes the type's
+        /// declared failure — `open` lets the run go on, `closed` stops it.
+        fn consultRefused(server: *Self, selection: extension.Selection, consult: extension.Consult) bool {
+            // The index came from `clusterNamed`, which finds only a
+            // cluster a consult can ask.
+            assert(consult.cluster_index < server.config.clusters.len);
+            assert(extension.consultable(&server.config.clusters[consult.cluster_index]));
+            assert(consult.request.len >= 1);
+            server.counters.increment("l7_policy_consult_failed");
+            // A refusal's own count is the `503` answer's, by `respond`.
+            return consultFailureOf(selection) == .closed;
+        }
+
+        /// The selected policy type's declared consult failure (#437).
+        /// Only a type that declares `consulted` may consult: a consult
+        /// from any other is the build's bug, held to that as a `respond`
+        /// naming no answer is, and named so the panic says whose.
+        fn consultFailureOf(selection: extension.Selection) extension.ConsultFailure {
+            assert(selection.index < runtime.extensions.request_policies.len);
+            inline for (runtime.extensions.request_policies, 0..) |Policy, index| {
+                if (selection.index == index) {
+                    if (comptime !extension.policyConsults(Policy)) {
+                        @panic(@typeName(Policy) ++ " returned `consult` but declares no `consulted`");
+                    }
+                    return Policy.consult_failure;
+                }
+            }
+            unreachable;
+        }
 
         /// Run `selections` over `request` in order (#417): the first
         /// reject wins. Dispatch is the comptime list's, like
@@ -5230,6 +5269,9 @@ pub fn Server(comptime runtime: Runtime) type {
                         .stop = .{ .reject = status },
                         .proceeded = @intCast(position),
                         .route = route,
+                    },
+                    .consult => |consult| if (server.consultRefused(selection, consult)) {
+                        return .{ .stop = .unavailable, .proceeded = @intCast(position), .route = route };
                     },
                     .respond => |answer_index| {
                         // `extension.respond` names a declared answer; a

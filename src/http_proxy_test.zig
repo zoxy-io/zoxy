@@ -55,13 +55,15 @@ const ScriptedPolicy = @import("testing/policy.zig").ScriptedPolicy;
 const ScriptedResponsePolicy = @import("testing/response_policy.zig").ScriptedResponsePolicy;
 const ScriptedConnectionPolicy = @import("testing/connection_policy.zig").ScriptedConnectionPolicy;
 const ScriptedHandler = @import("testing/handler.zig").ScriptedHandler;
+const ScriptedConsultPolicy = @import("testing/consult.zig").ScriptedConsult(.closed);
+const ScriptedConsultOpenPolicy = @import("testing/consult.zig").ScriptedConsult(.open);
 
 /// The beds' runtime lists one picker and one request policy (#417), so a
 /// scenario can select an instance of either; every scenario that selects
 /// none runs the stock path.
 const runtime: extension.Runtime = .{ .Io = SimIo, .extensions = .{
     .pickers = &.{ScriptedPicker},
-    .request_policies = &.{ScriptedPolicy},
+    .request_policies = &.{ ScriptedPolicy, ScriptedConsultPolicy, ScriptedConsultOpenPolicy },
     .response_policies = &.{ScriptedResponsePolicy},
     .connection_policies = &.{ScriptedConnectionPolicy},
     .handlers = &.{ScriptedHandler},
@@ -11291,4 +11293,42 @@ test "h2: a handler route's stream whose body never comes ends on its deadline (
     const answers = try h2Answers(bed.client.response(), &storage);
     try std.testing.expectEqual(@as(u16, 408), (try h2AnswerFor(answers, 1)).status);
     try bed.expectDrained();
+}
+
+test "l7: a consult that cannot be made takes its type's declared failure (#437)" {
+    // No consult is made yet: a type failing closed answers `503`, and one
+    // failing open lets the request on to its origin.
+    {
+        var policy: ScriptedConsultPolicy = .{ .cluster_name = "origin" };
+        const selected = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &policy)};
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .seed = 4371,
+            .request_policies = &selected,
+            .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        });
+        defer bed.tearDown();
+        try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+        try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 503 "));
+        try std.testing.expectEqual(@as(u32, 1), policy.consults);
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_policy_consult_failed"));
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_policy_consult_refused"));
+        try bed.expectDrained();
+    }
+    {
+        var policy: ScriptedConsultOpenPolicy = .{ .cluster_name = "origin" };
+        const selected = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &policy)};
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .seed = 4372,
+            .request_policies = &selected,
+            .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        });
+        defer bed.tearDown();
+        try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+        try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 200 "));
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_policy_consult_failed"));
+        try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_policy_consult_refused"));
+        try bed.expectDrained();
+    }
 }
