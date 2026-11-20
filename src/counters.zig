@@ -469,6 +469,8 @@ pub const Counters = struct {
     /// the axis — the census fails if no seed ever gets a head
     /// outstanding long enough to be reaped, which was true of every
     /// sweep before `dribbled_head` existed.
+    /// The same budget bounds a handler route's body (#434), on a socket
+    /// and on an HTTP/2 stream alike, and its reap counts here too.
     l7_head_budget_expired: Value = Value.init(0),
     /// Head-budget reaps answered `408` rather than reset (#247) — a
     /// client that began a request and stopped, told why it is being

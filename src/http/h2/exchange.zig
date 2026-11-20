@@ -504,6 +504,13 @@ pub fn Exchange(comptime runtime: Runtime) type {
             assert(conn.state == .h2);
             const length: u32 = @intCast(data.bytes.len);
             const stream = find(conn, data.stream) orelse return drop(conn, data);
+            // A handler route's body (#434) is kept beside its head, all of
+            // it at once, so its window is credited now.
+            if (Proxy.readsHandlerBody(stream)) {
+                if (length >= 1) conn.h2.?.session.consume(data.stream, length);
+                Proxy.takeHandlerData(server, stream, data.bytes, data.end_stream);
+                return length;
+            }
             if (!forwarding(stream)) return drop(conn, data);
             const body = &stream.h2_body;
             // The first payload sits where a frame's starts: past room for
@@ -537,6 +544,8 @@ pub fn Exchange(comptime runtime: Runtime) type {
         pub fn onTrailers(server: *ServerType, conn: *ConnType, trailers: *const Session.Step.Trailers) void {
             assert(conn.state == .h2);
             const stream = find(conn, trailers.stream) orelse return;
+            // A trailer section ends a handler route's body too (#434).
+            if (Proxy.readsHandlerBody(stream)) return Proxy.takeHandlerData(server, stream, &.{}, true);
             if (!forwarding(stream)) return;
             stream.h2_body.client_ended = true;
             if (stream.l7.request_leg == .pumping_body) frameAndSend(server, stream);
