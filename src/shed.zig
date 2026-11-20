@@ -81,10 +81,7 @@ fn staticTemplate(
     // apart. Written only here, on a page this proxy renders itself — a
     // relayed response keeps whatever the hop before it wrote (§7), so
     // the List reads back as a chain rather than being overwritten.
-    const status_line = if (comptime causeToken(cause)) |token|
-        "Proxy-Status: " ++ proxy_status_identity ++ "; error=" ++ token ++ "\r\n"
-    else
-        "";
+    const status_line = comptime proxyStatusLine(cause);
     const suffix = "\r\n" ++ server_line ++ status_line ++ switch (persistence) {
         .keep => "",
         .close => "Connection: close\r\n",
@@ -124,6 +121,13 @@ pub const ProxyStatusCause = enum {
     /// The backend was dialed and did not answer inside the deadline.
     timeout,
 };
+
+/// The `Proxy-Status` line a page this proxy renders carries for
+/// `cause`, or nothing where the registry has nothing to add.
+pub fn proxyStatusLine(comptime cause: ProxyStatusCause) []const u8 {
+    const token = comptime causeToken(cause) orelse return "";
+    return "Proxy-Status: " ++ proxy_status_identity ++ "; error=" ++ token ++ "\r\n";
+}
 
 /// The registered token each cause is named by, or null where the
 /// registry has nothing to add.

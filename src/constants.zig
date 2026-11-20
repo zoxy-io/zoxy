@@ -158,6 +158,22 @@ pub const extension_metric_help_bytes_max: u32 = 256;
 /// each, so this bounds what one selection can add to the banner.
 pub const extension_metrics_per_type_max: u32 = 64;
 
+/// The most answers one request-policy type declares (#431): a policy's
+/// own pages — a challenge, a maintenance notice, a login redirect —
+/// each rendered at startup in four variants.
+pub const extension_answers_per_type_max: u32 = 64;
+
+/// The most headers one answer carries beside the ones zoxy writes.
+pub const extension_answer_headers_max: u32 = 16;
+
+/// The longest header line an answer declares, name and value together.
+pub const extension_answer_header_bytes_max: u32 = 1024;
+
+/// The longest body an answer carries: a page, not a payload. Four
+/// copies of each are rendered, so the bound is what keeps a build's
+/// pages a line in the banner rather than a pool.
+pub const extension_answer_body_bytes_max: u32 = 16 * 1024;
+
 comptime {
     // A name must fit the rule it is held to — a letter, then more — and
     // a help line must have room to say more than the name does.
@@ -167,6 +183,11 @@ comptime {
     // counters and gauges together stay a small index.
     assert(extension_metrics_per_type_max >= 1);
     assert(2 * extension_metrics_per_type_max <= std.math.maxInt(u16));
+    // An answer's index rides a `u16` verdict arm.
+    assert(extension_answers_per_type_max <= std.math.maxInt(u16));
+    assert(extension_answer_headers_max >= 1);
+    assert(extension_answer_header_bytes_max >= 64);
+    assert(extension_answer_body_bytes_max >= 1024);
 }
 
 pub const proxy_header_bytes_max: u32 = 512;
@@ -1938,6 +1959,11 @@ pub const PoolSizes = struct {
     /// labelling your metrics should be visible next to everything else
     /// you pay for. `Server.metricsBytes` is the closed form.
     metrics_bytes: u64,
+    /// A build's own policy answers (#431): every page its request
+    /// policies declare, rendered once at startup in each of its four
+    /// variants. A property of the build rather than the config, and zero
+    /// in a build whose policies declare none — the stock binary.
+    answer_bytes: u64,
     /// The §5 head-buffer ring: how many buffers the deployment registered
     /// (`limits.head_buffers`; zero on an L4-only config) and the unit
     /// size of each. The total term is `count × (unit + 1)` — the slab
@@ -2106,7 +2132,7 @@ pub fn memoryBytesTotal(sizes: *const PoolSizes) u64 {
         @as(u64, sizes.relay_buffers) * sizes.relay_buffer_pair_bytes +
         @as(u64, sizes.upstream_slots) * sizes.upstream_bytes +
         sizes.access_log_bytes + sizes.log_header_bytes +
-        sizes.endpoint_table_bytes + sizes.metrics_bytes +
+        sizes.endpoint_table_bytes + sizes.metrics_bytes + sizes.answer_bytes +
         @as(u64, sizes.tunnels) * sizes.tunnel_buffer_pair_bytes +
         @as(u64, sizes.head_buffers) * (sizes.head_buffer_bytes + 1) +
         bufferGroupDescriptorBytes(sizes.head_buffers) +
@@ -2187,6 +2213,7 @@ test "budgets: HTTP/2 is priced by its own terms, and its shared streams by thei
         .access_log_bytes = accessLogBytes(0),
         .endpoint_table_bytes = 0,
         .metrics_bytes = metrics,
+        .answer_bytes = 0,
         .head_buffers = 0,
         .head_buffer_bytes = head_buffer_bytes_default,
         .upstream_head_buffers = 0,
@@ -2271,6 +2298,7 @@ test "budgets: memory total matches the closed form" {
         .access_log_bytes = accessLogBytes(access_log_buffer_bytes_default),
         .endpoint_table_bytes = endpoint_tables,
         .metrics_bytes = metrics,
+        .answer_bytes = 0,
         .head_buffers = conn_slots_max,
         .head_buffer_bytes = head_buffer_bytes_default,
         .upstream_head_buffers = upstream_slots_max,
@@ -2294,6 +2322,7 @@ test "budgets: memory total matches the closed form" {
         .access_log_bytes = accessLogBytes(0),
         .endpoint_table_bytes = 0,
         .metrics_bytes = metrics,
+        .answer_bytes = 0,
         // The L4-only shape: no ring, no upstream head pool, no scratch
         // terms — but the prober's buffer is unconditional.
         .head_buffers = 0,
@@ -2322,6 +2351,7 @@ test "budgets: memory total matches the closed form" {
         .access_log_bytes = accessLogBytes(0),
         .endpoint_table_bytes = 0,
         .metrics_bytes = metrics,
+        .answer_bytes = 0,
         .head_buffers = 0,
         .head_buffer_bytes = head_buffer_bytes_default,
         .upstream_head_buffers = 0,
@@ -2360,6 +2390,7 @@ test "budgets: memory total matches the closed form" {
         .access_log_bytes = accessLogBytes(0),
         .endpoint_table_bytes = 0,
         .metrics_bytes = metrics,
+        .answer_bytes = 0,
         .head_buffers = 0,
         .head_buffer_bytes = head_buffer_bytes_default,
         .upstream_head_buffers = 0,

@@ -477,6 +477,151 @@ pub fn policiesComplete(comptime extensions: Extensions) bool {
     return false;
 }
 
+/// One answer a request policy may give instead of handing a request on
+/// (#431): a challenge, a maintenance notice, a redirect to a login page.
+/// A policy type declares its answers by name,
+///
+///     pub const answers = .{
+///         .login = extension.Answer{
+///             .status = 401,
+///             .headers = &.{.{ .name = "WWW-Authenticate", .value = "Bearer" }},
+///         },
+///     };
+///
+/// and zoxy renders every one into a static page at startup, priced in
+/// the banner. Wholly static: nothing in a page depends on the request.
+/// The headers that frame a response and that say who sent it —
+/// `Content-Length`, `Connection` and the rest, `Date`, `Server`,
+/// `Proxy-Status`, and `Content-Type`, which `content_type` sets — stay
+/// zoxy's own, and declaring one is a compile error.
+pub const Answer = struct {
+    /// 300 to 599. A redirect names its target in a `Location` header.
+    status: u16,
+    headers: []const Header = &.{},
+    body: []const u8 = "",
+    /// Sent when the body is not empty.
+    content_type: []const u8 = "text/plain; charset=utf-8",
+
+    pub const Header = struct {
+        name: []const u8,
+        value: []const u8,
+    };
+};
+
+/// Whether `Policy` declares answers of its own.
+pub fn hasAnswers(comptime Policy: type) bool {
+    return @hasDecl(Policy, "answers");
+}
+
+/// `Policy`'s answers, by name.
+pub fn AnswerName(comptime Policy: type) type {
+    return std.meta.FieldEnum(@TypeOf(Policy.answers));
+}
+
+/// How many answers `Policy` declares; zero for one that declares none.
+pub fn answerCount(comptime Policy: type) u16 {
+    if (!hasAnswers(Policy)) return 0;
+    return @typeInfo(@TypeOf(Policy.answers)).@"struct".field_names.len;
+}
+
+/// The headers an answer may not declare: what frames the response,
+/// what governs the connection, and what says who answered.
+const answer_reserved_headers = [_][]const u8{
+    "content-length",   "transfer-encoding", "connection",   "keep-alive",
+    "proxy-connection", "upgrade",           "te",           "trailer",
+    "date",             "server",            "content-type", "proxy-status",
+};
+
+/// Refuse, at compile time, answers zoxy could not serve as written: a
+/// status outside 300..599, a redirect without its `Location`, a header
+/// that is zoxy's own or that would split the head, or anything past
+/// its bound.
+pub fn assertAnswers(comptime Policy: type) void {
+    @setEvalBranchQuota(64 * constants.extension_answers_per_type_max *
+        (constants.extension_answer_headers_max * constants.extension_answer_header_bytes_max +
+            constants.extension_answer_body_bytes_max) + 1000);
+    const name = @typeName(Policy);
+    const info = @typeInfo(@TypeOf(Policy.answers));
+    if (info != .@"struct") @compileError(name ++ ".answers must be a struct literal of name = extension.Answer");
+    if (info.@"struct".field_names.len > constants.extension_answers_per_type_max) {
+        @compileError(name ++ " declares more answers than extension_answers_per_type_max");
+    }
+    for (info.@"struct".field_names) |answer_name| {
+        const where = name ++ ".answers." ++ answer_name;
+        if (@TypeOf(@field(Policy.answers, answer_name)) != Answer) {
+            @compileError(where ++ " must be an extension.Answer");
+        }
+        assertAnswer(where, @field(Policy.answers, answer_name));
+    }
+}
+
+fn assertAnswer(comptime where: []const u8, comptime answer: Answer) void {
+    if (answer.status < 300 or answer.status > 599) @compileError(where ++ ".status must be 300 to 599");
+    if (answer.headers.len > constants.extension_answer_headers_max) {
+        @compileError(where ++ " declares more headers than extension_answer_headers_max");
+    }
+    if (answer.body.len > constants.extension_answer_body_bytes_max) {
+        @compileError(where ++ ".body is longer than extension_answer_body_bytes_max");
+    }
+    if (answer.content_type.len == 0 or !answerValueValid(answer.content_type)) {
+        @compileError(where ++ ".content_type must be one line");
+    }
+    // RFC 9110 §15.4: a 304 carries no content, so no body to frame.
+    if (answer.status == 304 and answer.body.len != 0) @compileError(where ++ " is a 304 with a body");
+    var located = false;
+    for (answer.headers) |header| {
+        if (!answerHeaderNameValid(header.name)) @compileError(where ++ ": `" ++ header.name ++ "` is not a header name");
+        if (!answerValueValid(header.value)) @compileError(where ++ ": `" ++ header.name ++ "`'s value must be one line");
+        if (header.name.len + header.value.len > constants.extension_answer_header_bytes_max) {
+            @compileError(where ++ ": `" ++ header.name ++ "` is longer than extension_answer_header_bytes_max");
+        }
+        for (answer_reserved_headers) |reserved| {
+            if (std.ascii.eqlIgnoreCase(header.name, reserved)) {
+                @compileError(where ++ ": `" ++ header.name ++ "` is zoxy's own header");
+            }
+        }
+        if (std.ascii.eqlIgnoreCase(header.name, "location")) located = true;
+    }
+    if (redirectNeedsLocation(answer.status) and !located) {
+        @compileError(where ++ " is a redirect without a `Location`");
+    }
+}
+
+/// The redirects whose target RFC 9110 §15.4 says `Location` names: a
+/// 300's choices, a 304 and the unused 305 and 306 name none.
+fn redirectNeedsLocation(comptime status: u16) bool {
+    return switch (status) {
+        301, 302, 303, 307, 308 => true,
+        else => false,
+    };
+}
+
+/// A token (RFC 9110 §5.6.2): what a field name is.
+fn answerHeaderNameValid(comptime text: []const u8) bool {
+    if (text.len == 0) return false;
+    for (text) |byte| {
+        const ok = std.ascii.isAlphanumeric(byte) or std.mem.indexOfScalar(u8, "!#$%&'*+-.^_`|~", byte) != null;
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// A field value both protocols read as written (RFC 9110 §5.5, RFC 9113
+/// §8.2.1): visible characters, spaces and tabs within, and neither at
+/// either end — which HTTP/2 forbids and HTTP/1.1 parsers trim.
+fn answerValueValid(comptime text: []const u8) bool {
+    for (text) |byte| {
+        const control = byte < 0x20 or byte == 0x7f;
+        if (control and byte != '\t') return false;
+    }
+    if (text.len == 0) return true;
+    const edges = [_]u8{ text[0], text[text.len - 1] };
+    for (edges) |edge| {
+        if (edge == ' ' or edge == '\t') return false;
+    }
+    return true;
+}
+
 /// The statuses a policy may refuse with: the static reject set a filter
 /// rule may use (§8), so every one is a page the proxy already serves.
 pub const RejectStatus = enum(u16) {
@@ -556,6 +701,7 @@ pub fn assertRequestPolicy(comptime Policy: type) void {
     if (@hasDecl(Policy, "bind")) {
         assertBind(Policy, PolicySite);
     }
+    if (hasAnswers(Policy)) assertAnswers(Policy);
     if (policyCompletes(Policy)) {
         const complete_fn = @typeInfo(@TypeOf(Policy.complete)).@"fn";
         const complete_ok = complete_fn.param_types.len == 2 and

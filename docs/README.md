@@ -54,6 +54,7 @@ budgets (DESIGN.md §5/§8; closed-form except where marked):
           + access log 0 KiB (+ logged headers 0 B)
           + endpoint tables 29 B (1 cluster(s) x 1 wide)
           + labeled metrics 26450 B (tables, labels and render buffers)
+          + policy answers 0 B (a build's own pages, four variants each)
           + tunnels 0 x 0 B (their own relay buffers, never HTTP's)
           + tls engines 0 x 0 B (+ plaintext 0 B each, libcrypto heap 0 KiB)
           + config arena 2 KiB (measured, not closed-form)
