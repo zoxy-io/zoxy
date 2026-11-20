@@ -1685,7 +1685,17 @@ lists do not reach is refused at step zero (`ExtensionUnserved`).
   - a reject answers with the static response, logs outcome
     `rejected`, carries Proxy-Status `http_request_denied` where the
     listener sends it, and counts `l7_policy_rejected`. A retry or a
-    replay does not evaluate again.
+    replay does not evaluate again;
+  - an optional
+    `complete(*P, *const extension.RequestCompletion) void` (#429) hears
+    how a request it handed on ended, exactly once, at the moment its
+    access-log line is written, whatever ended it — a later policy's
+    reject included. An upgrade completes at its `101`, and a policy
+    that rejected hears nothing. The route's policies complete before
+    the listener's. The completion carries the site, the routed cluster
+    when there is one, the tag, the status and the line's outcome, the
+    loop-clock times the request began and ended, and the policy's own
+    metrics: what a rate or concurrency limit counts back down by.
 
 **Metrics** (#435). A listed type may declare its own counters and
 gauges: `metrics_prefix`, then `counters` and `gauges`, each a struct

@@ -816,12 +816,15 @@ pub fn Proxy(comptime runtime: Runtime) type {
             selections: []const extension.Selection,
             metrics: []const extension.Metrics,
             view: *extension.Request,
+            /// The route these are, or null for the listener's own.
+            route_index: ?u16,
         ) bool {
             assert(selections.len >= 1);
             assert(view.tag == stream.log.tag);
-            const refused = server.evaluatePolicies(selections, metrics, view);
+            const run = server.evaluatePolicies(selections, metrics, view);
             stream.log.tag = view.tag;
-            const status = refused orelse return false;
+            server.notePoliciesProceeded(stream, route_index, run.proceeded);
+            const status = run.refused orelse return false;
             respondPolicy(server, stream, status);
             return true;
         }
@@ -1179,7 +1182,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             if (conn.request_policies.len >= 1) {
                 var view = requestView(stream, request, keys.host, &keys.views, render_scratch, null);
                 const metrics = server.extension_metrics.listenerPolicies(conn.listener_index);
-                if (refusedByPolicies(server, stream, conn.request_policies, metrics, &view)) return;
+                if (refusedByPolicies(server, stream, conn.request_policies, metrics, &view, null)) return;
             }
             // §7 filters run before routing: a terminal verdict — reject
             // or redirect (#176) — stops the request whether or not it
@@ -1204,12 +1207,13 @@ pub fn Proxy(comptime runtime: Runtime) type {
             };
             const routed = &conn.routes[route_index];
             stream.cluster_index = routed.cluster_index;
+            server.notePoliciesRouted(stream, routed.cluster_index);
             // #417: the route's own policies, now that the cluster is
             // known, and still before the first resource below.
             if (routed.request_policies.len >= 1) {
                 var view = requestView(stream, request, keys.host, &keys.views, render_scratch, routed.cluster_index);
                 const metrics = server.extension_metrics.routePolicies(conn.listener_index, route_index);
-                if (refusedByPolicies(server, stream, routed.request_policies, metrics, &view)) return;
+                if (refusedByPolicies(server, stream, routed.request_policies, metrics, &view, route_index)) return;
             }
 
             stream.relay_buffer = server.acquireRelayBuffer() orelse {
@@ -3070,6 +3074,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             // #423: the handshake was the origin's answer, and the client
             // has it; what the tunnel carries after is no pick's outcome.
             server.completePick(stream, .{ .response = 101 });
+            server.completePolicies(stream, .ok);
             // The tunnel's own clock replaces the three that would each
             // cut a healthy session (§8). Stored, not re-based: a rebase
             // exists to pull a deadline *earlier* than the armed timer,
@@ -3974,8 +3979,10 @@ pub fn Proxy(comptime runtime: Runtime) type {
             assert(stream.relay_buffer == null);
             assert(stream.upstream == null);
             assert(stream.client_write.pending.len == 0);
-            // #423: a pick no outcome claimed ends with its request.
+            // #423: a pick no outcome claimed ends with its request, and
+            // #429: so do its policies, as its line read.
             server.completePick(stream, .aborted);
+            server.completePoliciesAtLine(stream);
             // The exchange that just ended has spoken for itself, so its
             // accounting resets with the rest of the per-request state
             // (§8). The captures are left in place: their lengths are what

@@ -210,6 +210,9 @@ pub fn Conn(comptime runtime: Runtime) type {
         /// stream's pending-pick record compiles in or out on.
         pub const completes_picks = @import("../extension.zig").completes(runtime.extensions);
 
+        /// Whether any request policy the build lists completes (#429).
+        pub const completes_policies = @import("../extension.zig").policiesComplete(runtime.extensions);
+
         pub const State = enum(u8) {
             // L4 relay states.
             /// Reading the PROXY protocol header a `proxy_protocol`

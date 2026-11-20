@@ -10436,3 +10436,99 @@ test "l7: a policy reads the loop clock, the one a picker reads in the same tick
     try std.testing.expectEqual(picker.seen_now_ns, policy.seen_now_ns);
     try bed.expectDrained();
 }
+
+test "l7: a policy that proceeded hears a later policy's reject; the rejecting one hears nothing (#429)" {
+    var first: ScriptedPolicy = .{ .tag = 5 };
+    var guard: ScriptedPolicy = .{ .reject_prefix = "/deny" };
+    const on_listener = [_]extension.Selection{
+        extension.select(runtime.extensions.request_policies, &first),
+        extension.select(runtime.extensions.request_policies, &guard),
+    };
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 4291,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .request_policies = &on_listener,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /deny HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 403 "));
+    try std.testing.expectEqual(@as(u32, 1), first.completions);
+    try std.testing.expectEqual(@as(u32, 0), guard.completions);
+    const done = first.last.?;
+    try std.testing.expectEqual(extension.RequestCompletion.Outcome.rejected, done.outcome);
+    try std.testing.expectEqual(@as(u16, 403), done.status);
+    try std.testing.expectEqual(@as(u64, 5), done.tag);
+    try std.testing.expect(done.route_index == null);
+    // Refused at the listener phase: routing never ran.
+    try std.testing.expect(done.cluster_index == null);
+    try bed.expectDrained();
+}
+
+test "l7: a served request completes its route's policies and its listener's, routed (#429)" {
+    var outer: ScriptedPolicy = .{};
+    var inner: ScriptedPolicy = .{};
+    const on_listener = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &outer)};
+    const on_route = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &inner)};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 4292,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .route_prefix = "/api",
+        .request_policies = &on_listener,
+        .route_request_policies = &on_route,
+    });
+    defer bed.tearDown();
+
+    bed.client.second_request = "GET /nowhere HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+    try bed.exchange("GET /api/x HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    // The first request was served through both sites; the second found
+    // no route, so only the listener's policy had handed it on.
+    try std.testing.expectEqual(@as(u32, 2), outer.completions);
+    try std.testing.expectEqual(@as(u32, 1), inner.completions);
+    const served = inner.last.?;
+    try std.testing.expectEqual(extension.RequestCompletion.Outcome.ok, served.outcome);
+    try std.testing.expectEqual(@as(u16, 200), served.status);
+    try std.testing.expectEqual(@as(?u16, 0), served.route_index);
+    try std.testing.expectEqual(@as(?u16, 0), served.cluster_index);
+    try std.testing.expect(served.done_ns >= served.started_ns);
+    const unrouted = outer.last.?;
+    try std.testing.expectEqual(extension.RequestCompletion.Outcome.rejected, unrouted.outcome);
+    try std.testing.expectEqual(@as(u16, 404), unrouted.status);
+    try std.testing.expect(unrouted.route_index == null);
+    try std.testing.expect(unrouted.cluster_index == null);
+    const metrics = bed.server.extension_metrics.listenerPolicies(0)[0];
+    try std.testing.expectEqual(@as(u64, 2), metrics.counter(ScriptedPolicy, .completed));
+    try std.testing.expectEqual(@as(u64, 1), metrics.counter(ScriptedPolicy, .completed_ok));
+    try std.testing.expectEqual(@as(u64, 1), metrics.counter(ScriptedPolicy, .completed_refused));
+    try bed.expectDrained();
+}
+
+test "h2: each stream a policy handed on completes on its own (#429)" {
+    var policy: ScriptedPolicy = .{ .reject_prefix = "/denied" };
+    const selected = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &policy)};
+    var options = h2BedOptions(4293);
+    options.request_policies = &selected;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    var wire: H2Wire = .{};
+    wire.preface(&.{});
+    wire.get(1, "GET", "/denied");
+    wire.get(3, "GET", "/a");
+    wire.get(5, "GET", "/b");
+    try bed.exchange(wire.written());
+
+    var storage: [4]H2Answer = undefined;
+    const answers = try h2Answers(bed.client.response(), &storage);
+    try std.testing.expectEqual(@as(usize, 3), answers.len);
+    try std.testing.expectEqual(@as(u32, 3), policy.evaluated);
+    try std.testing.expectEqual(@as(u32, 1), policy.rejected);
+    try std.testing.expectEqual(@as(u32, 2), policy.completions);
+    try std.testing.expectEqual(extension.RequestCompletion.Outcome.ok, policy.last.?.outcome);
+    try bed.expectDrained();
+}

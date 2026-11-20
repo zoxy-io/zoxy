@@ -413,6 +413,70 @@ pub const Proceed = struct {
     tag: ?u64 = null,
 };
 
+/// How a request a policy let through ended (#429). A policy may declare
+///
+///     pub fn complete(self: *P, done: *const RequestCompletion) void
+///
+/// and zoxy calls it exactly once for every request it handed on —
+/// `proceed` or `proceed_with` — when that exchange ends, whatever ended
+/// it: the origin's whole response, a later policy's reject, a filter, no
+/// route, a shed, a timeout. A policy that rejected gets none. It is the
+/// moment the access-log line is written, and an upgrade completes at its
+/// `101`. What a limiter counts up as a request passes, it counts down
+/// here. The obligations are `evaluate`'s.
+pub const RequestCompletion = struct {
+    /// The site this policy ran at: the listener, and the route when it
+    /// was one of the route's.
+    listener_index: u16,
+    route_index: ?u16,
+    /// The cluster routing chose, or null when the request never routed.
+    cluster_index: ?u16,
+    /// The request's tag (#433), as it ended.
+    tag: u64,
+    /// The status the request's line reports — what the client was
+    /// sent, or was being sent when the exchange ended — or zero when
+    /// there was none.
+    status: u16,
+    outcome: Outcome,
+    /// The loop clock when the request began — its first head byte — and
+    /// when it ended.
+    started_ns: u64,
+    done_ns: u64,
+    /// This policy's own counters and gauges at its site (#435).
+    metrics: Metrics = .{},
+
+    /// What the request's access-log line says happened (§8).
+    pub const Outcome = enum {
+        /// The origin's response, whole.
+        ok,
+        /// Refused: a policy, a filter, no route, or a head this proxy
+        /// would not take.
+        rejected,
+        /// A filter's redirect.
+        redirected,
+        /// Answered by this proxy on the origin's behalf.
+        responded,
+        shed,
+        timed_out,
+        upstream_failed,
+        /// The client left, or a drain ended it, before an answer.
+        aborted,
+    };
+};
+
+/// Whether `Policy` declares the optional `complete`.
+pub fn policyCompletes(comptime Policy: type) bool {
+    return @hasDecl(Policy, "complete");
+}
+
+/// Whether any request policy the build lists completes.
+pub fn policiesComplete(comptime extensions: Extensions) bool {
+    inline for (extensions.request_policies) |Policy| {
+        if (comptime policyCompletes(Policy)) return true;
+    }
+    return false;
+}
+
 /// The statuses a policy may refuse with: the static reject set a filter
 /// rule may use (§8), so every one is a page the proxy already serves.
 pub const RejectStatus = enum(u16) {
@@ -491,6 +555,17 @@ pub fn assertRequestPolicy(comptime Policy: type) void {
     }
     if (@hasDecl(Policy, "bind")) {
         assertBind(Policy, PolicySite);
+    }
+    if (policyCompletes(Policy)) {
+        const complete_fn = @typeInfo(@TypeOf(Policy.complete)).@"fn";
+        const complete_ok = complete_fn.param_types.len == 2 and
+            complete_fn.param_types[0] == *Policy and
+            complete_fn.param_types[1] == *const RequestCompletion and
+            complete_fn.return_type == void;
+        if (!complete_ok) {
+            @compileError(name ++ ".complete must be `fn (*" ++ name ++
+                ", *const extension.RequestCompletion) void`");
+        }
     }
 }
 
