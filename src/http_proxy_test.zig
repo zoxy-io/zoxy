@@ -10532,3 +10532,108 @@ test "h2: each stream a policy handed on completes on its own (#429)" {
     try std.testing.expectEqual(extension.RequestCompletion.Outcome.ok, policy.last.?.outcome);
     try bed.expectDrained();
 }
+
+test "l7: a policy answers with its own page — its header, its body, a real Date — counted as a reject (#431)" {
+    var policy: ScriptedPolicy = .{ .answer_prefix = "/maint", .answer = .maintenance };
+    const selected = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &policy)};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 4310,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .request_policies = &selected,
+        .access_log = true,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /maint/x HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    const response = bed.client.response();
+    try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 503 Service Unavailable\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, response, "\r\nRetry-After: 120\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, response, "\r\n\r\nback soon\n"));
+    // Stamped at startup like zoxy's own pages: never the placeholder.
+    try std.testing.expect(std.mem.indexOf(u8, response, "Xxx, 00") == null);
+    // The listener sends no Proxy-Status, so the plain variant went out.
+    try std.testing.expect(std.mem.indexOf(u8, response, "Proxy-Status") == null);
+    try std.testing.expectEqual(@as(u32, 0), bed.origin.accepted_count);
+    try std.testing.expectEqual(@as(u32, 1), policy.answered);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_policy_rejected"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_responded"));
+    const line = try onlyAccessLogLine(&bed);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"outcome\":\"rejected\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"status\":503") != null);
+    try bed.expectDrained();
+}
+
+test "l7: a policy's answer carries Proxy-Status where the listener sends it, and a HEAD gets its head alone (#431)" {
+    var policy: ScriptedPolicy = .{ .answer_prefix = "/", .answer = .denied };
+    const selected = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &policy)};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 4311,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .request_policies = &selected,
+        .proxy_status = true,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("HEAD /x HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    const response = bed.client.response();
+    try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 403 Forbidden\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, response, "\r\nX-Scripted-Policy: denied\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Proxy-Status: zoxy; error=http_request_denied\r\n") != null);
+    // The head names the GET's length and sends none of it.
+    try std.testing.expect(std.mem.indexOf(u8, response, "Content-Length: 23\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, response, "\r\n\r\n"));
+    try bed.expectDrained();
+}
+
+test "l7: a route's policy redirects to its login page before any resource is taken (#431)" {
+    var guard: ScriptedPolicy = .{ .answer_prefix = "/api/admin", .answer = .login };
+    const on_route = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &guard)};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 4312,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .route_prefix = "/api",
+        .route_request_policies = &on_route,
+        .relay_buffers = 1,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /api/admin HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    const response = bed.client.response();
+    try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 302 Found\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, response, "\r\nLocation: /login\r\n") != null);
+    try std.testing.expect(guard.routed);
+    try std.testing.expectEqual(@as(u32, 0), bed.origin.accepted_count);
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_shed_relay_buffers"));
+    try bed.expectDrained();
+}
+
+test "h2: a policy's answer is a stream's, mapped to fields (#431)" {
+    var policy: ScriptedPolicy = .{ .answer_prefix = "/maint", .answer = .maintenance };
+    const selected = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &policy)};
+    var options = h2BedOptions(4313);
+    options.request_policies = &selected;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    var wire: H2Wire = .{};
+    wire.preface(&.{});
+    wire.get(1, "GET", "/maint");
+    wire.get(3, "GET", "/served");
+    try bed.exchange(wire.written());
+
+    var storage: [4]H2Answer = undefined;
+    const answers = try h2Answers(bed.client.response(), &storage);
+    try std.testing.expectEqual(@as(usize, 2), answers.len);
+    try std.testing.expectEqual(@as(u16, 503), (try h2AnswerFor(answers, 1)).status);
+    try std.testing.expectEqual(@as(u16, 200), (try h2AnswerFor(answers, 3)).status);
+    try std.testing.expectEqual(@as(u32, 1), policy.answered);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_policy_rejected"));
+    try bed.expectDrained();
+}
