@@ -1343,6 +1343,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             switch (outcome) {
                 .dial => |chosen| {
                     server.witnessPick(stream.cluster_index, &chosen);
+                    server.notePick(stream, stream.cluster_index, chosen.endpoint_index, stream.l7.tried_count >= 1);
                     return chosen;
                 },
                 .exhausted => {
@@ -1520,6 +1521,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
                 // parked origin connection, not a client one).
                 if (!acquireUpstreamHeadOrShed(server, stream)) return;
                 stream.l7.upstream_was_reused = true;
+                server.notePickConnected(stream);
                 stream.moveTo(.dialing);
                 // No await happened: this runs in the same callback as the
                 // parse whose result is still live, so the reuse path —
@@ -1752,6 +1754,9 @@ pub fn Proxy(comptime runtime: Runtime) type {
             }
             const socket = result catch |err| {
                 server.counters.increment("upstream_connect_failed");
+                // #423: this pick's outcome, whatever comes next — a retry
+                // is a pick of its own.
+                server.completePick(stream, .connect_failed);
                 // The labeled twin (#179): the pick did not survive the
                 // await, but the leased slot did — it still names the
                 // endpoint this dial was for, and `respond`'s disposal
@@ -1793,6 +1798,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             };
             stream.upstream.?.socket = socket;
             stream.upstream_socket = socket;
+            server.notePickConnected(stream);
             const upstream = stream.upstream.?;
             server.disableNagle(
                 socket,
@@ -2974,6 +2980,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             const head_write_len: u32 = @intCast(rendered.len + trailing.len);
             stream.l7.response_leg = .sending_head;
             stream.l7.response_started = true;
+            server.notePickHead(stream);
             // The status is recorded at `beginTunnel`, not here: a `101`
             // in the log means a tunnel the client actually got, so a
             // handshake whose write never landed reports the teardown it
@@ -3059,6 +3066,9 @@ pub fn Proxy(comptime runtime: Runtime) type {
             // (§8): the one line this connection writes at close is the
             // tunnel's, and `101` is what identifies it as one.
             stream.log.status = 101;
+            // #423: the handshake was the origin's answer, and the client
+            // has it; what the tunnel carries after is no pick's outcome.
+            server.completePick(stream, .{ .response = 101 });
             // The tunnel's own clock replaces the three that would each
             // cut a healthy session (§8). Stored, not re-based: a rebase
             // exists to pull a deadline *earlier* than the armed timer,
@@ -3343,6 +3353,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             assert(head_write_len >= 1);
             stream.l7.response_leg = .sending_head;
             stream.l7.response_started = true;
+            server.notePickHead(stream);
             creditSticky(server, verdict);
             stream.log.status = response.status;
             server.captureResponseLogHeaders(stream, response.headers);
@@ -3771,6 +3782,9 @@ pub fn Proxy(comptime runtime: Runtime) type {
             assert(stream.l7.response_started);
             stream.l7.response_leg = .done;
             server.counters.increment("l7_responses");
+            // #423: the whole response reached the client.
+            assert(stream.log.status != 0);
+            server.completePick(stream, .{ .response = stream.log.status });
             // The labeled twin (#179): the slot is still attached here —
             // park and detach run below — and it names the endpoint that
             // actually served, which is what "requests per backend" means.
@@ -3959,6 +3973,8 @@ pub fn Proxy(comptime runtime: Runtime) type {
             assert(stream.relay_buffer == null);
             assert(stream.upstream == null);
             assert(stream.client_write.pending.len == 0);
+            // #423: a pick no outcome claimed ends with its request.
+            server.completePick(stream, .aborted);
             // The exchange that just ended has spoken for itself, so its
             // accounting resets with the rest of the per-request state
             // (§8). The captures are left in place: their lengths are what
@@ -4101,8 +4117,11 @@ pub fn Proxy(comptime runtime: Runtime) type {
         /// sample of it (`Labeled.reconciles`). The endpoint is always
         /// known: a deadline can only be answered against a try, and a
         /// try is a pick.
-        fn witnessNoResponse(server: *ServerType, stream: *const StreamType) void {
+        fn witnessNoResponse(server: *ServerType, stream: *StreamType) void {
             assert(stream.upstream != null);
+            // #423: both `504` sites come here and only they do, so this is
+            // also where a pick learns its deadline ran out.
+            server.completePick(stream, .timed_out);
             server.labeled.incrementEndpoint(.no_response, server.upstreams.keys.key(
                 stream.upstream.?.cluster_index,
                 stream.upstream.?.endpoint_index,
@@ -4368,6 +4387,9 @@ pub fn Proxy(comptime runtime: Runtime) type {
             assert(stream.phase == .exchanging);
             assert(stream.l7.pending_verdict == .none); // Handlers divert first.
             if (replayEligible(stream)) {
+                // #423: the parked connection went stale, not the endpoint;
+                // the replay is a pick of its own.
+                server.completePick(stream, .stale);
                 stream.l7.pending_verdict = .replay;
                 stream.l7.replay_used = true; // Spent now: a loop is impossible.
                 // Force the sibling op, if armed (the response recv during
@@ -4377,6 +4399,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
                 settlePendingVerdict(server, stream);
                 return;
             }
+            server.completePickFailed(stream);
             if (stream.l7.response_started or stream.armed.data_client_to_upstream or
                 stream.armed.data_upstream_to_client)
             {
@@ -4657,6 +4680,13 @@ pub fn Proxy(comptime runtime: Runtime) type {
             // the byte count includes the answer itself (§8).
             stream.log.status = status;
             stream.log.outcome = comptime outcomeOfCounter(counter);
+            // #423: an answer of this proxy's own ends whatever pick is
+            // still owed, with the outcome the line reads.
+            if (comptime outcomeOfCounter(counter) == .upstream_failed) {
+                server.completePickFailed(stream);
+            } else {
+                server.completePick(stream, comptime pickOutcomeOf(outcomeOfCounter(counter)));
+            }
             // §8's "then keep or close per pressure". Closing is not free:
             // it costs the client a fresh handshake and this proxy a fresh
             // accept, conn slot and admission — which is how a shed storm
@@ -4984,6 +5014,22 @@ pub fn Proxy(comptime runtime: Runtime) type {
             } else {
                 armClientWrite(server, stream, rendered, .redirect_lingering_close);
             }
+        }
+
+        /// What a pick still owed when this proxy answered on its own
+        /// completes as (#423), by the outcome its line reads: a shed
+        /// never reached the origin, a `504` and a client's gRPC deadline
+        /// ran out of time, and every other local answer — a body the
+        /// listener refuses mid-flight, say — is the exchange aborted on
+        /// this side. A `502` is the origin's leg failing, which
+        /// `completePickFailed` splits by whether it ever connected.
+        fn pickOutcomeOf(comptime outcome: access_log.Outcome) extension.Completion.Outcome {
+            comptime assert(outcome != .upstream_failed);
+            return switch (outcome) {
+                .shed => .shed,
+                .timed_out => .timed_out,
+                else => .aborted,
+            };
         }
 
         /// The access-log outcome a `respond` rung reports (§8), keyed off

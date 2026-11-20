@@ -1646,6 +1646,17 @@ lists do not reach is refused at step zero (`ExtensionUnserved`).
   - a slot out of range falls back to p2c over the same set and counts
     `upstream_fallback_picks`, and per cluster
     `cluster_upstream_fallback_picks`;
+  - an optional `complete(*P, *const extension.Completion) void` (#423)
+    hears how each pick turned out, exactly once per pick, once its
+    outcome is final: the origin's whole response and its status, a
+    failed dial, a timeout, a failure on the origin's side, a stale
+    parked connection, a shed, or an exchange aborted on this side. A
+    retry or a replay is a pick of its own. The completion carries the
+    endpoint and its identity, whether the pick was a retry, the
+    request's tag, the picker's own metrics, and the loop-clock times of
+    the pick, of the attempt having a connection to send on, of the response
+    head, and of the outcome. L7 picks complete; an L4 connection's do
+    not yet;
   - zoxy owns dialing, pooling, retries and accounting.
 - **Request policies**, each an ordered list:
   - per http listener, run after the head canonicalizes and before
@@ -1732,8 +1743,8 @@ CI builds, tests and smokes it against a fetched package.
 **Not offered yet:**
 - live endpoint discovery, which needs preallocated slots and endpoint
   identities that survive in-flight work;
-- further phases: header edits, response policies, a completion hook
-  for latency-aware pickers, and L4 connection policies;
+- further phases: header edits, response policies, completions for L4
+  picks, and L4 connection policies;
 - regex in stock filters and routes, which waits until after v1.0.0.
 
 **Published, not frozen.** HTTP/3 would move the exchange's internal

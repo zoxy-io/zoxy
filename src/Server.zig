@@ -901,6 +901,8 @@ pub fn Server(comptime runtime: Runtime) type {
                 server.releaseRelayBuffer(buffer);
                 stream.relay_buffer = null;
             }
+            // #423: a pick no outcome claimed ended with its stream.
+            server.completePick(stream, .aborted);
             server.logExchange(stream);
             server.releaseStaticSend(stream);
             if (stream.h2_head != null) server.returnHeadBuffer(stream);
@@ -4348,6 +4350,8 @@ pub fn Server(comptime runtime: Runtime) type {
             // ended without one — a client that left mid-request, a
             // truncated body, a drain straggler — and every L4 connection,
             // whose whole life is the unit being logged.
+            // #423: likewise the last chance to complete a pick.
+            server.completePick(conn.stream, .aborted);
             server.logExchange(conn.stream);
             // Which returns the stream with it (§5).
             server.releaseConn(conn);
@@ -4705,6 +4709,117 @@ pub fn Server(comptime runtime: Runtime) type {
                     if (comptime !@hasDecl(Picker, "bind")) return;
                     const picker: *Picker = @ptrCast(@alignCast(selection.instance));
                     return Picker.bind(picker, site, startup);
+                }
+            }
+            unreachable;
+        }
+
+        /// Record a pick whose completion is owed (#423), when its
+        /// cluster's picker declares `complete`. Every pick finds none
+        /// owed — on any cluster — because the attempt it replaces
+        /// completed first: that is the exactly-once the contract states.
+        pub fn notePick(
+            server: *Self,
+            stream: *StreamType,
+            cluster_index: u16,
+            endpoint_index: u16,
+            retry: bool,
+        ) void {
+            if (comptime !ConnType.completes_picks) return;
+            assert(!stream.pick.active);
+            assert(endpoint_index < server.config.clusters[cluster_index].endpoints.len);
+            const selection = switch (server.config.clusters[cluster_index].pick) {
+                .extension => |selection| selection,
+                .rr, .p2c, .hash => return,
+            };
+            if (!selectionCompletes(selection)) return;
+            stream.pick = .{
+                .active = true,
+                .retry = retry,
+                .cluster_index = cluster_index,
+                .endpoint_index = endpoint_index,
+                .picked_ns = server.io.nowNs(),
+            };
+        }
+
+        /// The owed pick's attempt has a connection to send on (#423): a
+        /// dial completed, a parked one was taken, or its stream opened on
+        /// an HTTP/2 origin connection.
+        pub fn notePickConnected(server: *Self, stream: *StreamType) void {
+            if (comptime !ConnType.completes_picks) return;
+            if (!stream.pick.active) return;
+            assert(stream.pick.connected_ns == 0);
+            stream.pick.connected_ns = server.io.nowNs();
+            assert(stream.pick.connected_ns >= stream.pick.picked_ns);
+        }
+
+        /// The owed pick's response head arrived (#423).
+        pub fn notePickHead(server: *Self, stream: *StreamType) void {
+            if (comptime !ConnType.completes_picks) return;
+            if (!stream.pick.active) return;
+            assert(stream.pick.head_ns == 0);
+            stream.pick.head_ns = server.io.nowNs();
+            assert(stream.pick.head_ns >= stream.pick.picked_ns);
+        }
+
+        /// Hand the owed completion over, if one is owed (#423): called at
+        /// every place an attempt's outcome becomes final, the first of
+        /// which delivers it, and at every place a stream is turned round
+        /// or released, which delivers whatever no outcome claimed.
+        pub fn completePick(server: *Self, stream: *StreamType, outcome: extension.Completion.Outcome) void {
+            if (comptime !ConnType.completes_picks) return;
+            if (!stream.pick.active) return;
+            const pending = stream.pick;
+            stream.pick = .{};
+            const now_ns = server.io.nowNs();
+            assert(now_ns >= pending.picked_ns);
+            const cluster = &server.config.clusters[pending.cluster_index];
+            assert(pending.endpoint_index < cluster.endpoints.len);
+            const key = server.balancer.keys.key(pending.cluster_index, pending.endpoint_index);
+            const done: extension.Completion = .{
+                .cluster_index = pending.cluster_index,
+                .endpoint_index = pending.endpoint_index,
+                .identity = server.balancer.endpoint_hashes[key],
+                .retry = pending.retry,
+                .picked_ns = pending.picked_ns,
+                .connected_ns = if (pending.connected_ns == 0) null else pending.connected_ns,
+                .head_ns = if (pending.head_ns == 0) null else pending.head_ns,
+                .done_ns = now_ns,
+                .outcome = outcome,
+                .tag = stream.log.tag,
+                .metrics = server.extension_metrics.picker(pending.cluster_index),
+            };
+            callComplete(cluster.pick.extension, &done);
+        }
+
+        /// An attempt that failed on the origin's side (#423): it completes
+        /// `connect_failed` when it never had a connection to send on — an
+        /// HTTP/2 origin connection its exchange waited on, still dialing,
+        /// handshaking, or with no stream free for it yet — and `failed`
+        /// once it had.
+        pub fn completePickFailed(server: *Self, stream: *StreamType) void {
+            if (comptime !ConnType.completes_picks) return;
+            if (!stream.pick.active) return;
+            server.completePick(stream, if (stream.pick.connected_ns == 0) .connect_failed else .failed);
+        }
+
+        fn selectionCompletes(selection: extension.Selection) bool {
+            assert(selection.index < runtime.extensions.pickers.len);
+            inline for (runtime.extensions.pickers, 0..) |Picker, index| {
+                if (selection.index == index) return comptime extension.pickerCompletes(Picker);
+            }
+            unreachable;
+        }
+
+        fn callComplete(selection: extension.Selection, done: *const extension.Completion) void {
+            assert(selection.index < runtime.extensions.pickers.len);
+            assert(done.done_ns >= done.picked_ns);
+            inline for (runtime.extensions.pickers, 0..) |Picker, index| {
+                if (selection.index == index) {
+                    // `notePick` owes completions only to pickers that take them.
+                    if (comptime !extension.pickerCompletes(Picker)) unreachable;
+                    const picker: *Picker = @ptrCast(@alignCast(selection.instance));
+                    return Picker.complete(picker, done);
                 }
             }
             unreachable;

@@ -274,6 +274,85 @@ pub const Random = struct {
     }
 };
 
+/// How one pick turned out (#423). A picker may declare
+///
+///     pub fn complete(self: *P, done: *const Completion) void
+///
+/// and zoxy calls it exactly once for every pick it made for a cluster
+/// that selects the instance, once that pick's outcome is final: a retry
+/// or a replay is a pick of its own, and the attempt it replaces has
+/// already completed. The same obligations as `pick` hold — the loop
+/// thread, run to completion, no allocation, no clock, no I/O — and the
+/// times are the loop clock's, the one `PickInput.now_ns` reads.
+pub const Completion = struct {
+    cluster_index: u16,
+    /// The endpoint picked, by index into its cluster, and its stable
+    /// identity: what `Candidates.endpointIndex` and `identity` named.
+    endpoint_index: u16,
+    identity: u64,
+    /// Whether this pick replaced a dial that failed (#181).
+    retry: bool,
+    /// When the pick was made.
+    picked_ns: u64,
+    /// When this attempt had a connection to send on: its dial completed,
+    /// a parked connection was taken, or its stream opened on an HTTP/2
+    /// origin's connection. Null when none ever was.
+    connected_ns: ?u64,
+    /// When the origin's response head arrived — time to first byte, read
+    /// against `picked_ns`. Null when none did.
+    head_ns: ?u64,
+    /// When the outcome became final.
+    done_ns: u64,
+    outcome: Outcome,
+    /// The request's tag (#433), zero when it carried none.
+    tag: u64,
+    /// The picker's own counters and gauges for this cluster (#435).
+    metrics: Metrics = .{},
+
+    pub const Outcome = union(enum) {
+        /// The origin answered, and the whole response reached the
+        /// client: its final status.
+        response: u16,
+        /// The attempt never had a connection to send on: the dial was
+        /// refused, unreachable, or cut short, or an HTTP/2 origin's
+        /// connection it waited on failed to open.
+        connect_failed,
+        /// The deadline ran out before the origin answered (`504`, or the
+        /// client's own gRPC deadline): in the dial, or after it.
+        timed_out,
+        /// The exchange failed on the origin's side once connected: a
+        /// reset, a hangup, a response cut short.
+        failed,
+        /// The parked connection taken for this attempt had gone stale;
+        /// the request is replayed on a pick of its own (§7). Not the
+        /// endpoint's verdict.
+        stale,
+        /// The pick was made, but this proxy had no resource left to dial
+        /// with (§8): the origin never heard of the request.
+        shed,
+        /// The exchange ended on this proxy's or the client's side
+        /// before the origin's answer was whole: the client left, the
+        /// request broke a rule mid-flight, or a drain ended it. Its
+        /// `done_ns` may be when the stream was given back, later than
+        /// the attempt really ended: not a latency to steer by.
+        aborted,
+    };
+};
+
+/// Whether `Picker` declares the optional `complete`.
+pub fn pickerCompletes(comptime Picker: type) bool {
+    return @hasDecl(Picker, "complete");
+}
+
+/// Whether any picker the build lists completes: in a build where none
+/// does, the bookkeeping behind `Completion` compiles out.
+pub fn completes(comptime extensions: Extensions) bool {
+    inline for (extensions.pickers) |Picker| {
+        if (comptime pickerCompletes(Picker)) return true;
+    }
+    return false;
+}
+
 /// The cluster a `bind` is called for.
 pub const ClusterSite = struct {
     index: u16,
@@ -365,6 +444,17 @@ pub fn assertPicker(comptime Picker: type) void {
     }
     if (@hasDecl(Picker, "bind")) {
         assertBind(Picker, ClusterSite);
+    }
+    if (pickerCompletes(Picker)) {
+        const complete_fn = @typeInfo(@TypeOf(Picker.complete)).@"fn";
+        const complete_ok = complete_fn.param_types.len == 2 and
+            complete_fn.param_types[0] == *Picker and
+            complete_fn.param_types[1] == *const Completion and
+            complete_fn.return_type == void;
+        if (!complete_ok) {
+            @compileError(name ++ ".complete must be `fn (*" ++ name ++
+                ", *const extension.Completion) void`");
+        }
     }
 }
 

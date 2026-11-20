@@ -206,6 +206,10 @@ pub fn Conn(comptime runtime: Runtime) type {
         /// own docstring for why that is a parameter and not an import.
         pub const StreamType = stream_module.Stream(IoType, Self);
 
+        /// Whether any picker the build lists completes (#423): what a
+        /// stream's pending-pick record compiles in or out on.
+        pub const completes_picks = @import("../extension.zig").completes(runtime.extensions);
+
         pub const State = enum(u8) {
             // L4 relay states.
             /// Reading the PROXY protocol header a `proxy_protocol`

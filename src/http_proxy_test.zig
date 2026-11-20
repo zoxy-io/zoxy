@@ -10302,3 +10302,114 @@ test "l7: a metered policy counts apart at each site it runs at, and a picker at
     try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_accepted ").? < std.mem.indexOf(u8, text, "zoxy_ext_").?);
     try bed.expectDrained();
 }
+
+test "l7: a pick completes with the origin's whole response, its times in order and its tag (#423)" {
+    var tagger: ScriptedPolicy = .{ .tag = 7 };
+    var picker: ScriptedPicker = .{ .choice = .first };
+    const on_listener = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &tagger)};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 4230,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .request_policies = &on_listener,
+        .pick = .{ .extension = extension.select(runtime.extensions.pickers, &picker) },
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 200 "));
+    try std.testing.expectEqual(@as(u32, 1), picker.calls);
+    try std.testing.expectEqual(@as(u32, 1), picker.completions);
+    const done = picker.last.?;
+    try std.testing.expectEqual(extension.Completion.Outcome{ .response = 200 }, done.outcome);
+    try std.testing.expectEqual(@as(u16, 0), done.cluster_index);
+    try std.testing.expect(!done.retry);
+    try std.testing.expectEqual(@as(u64, 7), done.tag);
+    try std.testing.expect(done.picked_ns <= done.connected_ns.?);
+    try std.testing.expect(done.connected_ns.? <= done.head_ns.?);
+    try std.testing.expect(done.head_ns.? <= done.done_ns);
+    try bed.expectDrained();
+}
+
+test "l7: a failed dial completes before its retry's pick, which completes on its own (#423)" {
+    var picker: ScriptedPicker = .{ .choice = .first };
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 4231,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .refusing_endpoint_first = true,
+        .retries = 1,
+        .pick = .{ .extension = extension.select(runtime.extensions.pickers, &picker) },
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 200 "));
+    try std.testing.expectEqual(@as(u32, 2), picker.calls);
+    try std.testing.expectEqual(@as(u32, 2), picker.completions);
+    const metrics = bed.server.extension_metrics.picker(0);
+    try std.testing.expectEqual(@as(u64, 1), metrics.counter(ScriptedPicker, .completed_connect_failed));
+    try std.testing.expectEqual(@as(u64, 1), metrics.counter(ScriptedPicker, .completed_response));
+    // The last is the retry's: the origin, endpoint 1.
+    const done = picker.last.?;
+    try std.testing.expect(done.retry);
+    try std.testing.expectEqual(@as(u16, 1), done.endpoint_index);
+    try bed.expectDrained();
+}
+
+test "l7: a mute origin's pick completes as timed out, connected but headless (#423)" {
+    var picker: ScriptedPicker = .{ .choice = .first };
+    var options: Http1Bed.Options = .{
+        .seed = 4232,
+        .pick = .{ .extension = extension.select(runtime.extensions.pickers, &picker) },
+    };
+    options.origin_mute = true;
+    options.request_timeout_ms = 30;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 504 "));
+    try std.testing.expectEqual(@as(u32, 1), picker.completions);
+    const done = picker.last.?;
+    try std.testing.expectEqual(extension.Completion.Outcome.timed_out, done.outcome);
+    try std.testing.expect(done.connected_ns != null);
+    try std.testing.expect(done.head_ns == null);
+    try bed.expectDrained();
+}
+
+test "h2: a pick this proxy cannot dial for completes as shed (#423)" {
+    // One upstream slot, two streams: the second picks and finds none.
+    var picker: ScriptedPicker = .{ .choice = .first };
+    var options = h2BedOptions(4233);
+    options.upstream_slots = 1;
+    options.pick = .{ .extension = extension.select(runtime.extensions.pickers, &picker) };
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    var wire: H2Wire = .{};
+    wire.preface(&.{});
+    wire.get(1, "GET", "/a");
+    wire.get(3, "GET", "/b");
+    try bed.exchange(wire.written());
+
+    var storage: [4]H2Answer = undefined;
+    const answers = try h2Answers(bed.client.response(), &storage);
+    try std.testing.expectEqual(@as(u16, 200), (try h2AnswerFor(answers, 1)).status);
+    try std.testing.expectEqual(@as(u16, 503), (try h2AnswerFor(answers, 3)).status);
+    try std.testing.expectEqual(@as(u32, 2), picker.calls);
+    try std.testing.expectEqual(@as(u32, 2), picker.completions);
+    // The served stream completed as a response; the other has no series
+    // of its own, and every other outcome's stayed at zero.
+    const metrics = bed.server.extension_metrics.picker(0);
+    try std.testing.expectEqual(@as(u64, 1), metrics.counter(ScriptedPicker, .completed_response));
+    try std.testing.expectEqual(@as(u64, 0), metrics.counter(ScriptedPicker, .completed_aborted));
+    try std.testing.expectEqual(@as(u64, 0), metrics.counter(ScriptedPicker, .completed_failed));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_shed_upstream_slots"));
+    try bed.expectDrained();
+}
