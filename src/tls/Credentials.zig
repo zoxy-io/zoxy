@@ -141,10 +141,16 @@ const Pairing = enum {
 /// never compares them. Without this a mismatched pair would start, pass
 /// `--check`, and fail every handshake: a client checks the
 /// CertificateVerify against the leaf, and another key's signature fails
-/// that check. So load makes the same check once. The key signs, and
-/// `std.crypto`, the verifier the live gate's client uses, checks the
-/// signature against the leaf, so libcrypto is not the one vouching for
-/// its own signature.
+/// that check. So load makes the same check once: the key signs, and the
+/// leaf's public key must verify the signature.
+///
+/// The verifiers are the ones zssl uses for a peer's CertificateVerify:
+/// libcrypto for ECDSA (`zssl.backend.verifyEcdsa`) and `std.crypto` for
+/// RSA-PSS. Keep ECDSA on libcrypto, though it means libcrypto checks its
+/// own signature. `std.crypto` verifies P-256 slowly in a Debug build,
+/// and the simulator loads a pair for every TLS seed in Debug, so it more
+/// than doubled every sweep's time. zssl's differential test already
+/// checks `std.crypto` signatures against libcrypto's verifier.
 fn expectKeyOfLeaf(
     signer: *const zssl.backend.Signer,
     leaf: *const std.crypto.Certificate.Parsed,
@@ -165,7 +171,7 @@ fn expectKeyOfLeaf(
 }
 
 /// An ECDSA key against the leaf: the leaf's curve must be the key's,
-/// and its point must verify the signature.
+/// and its point must verify the signature under libcrypto.
 fn ecdsaPairing(
     scheme: zssl.backend.SignatureScheme,
     leaf: *const std.crypto.Certificate.Parsed,
@@ -184,29 +190,11 @@ fn ecdsaPairing(
         .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 => unreachable,
     };
     if (leaf_curve != key_curve) return .mismatched;
-    return switch (key_curve) {
-        .X9_62_prime256v1 => ecdsaVerifies(std.crypto.sign.ecdsa.EcdsaP256Sha256, leaf.pubKey(), signature),
-        .secp384r1 => ecdsaVerifies(std.crypto.sign.ecdsa.EcdsaP384Sha384, leaf.pubKey(), signature),
-        .secp521r1 => unreachable, // zssl signs on neither.
+    // A leaf point off the curve is a leaf that cannot hold this key.
+    zssl.backend.verifyEcdsa(scheme, leaf.pubKey(), pairing_message, signature) catch |err| return switch (err) {
+        error.BadPublicKey, error.SignatureInvalid => .mismatched,
+        else => error.LibcryptoFailed,
     };
-}
-
-/// Whether the leaf's SEC1 point verifies the key's own DER signature.
-/// A point that does not decode is a leaf that cannot hold this key. A
-/// signature that does not parse is libcrypto's own output failing
-/// `std.crypto`'s strict DER: a disagreement between the two libraries,
-/// not the operator's mistake, so it is reported as libcrypto's failure
-/// rather than as a mismatch.
-fn ecdsaVerifies(
-    comptime Ecdsa: type,
-    public_key_sec1: []const u8,
-    signature_der: []const u8,
-) error{LibcryptoFailed}!Pairing {
-    assert(public_key_sec1.len >= 1);
-    assert(signature_der.len >= 8);
-    const public_key = Ecdsa.PublicKey.fromSec1(public_key_sec1) catch return .mismatched;
-    const signature = Ecdsa.Signature.fromDer(signature_der) catch return error.LibcryptoFailed;
-    signature.verify(pairing_message, public_key) catch return .mismatched;
     return .matched;
 }
 
