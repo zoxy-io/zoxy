@@ -53,6 +53,7 @@ const extension = @import("extension.zig");
 const ScriptedPicker = @import("testing/picker.zig").ScriptedPicker;
 const ScriptedPolicy = @import("testing/policy.zig").ScriptedPolicy;
 const ScriptedResponsePolicy = @import("testing/response_policy.zig").ScriptedResponsePolicy;
+const ScriptedConnectionPolicy = @import("testing/connection_policy.zig").ScriptedConnectionPolicy;
 
 /// The beds' runtime lists one picker and one request policy (#417), so a
 /// scenario can select an instance of either; every scenario that selects
@@ -61,6 +62,7 @@ const runtime: extension.Runtime = .{ .Io = SimIo, .extensions = .{
     .pickers = &.{ScriptedPicker},
     .request_policies = &.{ScriptedPolicy},
     .response_policies = &.{ScriptedResponsePolicy},
+    .connection_policies = &.{ScriptedConnectionPolicy},
 } };
 const ServerSim = Server(runtime);
 
@@ -989,6 +991,8 @@ const Http1Bed = struct {
         request_policies: []const extension.Selection = &.{},
         /// #417's request policies on the bed's one route.
         route_request_policies: []const extension.Selection = &.{},
+        /// #425's connection policies on the listener.
+        connection_policies: []const extension.Selection = &.{},
         /// #424's response policies on the listener and on its one route.
         response_policies: []const extension.Selection = &.{},
         route_response_policies: []const extension.Selection = &.{},
@@ -1117,6 +1121,7 @@ const Http1Bed = struct {
             .request_filters = options.request_filters,
             .request_policies = options.request_policies,
             .response_policies = options.response_policies,
+            .connection_policies = options.connection_policies,
             .response_filters = options.response_filters,
             .protocol = .http,
             .upgrades = options.upgrades,
@@ -10931,5 +10936,56 @@ test "l7: a plaintext request carries no client names (#432)" {
     try std.testing.expectEqual(@as(u32, 1), policy.evaluated);
     try std.testing.expectEqual(@as(u8, 0), policy.seen_client_names);
     try std.testing.expect(!policy.seen_client_names_truncated);
+    try bed.expectDrained();
+}
+
+test "l7: a connection policy refuses an http connection before its first head, and logs it (#425)" {
+    var policy: ScriptedConnectionPolicy = .{ .verdict = .reject };
+    const selected = [_]extension.Selection{extension.select(runtime.extensions.connection_policies, &policy)};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 4252,
+        .access_log = true,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .connection_policies = &selected,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqual(@as(usize, 0), bed.client.response().len);
+    try std.testing.expectEqual(@as(u32, 1), policy.refused);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("conn_policy_rejected"));
+    try std.testing.expectEqual(@as(u32, 0), bed.origin.conns[0].request_len);
+    const line = try onlyAccessLogLine(&bed);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"kind\":\"http\",\"outcome\":\"rejected\"") != null);
+    try bed.expectDrained();
+}
+
+test "tls: a connection policy's refusal costs no handshake (#425)" {
+    var policy: ScriptedConnectionPolicy = .{ .verdict = .reset };
+    const selected = [_]extension.Selection{extension.select(runtime.extensions.connection_policies, &policy)};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 4253,
+        .tls = true,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .connection_policies = &selected,
+    });
+    defer bed.tearDown();
+
+    var client: TlsClient = undefined;
+    try client.start(&bed.sim_io, Http1Bed.bindAddress(), .{
+        .host_name = fixture_host_name,
+        .app_data = "GET / HTTP/1.1\r\nHost: a\r\n\r\n",
+        .exchange_end = .http_response,
+    });
+    var wind_down: TlsWindDown = .{ .bed = &bed };
+    wind_down.attach(&client);
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(@as(u32, 0), client.responsesReceived());
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("tls_handshakes_completed"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("conn_policy_reset"));
     try bed.expectDrained();
 }

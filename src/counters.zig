@@ -24,6 +24,12 @@ pub const Counters = struct {
     admitted: Value = Value.init(0),
     /// Admitted connections fully torn down (slot released).
     completed: Value = Value.init(0),
+    /// Admitted connections a build's connection policy refused (#425),
+    /// before a handshake, a peek or a first head. Not `shed_`: the
+    /// connection was admitted and completes as any other does.
+    conn_policy_rejected: Value = Value.init(0),
+    /// Of those, the ones refused with an RST rather than a FIN.
+    conn_policy_reset: Value = Value.init(0),
     /// §8 rung: conn slots exhausted at accept → RST.
     shed_conn_slots: Value = Value.init(0),
     /// §8 rung: relay buffers exhausted at admission → close.
@@ -1107,6 +1113,9 @@ pub const Counters = struct {
         const shed = counters.shedTotal();
         assert(completed <= admitted);
         assert(admitted <= accepted);
+        // #425: a policy refuses an admitted connection, by RST or not.
+        assert(counters.get("conn_policy_reset") <= counters.get("conn_policy_rejected"));
+        assert(counters.get("conn_policy_rejected") <= admitted);
         // Every 504 verdict rides a deadline expiry (§8) — the verdict
         // path increments both, the teardown path only the expiry.
         assert(counters.get("l7_gateway_timeout") + counters.get("l7_grpc_deadline_exceeded") <=

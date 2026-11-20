@@ -28,10 +28,14 @@ const assert = std.debug.assert;
 
 const extension = @import("extension.zig");
 const ScriptedPicker = @import("testing/picker.zig").ScriptedPicker;
+const ScriptedConnectionPolicy = @import("testing/connection_policy.zig").ScriptedConnectionPolicy;
 
 /// The bed's runtime lists one picker (#417), so a scenario can select an
 /// instance of it; every scenario that selects none runs the stock path.
-const runtime: extension.Runtime = .{ .Io = SimIo, .extensions = .{ .pickers = &.{ScriptedPicker} } };
+const runtime: extension.Runtime = .{ .Io = SimIo, .extensions = .{
+    .pickers = &.{ScriptedPicker},
+    .connection_policies = &.{ScriptedConnectionPolicy},
+} };
 const ServerSim = Server(runtime);
 const Origin = origin_mod.Origin(SimIo);
 
@@ -277,6 +281,9 @@ pub const TestBed = struct {
     /// no pre-existing case pays for a peek phase it never wanted.
     sni_routes: []const sni_router.Route,
     listeners: [1]config_module.Config.Listener,
+    /// The one listener's connection policy selection (#425), when a
+    /// scenario gives one.
+    connection_policy_selections: [1]extension.Selection,
     config: config_module.Config,
     server: ServerSim,
     scenario: Scenario,
@@ -344,12 +351,24 @@ pub const TestBed = struct {
         /// An extension picker instance the one cluster selects (#417);
         /// null keeps the built-in p2c every other scenario uses.
         picker: ?*ScriptedPicker = null,
+        /// A connection policy the one listener selects (#425); null
+        /// selects none.
+        connection_policy: ?*ScriptedConnectionPolicy = null,
     };
 
     const origin_socket_path = "/run/zoxy-test/l4-origin.sock";
 
     pub fn bindAddress() std.Io.net.IpAddress {
         return std.Io.net.IpAddress.parseLiteral("127.0.0.1:8080") catch unreachable;
+    }
+
+    /// The listener's connection-policy list: `policy`, selected, or
+    /// none.
+    fn connectionPolicies(bed: *TestBed, policy: ?*ScriptedConnectionPolicy) []const extension.Selection {
+        const selected = policy orelse return &.{};
+        bed.connection_policy_selections = .{extension.select(runtime.extensions.connection_policies, selected)};
+        assert(bed.connection_policy_selections[0].index == 0);
+        return &bed.connection_policy_selections;
     }
 
     fn originAddress() std.Io.net.IpAddress {
@@ -471,6 +490,7 @@ pub const TestBed = struct {
             .sni_routes = bed.sni_routes,
             .protocol = .l4,
             .proxy_protocol = options.proxy_protocol,
+            .connection_policies = bed.connectionPolicies(options.connection_policy),
             // The bed loads its credentials itself from these same bytes,
             // so what this states is only that the listener terminates —
             // which is what `Server.start` checks its credentials against.
@@ -2636,4 +2656,64 @@ test "l4: a relayed connection's pick completes closed with its bytes, a refused
         try std.testing.expect(done.connected_ns == null);
         try bed.expectDrained();
     }
+}
+
+test "l4: a connection policy refuses before the dial, with a FIN or an RST as it chooses (#425)" {
+    const cases = [_]struct { verdict: extension.ConnectionVerdict, outcome: Client.Outcome, resets: u64 }{
+        .{ .verdict = .reject, .outcome = .eof, .resets = 0 },
+        .{ .verdict = .reset, .outcome = .reset, .resets = 1 },
+    };
+    for (cases, 0..) |case, index| {
+        var policy: ScriptedConnectionPolicy = .{ .verdict = case.verdict };
+        var bed: TestBed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .sim = .{ .seed = 425 + index },
+            .connection_policy = &policy,
+            .access_log = true,
+        });
+        defer bed.tearDown();
+
+        bed.startClients(1, true);
+        try bed.sim_io.run();
+
+        try std.testing.expectEqual(case.outcome, bed.scenario.clients[0].outcome);
+        try std.testing.expectEqual(@as(u32, 0), bed.scenario.clients[0].received_len);
+        try std.testing.expectEqual(@as(u32, 1), policy.binds);
+        try std.testing.expectEqual(@as(u32, 1), policy.refused);
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("conn_policy_rejected"));
+        try std.testing.expectEqual(case.resets, bed.server.counters.get("conn_policy_reset"));
+        // Refused before the dial: the origin never heard of it.
+        try std.testing.expectEqual(@as(u8, 0), bed.scenario.origin.conns_count);
+        const line = std.mem.trimEnd(u8, bed.sim_io.sinkBytes(), "\n");
+        try std.testing.expect(std.mem.indexOf(u8, line, "\"kind\":\"l4\",\"outcome\":\"rejected\"") != null);
+        try std.testing.expect(bed.server.reconcile());
+        try bed.expectDrained();
+    }
+}
+
+test "l4: a connection policy reads the client a PROXY header names, and its proceed relays (#425)" {
+    var policy: ScriptedConnectionPolicy = .{};
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 4251 },
+        .proxy_protocol = .require,
+        .connection_policy = &policy,
+    });
+    defer bed.tearDown();
+
+    bed.scenario.clients_count = 1;
+    const client = &bed.scenario.clients[0];
+    client.exchange = true;
+    client.prefix = proxy_v1_line;
+    client.start(&bed.scenario, TestBed.bindAddress());
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(Client.Outcome.eof, client.outcome);
+    try std.testing.expectEqualStrings(echo_token, client.receive_buffer[0..client.received_len]);
+    try std.testing.expectEqual(@as(u32, 1), policy.evaluated);
+    try std.testing.expectEqual(@as(u32, 1), policy.addressed);
+    // The header's client, not the fronting proxy's own address.
+    try std.testing.expectEqual(@as(u16, 4711), policy.last_client_port);
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("conn_policy_rejected"));
+    try bed.expectDrained();
 }

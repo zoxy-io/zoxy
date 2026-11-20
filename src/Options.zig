@@ -67,6 +67,10 @@ pub const Listener = struct {
     /// Terminate TLS on this socket (§4), or null for plaintext.
     tls: ?Tls = null,
     protocol: Protocol,
+    /// #425's connection policies, in order, on every connection admitted
+    /// here, l4 or http, before a handshake, a peek or a first head; the
+    /// first refusal wins.
+    connection_policies: []const extension.Selection = &.{},
 
     /// Tagged by the resolved listener's own protocol, so the two cannot
     /// come to name different sets.
