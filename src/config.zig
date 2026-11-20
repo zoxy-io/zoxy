@@ -2830,6 +2830,7 @@ fn resolveSniRoutes(
             // table can reach is reachable from an l4 listener, so every
             // one of them is held to the rule the admitted cluster is.
             .cluster_index = try l4ClusterIndexOf(clusters, route_stated.cluster),
+            .connection_policies = route_stated.connection_policies,
         };
     }
     std.mem.sort(sni_router.Route, routes, {}, sniRouteMoreSpecific);
@@ -4480,6 +4481,34 @@ test "config: an access log written as options (#417)" {
         resolveAccessLogSink(.{ .sink = .{ .file = "" } }),
     );
     try std.testing.expectEqual(@as(?Config.AccessLogSink, null), try resolveAccessLogSink(null));
+}
+
+test "config: connection policies ride the listener and its SNI routes through the sort (#425)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const clusters = try resolveClusters(arena, &[_]Options.Cluster{.{
+        .name = "origin",
+        .endpoints = &.{.{ .address = .{ .ip = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:9000") } }},
+        .pick = .p2c,
+    }});
+    var instance: u8 = 0;
+    const policy: extension_module.Selection = .{ .index = 0, .instance = &instance };
+    // The any-name route stated first: the sort moves the named one ahead,
+    // and its policies must move with it.
+    const l4: Options.Listener = .{
+        .bind = .{ .ip = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:8443") },
+        .connection_policies = &.{policy},
+        .protocol = .{ .l4 = .{ .target = .{ .routes = &.{
+            .{ .cluster = "origin" },
+            .{ .sni = "api.example.com", .cluster = "origin", .connection_policies = &.{ policy, policy } },
+        } } } },
+    };
+    const listeners = try resolveListeners(arena, &[_]Options.Listener{l4}, clusters, constants.head_buffer_bytes_min, &.{});
+    try std.testing.expectEqual(@as(usize, 1), listeners[0].connection_policies.len);
+    try std.testing.expectEqualStrings("api.example.com", listeners[0].sni_routes[0].server_name.?);
+    try std.testing.expectEqual(@as(usize, 2), listeners[0].sni_routes[0].connection_policies.len);
+    try std.testing.expectEqual(@as(usize, 0), listeners[0].sni_routes[1].connection_policies.len);
 }
 
 test "config: listeners written as options meet the loader's rules (#417)" {

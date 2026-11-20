@@ -3613,7 +3613,7 @@ pub fn Server(comptime runtime: Runtime) type {
                 parser.canonicalHost(raw, &host_scratch)
             else
                 null;
-            const routed = sni_router.route(conn.sni_routes, canonical);
+            const routed = sni_router.routeIndex(conn.sni_routes, canonical);
             // `absent` is a fact about the client and is counted whatever
             // the table did with it; the other two are facts about the
             // table, so they are the ones the fork picks between.
@@ -3624,7 +3624,7 @@ pub fn Server(comptime runtime: Runtime) type {
             } else {
                 server.counters.increment("l4_sni_no_route");
             }
-            const cluster_index = routed orelse {
+            const route_index = routed orelse {
                 // Nothing claimed this connection and the operator wrote
                 // no catch-all, which is them saying to close it rather
                 // than send it somewhere they did not name (§6).
@@ -3634,7 +3634,9 @@ pub fn Server(comptime runtime: Runtime) type {
             // The provisional cluster admission stored is replaced here,
             // before the dial can consume it — the whole reason
             // `admittedCluster` is allowed to be provisional at all.
-            conn.stream.cluster_index = cluster_index;
+            conn.stream.cluster_index = conn.sni_routes[route_index].cluster_index;
+            // #425: the route's policies, before its hello counts as sent.
+            if (!server.admittedByRoutePolicies(conn, route_index, canonical)) return;
             // Every staged byte is payload the origin receives, so every
             // one of them counts (§8). This is where the hello differs
             // from the PROXY header rather than where it differs from the
@@ -4626,6 +4628,14 @@ pub fn Server(comptime runtime: Runtime) type {
                     assert(selection.index < runtime.extensions.connection_policies.len);
                     selects = true;
                 }
+                // An SNI table belongs to an l4 listener alone (#298).
+                if (listener.sni_routes.len >= 1) assert(listener.protocol == .l4);
+                for (listener.sni_routes) |*route| {
+                    for (route.connection_policies) |selection| {
+                        assert(selection.index < runtime.extensions.connection_policies.len);
+                        selects = true;
+                    }
+                }
                 // A policy reads a request, and an l4 listener has none.
                 if (listener.request_policies.len >= 1) assert(listener.protocol == .http);
                 for (listener.request_policies) |selection| {
@@ -4698,8 +4708,31 @@ pub fn Server(comptime runtime: Runtime) type {
                     try bindFrom(runtime.extensions.response_policies, selection, &site, startup);
                 }
                 try bindRoutePolicies(listener, @intCast(index), startup);
+                try bindSniRoutePolicies(listener, @intCast(index), startup);
             }
             server.extensions_bound = true;
+        }
+
+        /// One l4 listener's SNI-route connection policies (#425), each
+        /// bound with its route's index in the SNI table and its cluster.
+        fn bindSniRoutePolicies(
+            listener: *const config_module.Config.Listener,
+            listener_index: u16,
+            startup: *const extension.Startup,
+        ) anyerror!void {
+            assert(listener.sni_routes.len <= std.math.maxInt(u16));
+            if (listener.sni_routes.len >= 1) assert(listener.protocol == .l4);
+            for (listener.sni_routes, 0..) |*route, route_index| {
+                const site: extension.PolicySite = .{
+                    .listener_index = listener_index,
+                    .route_index = @intCast(route_index),
+                    .cluster_index = route.cluster_index,
+                    .routes = listener.routes,
+                };
+                for (route.connection_policies) |selection| {
+                    try bindFrom(runtime.extensions.connection_policies, selection, &site, startup);
+                }
+            }
         }
 
         /// One listener's route-phase policies (#417), each bound with the
@@ -4736,14 +4769,48 @@ pub fn Server(comptime runtime: Runtime) type {
             assert(conn.isLive());
             assert(conn.listener_index < server.config.listeners.len);
             const selections = server.config.listeners[conn.listener_index].connection_policies;
-            if (selections.len == 0) return true;
-            const view: extension.Connection = .{
+            return server.admittedBy(conn, selections, &.{
                 .client = if (conn.client_address) |*address| address else null,
                 .listener_index = conn.listener_index,
                 .now_ns = server.io.nowNs(),
-            };
+            });
+        }
+
+        /// The same, at an SNI route's phase (#425): once the hello named
+        /// the route, before the dial, with the name and the cluster.
+        fn admittedByRoutePolicies(
+            server: *Self,
+            conn: *ConnType,
+            route_index: u16,
+            server_name: ?[]const u8,
+        ) bool {
+            if (comptime runtime.extensions.connection_policies.len == 0) return true;
+            assert(conn.state == .l4_peeking_client_hello);
+            assert(route_index < conn.sni_routes.len);
+            const route = &conn.sni_routes[route_index];
+            return server.admittedBy(conn, route.connection_policies, &.{
+                .client = if (conn.client_address) |*address| address else null,
+                .listener_index = conn.listener_index,
+                .now_ns = server.io.nowNs(),
+                .route_index = route_index,
+                .cluster_index = route.cluster_index,
+                .server_name = server_name,
+            });
+        }
+
+        /// One site's connection policies over `view`, in order; the first
+        /// refusal refuses the connection and ends the run.
+        fn admittedBy(
+            server: *Self,
+            conn: *ConnType,
+            selections: []const extension.Selection,
+            view: *const extension.Connection,
+        ) bool {
+            assert(view.listener_index == conn.listener_index);
+            assert(view.now_ns >= 1);
+            if (selections.len == 0) return true;
             for (selections) |selection| {
-                switch (callConnectionPolicy(selection, &view)) {
+                switch (callConnectionPolicy(selection, view)) {
                     .proceed => {},
                     .reject => {
                         server.refuseConnection(conn, .fin);

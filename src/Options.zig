@@ -291,6 +291,9 @@ pub const Listener = struct {
         sni: ?[]const u8 = null,
         /// The cluster's name.
         cluster: []const u8,
+        /// #425's connection policies on this route, in order, once the
+        /// hello is read and before the dial; the first refusal wins.
+        connection_policies: []const extension.Selection = &.{},
     };
 };
 

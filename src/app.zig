@@ -154,6 +154,11 @@ pub fn App(comptime extensions: extension.Extensions) type {
                 for (listener.connection_policies) |selection| {
                     try refuseUnserved(selection, extensions.connection_policies.len);
                 }
+                for (listener.sni_routes) |*route| {
+                    for (route.connection_policies) |selection| {
+                        try refuseUnserved(selection, extensions.connection_policies.len);
+                    }
+                }
                 for (listener.request_policies) |selection| {
                     try refuseUnserved(selection, extensions.request_policies.len);
                 }
