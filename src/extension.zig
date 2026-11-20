@@ -420,6 +420,7 @@ pub fn assertExtensions(comptime extensions: Extensions) void {
                 @compileError(@typeName(Family) ++ " and " ++ @typeName(Later) ++
                     " declare the same metrics_prefix \"" ++ Family.metrics_prefix ++ "\"");
             }
+            assertSeriesApart(Family, Later);
         }
     }
     inline for (extensions.pickers, 0..) |Picker, index| {
@@ -600,6 +601,33 @@ pub fn assertMetrics(comptime Extension: type) void {
             @compileError(name ++ " declares " ++ counter_name ++ " both as a counter and as a gauge");
         }
     }
+}
+
+/// Distinct prefixes do not make distinct series: `a` with `b_c` and
+/// `a_b` with `c` both spell `zoxy_ext_a_b_c`, and one metric with two
+/// `# HELP` lines is not exposition. Refuse the pair at compile time.
+fn assertSeriesApart(comptime First: type, comptime Second: type) void {
+    @setEvalBranchQuota(16 * metrics_per_type_max * metrics_per_type_max * metric_name_bytes_max + 1000);
+    for (seriesSuffixes(First)) |first| {
+        for (seriesSuffixes(Second)) |second| {
+            if (std.mem.eql(u8, first, second)) {
+                @compileError(@typeName(First) ++ " and " ++ @typeName(Second) ++
+                    " both declare the series " ++ metric_prefix ++ first);
+            }
+        }
+    }
+}
+
+/// Every series `Extension` declares, as `<prefix>_<name>`.
+fn seriesSuffixes(comptime Extension: type) []const []const u8 {
+    var suffixes: []const []const u8 = &.{};
+    for (@typeInfo(@TypeOf(declaredCounters(Extension))).@"struct".field_names) |name| {
+        suffixes = suffixes ++ [_][]const u8{Extension.metrics_prefix ++ "_" ++ name};
+    }
+    for (@typeInfo(@TypeOf(declaredGauges(Extension))).@"struct".field_names) |name| {
+        suffixes = suffixes ++ [_][]const u8{Extension.metrics_prefix ++ "_" ++ name};
+    }
+    return suffixes;
 }
 
 fn assertDeclared(comptime Extension: type, comptime declared: anytype, comptime kind: []const u8) void {

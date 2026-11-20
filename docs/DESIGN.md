@@ -1205,6 +1205,8 @@ Rules the table follows:
     completes.
   - Label cardinality is bounded by the config alone. There is never a
     per-path or per-status label.
+  - A build's own families follow zoxy's, as `zoxy_ext_<prefix>_<name>`
+    once per site that selects the type (§13).
 - **The access log** is opt-in.
   - **What a line says.** One JSON line per HTTP exchange and per L4
     connection:
@@ -1671,6 +1673,25 @@ lists do not reach is refused at step zero (`ExtensionUnserved`).
     `rejected`, carries Proxy-Status `http_request_denied` where the
     listener sends it, and counts `l7_policy_rejected`. A retry or a
     replay does not evaluate again.
+
+**Metrics** (#435). A listed type may declare its own counters and
+gauges: `metrics_prefix`, then `counters` and `gauges`, each a struct
+literal of name and help text.
+- Each name is the series `zoxy_ext_<prefix>_<name>`, rendered after
+  zoxy's own with its `# HELP` and `# TYPE`, once per site that selects
+  the type. A family no site selects renders nothing.
+- A site is a picker's cluster (`cluster`), a listener its policies run
+  on (`listener`, its bind address), or a route (`listener` and `route`,
+  named by what it matches: `api.example.com/v1 x-canary=1`).
+- zoxy reserves the slots at startup and resolves the site for every
+  serving call: `PickInput.metrics` and `Request.metrics` are the call's
+  own, bumped with `add` and `set` by a name the type declared. Every
+  instance of one type at one site shares that site's slots, and one
+  instance at two sites counts apart at each.
+- The prefix and names are `[a-z][a-z0-9_]*` and the help is one line,
+  held at compile time, and a prefix is unique within the build. The
+  tables and their render bound are priced in the banner's labeled
+  metrics; a build that meters nothing prices nothing.
 
 **Obligations on every serving call.** These are stated here and
 asserted at the seam wherever zoxy can see them:

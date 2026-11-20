@@ -632,11 +632,13 @@ pub fn Server(comptime runtime: Runtime) type {
             const keys = endpointKeysFor(config);
             const tables = counters_module.Labeled.tableBytes(config, keys) +
                 ExtensionMetrics.tableBytes(config);
-            const labeled_render = counters_module.Labeled.renderBytesMaxFor(config);
-            const admin_response = admin_module.response_head.len +
-                counters_module.Counters.render_bytes_max + labeled_render;
-            const dump_staging =
-                counters_module.Counters.render_bytes_max + labeled_render;
+            // The whole exposition `renderExposition` writes: zoxy's
+            // counters, its labeled breakdown, and the build's own (#435).
+            const exposition = counters_module.Counters.render_bytes_max +
+                counters_module.Labeled.renderBytesMaxFor(config) +
+                ExtensionMetrics.renderBytesMaxFor(config);
+            const admin_response = admin_module.response_head.len + exposition;
+            const dump_staging = exposition;
             const total = tables + admin_response + dump_staging;
             assert(total > 0);
             return total;
@@ -1418,10 +1420,7 @@ pub fn Server(comptime runtime: Runtime) type {
             server.counters = .{};
             try server.labeled.init(arena, config, keys);
             try server.extension_metrics.init(arena, config);
-            server.dump_buffer = try arena.alloc(
-                u8,
-                counters_module.Counters.render_bytes_max + server.labeled.render_bytes_max,
-            );
+            server.dump_buffer = try arena.alloc(u8, server.expositionBytesMax());
             assert(server.dump_buffer.len > counters_module.Counters.render_bytes_max);
         }
 
@@ -2186,14 +2185,32 @@ pub fn Server(comptime runtime: Runtime) type {
         /// output honest: Prometheus exposition is a snapshot, so two of
         /// them concatenated repeat every series and parse as neither.
         pub fn dumpMetrics(server: *const Self) void {
-            assert(server.dump_buffer.len >= counters_module.Counters.render_bytes_max);
+            assert(server.dump_buffer.len == server.expositionBytesMax());
+            std.debug.print("{s}", .{server.renderExposition(server.dump_buffer)});
+        }
+
+        /// The whole exposition, zero-alloc into `buffer` (§5): the
+        /// counters and gauges, the #179 labeled breakdown, then the
+        /// build's own series (#435). The scrape and the exit tally both
+        /// render through here, so they cannot disagree on the wire
+        /// format. The gauges and the labeled live views are sampled now.
+        pub fn renderExposition(server: *const Self, buffer: []u8) []const u8 {
+            assert(buffer.len >= server.expositionBytesMax());
             const snapshot = server.gauges();
-            const text = server.counters.render(&snapshot, server.dump_buffer);
+            const text = server.counters.render(&snapshot, buffer);
             const views = server.labeledViews();
-            const labeled_text =
-                server.labeled.render(&views, server.dump_buffer[text.len..]);
-            assert(text.len + labeled_text.len <= server.dump_buffer.len);
-            std.debug.print("{s}{s}", .{ text, labeled_text });
+            const labeled = server.labeled.render(&views, buffer[text.len..]);
+            const own = server.extension_metrics.render(buffer[text.len + labeled.len ..]);
+            const total = text.len + labeled.len + own.len;
+            assert(total <= server.expositionBytesMax());
+            return buffer[0..total];
+        }
+
+        /// `renderExposition`'s exact bound for this server.
+        pub fn expositionBytesMax(server: *const Self) usize {
+            return counters_module.Counters.render_bytes_max +
+                server.labeled.render_bytes_max +
+                server.extension_metrics.render_bytes_max;
         }
 
         /// The live views the labeled gauges read at render time (§8,
