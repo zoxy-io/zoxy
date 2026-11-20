@@ -60,6 +60,7 @@ const h2_exchange = @import("h2/exchange.zig");
 const downgrade = @import("h2/downgrade.zig");
 const router = @import("router.zig");
 const filter = @import("filter.zig");
+const policy_edits_module = @import("../policy_edits.zig");
 const shed = @import("../shed.zig");
 const TlsEngine = @import("../tls/Engine.zig");
 
@@ -148,7 +149,8 @@ pub const RenderScratch = struct {
     /// rather than a trace worth re-deriving whenever either side moves.
     route_host: [constants.host_bytes_max]u8,
     host: [constants.host_bytes_max]u8,
-    request_edits: [constants.header_edits_max]filter.AppliedHeaderEdit,
+    /// The filters' edits and a build's policies' (#424), composed.
+    request_edits: [constants.request_edits_max]filter.AppliedHeaderEdit,
     response_edits: [constants.response_edits_max]filter.AppliedHeaderEdit,
     forwarded: [constants.forwarded_value_bytes_max]u8,
     hops: [max_forwards_digits_max]u8,
@@ -853,7 +855,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             assert((route_index == null) == (chosen_route != null));
             assert(selections.len >= 1);
             assert(view.tag == stream.log.tag);
-            const run = server.evaluatePolicies(selections, metrics, view);
+            const run = server.evaluatePolicies(selections, metrics, view, stream, route_index != null);
             stream.log.tag = view.tag;
             server.notePoliciesProceeded(stream, route_index, run.proceeded);
             if (run.route) |index| {
@@ -970,13 +972,21 @@ pub fn Proxy(comptime runtime: Runtime) type {
             views: *const TargetViews,
             host_scratch: *[constants.host_bytes_max]u8,
             rewrite_scratch: []u8,
-            edit_buffer: *[constants.header_edits_max]filter.AppliedHeaderEdit,
+            edit_buffer: *[constants.request_edits_max]filter.AppliedHeaderEdit,
         ) error{Oversize}!Forwarded {
             const conn = stream.conn;
             const base = views.forward;
             assert(base.path.len >= 1);
+            // #424: a build's policies' edits, in the order they decided;
+            // none in a build whose policies edit nothing.
+            const policy = if (comptime ServerType.PolicyEdits.enabled)
+                conn.server.policy_edits.editsOf(conn.server.streamIndex(stream))
+            else
+                ServerType.PolicyEdits.Edits{};
+            const policy_edits = policy.listener.len + policy.route.len;
             if (conn.request_filters.len == 0) {
-                return .{ .target = base, .edits = &.{} };
+                if (policy_edits == 0) return .{ .target = base, .edits = &.{} };
+                return .{ .target = base, .edits = policy_edits_module.compose(policy.listener, &.{}, policy.route, edit_buffer) };
             }
             // The canonical *host* is still recomputed here, unlike the
             // target views above. It is not threaded from the route phase
@@ -1000,8 +1010,10 @@ pub fn Proxy(comptime runtime: Runtime) type {
                 .headers = request.headers,
                 .client = clientAddressOf(stream),
             };
-            // One scan yields both the rewrite and the header edits (§7).
-            const forward = filter.collectForward(conn.request_filters, view, edit_buffer);
+            // One scan yields both the rewrite and the header edits (§7),
+            // written where they fall between the policies' (#424).
+            const filter_room = edit_buffer[policy.listener.len..][0..constants.header_edits_max];
+            const forward = filter.collectForward(conn.request_filters, view, filter_room);
             // Rewrite only origin-form targets; asterisk-form names no path.
             var target = base;
             if (views.origin_form) {
@@ -1009,7 +1021,9 @@ pub fn Proxy(comptime runtime: Runtime) type {
                     target.path = try filter.rewritePath(rewrite, base.path, rewrite_scratch);
                 }
             }
-            return .{ .target = target, .edits = forward.edits };
+            if (policy_edits == 0) return .{ .target = target, .edits = forward.edits };
+            const edits = policy_edits_module.compose(policy.listener, forward.edits, policy.route, edit_buffer);
+            return .{ .target = target, .edits = edits };
         }
 
         /// What the parsed head says about the request itself, recorded on

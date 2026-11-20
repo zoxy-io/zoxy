@@ -396,6 +396,13 @@ const uncovered = [_]Uncovered{
             "host-miss 404s",
     },
     .{
+        .name = "l7_policy_edit_refused",
+        .why = .unreached,
+        .reason = "the harness's policies edit with a fixed, valid header, " ++
+            "which zoxy never refuses; src/http_proxy_test.zig edits a " ++
+            "header zoxy writes itself, and splits one with CRLF",
+    },
+    .{
         .name = "l7_policy_route_fallback",
         .why = .unreached,
         .reason = "the harness's listener policy routes only by a name " ++

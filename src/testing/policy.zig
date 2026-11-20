@@ -33,6 +33,8 @@ pub const ScriptedPolicy = struct {
     route_raw: ?u16 = null,
     /// Requests it chose a route for.
     rerouted: u32 = 0,
+    /// The edits it hands on with every request it proceeds with (#424).
+    edits: []const extension.Edit = &.{},
     /// `route_name`'s index on each listener the instance is bound to.
     route_targets: [route_listeners_max]?u16 = @splat(null),
     /// The tag it sets on every request it hands on (#433), through
@@ -68,6 +70,8 @@ pub const ScriptedPolicy = struct {
     pub const path_bytes_max = 64;
     /// The listeners one instance resolves its route on.
     pub const route_listeners_max = 4;
+    /// What one verdict's edits may copy (#424).
+    pub const edit_bytes_max = 256;
 
     /// Its own series (#435), so the gates reach every metered arm: a
     /// counter for each way a request leaves it, and a gauge.
@@ -81,6 +85,7 @@ pub const ScriptedPolicy = struct {
         .completed_refused = "Requests it handed on that something after it refused.",
         .answered = "Requests it answered with one of its own pages.",
         .rerouted = "Requests it chose a route for.",
+        .edited = "Requests it handed on with header edits.",
     };
     pub const gauges = .{
         .path_bytes = "Bytes of the last request's canonical path.",
@@ -197,7 +202,8 @@ pub const ScriptedPolicy = struct {
     fn handOn(policy: *ScriptedPolicy, request: *const extension.Request) extension.Verdict {
         const route = policy.routeFor(request);
         if (route != null) assert(policy.route_raw != null or policy.route_name.len != 0);
-        if (policy.tag == null) {
+        assert(policy.edits.len <= extension.edits_per_verdict_max);
+        if (policy.tag == null and policy.edits.len == 0) {
             if (route == null) return .proceed;
         }
         if (policy.tag != null) request.metrics.add(ScriptedPolicy, .tagged, 1);
@@ -205,7 +211,8 @@ pub const ScriptedPolicy = struct {
             policy.rerouted += 1;
             request.metrics.add(ScriptedPolicy, .rerouted, 1);
         }
-        return .{ .proceed_with = .{ .tag = policy.tag, .route = route } };
+        if (policy.edits.len != 0) request.metrics.add(ScriptedPolicy, .edited, 1);
+        return .{ .proceed_with = .{ .tag = policy.tag, .route = route, .edits = policy.edits } };
     }
 
     /// The route it sends `request` to, if any: `route_raw` as given, or

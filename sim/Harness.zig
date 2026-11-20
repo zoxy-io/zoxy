@@ -473,6 +473,9 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
         // #430: the guarded route is chosen by name, and tagged as well.
         .route_prefix = l7.canon.guarded_prefix,
         .route_name = l7.canon.guarded_route_name,
+        // #424: every request it hands on carries a header of its own,
+        // through every render — the first try, a retry and a replay.
+        .edits = &.{.{ .add = .{ .name = "X-Scripted-Policy", .value = "listener" } }},
     };
     harness.policy_selections = .{
         zoxy.extension.select(runtime.extensions.request_policies, &harness.policy_listener),

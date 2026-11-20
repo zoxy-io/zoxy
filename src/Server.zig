@@ -226,6 +226,10 @@ pub fn Server(comptime runtime: Runtime) type {
         /// The pages a build's request policies answer with (#431); empty
         /// in a build whose policies declare none.
         answers: AnswerTable,
+        /// Every stream slot's scratch for the edits its request's
+        /// policies make (#424); empty in a build whose policies edit
+        /// nothing.
+        policy_edits: PolicyEdits,
         /// Staging for the §8 exit tally: the
         /// full exposition — counters then labeled — no longer fits a
         /// fixed stack buffer once its length is the config's, so it is
@@ -454,6 +458,8 @@ pub fn Server(comptime runtime: Runtime) type {
         pub const ExtensionMetrics = extension_metrics.Table(runtime.extensions);
         /// A build's own policy answers, rendered at startup (#431).
         pub const AnswerTable = @import("extension_answers.zig").Table(runtime.extensions);
+        /// The header edits a build's request policies make (#424).
+        pub const PolicyEdits = @import("policy_edits.zig").Table(runtime.extensions);
         pub const StreamType = ConnType.StreamType;
         pub const AccessLogType = access_log_module.AccessLog(runtime);
         pub const Proxy = proxy.Proxy(runtime);
@@ -1227,6 +1233,10 @@ pub fn Server(comptime runtime: Runtime) type {
                 probe_scratch_bytes + h2ScratchBytes(options) ==
                 headScratchBytes(options.*, health_probes));
             try server.initLogHeaders(arena, options);
+            // #424: every stream slot's scratch for its request's policy
+            // edits — the bytes the banner prices, asserted at `init`.
+            const stream_slots = constants.streamSlotsFor(options.conn_slots, options.stream_slots);
+            try server.policy_edits.init(arena, server.config, stream_slots);
         }
 
         /// Lend the serving path's header scratch for one parse and the
@@ -3086,7 +3096,7 @@ pub fn Server(comptime runtime: Runtime) type {
         /// sized by `constants.streamSlotsFor` lays them out in. An
         /// admission stream is the one its connection names; a shared one
         /// belongs to a connection whose own stream is another.
-        fn streamIndex(server: *const Self, stream: *const StreamType) u32 {
+        pub fn streamIndex(server: *const Self, stream: *const StreamType) u32 {
             if (stream.conn.stream == stream) {
                 const index = server.streams.indexOf(stream);
                 assert(index < server.streams.capacity());
@@ -4413,6 +4423,8 @@ pub fn Server(comptime runtime: Runtime) type {
         /// stopwatch, and §4's tick clock had been one all along.
         pub fn beginRequest(server: *Self, stream: *StreamType) void {
             if (stream.log.started_ns != 0) return;
+            // #424: a request begins with no policy edits of its own.
+            if (comptime PolicyEdits.enabled) server.policy_edits.reset(server.streamIndex(stream));
             stream.log.started_ns = server.io.nowNs();
             assert(stream.log.started_ns != 0);
             if (server.access_log.sink == null) return;
@@ -4715,6 +4727,11 @@ pub fn Server(comptime runtime: Runtime) type {
             /// one overwrites, so the next policy reads it (#433). The
             /// caller keeps that tag whatever the verdict.
             request: *extension.Request,
+            /// The exchange the policies' edits are for (#424).
+            stream: *const StreamType,
+            /// Whether these are its route's policies, whose edits follow
+            /// its listener's.
+            route_phase: bool,
         ) PolicyRun {
             assert(server.extensions_bound);
             assert(selections.len >= 1);
@@ -4731,6 +4748,16 @@ pub fn Server(comptime runtime: Runtime) type {
                     .proceed_with => |proceed| {
                         if (proceed.tag) |tag| request.tag = tag;
                         if (proceed.route) |index| route = index;
+                        // #424: copied now — the view behind them is gone
+                        // by the render — or the request is refused.
+                        const bound = PolicyEdits.editBytesOfSelection(selection);
+                        server.policy_edits.take(server.streamIndex(stream), route_phase, proceed.edits, bound) catch {
+                            // Counted here and, through `respondPolicy`, as
+                            // the policy reject it is answered as: the
+                            // refusal's own reason, and the reject total.
+                            server.counters.increment("l7_policy_edit_refused");
+                            return .{ .stop = .{ .reject = .bad_request }, .proceeded = @intCast(position), .route = route };
+                        };
                     },
                     .reject => |status| return .{
                         .stop = .{ .reject = status },

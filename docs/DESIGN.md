@@ -1665,8 +1665,8 @@ lists do not reach is refused at step zero (`ExtensionUnserved`).
   - per route, run once the route is chosen and before any resource is
     taken for it;
   - `evaluate(*P, *const Request) Verdict` returns `proceed`;
-    `proceed_with`, which proceeds and may set the request's tag and,
-    at the listener phase, its route;
+    `proceed_with`, which proceeds and may set the request's tag, edit
+    its headers, and, at the listener phase, choose its route;
     `reject` with a status from the static reject set: 400, 403, 404 or
     429; or `respond`, one of the type's own answers. The first reject
     or answer wins;
@@ -1702,6 +1702,19 @@ lists do not reach is refused at step zero (`ExtensionUnserved`).
     choice made at the route phase, leaves the table's match standing
     and counts `l7_policy_route_fallback`, as an out-of-set pick falls
     back to p2c;
+  - header edits (#424) are the request filters' three — `set`, `add`,
+    `remove` — at most `edits_per_verdict_max` a verdict, their names
+    and values within the type's declared `edit_bytes_max`. They are
+    copied when the verdict is read, into scratch every stream slot
+    reserves for the config's costliest listener and route (priced in
+    the banner as `policy edits`; `PolicyEditsOverLimit` refuses lists
+    that could overrun the render's buffer), and they apply in the
+    order their deciders ran: the listener's policies', the filters',
+    the route's policies', a later `set` or `remove` of a name dropping
+    every earlier edit of it. A retry or a replay renders them again. A
+    name zoxy writes itself, or a value that is not a field value, is
+    refused with a `400` and counts `l7_policy_edit_refused`, since a
+    value may come from the request;
   - the tag (#433) is one `u64` per request, zero until a policy sets
     it. The later write wins, and a tag set before a later reject
     stays. Every later view of the request carries it: the next
@@ -1781,8 +1794,7 @@ CI builds, tests and smokes it against a fetched package.
 **Not offered yet:**
 - live endpoint discovery, which needs preallocated slots and endpoint
   identities that survive in-flight work;
-- further phases: header edits, response policies, and L4 connection
-  policies;
+- further phases: response policies, and L4 connection policies;
 - regex in stock filters and routes, which waits until after v1.0.0.
 
 **Published, not frozen.** HTTP/3 would move the exchange's internal

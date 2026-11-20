@@ -155,6 +155,11 @@ pub const Counters = struct {
     /// (#430): the table's own match stood. A picker's out-of-set slot is
     /// `upstream_fallback_picks`; this is the same mistake one step up.
     l7_policy_route_fallback: Value = Value.init(0),
+    /// A build's policy asked to edit a header zoxy writes itself, or to
+    /// write a value that is not a field value (#424): the request was
+    /// refused with a `400` rather than edited — a value from the request
+    /// must never become a header of zoxy's, or a second header.
+    l7_policy_edit_refused: Value = Value.init(0),
     /// A §7 filter rule answered the request with a redirect (#176):
     /// one of the closed statuses plus a Location rendered per request.
     /// `l7_filtered`'s sibling — admitted and answered, so outside
