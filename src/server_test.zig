@@ -2717,3 +2717,61 @@ test "l4: a connection policy reads the client a PROXY header names, and its pro
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("conn_policy_rejected"));
     try bed.expectDrained();
 }
+
+test "sni routing: a route's connection policy reads the name and refuses before the dial (#425)" {
+    // The named route refuses with an RST; the catch-all lets its client
+    // on. Each reads the name its hello asked for and the route's cluster.
+    var refusing: ScriptedConnectionPolicy = .{ .verdict = .reset };
+    var passing: ScriptedConnectionPolicy = .{};
+    const on_named = [_]extension.Selection{extension.select(runtime.extensions.connection_policies, &refusing)};
+    const on_rest = [_]extension.Selection{extension.select(runtime.extensions.connection_policies, &passing)};
+    const routes = [_]sni_router.Route{
+        .{ .server_name = "api.example.com", .cluster_index = 0, .connection_policies = &on_named },
+        .{ .cluster_index = 0, .connection_policies = &on_rest },
+    };
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 4254 },
+        .sni_routes = &routes,
+        .access_log = true,
+    });
+    defer bed.tearDown();
+    // The let-on hello reaches the origin, which takes it as one.
+    bed.scenario.origin.expect_client_hello = true;
+
+    var named_buffer: [128]u8 = undefined;
+    var other_buffer: [128]u8 = undefined;
+    bed.scenario.clients_count = 2;
+    for (bed.scenario.clients[0..2], [_][]const u8{
+        sniHello(&named_buffer, "api.example.com"),
+        sniHello(&other_buffer, "other.example.com"),
+    }) |*client, hello| {
+        client.exchange = true;
+        client.prefix = hello;
+        client.start(&bed.scenario, TestBed.bindAddress());
+    }
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(Client.Outcome.reset, bed.scenario.clients[0].outcome);
+    try std.testing.expectEqual(@as(u32, 0), bed.scenario.clients[0].received_len);
+    try std.testing.expectEqual(Client.Outcome.eof, bed.scenario.clients[1].outcome);
+    try std.testing.expectEqualStrings(
+        echo_token,
+        bed.scenario.clients[1].receive_buffer[0..bed.scenario.clients[1].received_len],
+    );
+    for ([_]*const ScriptedConnectionPolicy{ &refusing, &passing }, [_][]const u8{
+        "api.example.com",
+        "other.example.com",
+    }) |policy, name| {
+        try std.testing.expectEqual(@as(u32, 1), policy.binds);
+        try std.testing.expectEqual(@as(u32, 1), policy.routed);
+        try std.testing.expectEqualStrings(name, policy.lastServerName());
+    }
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("conn_policy_reset"));
+    try std.testing.expectEqual(@as(u8, 1), bed.scenario.origin.conns_count);
+    // The refused hello never counted as sent: its line says so.
+    try std.testing.expect(std.mem.indexOf(u8, bed.sim_io.sinkBytes(), "\"outcome\":\"rejected\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bed.sim_io.sinkBytes(), "\"bytes_in\":0,") != null);
+    try std.testing.expect(bed.server.reconcile());
+    try bed.expectDrained();
+}

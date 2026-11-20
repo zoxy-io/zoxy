@@ -25,6 +25,11 @@ pub const ScriptedConnectionPolicy = struct {
     addressed: u32 = 0,
     last_client_port: u16 = 0,
     last_listener: u16 = 0,
+    /// Connections it read at an SNI route's phase, and the last one's
+    /// name, copied out — the view is valid only for the call.
+    routed: u32 = 0,
+    server_name: [64]u8 = @splat(0),
+    server_name_len: u8 = 0,
     /// The loop clock the last connection was evaluated at.
     seen_now_ns: u64 = 0,
 
@@ -34,9 +39,8 @@ pub const ScriptedConnectionPolicy = struct {
         startup: *const extension.Startup,
     ) !void {
         _ = startup;
-        // A connection policy sits on a listener, never on a route.
-        assert(site.route_index == null);
-        assert(site.cluster_index == null);
+        // A listener is bound with no route; an SNI route with its cluster.
+        assert((site.route_index == null) == (site.cluster_index == null));
         policy.binds += 1;
         // A server's clock starts afresh; see `ScriptedPolicy.bind`.
         policy.seen_now_ns = 0;
@@ -51,6 +55,7 @@ pub const ScriptedConnectionPolicy = struct {
         policy.seen_now_ns = connection.now_ns;
         policy.evaluated += 1;
         policy.last_listener = connection.listener_index;
+        if (connection.route_index != null) policy.noteRouted(connection);
         if (connection.client) |client| {
             policy.addressed += 1;
             policy.last_client_port = client.getPort();
@@ -59,6 +64,22 @@ pub const ScriptedConnectionPolicy = struct {
         if (verdict != .proceed) policy.refused += 1;
         assert(policy.refused <= policy.evaluated);
         return verdict;
+    }
+
+    fn noteRouted(policy: *ScriptedConnectionPolicy, connection: *const extension.Connection) void {
+        // A route's phase names its cluster; a listener's names neither.
+        assert(connection.cluster_index != null);
+        policy.routed += 1;
+        const name = connection.server_name orelse "";
+        const kept = @min(name.len, policy.server_name.len);
+        @memcpy(policy.server_name[0..kept], name[0..kept]);
+        policy.server_name_len = @intCast(kept);
+    }
+
+    /// The name the last routed connection's hello asked for.
+    pub fn lastServerName(policy: *const ScriptedConnectionPolicy) []const u8 {
+        assert(policy.server_name_len <= policy.server_name.len);
+        return policy.server_name[0..policy.server_name_len];
     }
 
     fn verdictFor(

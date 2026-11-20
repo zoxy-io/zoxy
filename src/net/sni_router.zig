@@ -26,6 +26,8 @@
 
 const std = @import("std");
 
+const extension = @import("../extension.zig");
+
 const assert = std.debug.assert;
 
 /// One rule: the name a client must have asked for, and the cluster that
@@ -35,6 +37,9 @@ const assert = std.debug.assert;
 pub const Route = struct {
     server_name: ?[]const u8 = null,
     cluster_index: u16,
+    /// #425's connection policies on this route, selected in code: run
+    /// once the hello is read and the route chosen, before the dial.
+    connection_policies: []const extension.Selection = &.{},
 };
 
 /// The cluster for a connection whose ClientHello named `server_name`
@@ -45,11 +50,17 @@ pub const Route = struct {
 /// specific: a route naming this client's name beats the any-name route,
 /// and a client that named nothing meets only the any-name one.
 pub fn route(routes: []const Route, server_name: ?[]const u8) ?u16 {
+    const index = routeIndex(routes, server_name) orelse return null;
+    return routes[index].cluster_index;
+}
+
+/// The matching route's index in `routes`, as `route` chooses it: what a
+/// caller needs that runs the route's own policies (#425).
+pub fn routeIndex(routes: []const Route, server_name: ?[]const u8) ?u16 {
     assert(routes.len >= 1);
-    for (routes) |candidate| {
-        if (matches(candidate.server_name, server_name)) {
-            return candidate.cluster_index;
-        }
+    assert(routes.len <= std.math.maxInt(u16));
+    for (routes, 0..) |candidate, index| {
+        if (matches(candidate.server_name, server_name)) return @intCast(index);
     }
     return null;
 }
@@ -80,6 +91,10 @@ test "sni_router: a named route beats the any-name one" {
     // on the any-name route.
     try testing.expectEqual(@as(?u16, 0), route(&routes, "other.example.com"));
     try testing.expectEqual(@as(?u16, 0), route(&routes, null));
+    // The index is the sorted table's, the one a route's policies are
+    // bound with (#425): the any-name route sits last.
+    try testing.expectEqual(@as(?u16, 1), routeIndex(&routes, "db.example.com"));
+    try testing.expectEqual(@as(?u16, 2), routeIndex(&routes, null));
 }
 
 test "sni_router: matching is exact, not by suffix" {

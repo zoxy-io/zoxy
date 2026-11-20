@@ -542,6 +542,13 @@ pub const Connection = struct {
     listener_index: u16,
     /// The loop clock (#429).
     now_ns: u64,
+    /// At an SNI route's phase: the route's index in its listener's SNI
+    /// table, the cluster it sends to, and the canonical name the hello
+    /// asked for — null when it asked for none. All null at the
+    /// listener's phase, before any hello is read.
+    route_index: ?u16 = null,
+    cluster_index: ?u16 = null,
+    server_name: ?[]const u8 = null,
 };
 
 /// What a connection policy decides (#425). A refusal closes the
@@ -793,7 +800,8 @@ comptime {
 /// Where a policy is bound: a listener, or one of its routes.
 pub const PolicySite = struct {
     listener_index: u16,
-    /// The route's index in its listener's table, or null for the
+    /// The route's index in its listener's table — for a connection
+    /// policy on an l4 listener, its SNI table (#425) — or null for the
     /// listener itself.
     route_index: ?u16,
     /// The cluster the route sends to; null for the listener.

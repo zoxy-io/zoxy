@@ -1747,7 +1747,8 @@ lists do not reach is refused at step zero (`ExtensionUnserved`).
     metrics: what a rate or concurrency limit counts back down by.
 
 - **Connection policies** (#425), an ordered list per listener of
-  either protocol, selected with `App.connectionPolicy`:
+  either protocol and per SNI route, selected with
+  `App.connectionPolicy`:
   - `evaluate(*P, *const Connection) ConnectionVerdict` runs once the
     client's address is known — after the PROXY header, on a listener
     that takes one — and before anything is read for the protocol: no
@@ -1755,7 +1756,13 @@ lists do not reach is refused at step zero (`ExtensionUnserved`).
     no handshake, and request policies cannot do this for an http
     listener: they meet a connection only once a head arrives;
   - the view holds the client address, the listener and the loop's
-    `now_ns`; an optional `bind` is a request policy's, with no route;
+    `now_ns`; an optional `bind` is a request policy's, its site the
+    listener's or, for a policy on an SNI route, that route's;
+  - an SNI route's list runs once the hello is read and has chosen the
+    route, before the dial and before its bytes count as sent, so a
+    refused connection logs `bytes_in: 0`. Its view adds the route's
+    index in the SNI table, its cluster, and the canonical name the
+    hello asked for; its `bind` site carries the same index;
   - `proceed`, or a refusal that closes the connection without a byte
     written: `reject` with a FIN, `reset` with an RST (SO_LINGER 0, and
     no FIN first). Either counts `conn_policy_rejected`, an RST
@@ -1839,8 +1846,7 @@ CI builds, tests and smokes it against a fetched package.
 **Not offered yet:**
 - live endpoint discovery, which needs preallocated slots and endpoint
   identities that survive in-flight work;
-- further phases: a connection policy on an SNI route, and the
-  connection's tag, completion and metrics (#425's later slices);
+- a connection's tag, completion and metrics (#425's later slices);
 - regex in stock filters and routes, which waits until after v1.0.0.
 
 **Published, not frozen.** HTTP/3 would move the exchange's internal
