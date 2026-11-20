@@ -403,40 +403,11 @@ const uncovered = [_]Uncovered{
             "header zoxy writes itself, and splits one with CRLF",
     },
     .{
-        .name = "health_endpoint_down_arrival",
-        .why = .unreached,
-        .reason = "no sim cluster reserves endpoint slots yet (#428); " ++
-            "server_test restores an arrival through its first probe",
-    },
-    .{
-        .name = "endpoints_reclaimed",
-        .why = .unreached,
-        .reason = "no sim cluster reserves endpoint slots yet (#428); " ++
-            "server_test frees a drained slot and holds a busy one",
-    },
-    .{
-        .name = "endpoints_arrived",
-        .why = .unreached,
-        .reason = "no sim cluster reserves endpoint slots yet (#428); " ++
-            "server_test drives updates end to end",
-    },
-    .{
-        .name = "endpoints_departed",
-        .why = .unreached,
-        .reason = "no sim cluster reserves endpoint slots yet (#428); " ++
-            "server_test drives updates end to end",
-    },
-    .{
-        .name = "endpoints_reweighted",
-        .why = .unreached,
-        .reason = "no sim cluster reserves endpoint slots yet (#428); " ++
-            "server_test drives updates end to end",
-    },
-    .{
         .name = "endpoints_parked_closed",
         .why = .unreached,
-        .reason = "no sim cluster reserves endpoint slots yet (#428); " ++
-            "server_test drives updates end to end",
+        .reason = "while the sim's churn departs only the refusing endpoint, " ++
+            "nothing it departs has parked (#428); the close is the " ++
+            "ejection's own loop (`reapParkedOf`), which health_parked_closed covers",
     },
     .{
         .name = "l7_handler_answer_refused",
