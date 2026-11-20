@@ -5398,6 +5398,43 @@ pub fn Server(comptime runtime: Runtime) type {
             return server.replaceEndpoints(cluster_index, endpoints);
         }
 
+        /// Whether anything still holds slot (`cluster_index`,
+        /// `endpoint_index`) (#428): a lease or an L4 connection, a parked
+        /// connection, a stream whose line or owed completion names it, an
+        /// HTTP/2 origin connection, or a probe still out. Scanned rather
+        /// than counted: an update is a control-plane call, and the scan is
+        /// bounded by the pools.
+        pub fn endpointReferenced(server: *const Self, cluster_index: u16, endpoint_index: u16) bool {
+            assert(cluster_index < server.config.clusters.len);
+            assert(endpoint_index < server.config.clusters[cluster_index].endpoints.len);
+            const key = server.upstreams.keys.key(cluster_index, endpoint_index);
+            if (server.endpointLoad().inFlight(key) != 0) return true;
+            if (server.upstreams.parkedAt(key)) return true;
+            if (streamsName(&server.streams, cluster_index, endpoint_index)) return true;
+            if (streamsName(&server.shared_streams, cluster_index, endpoint_index)) return true;
+            for (server.h2_origins.slots) |*slot| {
+                if (!server.h2_origins.isAcquired(slot)) continue;
+                if (slot.cluster_index == cluster_index and slot.endpoint_index == endpoint_index) return true;
+            }
+            return server.health.probing(cluster_index, endpoint_index);
+        }
+
+        fn streamsName(pool: *const Pool(StreamType), cluster_index: u16, endpoint_index: u16) bool {
+            assert(endpoint_index <= constants.endpoint_index_max);
+            for (pool.slots) |*stream| {
+                if (!pool.isAcquired(stream)) continue;
+                // The owed completion first: it names its own cluster,
+                // whatever routing has since made of the stream's.
+                if (comptime ConnType.completes_picks) {
+                    const pick = &stream.pick;
+                    if (pick.active and pick.cluster_index == cluster_index and pick.endpoint_index == endpoint_index) return true;
+                }
+                if (stream.cluster_index != cluster_index) continue;
+                if (stream.log.endpoint_index == endpoint_index) return true;
+            }
+            return false;
+        }
+
         /// Make `endpoints` the set of cluster `cluster_index`, which must
         /// have reserved slots (#428): see `endpoint_sets.replace`.
         pub fn replaceEndpoints(

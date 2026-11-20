@@ -3180,3 +3180,35 @@ test "endpoints: an arrival that passes its first probe is restored, the counts 
     try std.testing.expect(bed.server.reconcile());
     try bed.expectDrained();
 }
+
+test "endpoints: a drained slot nothing holds is freed for the next arrival, a held one never (#428)" {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 4285 },
+        .blackholed_endpoints = 1,
+        .endpoint_slots = 2,
+    });
+    defer bed.tearDown();
+    const slots = bed.server.config.clusters[0].slots.?;
+
+    // The black hole leaves; nothing ever went to it, so at the next
+    // update its slot is free, and the arrival takes it.
+    try bed.server.replaceEndpoints(0, &.{slotEndpoint("127.0.0.1:9000")});
+    try std.testing.expectEqual(config_module.Config.EndpointState.draining, slots.states[1]);
+    try bed.server.replaceEndpoints(0, &.{ slotEndpoint("127.0.0.1:9000"), slotEndpoint("127.0.0.1:9300") });
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("endpoints_reclaimed"));
+    try std.testing.expect(slots.addresses[1].ip.eql(&(try std.Io.net.IpAddress.parseLiteral("127.0.0.1:9300"))));
+
+    // Now the arrival leaves while work still holds it: its slot stays
+    // draining, and a newcomer finds no room.
+    try bed.server.replaceEndpoints(0, &.{slotEndpoint("127.0.0.1:9000")});
+    const held = bed.server.upstreams.keys.key(0, 1);
+    bed.server.l4_inflight[held] = 1;
+    try std.testing.expectError(
+        error.SlotsExhausted,
+        bed.server.replaceEndpoints(0, &.{ slotEndpoint("127.0.0.1:9000"), slotEndpoint("127.0.0.1:9400") }),
+    );
+    try std.testing.expectEqual(config_module.Config.EndpointState.draining, slots.states[1]);
+    bed.server.l4_inflight[held] = 0;
+    try bed.expectDrained();
+}

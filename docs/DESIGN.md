@@ -917,6 +917,15 @@ shed the request. A retry that has tried every routable endpoint answers
     with nonzero ports, weights and tiers in bound, no duplicate, some
     weight), and refused whole (`SlotsExhausted`) when its arrivals
     outnumber the free slots.
+    - First, every draining slot nothing holds any longer is freed
+      (`endpoints_reclaimed`): no lease or L4 connection, no parked
+      connection, no stream whose line or owed completion names it, no
+      HTTP/2 origin connection, no probe still out — scanned across the
+      pools, since an update is a control-plane call. A cluster needs
+      room for its set plus what is still draining, and an update
+      refused for room may still have freed some. A freed slot keeps
+      its per-endpoint series for the endpoint that next takes it,
+      which is what keeps every family's rows summing to its total.
     - An endpoint already in the set keeps its slot — health, in-flight
       work, parked connections, sticky placements — and takes its new
       weight and tier in place (`endpoints_reweighted`).
@@ -1973,9 +1982,6 @@ cover with the bed. `examples/edge` is a working build:
 CI builds, tests and smokes it against a fetched package.
 
 **Not offered yet:**
-- freeing a drained endpoint slot for reuse once nothing references
-  it (#428's next slice): until then a cluster needs a slot for every
-  endpoint it has held;
 - regex in stock filters and routes, which waits until after v1.0.0.
 
 **Published, not frozen.** HTTP/3 would move the exchange's internal

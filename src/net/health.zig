@@ -1375,6 +1375,17 @@ pub fn Checker(comptime runtime: Runtime) type {
             checker.eject_deadline_ns[key] = 0;
         }
 
+        /// Whether a probe is still out against a slot (#428): its verdict
+        /// would land on whatever the slot held.
+        pub fn probing(checker: *const Self, cluster_index: u16, endpoint_index: u16) bool {
+            assert(cluster_index < checker.server.config.clusters.len);
+            for (checker.probes) |*probe| {
+                if (probe.armedCount() == 0) continue;
+                if (probe.target_cluster == cluster_index and probe.target_endpoint == endpoint_index) return true;
+            }
+            return false;
+        }
+
         /// Close an endpoint's parked connections as it leaves the set
         /// (#428): the ejection path's own obligation, for the same reason.
         pub fn closeParkedOf(checker: *Self, cluster_index: u16, endpoint_index: u16) void {

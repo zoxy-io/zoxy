@@ -394,6 +394,12 @@ pub const Balancer = struct {
         }
     }
 
+    /// A slot freed (#428): no endpoint, no identity.
+    pub fn vacate(balancer: *Balancer, cluster_index: u16, endpoint_index: u16) void {
+        assert(!balancer.config.clusters[cluster_index].occupiedAt(endpoint_index));
+        balancer.endpoint_hashes[balancer.keys.key(cluster_index, endpoint_index)] = 0;
+    }
+
     pub const Policy = union(enum) {
         rr: pickers.RoundRobin,
         p2c: pickers.PowerOfTwoChoices,
