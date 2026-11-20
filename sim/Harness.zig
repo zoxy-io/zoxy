@@ -2873,6 +2873,10 @@ pub fn verify(harness: *Harness) !void {
     for (&harness.pickers) |*picker| {
         if (picker.completions != picker.calls) return error.PickNotCompleted;
     }
+    // #429: every request either policy handed on completed, exactly once.
+    for ([_]*const zoxy.testing.ScriptedPolicy{ &harness.policy_listener, &harness.policy_route }) |policy| {
+        if (policy.completions != policy.evaluated - policy.rejected) return error.PolicyNotCompleted;
+    }
     if (!harness.io.sockets.isFullyReleased()) return error.SocketLeak;
     // §7: no malformed byte may ever reach an origin.
     if (harness.origin_http.violations != 0) return error.OriginSawMalformedBytes;

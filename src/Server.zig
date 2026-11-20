@@ -904,6 +904,8 @@ pub fn Server(comptime runtime: Runtime) type {
             // #423: a pick no outcome claimed ended with its stream.
             server.completePickAtRelease(stream);
             server.logExchange(stream);
+            // #429: the line's hook completed whatever policies it owed.
+            if (comptime ConnType.completes_policies) assert(!stream.policies.owed());
             server.releaseStaticSend(stream);
             if (stream.h2_head != null) server.returnHeadBuffer(stream);
             var link: *?*StreamType = &conn.h2_streams;
@@ -4356,6 +4358,7 @@ pub fn Server(comptime runtime: Runtime) type {
             // #423: likewise the last chance to complete a pick.
             server.completePickAtRelease(conn.stream);
             server.logExchange(conn.stream);
+            if (comptime ConnType.completes_policies) assert(!conn.stream.policies.owed());
             // Which returns the stream with it (§5).
             server.releaseConn(conn);
             server.counters.increment("completed");
@@ -4411,6 +4414,9 @@ pub fn Server(comptime runtime: Runtime) type {
         /// `emitted` deciding which of the two speaks for an exchange that
         /// took both.
         pub fn logExchange(server: *Self, stream: *StreamType) void {
+            // #429: the policies a request owes hear of it at this line's
+            // moment, logged or not.
+            server.completePoliciesAtLine(stream);
             if (server.access_log.sink == null) return;
             if (stream.log.emitted) return;
             // Nothing was asked of this exchange: an L7 slot that idled
@@ -4654,9 +4660,16 @@ pub fn Server(comptime runtime: Runtime) type {
             unreachable;
         }
 
+        /// What one site's policies decided (#417): the first reject, or
+        /// null when every one handed the request on — and how many did
+        /// before that reject, the ones it now owes a completion (#429).
+        pub const PolicyRun = struct {
+            refused: ?extension.RejectStatus,
+            proceeded: u16,
+        };
+
         /// Run `selections` over `request` in order (#417): the first
-        /// reject wins and is returned, and null means every one handed
-        /// the request on. Dispatch is the comptime list's, like
+        /// reject wins. Dispatch is the comptime list's, like
         /// `callPicker`.
         pub fn evaluatePolicies(
             server: *Self,
@@ -4668,9 +4681,10 @@ pub fn Server(comptime runtime: Runtime) type {
             /// one overwrites, so the next policy reads it (#433). The
             /// caller keeps that tag whatever the verdict.
             request: *extension.Request,
-        ) ?extension.RejectStatus {
+        ) PolicyRun {
             assert(server.extensions_bound);
             assert(selections.len >= 1);
+            assert(selections.len <= std.math.maxInt(u16));
             assert(metrics.len == 0 or metrics.len == selections.len);
             // Each policy's slots are its own: none outlives its call, so
             // a later view of the request — a picker's — carries none.
@@ -4682,10 +4696,125 @@ pub fn Server(comptime runtime: Runtime) type {
                     .proceed_with => |proceed| {
                         if (proceed.tag) |tag| request.tag = tag;
                     },
-                    .reject => |status| return status,
+                    .reject => |status| return .{ .refused = status, .proceeded = @intCast(position) },
                 }
             }
-            return null;
+            return .{ .refused = null, .proceeded = @intCast(selections.len) };
+        }
+
+        /// The policies of one phase that handed the request on (#429):
+        /// a listener's, or the route's named by `route_index`. A request
+        /// owes nothing when its listener phase begins, which is the
+        /// exactly-once a policy's `complete` is promised.
+        pub fn notePoliciesProceeded(server: *Self, stream: *StreamType, route_index: ?u16, proceeded: u16) void {
+            if (comptime !ConnType.completes_policies) return;
+            const listener = &server.config.listeners[stream.conn.listener_index];
+            if (route_index) |index| {
+                assert(index < listener.routes.len);
+                assert(proceeded <= listener.routes[index].request_policies.len);
+                assert(stream.policies.route_proceeded == 0);
+                stream.policies.route_index = index;
+                stream.policies.route_proceeded = proceeded;
+            } else {
+                assert(proceeded <= listener.request_policies.len);
+                assert(!stream.policies.owed());
+                stream.policies.listener_proceeded = proceeded;
+            }
+        }
+
+        /// The cluster routing chose, for the completions a request owes.
+        pub fn notePoliciesRouted(server: *Self, stream: *StreamType, cluster_index: u16) void {
+            if (comptime !ConnType.completes_policies) return;
+            assert(cluster_index < server.config.clusters.len);
+            stream.policies.routed = true;
+            stream.policies.cluster_index = cluster_index;
+        }
+
+        /// Hand every completion the request owes (#429) over, as its
+        /// access-log line would read: the hook `logExchange` runs whether
+        /// or not a sink is configured, and whatever calls it first for an
+        /// exchange delivers.
+        pub fn completePoliciesAtLine(server: *Self, stream: *StreamType) void {
+            if (comptime !ConnType.completes_policies) return;
+            if (!stream.policies.owed()) return;
+            // A request that ran a policy began: its first head byte set it.
+            assert(stream.log.started_ns != 0);
+            assert(stream.conn.protocol == .http);
+            server.completePolicies(stream, switch (stream.log.outcome) {
+                .ok => .ok,
+                .rejected => .rejected,
+                .redirected => .redirected,
+                .responded => .responded,
+                .shed => .shed,
+                .timed_out => .timed_out,
+                .upstream_failed => .upstream_failed,
+                .aborted => .aborted,
+                // Owed policies are an L7 request's, and an upgrade's were
+                // completed at its `101`: no line that ends `closed` owes.
+                .closed => unreachable,
+            });
+        }
+
+        /// Every policy that handed the request on hears how it ended,
+        /// once: the route's first, then the listener's, as a stack
+        /// unwinds.
+        pub fn completePolicies(server: *Self, stream: *StreamType, outcome: extension.RequestCompletion.Outcome) void {
+            if (comptime !ConnType.completes_policies) return;
+            if (!stream.policies.owed()) return;
+            const pending = stream.policies;
+            stream.policies = .{};
+            const listener_index = stream.conn.listener_index;
+            const listener = &server.config.listeners[listener_index];
+            const now_ns = server.io.nowNs();
+            assert(stream.log.started_ns != 0);
+            assert(now_ns >= stream.log.started_ns);
+            var done: extension.RequestCompletion = .{
+                .listener_index = listener_index,
+                .route_index = null,
+                .cluster_index = if (pending.routed) pending.cluster_index else null,
+                .tag = stream.log.tag,
+                .status = stream.log.status,
+                .outcome = outcome,
+                .started_ns = stream.log.started_ns,
+                .done_ns = now_ns,
+            };
+            if (pending.route_proceeded >= 1) {
+                done.route_index = pending.route_index;
+                const route = &listener.routes[pending.route_index];
+                const metrics = server.extension_metrics.routePolicies(listener_index, pending.route_index);
+                completeList(route.request_policies[0..pending.route_proceeded], metrics, &done);
+            }
+            done.route_index = null;
+            const metrics = server.extension_metrics.listenerPolicies(listener_index);
+            completeList(listener.request_policies[0..pending.listener_proceeded], metrics, &done);
+        }
+
+        fn completeList(
+            selections: []const extension.Selection,
+            metrics: []const extension.Metrics,
+            done: *extension.RequestCompletion,
+        ) void {
+            assert(metrics.len == 0 or metrics.len >= selections.len);
+            // Bounded by the list the site was configured with.
+            for (selections, 0..) |selection, position| {
+                done.metrics = if (metrics.len == 0) .{} else metrics[position];
+                callPolicyComplete(selection, done);
+            }
+            done.metrics = .{};
+        }
+
+        fn callPolicyComplete(selection: extension.Selection, done: *const extension.RequestCompletion) void {
+            assert(selection.index < runtime.extensions.request_policies.len);
+            assert(done.done_ns >= done.started_ns);
+            inline for (runtime.extensions.request_policies, 0..) |Policy, index| {
+                if (selection.index == index) {
+                    // A type that takes no completion owes none.
+                    if (comptime !extension.policyCompletes(Policy)) return;
+                    const policy: *Policy = @ptrCast(@alignCast(selection.instance));
+                    return Policy.complete(policy, done);
+                }
+            }
+            unreachable;
         }
 
         fn callPolicy(selection: extension.Selection, request: *const extension.Request) extension.Verdict {

@@ -355,6 +355,28 @@ pub const PendingPick = struct {
     head_ns: u64 = 0,
 };
 
+/// The request policies a request still owes a completion to (#429):
+/// every policy before a reject proceeded, so a list's owed are always
+/// its first `proceeded`, counted per phase.
+pub const PendingPolicies = struct {
+    /// The listener's policies that handed the request on.
+    listener_proceeded: u16 = 0,
+    /// The route whose policies ran, and how many of them handed it on.
+    route_index: u16 = 0,
+    route_proceeded: u16 = 0,
+    /// The cluster routing chose, once it has.
+    routed: bool = false,
+    cluster_index: u16 = 0,
+
+    pub fn owed(pending: *const PendingPolicies) bool {
+        // Each count is bounded by its list, which `evaluatePolicies`
+        // holds to a `u16`; widened so the sum cannot wrap.
+        const total: u32 = @as(u32, pending.listener_proceeded) + pending.route_proceeded;
+        if (!pending.routed) assert(pending.route_proceeded == 0);
+        return total >= 1;
+    }
+};
+
 /// `ConnType` is a parameter rather than an import, and that is load
 /// bearing: `Conn` names this type for its own field, so importing back
 /// would make the two generics mutually re-entrant — Zig memoizes an
@@ -465,6 +487,9 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
         /// rather than the log because an L4 connection owes one too.
         /// Void in a build whose pickers do not complete.
         pick: if (ConnType.completes_picks) PendingPick else void,
+        /// The request policies this exchange owes a completion (#429).
+        /// Void in a build whose policies do not complete.
+        policies: if (ConnType.completes_policies) PendingPolicies else void,
 
         /// Access-log capture (§8) — and the seam #274 exists to draw.
         ///
@@ -837,6 +862,7 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
             // first head byte lands.
             stream.log = .{};
             stream.pick = if (ConnType.completes_picks) .{} else {};
+            stream.policies = if (ConnType.completes_policies) .{} else {};
             // An admission stream's client is its connection; a shared one
             // is bound to its HTTP/2 stream after this (`Server`'s
             // `acquireSharedStream`).

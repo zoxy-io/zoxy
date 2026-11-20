@@ -26,6 +26,11 @@ pub const ScriptedPolicy = struct {
     seen_tag: u64 = 0,
     /// The loop clock the last request was evaluated at (#429).
     seen_now_ns: u64 = 0,
+    /// Completions received (#429): one for each request it handed on,
+    /// so `evaluated - rejected` once the server is idle.
+    completions: u32 = 0,
+    /// The last completion, copied out.
+    last: ?extension.RequestCompletion = null,
     /// Startup binds received, one per listener or route that selected
     /// the instance.
     binds: u32 = 0,
@@ -49,6 +54,9 @@ pub const ScriptedPolicy = struct {
         .evaluated = "Requests the scripted policy evaluated.",
         .rejected = "Requests it rejected.",
         .tagged = "Requests it handed on with a tag.",
+        .completed = "Requests it handed on that have since ended.",
+        .completed_ok = "Requests it handed on that the origin answered whole.",
+        .completed_refused = "Requests it handed on that something after it refused.",
     };
     pub const gauges = .{
         .path_bytes = "Bytes of the last request's canonical path.",
@@ -93,6 +101,24 @@ pub const ScriptedPolicy = struct {
         policy.rejected += 1;
         request.metrics.add(ScriptedPolicy, .rejected, 1);
         return .{ .reject = policy.status };
+    }
+
+    /// One completion per request it handed on (#429), its times in
+    /// order, and the ways a request ends after a policy counted apart.
+    pub fn complete(policy: *ScriptedPolicy, done: *const extension.RequestCompletion) void {
+        assert(done.done_ns >= done.started_ns);
+        assert(done.started_ns >= 1);
+        // A site's routed request names its cluster; a route's always is.
+        if (done.route_index != null) assert(done.cluster_index != null);
+        policy.completions += 1;
+        assert(policy.completions <= policy.evaluated - policy.rejected);
+        policy.last = done.*;
+        done.metrics.add(ScriptedPolicy, .completed, 1);
+        switch (done.outcome) {
+            .ok => done.metrics.add(ScriptedPolicy, .completed_ok, 1),
+            .rejected => done.metrics.add(ScriptedPolicy, .completed_refused, 1),
+            else => {},
+        }
     }
 
     /// Both ways of proceeding, so the gates reach both arms.
