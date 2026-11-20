@@ -23,7 +23,6 @@ const std = @import("std");
 
 const Runtime = @import("extension.zig").Runtime;
 const constants = @import("constants.zig");
-const counters_module = @import("counters.zig");
 const Io = @import("io/io.zig");
 const shed = @import("shed.zig");
 
@@ -124,9 +123,7 @@ pub fn Admin(comptime runtime: Runtime) type {
             // The server's labeled tables are initialized first
             // (`Server.init` orders it so): their render bound is a term
             // of this buffer.
-            admin.response = try arena.alloc(u8, response_head.len +
-                counters_module.Counters.render_bytes_max +
-                server.labeled.render_bytes_max);
+            admin.response = try arena.alloc(u8, response_head.len + server.expositionBytesMax());
             assert(admin.response.len <= std.math.maxInt(u32));
             admin.server = server;
             admin.bind_address = bind_address;
@@ -263,14 +260,8 @@ pub fn Admin(comptime runtime: Runtime) type {
         /// is answering.
         fn renderResponse(admin: *Self) void {
             @memcpy(admin.response[0..response_head.len], response_head);
-            const gauges = admin.server.gauges();
-            const body = admin.server.counters.render(&gauges, admin.response[response_head.len..]);
-            const views = admin.server.labeledViews();
-            const labeled = admin.server.labeled.render(
-                &views,
-                admin.response[response_head.len + body.len ..],
-            );
-            admin.response_len = @intCast(response_head.len + body.len + labeled.len);
+            const body = admin.server.renderExposition(admin.response[response_head.len..]);
+            admin.response_len = @intCast(response_head.len + body.len);
             admin.sent = 0;
             assert(admin.response_len >= response_head.len);
             assert(admin.response_len <= admin.response.len);

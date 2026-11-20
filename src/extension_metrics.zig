@@ -57,6 +57,11 @@ pub fn Table(comptime extensions: extension.Extensions) type {
         /// Per listener, per route, one entry per selection in the
         /// route's policy list.
         routes: [][][]Metrics = &.{},
+        /// Whether any site selects each family: a family no site selects
+        /// renders nothing, not even its `# HELP`.
+        family_used: [families.len]bool = @splat(false),
+        /// `render`'s exact bound for this server's config.
+        render_bytes_max: usize = 0,
 
         /// One metered type's slots at one site.
         pub const Block = struct {
@@ -78,29 +83,22 @@ pub fn Table(comptime extensions: extension.Extensions) type {
             var total: u64 = 0;
             total += @as(u64, config.clusters.len) * @sizeOf(Metrics);
             total += @as(u64, config.listeners.len) * (@sizeOf([]Metrics) + @sizeOf([][]Metrics));
-            for (config.clusters) |*cluster| {
-                const family = pickerFamily(cluster) orelse continue;
-                total += blockBytes(family, .{ .cluster = cluster.name });
-            }
             for (config.listeners) |*listener| {
-                total += listSiteBytes(listener.request_policies, .{ .listener = &listener.bind_address });
+                total += @as(u64, listener.request_policies.len) * @sizeOf(Metrics);
                 total += @as(u64, listener.routes.len) * @sizeOf([]Metrics);
                 for (listener.routes) |*route| {
-                    const site: Site = .{ .route = .{ .listener = &listener.bind_address, .route = route } };
-                    total += listSiteBytes(route.request_policies, site);
+                    total += @as(u64, route.request_policies.len) * @sizeOf(Metrics);
                 }
             }
-            return total;
-        }
-
-        fn listSiteBytes(selections: []const extension.Selection, site: Site) u64 {
-            var total: u64 = @as(u64, selections.len) * @sizeOf(Metrics);
-            for (selections, 0..) |selection, position| {
-                const family = policyFamily(selection) orelse continue;
-                if (firstOf(selections, position, family) != position) continue;
-                total += blockBytes(family, site);
-            }
-            return total;
+            const Sizer = struct {
+                total: u64 = 0,
+                fn visit(sizer: *@This(), family: u16, site: Site) void {
+                    sizer.total += blockBytes(family, site);
+                }
+            };
+            var sizer: Sizer = .{};
+            forEachBlock(config, &sizer);
+            return total + sizer.total;
         }
 
         fn blockBytes(family: u16, site: Site) u64 {
@@ -136,6 +134,98 @@ pub fn Table(comptime extensions: extension.Extensions) type {
                 }
             }
             assert(built == table.blocks.len);
+            table.render_bytes_max = renderBytesMaxFor(config);
+        }
+
+        /// `render`'s exact bound for `config`: each selected family's
+        /// `# HELP` and `# TYPE` lines, and a row per name per block with
+        /// the widest value — every term reachable, as `Labeled`'s are.
+        pub fn renderBytesMaxFor(config: *const Config) usize {
+            if (!enabled) return 0;
+            const Bound = struct {
+                total: usize = 0,
+                used: [families.len]bool = @splat(false),
+                fn visit(bound: *@This(), family: u16, site: Site) void {
+                    bound.used[family] = true;
+                    const label_bytes: usize = @intCast(labelBytes(site));
+                    bound.total += rows_bytes[family].names + rows_bytes[family].count * (label_bytes + row_tail_bytes);
+                }
+            };
+            var bound: Bound = .{};
+            forEachBlock(config, &bound);
+            for (bound.used, header_bytes) |used, header| {
+                if (used) bound.total += header;
+            }
+            return bound.total;
+        }
+
+        /// A row past its name and labels: the space, a u64 at its widest
+        /// and the newline.
+        const row_tail_bytes = " ".len + 20 + "\n".len;
+
+        /// Per family: the bytes of every series name, and how many there
+        /// are — what each of its blocks' rows costs past the labels.
+        const RowsBytes = struct { names: usize, count: usize };
+        const rows_bytes: [families.len]RowsBytes = blk: {
+            var collected: [families.len]RowsBytes = undefined;
+            for (families, &collected) |Family, *rows| {
+                rows.* = .{ .names = 0, .count = 0 };
+                for (seriesNames(Family)) |series| {
+                    rows.names += series.len;
+                    rows.count += 1;
+                }
+            }
+            break :blk collected;
+        };
+
+        /// Per family: its `# HELP` and `# TYPE` lines.
+        const header_bytes: [families.len]usize = blk: {
+            var collected: [families.len]usize = undefined;
+            for (families, &collected) |Family, *bytes| {
+                bytes.* = familyHeaderBytes(Family);
+            }
+            break :blk collected;
+        };
+
+        /// The exposition of every selected family, after zoxy's own:
+        /// zero-alloc into `buffer`, which holds `render_bytes_max`.
+        pub fn render(table: *const Self, buffer: []u8) []const u8 {
+            if (!enabled) return buffer[0..0];
+            assert(buffer.len >= table.render_bytes_max);
+            var writer = std.Io.Writer.fixed(buffer);
+            inline for (families, 0..) |Family, family| {
+                // The bound priced every byte, so the writer cannot fill.
+                if (table.family_used[family]) table.renderFamily(&writer, Family, family) catch unreachable;
+            }
+            const text = writer.buffered();
+            assert(text.len <= table.render_bytes_max);
+            return text;
+        }
+
+        fn renderFamily(
+            table: *const Self,
+            writer: *std.Io.Writer,
+            comptime Family: type,
+            comptime family: u16,
+        ) std.Io.Writer.Error!void {
+            const counters = comptime extension.declaredCounters(Family);
+            inline for (@typeInfo(@TypeOf(counters)).@"struct".field_names, 0..) |name, index| {
+                const series = comptime seriesName(Family, name);
+                try writer.writeAll(headerLines(series, @field(counters, name), "counter"));
+                for (table.blocks) |block| {
+                    if (block.family != family) continue;
+                    try writer.print(series ++ "{s} {d}\n", .{ block.label, block.counters[index] });
+                }
+            }
+            const gauges = comptime extension.declaredGauges(Family);
+            inline for (@typeInfo(@TypeOf(gauges)).@"struct".field_names, 0..) |name, index| {
+                const series = comptime seriesName(Family, name);
+                try writer.writeAll(headerLines(series, @field(gauges, name), "gauge"));
+                for (table.blocks) |block| {
+                    if (block.family != family) continue;
+                    try writer.print(series ++ "{s} {d}\n", .{ block.label, block.gauges[index] });
+                }
+            }
         }
 
         /// One list's slots, position by position: a later selection of
@@ -166,6 +256,7 @@ pub fn Table(comptime extensions: extension.Extensions) type {
             assert(built.* < table.blocks.len);
             const shape = shapes[family];
             const block = &table.blocks[built.*];
+            table.family_used[family] = true;
             block.* = .{
                 .family = family,
                 .label = try renderLabel(arena, site),
@@ -179,24 +270,41 @@ pub fn Table(comptime extensions: extension.Extensions) type {
         }
 
         fn blockCount(config: *const Config) u32 {
-            var count: u32 = 0;
-            for (config.clusters) |*cluster| {
-                if (pickerFamily(cluster) != null) count += 1;
-            }
-            for (config.listeners) |*listener| {
-                count += listBlockCount(listener.request_policies);
-                for (listener.routes) |*route| count += listBlockCount(route.request_policies);
-            }
-            return count;
+            const Counter = struct {
+                count: u32 = 0,
+                fn visit(counter: *@This(), family: u16, site: Site) void {
+                    _ = site;
+                    assert(family < families.len);
+                    counter.count += 1;
+                }
+            };
+            var counter: Counter = .{};
+            forEachBlock(config, &counter);
+            return counter.count;
         }
 
-        fn listBlockCount(selections: []const extension.Selection) u32 {
-            var count: u32 = 0;
+        /// Every block `init` builds, in its order, as (family, site) —
+        /// the one walk the banner's terms and the block count share.
+        /// `visitor.visit(family, site)` is called once per block.
+        fn forEachBlock(config: *const Config, visitor: anytype) void {
+            for (config.clusters) |*cluster| {
+                const family = pickerFamily(cluster) orelse continue;
+                visitor.visit(family, .{ .cluster = cluster.name });
+            }
+            for (config.listeners) |*listener| {
+                visitList(listener.request_policies, .{ .listener = &listener.bind_address }, visitor);
+                for (listener.routes) |*route| {
+                    const site: Site = .{ .route = .{ .listener = &listener.bind_address, .route = route } };
+                    visitList(route.request_policies, site, visitor);
+                }
+            }
+        }
+
+        fn visitList(selections: []const extension.Selection, site: Site, visitor: anytype) void {
             for (selections, 0..) |selection, position| {
                 const family = policyFamily(selection) orelse continue;
-                if (firstOf(selections, position, family) == position) count += 1;
+                if (firstOf(selections, position, family) == position) visitor.visit(family, site);
             }
-            return count;
         }
 
         /// The first position in `selections`, up to `position`, whose
@@ -271,6 +379,46 @@ pub fn Table(comptime extensions: extension.Extensions) type {
             unreachable;
         }
     };
+}
+
+/// `zoxy_ext_<prefix>_<name>`: one of `Family`'s series.
+fn seriesName(comptime Family: type, comptime name: []const u8) []const u8 {
+    return extension.metric_prefix ++ Family.metrics_prefix ++ "_" ++ name;
+}
+
+/// Every one of `Family`'s series names, counters first.
+fn seriesNames(comptime Family: type) []const []const u8 {
+    comptime {
+        var names: []const []const u8 = &.{};
+        for (@typeInfo(@TypeOf(extension.declaredCounters(Family))).@"struct".field_names) |name| {
+            names = names ++ [_][]const u8{seriesName(Family, name)};
+        }
+        for (@typeInfo(@TypeOf(extension.declaredGauges(Family))).@"struct".field_names) |name| {
+            names = names ++ [_][]const u8{seriesName(Family, name)};
+        }
+        return names;
+    }
+}
+
+/// One series' `# HELP` and `# TYPE` lines; the help is one line with
+/// nothing to escape (`extension.assertMetrics`).
+fn headerLines(comptime series: []const u8, comptime help: []const u8, comptime kind: []const u8) []const u8 {
+    return "# HELP " ++ series ++ " " ++ help ++ "\n# TYPE " ++ series ++ " " ++ kind ++ "\n";
+}
+
+fn familyHeaderBytes(comptime Family: type) usize {
+    comptime {
+        var total: usize = 0;
+        const counters = extension.declaredCounters(Family);
+        for (@typeInfo(@TypeOf(counters)).@"struct".field_names) |name| {
+            total += headerLines(seriesName(Family, name), @field(counters, name), "counter").len;
+        }
+        const gauges = extension.declaredGauges(Family);
+        for (@typeInfo(@TypeOf(gauges)).@"struct".field_names) |name| {
+            total += headerLines(seriesName(Family, name), @field(gauges, name), "gauge").len;
+        }
+        return total;
+    }
 }
 
 /// A site's labels as the exposition writes them, braces included:
@@ -376,9 +524,19 @@ const TestPicker = struct {
     }
 };
 
+/// Listed and metered, but selected nowhere: its family renders nothing.
+const TestUnselected = struct {
+    pub const metrics_prefix = "unselected";
+    pub const counters = .{ .never = "Never rendered." };
+
+    pub fn evaluate(_: *TestUnselected, _: *const extension.Request) extension.Verdict {
+        return .proceed;
+    }
+};
+
 const test_extensions: extension.Extensions = .{
     .pickers = &.{TestPicker},
-    .request_policies = &.{ TestMetered, TestPlain },
+    .request_policies = &.{ TestMetered, TestPlain, TestUnselected },
 };
 
 /// Two clusters, one with a metered picker; a listener whose list names
@@ -516,4 +674,49 @@ test "extension metrics: a unix listener and an escaped cluster name label as th
     try writeLabel(&aw.writer, .{ .cluster = "a\"b" });
     try testing.expectEqualStrings("{cluster=\"a\\\"b\"}", aw.written());
     try testing.expectEqual(@as(u64, aw.written().len), labelBytes(.{ .cluster = "a\"b" }));
+}
+
+test "extension metrics: each selected family renders per site, and the bound is exact (#435)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var first: TestMetered = .{};
+    var second: TestMetered = .{};
+    var plain: TestPlain = .{};
+    var picker: TestPicker = .{};
+    const config = try testConfig(arena, &first, &second, &plain, &picker);
+    const T = Table(test_extensions);
+    var table: T = undefined;
+    try table.init(arena, &config);
+    try testing.expectEqual(T.renderBytesMaxFor(&config), table.render_bytes_max);
+
+    table.listenerPolicies(0)[0].add(TestMetered, .seen, 3);
+    table.listenerPolicies(0)[2].set(TestMetered, .level, 7);
+    const buffer = try arena.alloc(u8, table.render_bytes_max);
+    const route = "{listener=\"127.0.0.1:8080\",route=\"api.example.com/v1 x-canary=1\"}";
+    try testing.expectEqualStrings(
+        "# HELP zoxy_ext_picker_picks Picks.\n" ++
+            "# TYPE zoxy_ext_picker_picks counter\n" ++
+            "zoxy_ext_picker_picks{cluster=\"api\"} 0\n" ++
+            "# HELP zoxy_ext_metered_seen Requests seen.\n" ++
+            "# TYPE zoxy_ext_metered_seen counter\n" ++
+            "zoxy_ext_metered_seen{listener=\"127.0.0.1:8080\"} 3\n" ++
+            "zoxy_ext_metered_seen" ++ route ++ " 0\n" ++
+            "# HELP zoxy_ext_metered_refused Requests refused.\n" ++
+            "# TYPE zoxy_ext_metered_refused counter\n" ++
+            "zoxy_ext_metered_refused{listener=\"127.0.0.1:8080\"} 0\n" ++
+            "zoxy_ext_metered_refused" ++ route ++ " 0\n" ++
+            "# HELP zoxy_ext_metered_level A level.\n" ++
+            "# TYPE zoxy_ext_metered_level gauge\n" ++
+            "zoxy_ext_metered_level{listener=\"127.0.0.1:8080\"} 7\n" ++
+            "zoxy_ext_metered_level" ++ route ++ " 0\n",
+        table.render(buffer),
+    );
+
+    // Every cell at its widest fills the bound to the last byte.
+    for (table.blocks) |block| {
+        @memset(block.counters, std.math.maxInt(u64));
+        @memset(block.gauges, std.math.maxInt(u64));
+    }
+    try testing.expectEqual(table.render_bytes_max, table.render(buffer).len);
 }

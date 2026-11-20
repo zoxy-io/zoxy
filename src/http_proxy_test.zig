@@ -10285,5 +10285,20 @@ test "l7: a metered policy counts apart at each site it runs at, and a picker at
     try std.testing.expectEqual(@as(u64, 1), at_cluster.counter(ScriptedPicker, .picks));
     try std.testing.expectEqual(@as(u64, 0), at_cluster.counter(ScriptedPicker, .past_end));
     try std.testing.expectEqual(@as(u64, picker.offered_count), at_cluster.gauge(ScriptedPicker, .offered));
+
+    // The scrape's exposition carries each site's series after zoxy's own.
+    const buffer = try std.testing.allocator.alloc(u8, bed.server.expositionBytesMax());
+    defer std.testing.allocator.free(buffer);
+    const text = bed.server.renderExposition(buffer);
+    const rows = [_][]const u8{
+        "# TYPE zoxy_ext_scripted_policy_evaluated counter\n",
+        "\nzoxy_ext_scripted_policy_evaluated{listener=\"127.0.0.1:8080\"} 2\n",
+        "\nzoxy_ext_scripted_policy_evaluated{listener=\"127.0.0.1:8080\",route=\"/api\"} 1\n",
+        "\nzoxy_ext_scripted_policy_rejected{listener=\"127.0.0.1:8080\"} 1\n",
+        "# TYPE zoxy_ext_scripted_policy_path_bytes gauge\n",
+        "\nzoxy_ext_scripted_picker_picks{cluster=\"origin\"} 1\n",
+    };
+    for (rows) |row| try std.testing.expect(std.mem.indexOf(u8, text, row) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_accepted ").? < std.mem.indexOf(u8, text, "zoxy_ext_").?);
     try bed.expectDrained();
 }
