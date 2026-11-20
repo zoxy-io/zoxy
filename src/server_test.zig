@@ -2572,3 +2572,68 @@ test "l4: a cluster's extension picker chooses the dial, and a slot past its set
         try bed.expectDrained();
     }
 }
+
+test "l4: a relayed connection's pick completes closed with its bytes, a refused one's as connect_failed (#423)" {
+    {
+        var picker: ScriptedPicker = .{ .choice = .first };
+        var bed: TestBed = undefined;
+        try bed.setUp(std.testing.allocator, .{ .sim = .{ .seed = 4234 }, .picker = &picker });
+        defer bed.tearDown();
+
+        bed.startClients(1, true);
+        try bed.sim_io.run();
+
+        try std.testing.expectEqual(@as(u8, 1), bed.scenario.outcomeCount(.eof));
+        try std.testing.expectEqual(@as(u32, 1), picker.completions);
+        const done = picker.last.?;
+        try std.testing.expectEqual(extension.Completion.Outcome.closed, done.outcome);
+        try std.testing.expect(done.connected_ns != null);
+        try std.testing.expect(done.head_ns == null);
+        try std.testing.expectEqual(@as(u64, 0), done.tag);
+        // The echo: what the client sent came back.
+        try std.testing.expect(done.bytes_from_client >= 1);
+        try std.testing.expectEqual(done.bytes_from_client, done.bytes_to_client);
+        try bed.expectDrained();
+    }
+    {
+        var picker: ScriptedPicker = .{ .choice = .first };
+        var bed: TestBed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .sim = .{ .seed = 4235 },
+            .origin_listens = false,
+            .picker = &picker,
+        });
+        defer bed.tearDown();
+
+        bed.startClients(1, false);
+        try bed.sim_io.run();
+
+        try std.testing.expectEqual(@as(u32, 1), picker.completions);
+        const done = picker.last.?;
+        try std.testing.expectEqual(extension.Completion.Outcome.connect_failed, done.outcome);
+        try std.testing.expect(done.connected_ns == null);
+        try bed.expectDrained();
+    }
+    {
+        // The picker's last slot is an endpoint that never answers a dial:
+        // the connect deadline ends the pick before the teardown does.
+        var picker: ScriptedPicker = .{ .choice = .last };
+        var bed: TestBed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .sim = .{ .seed = 4236 },
+            .blackholed_endpoints = 1,
+            .picker = &picker,
+        });
+        defer bed.tearDown();
+
+        bed.startClients(1, false);
+        try bed.sim_io.run();
+
+        try std.testing.expectEqual(@as(u32, 1), picker.completions);
+        const done = picker.last.?;
+        try std.testing.expectEqual(extension.Completion.Outcome.timed_out, done.outcome);
+        try std.testing.expectEqual(@as(u16, 1), done.endpoint_index);
+        try std.testing.expect(done.connected_ns == null);
+        try bed.expectDrained();
+    }
+}
