@@ -32,6 +32,9 @@ const rsa_key_pem = @embedFile("testdata/rsa2048-key.pem");
 const rsa3065_ca_pem = @embedFile("testdata/rsa3065-ca.pem");
 const rsa3065_issued_cert_pem = @embedFile("testdata/rsa3065-issued-cert.pem");
 const rsa3065_key_pem = @embedFile("testdata/rsa3065-key.pem");
+const names_ca_pem = @embedFile("testdata/names-ca.pem");
+const names_client_cert_pem = @embedFile("testdata/names-client-cert.pem");
+const names_client_key_pem = @embedFile("testdata/names-client-key.pem");
 
 /// Room for the largest record on the wire — a max-size plaintext record
 /// plus its header and AEAD tag — with slack for a second alongside it.
@@ -807,3 +810,23 @@ const ShownLeaf = struct {
         return self.bytes[0..self.len];
     }
 };
+
+test "engine: a verified client's names are kept beside its fingerprint (#432)" {
+    var bed: Bed = undefined;
+    const presented: PemPair = .{ .cert = names_client_cert_pem, .key = names_client_key_pem };
+    try bed.initMutualPresenting(true, presented, names_ca_pem);
+    defer bed.deinit();
+    try bed.handshake();
+    try std.testing.expect(bed.engine.clientFingerprint() != null);
+    const names = bed.engine.clientNames().?;
+    try std.testing.expectEqual(@as(u8, 3), names.count);
+    try std.testing.expectEqualStrings("spiffe://zoxy.test/ns/edge/sa/reports", names.value(0));
+}
+
+test "engine: a session with no verified client has no names (#432)" {
+    var bed: Bed = undefined;
+    try bed.initMutual(false, false, names_ca_pem);
+    defer bed.deinit();
+    try bed.handshake();
+    try std.testing.expect(bed.engine.clientNames() == null);
+}

@@ -479,6 +479,21 @@ pub const tls_certificates_max: u32 = 256;
 /// silently selecting on a prefix of what the certificate covers.
 pub const tls_certificate_names_max: u32 = 128;
 
+/// The verified client certificate's names a connection keeps for its
+/// policies (#432): its subjectAltName URIs and DNS names, in order, up to
+/// this many and `client_cert_names_bytes_max` bytes together. Kept inline
+/// in every TLS engine, so the bound is its price; a leaf naming more is
+/// kept to what fits, and the view says it was truncated.
+pub const client_cert_names_max: u32 = 8;
+pub const client_cert_names_bytes_max: u32 = 512;
+
+comptime {
+    assert(client_cert_names_max >= 1);
+    // A name's offset and length are `u16`s into the buffer.
+    assert(client_cert_names_bytes_max <= std.math.maxInt(u16));
+    assert(client_cert_names_bytes_max >= client_cert_names_max);
+}
+
 /// The heap baseline covers libcrypto's one-time tables and the working
 /// set that sequential handshakes recycle through the class free lists.
 /// See the plateau checks in `tls/heap_proof_test.zig`.

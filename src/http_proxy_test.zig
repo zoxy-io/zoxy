@@ -10834,3 +10834,102 @@ test "h2: a response policy edits each stream's head (#424)" {
     }
     try bed.expectDrained();
 }
+
+/// One request from a client presenting `cert_pem`, to a TLS listener that
+/// requires a certificate from the names CA and runs `policy` (#432).
+fn exchangeAsClient(
+    policy: *ScriptedPolicy,
+    seed: u64,
+    cert_pem: []const u8,
+    key_pem: []const u8,
+) !struct { status: u16, origin_heard: bool } {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const anchors = try trust.parseAnchors(arena, @embedFile("tls/testdata/names-ca.pem"));
+    var client_credentials = try Credentials.load(arena, cert_pem, key_pem, .{});
+    defer client_credentials.deinit();
+    const selected = [_]extension.Selection{extension.select(runtime.extensions.request_policies, policy)};
+
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = seed,
+        .tls = true,
+        .tls_client_ca = .{ .anchors = anchors, .verify = .required },
+        .request_policies = &selected,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    var client: TlsClient = undefined;
+    try client.start(&bed.sim_io, Http1Bed.bindAddress(), .{
+        .host_name = fixture_host_name,
+        .app_data = "GET /reports HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+        .exchange_end = .http_response,
+        .client_credentials = &client_credentials.inner,
+    });
+    var wind_down: TlsWindDown = .{ .bed = &bed };
+    wind_down.attach(&client);
+    try bed.sim_io.run();
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("tls_handshakes_completed"));
+    try std.testing.expectEqual(@as(u32, 1), client.responsesReceived());
+    const answer = client.app_received[0..client.app_received_len];
+    try std.testing.expect(std.mem.startsWith(u8, answer, "HTTP/1.1 "));
+    const status = try std.fmt.parseInt(u16, answer["HTTP/1.1 ".len..][0..3], 10);
+    const heard = bed.origin.conns[0].request_len != 0;
+    try bed.expectDrained();
+    return .{ .status = status, .origin_heard = heard };
+}
+
+test "tls: a policy admits a client by the URI its certificate names (#432)" {
+    var policy: ScriptedPolicy = .{ .require_client_uri = "spiffe://zoxy.test/ns/edge/sa/reports" };
+    const outcome = try exchangeAsClient(
+        &policy,
+        4321,
+        @embedFile("tls/testdata/names-client-cert.pem"),
+        @embedFile("tls/testdata/names-client-key.pem"),
+    );
+    try std.testing.expectEqual(@as(u16, 200), outcome.status);
+    try std.testing.expect(outcome.origin_heard);
+    try std.testing.expectEqual(@as(u32, 1), policy.evaluated);
+    // Two URIs and a DNS name; the IP name is not offered.
+    try std.testing.expectEqual(@as(u8, 3), policy.seen_client_names);
+    try std.testing.expect(!policy.seen_client_names_truncated);
+}
+
+test "tls: a policy refuses a verified client its certificate does not name, and is told when names were cut (#432)" {
+    // The many-names leaf verifies against the same CA, names ten hosts
+    // and no URI: the connection keeps eight, says so, and the policy
+    // finds no URI to admit it by.
+    var policy: ScriptedPolicy = .{ .require_client_uri = "spiffe://zoxy.test/ns/edge/sa/reports" };
+    const outcome = try exchangeAsClient(
+        &policy,
+        4322,
+        @embedFile("tls/testdata/names-many-cert.pem"),
+        @embedFile("tls/testdata/names-many-key.pem"),
+    );
+    try std.testing.expectEqual(@as(u16, 403), outcome.status);
+    try std.testing.expect(!outcome.origin_heard);
+    try std.testing.expectEqual(@as(u32, 1), policy.rejected);
+    try std.testing.expectEqual(@as(u8, constants.client_cert_names_max), policy.seen_client_names);
+    try std.testing.expect(policy.seen_client_names_truncated);
+}
+
+test "l7: a plaintext request carries no client names (#432)" {
+    var policy: ScriptedPolicy = .{};
+    const selected = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &policy)};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 4323,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .request_policies = &selected,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqual(@as(u32, 1), policy.evaluated);
+    try std.testing.expectEqual(@as(u8, 0), policy.seen_client_names);
+    try std.testing.expect(!policy.seen_client_names_truncated);
+    try bed.expectDrained();
+}

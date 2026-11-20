@@ -138,6 +138,10 @@ refused: bool,
 /// tells a client-certificate failure from every other one.
 client_anchors: []const []const u8,
 client_fingerprint: ?[trust.fingerprint_bytes]u8,
+/// The verified client leaf's URI and DNS names (#432), read beside its
+/// fingerprint while the leaf's bytes are live; meaningful only once the
+/// fingerprint is set.
+client_names: trust.ClientNames,
 client_cert_refused: bool,
 /// #297: the listener's certificates when it holds more than one (the
 /// default first), and the handshake's inputs kept so it can be started
@@ -376,6 +380,7 @@ pub fn init(engine: *Engine, config: *const Config) !void {
     engine.now_unix = config.now_unix;
     engine.client_anchors = if (config.client_auth) |auth| auth.anchors else &.{};
     engine.client_fingerprint = null;
+    engine.client_names = .{};
     engine.client_cert_refused = false;
     assert(config.client_auth == null or engine.client_anchors.len >= 1);
     assert(config.alpn_protocols.len <= alpn.protocols_max);
@@ -786,6 +791,13 @@ pub fn refuseMissingCertificate(engine: *Engine) void {
     engine.refused = true;
 }
 
+/// The verified client's names (#432), or null with no verified client.
+pub fn clientNames(engine: *const Engine) ?*const trust.ClientNames {
+    if (engine.client_fingerprint == null) return null;
+    assert(engine.client_names.count <= engine.client_names.entries.len);
+    return &engine.client_names;
+}
+
 /// The verified client's leaf fingerprint (#304), or null when the
 /// listener asked for none or the client was let in without one.
 pub fn clientFingerprint(engine: *const Engine) ?*const [trust.fingerprint_bytes]u8 {
@@ -842,6 +854,7 @@ fn verifyClientChain(context: *anyopaque, chain: zssl.certificate_list.Certifica
         return refuseClientChain(engine);
     }
     engine.client_fingerprint = trust.leafFingerprint(entries[0]);
+    trust.clientNames(entries[0], &engine.client_names);
     return true;
 }
 
