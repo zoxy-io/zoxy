@@ -467,7 +467,13 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
     harness.scenario_prng = std.Random.DefaultPrng.init(seed ^ 0x5a5a5a5a5a5a5a5a);
     const random = harness.scenario_prng.random();
     harness.drawPickers(seed);
-    harness.policy_listener = .{ .reject_prefix = l7.canon.policy_prefix, .tag = policy_tag };
+    harness.policy_listener = .{
+        .reject_prefix = l7.canon.policy_prefix,
+        .tag = policy_tag,
+        // #430: the guarded route is chosen by name, and tagged as well.
+        .route_prefix = l7.canon.guarded_prefix,
+        .route_name = l7.canon.guarded_route_name,
+    };
     harness.policy_selections = .{
         zoxy.extension.select(runtime.extensions.request_policies, &harness.policy_listener),
     };
@@ -741,6 +747,7 @@ fn httpRoutes(harness: *const Harness) [2]zoxy.Options.Listener.Route {
             .prefix = l7.canon.guarded_prefix,
             .cluster = http_cluster_name,
             .request_policies = &harness.route_policy_selections,
+            .name = l7.canon.guarded_route_name,
         },
         .{ .prefix = "/", .cluster = http_cluster_name },
     };

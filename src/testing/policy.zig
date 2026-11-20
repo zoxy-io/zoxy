@@ -22,6 +22,19 @@ pub const ScriptedPolicy = struct {
     answer: extension.AnswerName(ScriptedPolicy) = .denied,
     /// Requests it answered with one of its own pages.
     answered: u32 = 0,
+    /// The canonical-path prefix under which this instance sends the
+    /// request to a route (#430); empty routes nothing.
+    route_prefix: []const u8 = "",
+    /// The name of the route it sends to, resolved on each listener at
+    /// `bind`.
+    route_name: []const u8 = "",
+    /// An index to route to as given, unresolved and unchecked: how a
+    /// gate holds zoxy to falling back from a route the listener lacks.
+    route_raw: ?u16 = null,
+    /// Requests it chose a route for.
+    rerouted: u32 = 0,
+    /// `route_name`'s index on each listener the instance is bound to.
+    route_targets: [route_listeners_max]?u16 = @splat(null),
     /// The tag it sets on every request it hands on (#433), through
     /// `proceed_with`; null hands them on with a bare `proceed`.
     tag: ?u64 = null,
@@ -53,6 +66,8 @@ pub const ScriptedPolicy = struct {
     path_len: u8 = 0,
 
     pub const path_bytes_max = 64;
+    /// The listeners one instance resolves its route on.
+    pub const route_listeners_max = 4;
 
     /// Its own series (#435), so the gates reach every metered arm: a
     /// counter for each way a request leaves it, and a gauge.
@@ -65,6 +80,7 @@ pub const ScriptedPolicy = struct {
         .completed_ok = "Requests it handed on that the origin answered whole.",
         .completed_refused = "Requests it handed on that something after it refused.",
         .answered = "Requests it answered with one of its own pages.",
+        .rerouted = "Requests it chose a route for.",
     };
     pub const gauges = .{
         .path_bytes = "Bytes of the last request's canonical path.",
@@ -110,6 +126,11 @@ pub const ScriptedPolicy = struct {
         // across servers must not hold the last one's reading against it:
         // the clock runs forward within one server's life, not across two.
         policy.seen_now_ns = 0;
+        // A route is named once, here, per listener: never on a request.
+        if (site.route_index == null and policy.route_name.len != 0) {
+            assert(site.listener_index < route_listeners_max);
+            policy.route_targets[site.listener_index] = site.routeNamed(policy.route_name);
+        }
     }
 
     pub fn evaluate(policy: *ScriptedPolicy, request: *const extension.Request) extension.Verdict {
@@ -171,11 +192,30 @@ pub const ScriptedPolicy = struct {
         }
     }
 
-    /// Both ways of proceeding, so the gates reach both arms.
-    fn handOn(policy: *const ScriptedPolicy, request: *const extension.Request) extension.Verdict {
-        const tag = policy.tag orelse return .proceed;
-        request.metrics.add(ScriptedPolicy, .tagged, 1);
-        return .{ .proceed_with = .{ .tag = tag } };
+    /// Both ways of proceeding, so the gates reach both arms: a bare
+    /// `proceed`, or `proceed_with` a tag, a route, or both.
+    fn handOn(policy: *ScriptedPolicy, request: *const extension.Request) extension.Verdict {
+        const route = policy.routeFor(request);
+        if (route != null) assert(policy.route_raw != null or policy.route_name.len != 0);
+        if (policy.tag == null) {
+            if (route == null) return .proceed;
+        }
+        if (policy.tag != null) request.metrics.add(ScriptedPolicy, .tagged, 1);
+        if (route != null) {
+            policy.rerouted += 1;
+            request.metrics.add(ScriptedPolicy, .rerouted, 1);
+        }
+        return .{ .proceed_with = .{ .tag = policy.tag, .route = route } };
+    }
+
+    /// The route it sends `request` to, if any: `route_raw` as given, or
+    /// the route `route_name` names on the request's listener.
+    fn routeFor(policy: *const ScriptedPolicy, request: *const extension.Request) ?u16 {
+        if (!startsWithNonEmpty(request.path, policy.route_prefix)) return null;
+        if (policy.route_raw) |raw| return raw;
+        if (policy.route_name.len == 0) return null;
+        assert(request.listener_index < route_listeners_max);
+        return policy.route_targets[request.listener_index];
     }
 
     /// The last request's path, as recorded.

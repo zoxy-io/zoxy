@@ -396,6 +396,14 @@ const uncovered = [_]Uncovered{
             "host-miss 404s",
     },
     .{
+        .name = "l7_policy_route_fallback",
+        .why = .unreached,
+        .reason = "the harness's listener policy routes only by a name " ++
+            "the listener's table carries, resolved at bind, so every " ++
+            "choice names a route the table has; src/http_proxy_test.zig chooses one the " ++
+            "listener lacks, and one at the route phase",
+    },
+    .{
         .name = "l7_shed_upstream_slots",
         .why = .unreached,
         .reason = "the only seeds that starve a pool set relay_buffers and " ++

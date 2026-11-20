@@ -806,10 +806,38 @@ pub fn Proxy(comptime runtime: Runtime) type {
             return .{ .match = canonical.path, .forward = canonical, .origin_form = true };
         }
 
+        /// The route a request takes in `routes` (#430): the one a listener
+        /// policy chose, when the listener has a route there — taken as
+        /// chosen, its predicates unasked — and the table's match otherwise.
+        /// A choice that names no route is counted and left standing for
+        /// the table.
+        fn routeOf(
+            server: *ServerType,
+            routes: []const router.Route,
+            request: *const parser.RequestHead,
+            host: ?[]const u8,
+            path: []const u8,
+            chosen: ?u16,
+        ) ?u16 {
+            assert(routes.len >= 1);
+            assert(path.len >= 1 and path[0] == '/');
+            if (chosen) |index| {
+                if (index < routes.len) {
+                    server.counters.increment("l7_policy_routed");
+                    return index;
+                }
+                server.counters.increment("l7_policy_route_fallback");
+            }
+            const matched = router.matchIndex(routes, host, path, request.headers) orelse return null;
+            assert(matched < routes.len);
+            return matched;
+        }
+
         /// One site's policies over `view` (#417), the refusal answered
         /// here: true when it was, and the caller stops. The tag they
         /// leave outlives the view, refused or not (#433), for every later
-        /// view of the request.
+        /// view of the request; the route a listener's policies choose
+        /// (#430) is left in `chosen_route` for routing to take.
         fn refusedByPolicies(
             server: *ServerType,
             stream: *StreamType,
@@ -818,12 +846,24 @@ pub fn Proxy(comptime runtime: Runtime) type {
             view: *extension.Request,
             /// The route these are, or null for the listener's own.
             route_index: ?u16,
+            /// Where a listener's policies leave the route they chose
+            /// (#430); null at the route phase, which chooses none.
+            chosen_route: ?*?u16,
         ) bool {
+            assert((route_index == null) == (chosen_route != null));
             assert(selections.len >= 1);
             assert(view.tag == stream.log.tag);
             const run = server.evaluatePolicies(selections, metrics, view);
             stream.log.tag = view.tag;
             server.notePoliciesProceeded(stream, route_index, run.proceeded);
+            if (run.route) |index| {
+                if (chosen_route) |out| {
+                    out.* = index;
+                } else {
+                    // The route phase: its route is already chosen.
+                    server.counters.increment("l7_policy_route_fallback");
+                }
+            }
             const stop = run.stop orelse return false;
             switch (stop) {
                 .reject => |status| respondPolicy(server, stream, status),
@@ -1188,10 +1228,11 @@ pub fn Proxy(comptime runtime: Runtime) type {
             // #417: the listener's policies run first, on the same
             // canonical view the filters read, and a reject is answered
             // the way a filter's is — before any resource is taken.
+            var chosen_route: ?u16 = null;
             if (conn.request_policies.len >= 1) {
                 var view = requestView(stream, request, keys.host, &keys.views, render_scratch, null);
                 const metrics = server.extension_metrics.listenerPolicies(conn.listener_index);
-                if (refusedByPolicies(server, stream, conn.request_policies, metrics, &view, null)) return;
+                if (refusedByPolicies(server, stream, conn.request_policies, metrics, &view, null, &chosen_route)) return;
             }
             // §7 filters run before routing: a terminal verdict — reject
             // or redirect (#176) — stops the request whether or not it
@@ -1211,7 +1252,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
                     .respond => |page| return respondWithPage(server, stream, page),
                 }
             }
-            const route_index = router.matchIndex(conn.routes, keys.host, keys.views.match, request.headers) orelse {
+            const route_index = routeOf(server, conn.routes, request, keys.host, keys.views.match, chosen_route) orelse {
                 return respond(server, stream, 404, "l7_no_route");
             };
             const routed = &conn.routes[route_index];
@@ -1222,7 +1263,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             if (routed.request_policies.len >= 1) {
                 var view = requestView(stream, request, keys.host, &keys.views, render_scratch, routed.cluster_index);
                 const metrics = server.extension_metrics.routePolicies(conn.listener_index, route_index);
-                if (refusedByPolicies(server, stream, routed.request_policies, metrics, &view, route_index)) return;
+                if (refusedByPolicies(server, stream, routed.request_policies, metrics, &view, route_index, null)) return;
             }
 
             stream.relay_buffer = server.acquireRelayBuffer() orelse {

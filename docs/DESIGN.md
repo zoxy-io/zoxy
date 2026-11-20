@@ -1665,7 +1665,8 @@ lists do not reach is refused at step zero (`ExtensionUnserved`).
   - per route, run once the route is chosen and before any resource is
     taken for it;
   - `evaluate(*P, *const Request) Verdict` returns `proceed`;
-    `proceed_with`, which proceeds and may set the request's tag;
+    `proceed_with`, which proceeds and may set the request's tag and,
+    at the listener phase, its route;
     `reject` with a status from the static reject set: 400, 403, 404 or
     429; or `respond`, one of the type's own answers. The first reject
     or answer wins;
@@ -1691,6 +1692,16 @@ lists do not reach is refused at step zero (`ExtensionUnserved`).
     and the loop's `now_ns` (#429), the clock a picker reads, for a
     policy that times a window or refills a bucket. At the route phase
     it also holds the chosen cluster;
+  - a listener policy may choose the route (#430): an index into the
+    listener's table, resolved at `bind` by name. The listener's filters
+    still run first; the chosen route then stands in for the table's
+    match, its own policies and all, and counts `l7_policy_routed`. Its
+    host, header and prefix are not asked of the request, so a policy
+    that routes past a host-scoped route answers for that itself. The
+    later choice wins. An index the listener has no route at, or a
+    choice made at the route phase, leaves the table's match standing
+    and counts `l7_policy_route_fallback`, as an out-of-set pick falls
+    back to p2c;
   - the tag (#433) is one `u64` per request, zero until a policy sets
     it. The later write wins, and a tag set before a later reject
     stays. Every later view of the request carries it: the next

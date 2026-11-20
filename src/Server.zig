@@ -4685,6 +4685,9 @@ pub fn Server(comptime runtime: Runtime) type {
         pub const PolicyRun = struct {
             stop: ?Stop,
             proceeded: u16,
+            /// The route the last policy to choose one chose (#430), as
+            /// it was given: the caller judges it against its table.
+            route: ?u16,
 
             /// What stopped the request: a status from the static reject
             /// set, or one of the stopping policy type's own answers (#431).
@@ -4720,14 +4723,20 @@ pub fn Server(comptime runtime: Runtime) type {
             // Each policy's slots are its own: none outlives its call, so
             // a later view of the request — a picker's — carries none.
             defer request.metrics = .{};
+            var route: ?u16 = null;
             for (selections, 0..) |selection, position| {
                 request.metrics = if (metrics.len == 0) .{} else metrics[position];
                 switch (callPolicy(selection, request)) {
                     .proceed => {},
                     .proceed_with => |proceed| {
                         if (proceed.tag) |tag| request.tag = tag;
+                        if (proceed.route) |index| route = index;
                     },
-                    .reject => |status| return .{ .stop = .{ .reject = status }, .proceeded = @intCast(position) },
+                    .reject => |status| return .{
+                        .stop = .{ .reject = status },
+                        .proceeded = @intCast(position),
+                        .route = route,
+                    },
                     .respond => |answer_index| {
                         // `extension.respond` names a declared answer; a
                         // verdict built by hand is held to the same.
@@ -4736,11 +4745,11 @@ pub fn Server(comptime runtime: Runtime) type {
                             .policy_index = selection.index,
                             .answer_index = answer_index,
                         };
-                        return .{ .stop = .{ .respond = answered }, .proceeded = @intCast(position) };
+                        return .{ .stop = .{ .respond = answered }, .proceeded = @intCast(position), .route = route };
                     },
                 }
             }
-            return .{ .stop = null, .proceeded = @intCast(selections.len) };
+            return .{ .stop = null, .proceeded = @intCast(selections.len), .route = route };
         }
 
         /// The policies of one phase that handed the request on (#429):

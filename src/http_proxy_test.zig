@@ -10637,3 +10637,29 @@ test "h2: a policy's answer is a stream's, mapped to fields (#431)" {
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_policy_rejected"));
     try bed.expectDrained();
 }
+
+test "l7: a route a listener lacks, or one chosen at the route phase, falls back to the table and is counted (#430)" {
+    // The bed's one route is index 0: 99 names none.
+    var outer: ScriptedPolicy = .{ .route_prefix = "/", .route_raw = 99 };
+    var inner: ScriptedPolicy = .{ .route_prefix = "/", .route_raw = 0 };
+    const on_listener = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &outer)};
+    const on_route = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &inner)};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 4300,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .request_policies = &on_listener,
+        .route_request_policies = &on_route,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /x HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    // Served by the table's own match, the two choices counted apart.
+    try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 200 "));
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("l7_policy_route_fallback"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_policy_routed"));
+    try std.testing.expectEqual(@as(u32, 1), outer.rerouted);
+    try std.testing.expectEqual(@as(u32, 1), inner.rerouted);
+    try bed.expectDrained();
+}
