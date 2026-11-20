@@ -33,6 +33,7 @@ const filter = @import("http/filter.zig");
 const proxy_protocol = @import("net/proxy_protocol.zig");
 const client_hello = @import("net/client_hello.zig");
 const sni_router = @import("net/sni_router.zig");
+const endpoint_sets = @import("endpoint_sets.zig");
 const relay = @import("net/relay.zig");
 const shed = @import("shed.zig");
 const Credentials = @import("tls/Credentials.zig");
@@ -4728,9 +4729,14 @@ pub fn Server(comptime runtime: Runtime) type {
         /// it needs from the startup arena, and may refuse; a refusal stops
         /// the start with the instance's own error, which is why the set is
         /// `anyerror` — it is the extension author's, not this proxy's.
-        pub fn bindExtensions(server: *Self, startup: *const extension.Startup) anyerror!void {
+        pub fn bindExtensions(server: *Self, given: *const extension.Startup) anyerror!void {
             assert(!server.extensions_bound);
             assert(server.config.clusters.len >= 1);
+            // #428: what lends a build its clusters' endpoint sets.
+            var lent = given.*;
+            lent.endpoints_context = server;
+            lent.endpoints_lookup = lookupEndpointSet;
+            const startup = &lent;
             for (server.config.clusters, 0..) |*cluster, index| {
                 const site: extension.ClusterSite = .{
                     .index = @intCast(index),
@@ -5367,6 +5373,41 @@ pub fn Server(comptime runtime: Runtime) type {
                 }
             }
             unreachable;
+        }
+
+        /// The endpoint set of the cluster named `cluster_name` (#428), for
+        /// a build to change while it serves: null for a cluster that
+        /// reserved no slots, or none of that name.
+        pub fn lookupEndpointSet(context: *anyopaque, cluster_name: []const u8) ?extension.EndpointSet {
+            const server: *Self = @ptrCast(@alignCast(context));
+            assert(server.config.clusters.len >= 1);
+            for (server.config.clusters, 0..) |*cluster, index| {
+                if (!std.mem.eql(u8, cluster.name, cluster_name)) continue;
+                if (cluster.slots == null) return null;
+                return .{ .context = server, .cluster_index = @intCast(index), .replace_fn = replaceThunk };
+            }
+            return null;
+        }
+
+        fn replaceThunk(
+            context: *anyopaque,
+            cluster_index: u16,
+            endpoints: []const extension.EndpointSet.Endpoint,
+        ) extension.EndpointSet.UpdateError!void {
+            const server: *Self = @ptrCast(@alignCast(context));
+            return server.replaceEndpoints(cluster_index, endpoints);
+        }
+
+        /// Make `endpoints` the set of cluster `cluster_index`, which must
+        /// have reserved slots (#428): see `endpoint_sets.replace`.
+        pub fn replaceEndpoints(
+            server: *Self,
+            cluster_index: u16,
+            endpoints: []const extension.EndpointSet.Endpoint,
+        ) extension.EndpointSet.UpdateError!void {
+            assert(cluster_index < server.config.clusters.len);
+            assert(server.config.clusters[cluster_index].slots != null);
+            return endpoint_sets.replace(server, cluster_index, endpoints);
         }
 
         fn bindProbe(

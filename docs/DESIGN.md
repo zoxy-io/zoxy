@@ -910,6 +910,29 @@ shed the request. A retry that has tried every routable endpoint answers
   - A picker's `bind` site carries the slots' states, and sizing
     per-endpoint state to the site's endpoints sizes it for every
     endpoint the cluster can come to hold.
+  - **An update** is a whole new set, through the `EndpointSet` a
+    build takes from `Startup.endpointSet(name)` at bind and calls on
+    the loop thread alone — from a handler (#434), a policy, a picker.
+    It applies all at once or not at all: validated first (IP endpoints
+    with nonzero ports, weights and tiers in bound, no duplicate, some
+    weight), and refused whole (`SlotsExhausted`) when its arrivals
+    outnumber the free slots.
+    - An endpoint already in the set keeps its slot — health, in-flight
+      work, parked connections, sticky placements — and takes its new
+      weight and tier in place (`endpoints_reweighted`).
+    - One that leaves drains: weight 0, its health set aside, its
+      parked connections closed (`endpoints_parked_closed`), its
+      in-flight work running to its end, and a connection that work
+      finishes with closed rather than parked. A verdict that lands on
+      it afterwards changes nothing (`endpoints_departed`).
+    - One that arrives takes a free slot — its address, identity and
+      label its own — or rejoins the draining slot it left. On a
+      checked cluster it is out until its first probe passes, counted
+      down from its arrival (`health_endpoint_down_arrival`) so the
+      `up` that pass earns reconciles; on any other it is in at once,
+      a slow start ramping it either way (`endpoints_arrived`).
+    - An update compares each endpoint it names with every slot, so a
+      cluster of thousands of slots pays that per update.
 - **Rendezvous because it is stateless.**
   - N processes must agree with nothing shared between them, and the
     kernel spreads one client's connections across processes.
@@ -1950,9 +1973,9 @@ cover with the bed. `examples/edge` is a working build:
 CI builds, tests and smokes it against a fetched package.
 
 **Not offered yet:**
-- changing a cluster's endpoints while serving: the slots are reserved
-  (#428), and the update that fills and drains them is that issue's
-  next slice;
+- freeing a drained endpoint slot for reuse once nothing references
+  it (#428's next slice): until then a cluster needs a slot for every
+  endpoint it has held;
 - regex in stock filters and routes, which waits until after v1.0.0.
 
 **Published, not frozen.** HTTP/3 would move the exchange's internal

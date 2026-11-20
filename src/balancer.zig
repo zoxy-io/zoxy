@@ -381,6 +381,19 @@ pub const Balancer = struct {
         assert(balancer.endpoint_hashes.len == keys.count);
     }
 
+    /// An endpoint took slot `endpoint_index` (#428): its identity is its
+    /// new address's, and a round-robin's running total starts it afresh.
+    pub fn arrive(balancer: *Balancer, cluster_index: u16, endpoint_index: u16) void {
+        const cluster = &balancer.config.clusters[cluster_index];
+        assert(cluster.liveAt(endpoint_index));
+        const key = balancer.keys.key(cluster_index, endpoint_index);
+        balancer.endpoint_hashes[key] = endpointId(&cluster.endpoints[endpoint_index]);
+        switch (balancer.policies[cluster_index]) {
+            .rr => |*picker| picker.current[endpoint_index] = 0,
+            .p2c, .hash, .extension => {},
+        }
+    }
+
     pub const Policy = union(enum) {
         rr: pickers.RoundRobin,
         p2c: pickers.PowerOfTwoChoices,

@@ -403,6 +403,36 @@ const uncovered = [_]Uncovered{
             "header zoxy writes itself, and splits one with CRLF",
     },
     .{
+        .name = "health_endpoint_down_arrival",
+        .why = .unreached,
+        .reason = "no sim cluster reserves endpoint slots yet (#428); " ++
+            "server_test restores an arrival through its first probe",
+    },
+    .{
+        .name = "endpoints_arrived",
+        .why = .unreached,
+        .reason = "no sim cluster reserves endpoint slots yet (#428); " ++
+            "server_test drives updates end to end",
+    },
+    .{
+        .name = "endpoints_departed",
+        .why = .unreached,
+        .reason = "no sim cluster reserves endpoint slots yet (#428); " ++
+            "server_test drives updates end to end",
+    },
+    .{
+        .name = "endpoints_reweighted",
+        .why = .unreached,
+        .reason = "no sim cluster reserves endpoint slots yet (#428); " ++
+            "server_test drives updates end to end",
+    },
+    .{
+        .name = "endpoints_parked_closed",
+        .why = .unreached,
+        .reason = "no sim cluster reserves endpoint slots yet (#428); " ++
+            "server_test drives updates end to end",
+    },
+    .{
         .name = "l7_handler_answer_refused",
         .why = .unreached,
         .reason = "the harness's handler answers within its contract (#434); " ++

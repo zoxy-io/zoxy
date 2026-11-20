@@ -1305,6 +1305,9 @@ pub fn Checker(comptime runtime: Runtime) type {
         fn witnessPass(checker: *Self, cluster_index: u16, endpoint_index: u16) void {
             const rise = checker.checkOf(cluster_index).rise;
             assert(rise >= 1);
+            // A verdict on a slot whose endpoint left while it was out
+            // (#428) is about nothing in the set.
+            if (!checker.liveSlot(cluster_index, endpoint_index)) return;
             const key = checker.server.upstreams.keys.key(cluster_index, endpoint_index);
             checker.fail_streaks[key] = 0;
             if (checker.healthy[key]) {
@@ -1315,6 +1318,77 @@ pub fn Checker(comptime runtime: Runtime) type {
             assert(checker.ok_streaks[key] <= rise);
             if (checker.ok_streaks[key] < rise) return;
             checker.restore(key);
+        }
+
+        /// Whether a slot holds an endpoint of its cluster's set (#428).
+        fn liveSlot(checker: *const Self, cluster_index: u16, endpoint_index: u16) bool {
+            assert(cluster_index < checker.server.config.clusters.len);
+            return checker.server.config.clusters[cluster_index].liveAt(endpoint_index);
+        }
+
+        /// An endpoint took slot `endpoint_index` (#428). On a checked
+        /// cluster it is out until its first probe passes — one pass short
+        /// of `rise` — so traffic does not reach an instance still coming
+        /// up; on any other it is in at once. Either way its slow start,
+        /// where one is configured, ramps from now. A pass from a probe
+        /// sent before the slot left and rejoined counts: it is the same
+        /// address.
+        pub fn arrive(checker: *Self, cluster_index: u16, endpoint_index: u16) void {
+            const key = checker.server.upstreams.keys.key(cluster_index, endpoint_index);
+            // A slot comes back to the set from `depart`'s state, or a free
+            // one's: in, with nothing pending against it.
+            assert(checker.healthy[key]);
+            assert(checker.eject_deadline_ns[key] == 0);
+            checker.fail_streaks[key] = 0;
+            checker.ok_streaks[key] = 0;
+            checker.passive_streaks[key] = 0;
+            checker.passive_levels[key] = 0;
+            checker.restored_at_ns[key] = checker.server.io.nowNs();
+            const check = checker.server.config.clusters[cluster_index].check orelse return;
+            assert(check.rise >= 1);
+            checker.healthy[key] = false;
+            checker.unhealthy_count += 1;
+            assert(checker.unhealthy_count <= checker.ejectable_count);
+            checker.ok_streaks[key] = check.rise - 1;
+            // Down from its arrival, so the `up` its first pass earns has
+            // a `down` to answer — the reconcile identity and its labeled
+            // twin hold for it as for an ejection.
+            checker.server.counters.increment("health_endpoint_down");
+            checker.server.counters.increment("health_endpoint_down_arrival");
+            checker.server.labeled.incrementEndpoint(.health_down, key);
+        }
+
+        /// An endpoint left slot `endpoint_index` (#428): out of the mask's
+        /// reckoning — in, no streak, no cooldown — since a slot that holds
+        /// no endpoint of the set takes neither picks nor verdicts.
+        pub fn depart(checker: *Self, cluster_index: u16, endpoint_index: u16) void {
+            const key = checker.server.upstreams.keys.key(cluster_index, endpoint_index);
+            assert(!checker.server.config.clusters[cluster_index].liveAt(endpoint_index));
+            if (!checker.healthy[key]) {
+                checker.healthy[key] = true;
+                assert(checker.unhealthy_count >= 1);
+                checker.unhealthy_count -= 1;
+            }
+            checker.fail_streaks[key] = 0;
+            checker.ok_streaks[key] = 0;
+            checker.passive_streaks[key] = 0;
+            checker.eject_deadline_ns[key] = 0;
+        }
+
+        /// Close an endpoint's parked connections as it leaves the set
+        /// (#428): the ejection path's own obligation, for the same reason.
+        pub fn closeParkedOf(checker: *Self, cluster_index: u16, endpoint_index: u16) void {
+            assert(!checker.server.config.clusters[cluster_index].liveAt(endpoint_index));
+            const server = checker.server;
+            const capacity = server.upstreams.capacity();
+            var reaped: u32 = 0;
+            while (server.upstreams.checkout(cluster_index, endpoint_index)) |parked| {
+                server.io.closeNow(parked.socket);
+                server.releaseUpstream(parked);
+                server.counters.increment("endpoints_parked_closed");
+                reaped += 1;
+                assert(reaped <= capacity);
+            }
         }
 
         /// Return an endpoint to balancing (§7). The one writer of the
@@ -1356,6 +1430,7 @@ pub fn Checker(comptime runtime: Runtime) type {
             const fall = checker.checkOf(cluster_index).fall;
             assert(fall >= 1);
             checker.server.counters.increment("health_probes_failed");
+            if (!checker.liveSlot(cluster_index, endpoint_index)) return;
             const key = checker.server.upstreams.keys.key(cluster_index, endpoint_index);
             checker.ok_streaks[key] = 0;
             // Already ejected: nothing further to count — streaks resume
@@ -1467,6 +1542,8 @@ pub fn Checker(comptime runtime: Runtime) type {
         ) void {
             const passive = checker.passiveOf(cluster_index) orelse return;
             assert(passive.fall >= 1);
+            // Traffic that outlived its endpoint's place in the set (#428).
+            if (!checker.liveSlot(cluster_index, endpoint_index)) return;
             const key = checker.server.upstreams.keys.key(cluster_index, endpoint_index);
             // Already out: a request in flight when the ejection landed
             // can still fail afterwards, and counting it would deepen a
@@ -1488,6 +1565,7 @@ pub fn Checker(comptime runtime: Runtime) type {
             endpoint_index: u16,
         ) void {
             const passive = checker.passiveOf(cluster_index) orelse return;
+            if (!checker.liveSlot(cluster_index, endpoint_index)) return;
             const key = checker.server.upstreams.keys.key(cluster_index, endpoint_index);
             // A streak that had reached the threshold would already have
             // ejected and reset, so anything a success lands on is
