@@ -4411,6 +4411,10 @@ pub fn Server(comptime runtime: Runtime) type {
             server.completePickAtRelease(conn.stream);
             server.logExchange(conn.stream);
             if (comptime ConnType.completes_policies) assert(!conn.stream.policies.owed());
+            // #425: its connection policies hear how it ended, every line
+            // it owed counted.
+            server.completeConnectionPolicies(conn);
+            if (comptime ConnType.completes_connection_policies) assert(!conn.connection_policies.owed());
             // Which returns the stream with it (§5).
             server.releaseConn(conn);
             server.counters.increment("completed");
@@ -4476,6 +4480,7 @@ pub fn Server(comptime runtime: Runtime) type {
             // #429: the policies a request owes hear of it at this line's
             // moment, logged or not.
             server.completePoliciesAtLine(stream);
+            accountConnectionLine(stream);
             if (server.access_log.sink == null) return;
             if (stream.log.emitted) return;
             // Nothing was asked of this exchange: an L7 slot that idled
@@ -4829,8 +4834,10 @@ pub fn Server(comptime runtime: Runtime) type {
             if (selections.len == 0) return true;
             for (selections) |selection| {
                 switch (callConnectionPolicy(selection, view)) {
-                    .proceed => {},
-                    .proceed_with => |proceed| if (proceed.tag) |tag| {
+                    .proceed => noteConnectionProceeded(conn, view),
+                    .proceed_with => |proceed| {
+                        noteConnectionProceeded(conn, view);
+                        const tag = proceed.tag orelse continue;
                         view.tag = tag;
                         conn.tag = tag;
                         // An L4 connection's line is its whole life, begun
@@ -4859,12 +4866,130 @@ pub fn Server(comptime runtime: Runtime) type {
             server.counters.increment("conn_policy_rejected");
             if (close == .rst) server.counters.increment("conn_policy_reset");
             conn.close_with_rst = close == .rst;
+            conn.policy_refused = true;
             // An L4 connection's line began at admission; an http one's
             // would at its first head byte, which it will never read.
             server.beginRequest(conn.stream);
             conn.stream.log.outcome = .rejected;
             server.beginTeardown(conn);
             assert(conn.isTearingDown());
+        }
+
+        /// One connection policy proceeded on `conn` at `view`'s site
+        /// (#425), and is owed the connection's completion. The ones that
+        /// proceed are a prefix of each list: the first refusal ends a run.
+        fn noteConnectionProceeded(conn: *ConnType, view: *const extension.Connection) void {
+            if (comptime !ConnType.completes_connection_policies) return;
+            const pending = &conn.connection_policies;
+            if (view.route_index) |route_index| {
+                if (pending.routed) assert(pending.route_index == route_index);
+                pending.routed = true;
+                pending.route_index = route_index;
+                pending.route_proceeded += 1;
+            } else {
+                // The listener's phase runs first, and only once.
+                assert(!pending.routed);
+                pending.listener_proceeded += 1;
+            }
+        }
+
+        /// Fold an exchange's line into its connection's sums, once
+        /// (#425): what a connection policy's completion reports. An
+        /// exchange that never began has no line to count.
+        fn accountConnectionLine(stream: *StreamType) void {
+            if (comptime !ConnType.completes_connection_policies) return;
+            if (stream.log.started_ns == 0) return;
+            if (stream.log.accounted) return;
+            assert(stream.conn.isLive() or stream.conn.isTearingDown());
+            stream.log.accounted = true;
+            const pending = &stream.conn.connection_policies;
+            // Sums of `u64` byte counts a connection can never approach
+            // wrapping: checked rather than assumed.
+            assert(pending.bytes_from_client <= std.math.maxInt(u64) - stream.log.bytes_in);
+            pending.bytes_from_client += stream.log.bytes_in;
+            pending.bytes_to_client += stream.log.bytes_out;
+        }
+
+        /// Every connection policy that proceeded on `conn` hears how it
+        /// ended, once, at release (#425): the route's first, then the
+        /// listener's, as a stack unwinds.
+        fn completeConnectionPolicies(server: *Self, conn: *ConnType) void {
+            if (comptime !ConnType.completes_connection_policies) return;
+            const pending = conn.connection_policies;
+            conn.connection_policies = .{};
+            if (!pending.owed()) return;
+            assert(conn.listener_index < server.config.listeners.len);
+            var done: extension.ConnectionCompletion = .{
+                .client = if (conn.client_address) |*address| address else null,
+                .listener_index = conn.listener_index,
+                .route_index = null,
+                .tag = conn.tag,
+                .outcome = connectionOutcome(conn),
+                .started_ns = conn.birth_ns,
+                .done_ns = server.io.nowNs(),
+                .bytes_from_client = pending.bytes_from_client,
+                .bytes_to_client = pending.bytes_to_client,
+            };
+            assert(done.done_ns >= done.started_ns);
+            if (pending.routed) {
+                assert(pending.route_index < conn.sni_routes.len);
+                const route = &conn.sni_routes[pending.route_index];
+                done.route_index = pending.route_index;
+                completeConnectionList(route.connection_policies[0..pending.route_proceeded], &done);
+                done.route_index = null;
+            }
+            const listener = &server.config.listeners[conn.listener_index];
+            completeConnectionList(listener.connection_policies[0..pending.listener_proceeded], &done);
+        }
+
+        /// How a connection ended, as its policies hear it (#425).
+        fn connectionOutcome(conn: *const ConnType) extension.ConnectionCompletion.Outcome {
+            assert(conn.state == .tearing_down);
+            // A refusal's line says so on either protocol.
+            if (conn.policy_refused) assert(conn.stream.log.outcome == .rejected);
+            if (conn.policy_refused) return .rejected;
+            // Its requests had outcomes of their own.
+            if (conn.protocol == .http) return .closed;
+            return switch (conn.stream.log.outcome) {
+                .closed => .closed,
+                .aborted => .aborted,
+                // A relay's line ends drained or not: a refusal is a
+                // policy's, counted above, and the rest are an exchange's.
+                .rejected, .shed, .timed_out, .upstream_failed => unreachable,
+                .ok, .redirected, .responded => unreachable,
+            };
+        }
+
+        /// One site's proceeded policies, in list order, each hearing the
+        /// same completion.
+        fn completeConnectionList(
+            selections: []const extension.Selection,
+            done: *const extension.ConnectionCompletion,
+        ) void {
+            assert(done.done_ns >= done.started_ns);
+            // A route's list completes only when one of its policies
+            // proceeded; a listener's may be empty, its route's alone owed.
+            if (done.route_index != null) assert(selections.len >= 1);
+            for (selections) |selection| callConnectionPolicyComplete(selection, done);
+        }
+
+        /// The selected connection policy's `complete`, by the comptime
+        /// list; nothing for a type that declares none.
+        fn callConnectionPolicyComplete(
+            selection: extension.Selection,
+            done: *const extension.ConnectionCompletion,
+        ) void {
+            assert(selection.index < runtime.extensions.connection_policies.len);
+            assert(done.listener_index < std.math.maxInt(u16));
+            inline for (runtime.extensions.connection_policies, 0..) |Policy, index| {
+                if (selection.index == index) {
+                    // A type that takes no completion owes none.
+                    if (comptime !extension.connectionPolicyCompletes(Policy)) return;
+                    const policy: *Policy = @ptrCast(@alignCast(selection.instance));
+                    return Policy.complete(policy, done);
+                }
+            }
+            unreachable;
         }
 
         /// The selected connection policy's `evaluate`, by the comptime

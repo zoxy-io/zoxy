@@ -37,6 +37,12 @@ pub const ScriptedConnectionPolicy = struct {
     server_name_len: u8 = 0,
     /// The loop clock the last connection was evaluated at.
     seen_now_ns: u64 = 0,
+    /// Completions received (#425): one for each connection it proceeded
+    /// on, once released.
+    completions: u32 = 0,
+    /// The last completion, copied out; its `client` cleared, since the
+    /// view's address is valid only for the call.
+    last: ?extension.ConnectionCompletion = null,
 
     pub fn bind(
         policy: *ScriptedConnectionPolicy,
@@ -73,6 +79,22 @@ pub const ScriptedConnectionPolicy = struct {
         }
         assert(policy.refused <= policy.evaluated);
         return verdict;
+    }
+
+    /// The connections it let on: what it owes completions for.
+    pub fn proceeded(policy: *const ScriptedConnectionPolicy) u32 {
+        assert(policy.refused <= policy.evaluated);
+        return policy.evaluated - policy.refused;
+    }
+
+    pub fn complete(policy: *ScriptedConnectionPolicy, done: *const extension.ConnectionCompletion) void {
+        assert(done.done_ns >= done.started_ns);
+        assert(done.started_ns >= 1);
+        // One per connection it proceeded on: never one it refused.
+        policy.completions += 1;
+        assert(policy.completions <= policy.proceeded());
+        policy.last = done.*;
+        policy.last.?.client = null;
     }
 
     fn noteRouted(policy: *ScriptedConnectionPolicy, connection: *const extension.Connection) void {

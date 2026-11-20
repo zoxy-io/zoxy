@@ -274,6 +274,10 @@ pub const LogState = struct {
     /// fallback cannot emit a second one for an exchange that already
     /// reported its own outcome.
     emitted: bool = false,
+    /// Set once this exchange's bytes are folded into its connection's
+    /// sums (#425), logged or not: a connection policy's completion
+    /// counts each line once.
+    accounted: bool = false,
     method_len: u8 = 0,
     host_len: u16 = 0,
     path_len: u16 = 0,
@@ -309,6 +313,7 @@ pub const LogState = struct {
         state.tag = 0;
         state.outcome = .aborted;
         state.emitted = false;
+        state.accounted = false;
         state.method_len = 0;
         state.host_len = 0;
         state.path_len = 0;

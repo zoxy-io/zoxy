@@ -2950,6 +2950,9 @@ pub fn verify(harness: *Harness) !void {
     const refused = harness.connection_policy.refused;
     if (refused > harness.l4_denied_count) return error.ConnectionPolicyRefusedUnannounced;
     if (harness.clean and refused != harness.l4_denied_count) return error.ConnectionPolicyMissedDenied;
+    // And every connection it let on completed, exactly once, by release.
+    const connection_policy = &harness.connection_policy;
+    if (connection_policy.completions != connection_policy.proceeded()) return error.ConnectionPolicyNotCompleted;
     if (!harness.io.sockets.isFullyReleased()) return error.SocketLeak;
     // §7: no malformed byte may ever reach an origin.
     if (harness.origin_http.violations != 0) return error.OriginSawMalformedBytes;

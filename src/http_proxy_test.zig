@@ -11018,4 +11018,25 @@ test "h2: every stream on a tagged connection starts with the connection's tag (
     try std.testing.expectEqual(@as(u64, 5), request_policy.seen_tag);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, bed.sim_io.sinkBytes(), "\"tag\":5"));
     try bed.expectDrained();
+    // Released: the connection completes once, its bytes its lines' (#425).
+    try std.testing.expectEqual(@as(u32, 1), connection_policy.completions);
+    const done = connection_policy.last.?;
+    try std.testing.expectEqual(extension.ConnectionCompletion.Outcome.closed, done.outcome);
+    try std.testing.expectEqual(@as(u64, 5), done.tag);
+    try std.testing.expectEqual(sumLineField(bed.sim_io.sinkBytes(), "\"bytes_in\":"), done.bytes_from_client);
+    try std.testing.expectEqual(sumLineField(bed.sim_io.sinkBytes(), "\"bytes_out\":"), done.bytes_to_client);
+    try std.testing.expect(done.bytes_to_client >= 1);
+}
+
+/// A numeric field summed over every access-log line in `sink`.
+fn sumLineField(sink: []const u8, comptime key: []const u8) u64 {
+    var total: u64 = 0;
+    var lines = std.mem.splitScalar(u8, sink, '\n');
+    while (lines.next()) |line| {
+        const at = std.mem.indexOf(u8, line, key) orelse continue;
+        const digits = line[at + key.len ..];
+        const end = std.mem.indexOfNone(u8, digits, "0123456789") orelse digits.len;
+        total += std.fmt.parseInt(u64, digits[0..end], 10) catch unreachable;
+    }
+    return total;
 }

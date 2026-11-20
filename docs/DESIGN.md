@@ -1774,7 +1774,18 @@ lists do not reach is refused at step zero (`ExtensionUnserved`).
     no FIN first). Either counts `conn_policy_rejected`, an RST
     `conn_policy_reset` too, and the connection's line is logged
     `rejected` — kind `l4`, or `http` with no request. The first
-    refusal wins.
+    refusal wins;
+  - an optional `complete(*P, *const ConnectionCompletion) void` is
+    heard once for each connection the policy proceeded on, at its
+    release, a later policy's refusal included: the route's policies
+    first, then the listener's. It carries the client, the site, the
+    tag, an outcome — `closed`, `rejected`, or for an l4 relay that
+    never drained `aborted`, as its line says; an http connection's
+    requests have their own — the
+    loop clock at admission and release, and the bytes its lines
+    count, summed once per exchange whether or not a log is
+    configured. With it a policy can count what it let on and still
+    holds: a per-client cap on concurrent connections.
 - **Response policies** (#424), each an ordered list per http listener
   and per route, selected with `App.responsePolicy`:
   - `evaluate(*P, *const Response) ResponseVerdict` reads the origin's
@@ -1852,7 +1863,7 @@ CI builds, tests and smokes it against a fetched package.
 **Not offered yet:**
 - live endpoint discovery, which needs preallocated slots and endpoint
   identities that survive in-flight work;
-- a connection's completion and metrics (#425's later slices);
+- a connection policy's metrics (#425's last slice);
 - regex in stock filters and routes, which waits until after v1.0.0.
 
 **Published, not frozen.** HTTP/3 would move the exchange's internal

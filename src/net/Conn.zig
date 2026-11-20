@@ -199,6 +199,11 @@ pub fn Conn(comptime runtime: Runtime) type {
         /// The tag a connection policy set (#425), or 0: every request on
         /// an http connection starts with it.
         tag: u64,
+        /// The connection policies that proceeded on it, owed a completion
+        /// at release (#425); nothing in a build whose policies take none.
+        connection_policies: if (completes_connection_policies) PendingConnectionPolicies else void,
+        /// A connection policy refused it (#425).
+        policy_refused: bool,
         /// A connection policy refused this connection with an RST (#425):
         /// its teardown closes abortively, with no FIN written first.
         close_with_rst: bool,
@@ -220,6 +225,32 @@ pub fn Conn(comptime runtime: Runtime) type {
 
         /// Whether any request policy the build lists completes (#429).
         pub const completes_policies = @import("../extension.zig").policiesComplete(runtime.extensions);
+
+        /// Whether any connection policy the build lists completes (#425):
+        /// what the pending record and the byte sums compile in or out on.
+        pub const completes_connection_policies =
+            @import("../extension.zig").connectionPoliciesComplete(runtime.extensions);
+
+        /// The connection policies a connection owes a completion (#425):
+        /// the prefix of each site's list that proceeded on it.
+        pub const PendingConnectionPolicies = struct {
+            listener_proceeded: u16 = 0,
+            /// The SNI route whose policies ran, and how many proceeded.
+            routed: bool = false,
+            route_index: u16 = 0,
+            route_proceeded: u16 = 0,
+            /// What the connection's lines counted, summed.
+            bytes_from_client: u64 = 0,
+            bytes_to_client: u64 = 0,
+
+            pub fn owed(pending: *const PendingConnectionPolicies) bool {
+                // Each count is bounded by its list's `u16` length;
+                // widened so the sum cannot wrap.
+                const total: u32 = @as(u32, pending.listener_proceeded) + pending.route_proceeded;
+                if (!pending.routed) assert(pending.route_proceeded == 0);
+                return total >= 1;
+            }
+        };
 
         pub const State = enum(u8) {
             // L4 relay states.
@@ -388,6 +419,8 @@ pub fn Conn(comptime runtime: Runtime) type {
             conn.client_address = client_address;
             conn.close_with_rst = false;
             conn.tag = 0;
+            conn.connection_policies = if (completes_connection_policies) .{} else {};
+            conn.policy_refused = false;
             conn.op_deadline = .{};
             conn.op_deadline_cancel = .{};
             assert(conn.state == state);
