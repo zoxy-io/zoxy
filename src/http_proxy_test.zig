@@ -10663,3 +10663,86 @@ test "l7: a route a listener lacks, or one chosen at the route phase, falls back
     try std.testing.expectEqual(@as(u32, 1), inner.rerouted);
     try bed.expectDrained();
 }
+
+test "l7: policies edit the upstream head in decision order with the filters, the last word winning (#424)" {
+    // The listener's policy, then the filter, then the route's policy:
+    // the route's `set` of X-Tenant overrides the listener's, the filter's
+    // header stays, and the listener's `remove` takes the cookie.
+    var outer: ScriptedPolicy = .{ .edits = &.{
+        .{ .set = .{ .name = "X-Tenant", .value = "listener" } },
+        .{ .remove = "Cookie" },
+    } };
+    var inner: ScriptedPolicy = .{ .edits = &.{.{ .set = .{ .name = "X-Tenant", .value = "route" } }} };
+    const on_listener = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &outer)};
+    const on_route = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &inner)};
+    const rules = [_]filter.Rule{.{ .match = .{}, .actions = &.{.{ .header_set = .{ .name = "X-Via", .value = "zoxy" } }} }};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 4240,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .request_policies = &on_listener,
+        .route_request_policies = &on_route,
+        .request_filters = &rules,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\nCookie: a=1\r\nX-Tenant: client\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 200 "));
+    const heard = bed.origin.conns[0].request_buffer[0..bed.origin.conns[0].request_len];
+    try std.testing.expect(std.mem.indexOf(u8, heard, "\r\nX-Tenant: route\r\n") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, heard, "X-Tenant"));
+    try std.testing.expect(std.mem.indexOf(u8, heard, "\r\nX-Via: zoxy\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, heard, "Cookie") == null);
+    try bed.expectDrained();
+}
+
+test "l7: a policy edit naming zoxy's own header, or splitting one, refuses the request with a 400 (#424)" {
+    const cases = [_][]const extension.Edit{
+        &.{.{ .set = .{ .name = "Host", .value = "elsewhere" } }},
+        &.{.{ .add = .{ .name = "X-Tenant", .value = "a\r\nX-Admin: 1" } }},
+        &.{.{ .remove = "X-Forwarded-For" }},
+    };
+    for (cases, 0..) |edits, index| {
+        var policy: ScriptedPolicy = .{ .edits = edits };
+        const selected = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &policy)};
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .seed = 4241 + index,
+            .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+            .request_policies = &selected,
+        });
+        defer bed.tearDown();
+
+        try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+        try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 400 "));
+        try std.testing.expectEqual(@as(u32, 0), bed.origin.accepted_count);
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_policy_edit_refused"));
+        try bed.expectDrained();
+    }
+}
+
+test "l7: a retry renders the head again with the same policy edits (#424)" {
+    var policy: ScriptedPolicy = .{ .edits = &.{.{ .add = .{ .name = "X-Tenant", .value = "acme" } }} };
+    const selected = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &policy)};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 4244,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .refusing_endpoint_first = true,
+        .retries = 1,
+        .pick = .rr,
+        .request_policies = &selected,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 200 "));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_retried"));
+    const heard = bed.origin.conns[0].request_buffer[0..bed.origin.conns[0].request_len];
+    try std.testing.expect(std.mem.indexOf(u8, heard, "\r\nX-Tenant: acme\r\n") != null);
+    try std.testing.expectEqual(@as(u32, 1), policy.evaluated);
+    try bed.expectDrained();
+}

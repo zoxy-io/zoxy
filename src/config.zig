@@ -3364,42 +3364,7 @@ fn validateHeaderName(name: []const u8) ResolveError!void {
 fn validateEditableHeaderName(name: []const u8) ResolveError!void {
     try validateHeaderName(name);
     assert(name.len >= 1); // A valid token; the managed lists are non-empty.
-    for (render.hop_by_hop_names) |managed| {
-        assert(managed.len >= 1);
-        if (std.ascii.eqlIgnoreCase(name, managed)) {
-            return error.FilterHeaderNameReserved;
-        }
-    }
-    for (render.protected_names) |managed| {
-        assert(managed.len >= 1);
-        if (std.ascii.eqlIgnoreCase(name, managed)) {
-            return error.FilterHeaderNameReserved;
-        }
-    }
-    // Reserved unconditionally, not only on listeners that set it (§7).
-    // A filter can only write a *constant*, so an edit naming this header
-    // encodes one fixed address for every client — it looks like client
-    // forwarding and is the opposite of it. Barring the name everywhere
-    // means one mechanism owns the header, and an operator reaching for
-    // the wrong one is told at load rather than believing a log full of
-    // identical addresses.
-    if (std.ascii.eqlIgnoreCase(name, render.forwarded_for_name)) {
-        return error.FilterHeaderNameReserved;
-    }
-    // The verified client's identity (#304), for the same reason and a
-    // sharper one: a filter writing it would hand the origin an identity
-    // no certificate proved, and removing it would hide one that did.
-    if (std.ascii.eqlIgnoreCase(name, render.client_cert_name)) {
-        return error.FilterHeaderNameReserved;
-    }
-    // Reserved for the same reason and a stricter one (#240): the value
-    // is not merely computed but *required* to be — RFC 9110 §7.6.2 has
-    // each hop forward its own decrement, so a rule writing a constant
-    // here would restate a number this proxy recomputes per request and
-    // hand the next hop a budget that never counts down.
-    if (std.ascii.eqlIgnoreCase(name, render.max_forwards_name)) {
-        return error.FilterHeaderNameReserved;
-    }
+    if (render.isReservedEditName(name)) return error.FilterHeaderNameReserved;
 }
 
 /// A header value must be an RFC 9110 field-value: VCHAR / SP / HTAB /

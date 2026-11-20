@@ -139,6 +139,10 @@ pub fn Budget(comptime runtime: Runtime) type {
                 .endpoint_table_bytes = ServerType.endpointTableBytes(config),
                 .metrics_bytes = ServerType.metricsBytes(config),
                 .answer_bytes = ServerType.AnswerTable.bytes,
+                .policy_edit_bytes = ServerType.PolicyEdits.tableBytes(
+                    config,
+                    constants.streamSlotsFor(limits.conn_slots, limits.stream_slots),
+                ),
                 .head_buffers = limits.head_buffers,
                 .head_buffer_bytes = limits.head_buffer_bytes,
                 .upstream_head_buffers = limits.upstream_head_buffers,
@@ -428,6 +432,7 @@ pub fn Budget(comptime runtime: Runtime) type {
                 \\          + endpoint tables {d} B ({d} cluster(s) x {d} wide)
                 \\          + labeled metrics {d} B (tables, labels and render buffers)
                 \\          + policy answers {d} B (a build's own pages, four variants each)
+                \\          + policy edits {d} B (a build's request edits, every stream slot)
                 \\          + tunnels {d} x {d} B (their own relay buffers, never HTTP's)
                 \\          + tls engines {d} x {d} B (+ plaintext {d} B each, libcrypto heap {d} KiB)
                 \\
@@ -460,6 +465,7 @@ pub fn Budget(comptime runtime: Runtime) type {
                 // Zero unless a build's policies declare answers (#431):
                 // printed on the same terms as the lines around it.
                 sizes.answer_bytes,
+                sizes.policy_edit_bytes,
                 // Both read zero unless a listener allows an upgrade —
                 // printed rather than omitted, on the same terms as the
                 // TLS line below.

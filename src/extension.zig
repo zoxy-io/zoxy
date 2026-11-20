@@ -428,7 +428,53 @@ pub const Proceed = struct {
     /// already chosen, leaves the table's match standing and is counted
     /// (`l7_policy_route_fallback`).
     route: ?u16 = null,
+    /// Header edits to the request on its way upstream (#424), the
+    /// request filters' three. They apply in the order their deciders
+    /// ran: a listener's policies' before the filters', a route's after,
+    /// and a later `set` or `remove` of a name overrides what came before
+    /// it. Copied when the verdict is read, so a value may live in the
+    /// policy's own scratch — up to `edits_per_verdict_max` of them, their
+    /// names and values within the type's declared `edit_bytes_max`; more,
+    /// or a type that declared none, is the build's bug, and the seam
+    /// asserts on it. A name zoxy writes itself, or a value that is not a
+    /// field value, is refused with a `400` (`l7_policy_edit_refused`): a
+    /// value from the request must never become a header of zoxy's, or
+    /// two.
+    edits: []const Edit = &.{},
 };
+
+/// One header edit a policy asks of a request it hands on (#424).
+pub const Edit = union(enum) {
+    /// Every copy of the name replaced by this one line.
+    set: Header,
+    /// This line, beside whatever copies there are.
+    add: Header,
+    /// Every copy of the name removed.
+    remove: []const u8,
+
+    pub const Header = struct {
+        name: []const u8,
+        value: []const u8,
+    };
+
+    /// The bytes the edit's name and value take, as copied.
+    pub fn bytes(edit: Edit) u32 {
+        return switch (edit) {
+            .set, .add => |header| @intCast(header.name.len + header.value.len),
+            .remove => |name| @intCast(name.len),
+        };
+    }
+};
+
+/// The most edits one verdict carries (#424).
+pub const edits_per_verdict_max = constants.policy_edits_per_verdict_max;
+
+/// The bytes `Policy`'s verdicts may copy, at most, per request: its
+/// declared `edit_bytes_max`, or zero for a type that edits nothing.
+pub fn editBytesOf(comptime Policy: type) u32 {
+    if (!@hasDecl(Policy, "edit_bytes_max")) return 0;
+    return Policy.edit_bytes_max;
+}
 
 /// How a request a policy let through ended (#429). A policy may declare
 ///
@@ -747,6 +793,12 @@ pub fn assertRequestPolicy(comptime Policy: type) void {
         assertBind(Policy, PolicySite);
     }
     if (hasAnswers(Policy)) assertAnswers(Policy);
+    if (@hasDecl(Policy, "edit_bytes_max")) {
+        const bound: u32 = Policy.edit_bytes_max;
+        if (bound == 0 or bound > constants.policy_edit_bytes_max) {
+            @compileError(name ++ ".edit_bytes_max must be 1 to policy_edit_bytes_max");
+        }
+    }
     if (policyCompletes(Policy)) {
         const complete_fn = @typeInfo(@TypeOf(Policy.complete)).@"fn";
         const complete_ok = complete_fn.param_types.len == 2 and

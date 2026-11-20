@@ -1032,6 +1032,22 @@ pub const pick_name_bytes_max: u16 = 64;
 /// reserved slot cannot drift out of any of them.
 pub const response_edits_max: u16 = header_edits_max + 1;
 
+/// The most header edits one request policy's verdict carries (#424).
+pub const policy_edits_per_verdict_max: u16 = 8;
+
+/// The most bytes — names and values — one request-policy type may
+/// declare its verdict copies (#424): `edit_bytes_max`'s ceiling.
+pub const policy_edit_bytes_max: u32 = 4096;
+
+/// The most edits a build's policies may make to one request (#424): the
+/// listener's and its route's together. A config whose lists could make
+/// more is refused at startup, so the request render's buffer, sized from
+/// this, never overflows.
+pub const policy_edits_max: u16 = 64;
+
+/// A request render's edit ceiling: the filters' and the policies'.
+pub const request_edits_max: u16 = header_edits_max + policy_edits_max;
+
 /// Upper bound on one configured body's bytes (#159) — file or inline,
 /// rejected at load. The bound is the scope boundary, not a tuning
 /// knob: below it, holding the bytes in the startup arena is the cheap
@@ -1702,6 +1718,10 @@ comptime {
     assert(endpoint_inflight_max >= upstream_slots_max);
     assert(header_edits_max >= 1);
     assert(response_edits_max == header_edits_max + 1);
+    assert(policy_edits_per_verdict_max >= 1);
+    assert(policy_edits_max >= policy_edits_per_verdict_max);
+    assert(request_edits_max == header_edits_max + policy_edits_max);
+    assert(policy_edit_bytes_max >= 64);
     assert(body_bytes_max >= 1);
     // A body must fit the u32 lengths the render and the channel carry.
     assert(body_bytes_max <= std.math.maxInt(u32) / 2);
@@ -1971,6 +1991,11 @@ pub const PoolSizes = struct {
     /// variants. A property of the build rather than the config, and zero
     /// in a build whose policies declare none — the stock binary.
     answer_bytes: u64,
+    /// Every stream slot's scratch for a build's request-policy edits
+    /// (#424): the edits one request can carry and the bytes they copy,
+    /// on this config's worst listener. Zero in a build whose policies
+    /// edit nothing.
+    policy_edit_bytes: u64,
     /// The §5 head-buffer ring: how many buffers the deployment registered
     /// (`limits.head_buffers`; zero on an L4-only config) and the unit
     /// size of each. The total term is `count × (unit + 1)` — the slab
@@ -2139,7 +2164,7 @@ pub fn memoryBytesTotal(sizes: *const PoolSizes) u64 {
         @as(u64, sizes.relay_buffers) * sizes.relay_buffer_pair_bytes +
         @as(u64, sizes.upstream_slots) * sizes.upstream_bytes +
         sizes.access_log_bytes + sizes.log_header_bytes +
-        sizes.endpoint_table_bytes + sizes.metrics_bytes + sizes.answer_bytes +
+        sizes.endpoint_table_bytes + sizes.metrics_bytes + sizes.answer_bytes + sizes.policy_edit_bytes +
         @as(u64, sizes.tunnels) * sizes.tunnel_buffer_pair_bytes +
         @as(u64, sizes.head_buffers) * (sizes.head_buffer_bytes + 1) +
         bufferGroupDescriptorBytes(sizes.head_buffers) +
@@ -2221,6 +2246,7 @@ test "budgets: HTTP/2 is priced by its own terms, and its shared streams by thei
         .endpoint_table_bytes = 0,
         .metrics_bytes = metrics,
         .answer_bytes = 0,
+        .policy_edit_bytes = 0,
         .head_buffers = 0,
         .head_buffer_bytes = head_buffer_bytes_default,
         .upstream_head_buffers = 0,
@@ -2306,6 +2332,7 @@ test "budgets: memory total matches the closed form" {
         .endpoint_table_bytes = endpoint_tables,
         .metrics_bytes = metrics,
         .answer_bytes = 0,
+        .policy_edit_bytes = 0,
         .head_buffers = conn_slots_max,
         .head_buffer_bytes = head_buffer_bytes_default,
         .upstream_head_buffers = upstream_slots_max,
@@ -2330,6 +2357,7 @@ test "budgets: memory total matches the closed form" {
         .endpoint_table_bytes = 0,
         .metrics_bytes = metrics,
         .answer_bytes = 0,
+        .policy_edit_bytes = 0,
         // The L4-only shape: no ring, no upstream head pool, no scratch
         // terms — but the prober's buffer is unconditional.
         .head_buffers = 0,
@@ -2359,6 +2387,7 @@ test "budgets: memory total matches the closed form" {
         .endpoint_table_bytes = 0,
         .metrics_bytes = metrics,
         .answer_bytes = 0,
+        .policy_edit_bytes = 0,
         .head_buffers = 0,
         .head_buffer_bytes = head_buffer_bytes_default,
         .upstream_head_buffers = 0,
@@ -2398,6 +2427,7 @@ test "budgets: memory total matches the closed form" {
         .endpoint_table_bytes = 0,
         .metrics_bytes = metrics,
         .answer_bytes = 0,
+        .policy_edit_bytes = 0,
         .head_buffers = 0,
         .head_buffer_bytes = head_buffer_bytes_default,
         .upstream_head_buffers = 0,

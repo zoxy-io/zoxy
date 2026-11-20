@@ -59,6 +59,37 @@ pub const client_cert_hex_bytes: u32 = 2 * std.crypto.hash.sha2.Sha256.digest_le
 /// number this proxy computes per hop.
 pub const max_forwards_name = "Max-Forwards";
 
+/// The most edits one render applies: a request's filters' and policies'
+/// (#424), or a response's filters' and the #178 stamp.
+const edits_max = @max(constants.request_edits_max, constants.response_edits_max);
+
+/// Whether an edit may not name this header (§7): a hop-by-hop or framing
+/// header the render decides itself, `Host`, or one of the three this
+/// proxy computes per request. Shared by the filter compiler, at load,
+/// and the serving path, which judges a build's policy edits (#424).
+///
+/// The three are reserved unconditionally, not only where they are
+/// written. `X-Forwarded-For`: a filter can only write a constant, one
+/// fixed address for every client — it looks like client forwarding and
+/// is the opposite of it, so one mechanism owns the header. The verified
+/// client's identity (#304): an edit writing it would hand the origin an
+/// identity no certificate proved, and removing it would hide one that
+/// did. `Max-Forwards` (#240): RFC 9110 §7.6.2 has each hop forward its
+/// own decrement, which an edit would restate as a number that never
+/// counts down.
+pub fn isReservedEditName(name: []const u8) bool {
+    assert(name.len >= 1);
+    for (hop_by_hop_names) |managed| {
+        if (std.ascii.eqlIgnoreCase(name, managed)) return true;
+    }
+    for (protected_names) |managed| {
+        if (std.ascii.eqlIgnoreCase(name, managed)) return true;
+    }
+    return std.ascii.eqlIgnoreCase(name, forwarded_for_name) or
+        std.ascii.eqlIgnoreCase(name, client_cert_name) or
+        std.ascii.eqlIgnoreCase(name, max_forwards_name);
+}
+
 /// The most one chunk-size line takes (RFC 9112 §7.1): a `u64`'s sixteen
 /// hex digits, then CRLF.
 pub const chunk_prefix_bytes_max: u32 = 16 + 2;
@@ -191,7 +222,8 @@ pub fn renderRequestHead(
     // The forwarded target is the §7 canonical form the router matched on
     // (or `*` for OPTIONS), so the origin sees exactly the path we routed.
     assert(target.path.len >= 1);
-    assert(edits.len <= constants.header_edits_max);
+    // The filters' edits and a build's policies' (#424).
+    assert(edits.len <= constants.request_edits_max);
     assert(buffer.len <= std.math.maxInt(u32));
 
     var staging = Staging{ .buffer = buffer };
@@ -525,8 +557,9 @@ fn appendEndToEndHeaders(
     scratch: *HeadScratch,
 ) error{Oversize}!void {
     assert(headers.len <= constants.headers_max);
-    // One slot past the filter budget: the #178 Set-Cookie stamp.
-    assert(edits.len <= constants.response_edits_max);
+    // The request's filters and policies (#424), or the response's
+    // filters and the #178 Set-Cookie stamp: the larger bound holds both.
+    assert(edits.len <= edits_max);
     // Collect the Connection header value(s) once (usually zero or one).
     // Re-finding them inside the per-header hop-by-hop test made the walk
     // O(headers²) — the render's top user-CPU cost under load (§9).
@@ -620,8 +653,9 @@ fn collectNominations(
 /// copies must not be forwarded (`add` never suppresses — it appends).
 fn suppressedByEdit(name: []const u8, edits: []const filter.AppliedHeaderEdit) bool {
     assert(name.len >= 1);
-    // One slot past the filter budget: the #178 Set-Cookie stamp.
-    assert(edits.len <= constants.response_edits_max);
+    // The request's filters and policies (#424), or the response's
+    // filters and the #178 Set-Cookie stamp: the larger bound holds both.
+    assert(edits.len <= edits_max);
     for (edits) |edit| {
         switch (edit.kind) {
             .set, .remove => if (std.ascii.eqlIgnoreCase(name, edit.name)) return true,

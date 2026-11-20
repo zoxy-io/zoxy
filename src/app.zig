@@ -111,6 +111,7 @@ pub fn App(comptime extensions: extension.Extensions) type {
             const config = try config_module.resolve(arena, options);
             try refuseUnservedSelections(&config);
             try refuseUnfitAnswers(&config);
+            try refuseOverEditing(&config);
             assert(config.clusters.len == options.clusters.len);
             assert(config.listeners.len >= 1);
             return config;
@@ -152,6 +153,16 @@ pub fn App(comptime extensions: extension.Extensions) type {
             assert(config.limits.head_buffer_bytes >= 1);
             if (!Answers.enabled) return;
             if (Answers.head_bytes_max > config.limits.head_buffer_bytes) return error.AnswerHeadOverBuffer;
+        }
+
+        /// Policy lists that could edit one request more times than the
+        /// render's buffer holds (#424): every edit-making policy on a
+        /// listener and on its route may make `edits_per_verdict_max`.
+        fn refuseOverEditing(config: *const Config) error{PolicyEditsOverLimit}!void {
+            const Edits = @import("policy_edits.zig").Table(extensions);
+            assert(config.listeners.len >= 1);
+            const shape = Edits.shapeOf(config);
+            if (shape.edits > constants.policy_edits_max) return error.PolicyEditsOverLimit;
         }
 
         fn refuseUnserved(selection: extension.Selection, listed_count: usize) error{ExtensionUnserved}!void {
