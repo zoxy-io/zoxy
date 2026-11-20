@@ -200,13 +200,16 @@
         // both harnesses. A C surface in the *measurement* binaries, never
         // the proxy — no `src/` file imports zrk.
         //
-        // The two are one zssl commit apart again: v3.0.1 pins 827c7e5, and
-        // this file moved to 5f5c582 for #271's server-side ALPN (see the
-        // zssl record). Harmless for the reason it was harmless before:
-        // neither binary holds both — the harnesses link zrk's, the proxy
-        // under test is a separate process linking this one — and both
-        // reach the one zoxy-io/openssl 0377b65. The commit between them
-        // touches only the server, which zrk never runs. The
+        // The two are two zssl commits apart: v3.0.1 pins 827c7e5, and
+        // this file moved to 5f5c582 for #271's server-side ALPN, then to
+        // 69fa0aa for zoxy-io/zssl#23 (see the zssl record). Harmless for
+        // the reason it was harmless before: neither binary holds both —
+        // the harnesses link zrk's, the proxy under test is a separate
+        // process linking this one — and both reach the one
+        // zoxy-io/openssl 0377b65. Of the commits between them, 5f5c582
+        // touches only the server, which zrk never runs, and 69fa0aa
+        // refuses a peer's RSA key of 8k+1 bits, which zrk's client never
+        // meets: the bench serves only `cert.pem`, a P-256 leaf. The
         // optimize-mode collision that keeps `zoxy-profile-harness` off
         // the `zoxy` module (see build.zig) is unaffected and still
         // reason enough on its own. Bring them together when zrk next moves.
@@ -530,6 +533,29 @@
         // gates are the evidence, and the paragraphs below are the
         // record of reading them.
         //
+        // Re-audit for 69fa0aa, 2026-11-20 (zoxy-io/zoxy#441): one commit
+        // on, zoxy-io/zssl#23's fix, written because this proxy reached it.
+        //
+        //   - `verifyRsaPss` refuses, as `BadCertificate`, an RSA key whose
+        //     PSS encoding would not fill its modulus width: a modulus of
+        //     8k+1 bits, such as 3065. Before, it handed such a key to
+        //     `std.crypto`'s `PSSSignature.verify`, which asserts on it,
+        //     so a client under `client_ca` or an HTTPS origin holding one
+        //     stopped this process. The chain verifier runs first, so it
+        //     took a certificate from a CA the operator trusts, and then
+        //     one handshake. The engine and origin-client tests drive that
+        //     handshake both ways with such a leaf: on 5f5c582 both panic
+        //     at `assert(emLen == em.len)`, here both refuse.
+        //   - The rest is zssl's own two tests of it, a fixture and its
+        //     recipe.
+        //
+        // Nothing else moves. What it costs: nothing. `zoxy --check` on a
+        // TLS config prints the same budget as v1.0.2, `tls engines 1024 x
+        // 94640 B` included. The refusal is a bare teardown, like any
+        // failed handshake (§4). Gates on the zssl side: tests 180/180 in
+        // Debug and ReleaseSafe, interop five legs, BoGo 454 at its floor,
+        // tlsfuzzer 22/22, TLS-Anvil on zoxy-io/zssl#24.
+        //
         // Re-audit for 5f5c582, 2026-11-14 (zoxy-io/zoxy#271): one commit
         // on, server-side ALPN, written for this proxy's HTTP/2.
         //
@@ -686,8 +712,8 @@
         // RFC 8446 §4.3.2's CertificateRequest, RFC 5705 exporters, and
         // 0-RTT with the strike register RFC 8446 §8.2 needs.
         .zssl = .{
-            .url = "git+https://github.com/zoxy-io/zssl#5f5c5820e28e6f5ad40fb449db0df7f28547c352",
-            .hash = "zssl-0.0.1-5ocyiFkHEQBi4TIgT1Yh7RnCsa3274ieVA9wZwd9gGQR",
+            .url = "git+https://github.com/zoxy-io/zssl#69fa0aa38ed855c83b849ec3c09ad6da5d83c9d0",
+            .hash = "zssl-0.0.1-5ocyiNskEQD_TW-05znrFJyYb4IfNYBNOwVana4P8ZSx",
         },
     },
     // What a dependent receives (#417). `src` is the library and

@@ -132,3 +132,34 @@ openssl x509 -req -in leaf.csr -CA client-ca.pem -CAkey client-ca-key.pem \
   -set_serial 2 -not_before 20190101000000Z -not_after 20490101000000Z \
   -extfile leaf.ext -out client-cert.pem   # leaf.ext: CA:FALSE, clientAuth
 ```
+
+## A peer key std cannot verify (#441)
+
+A chain that verifies, over a key `std.crypto`'s RSA-PSS verifier
+asserts on. The engine and origin-client tests present it from each
+side and check that the handshake is refused rather than the process
+stopped (zoxy-io/zssl#23). Valid 2019 to 2049, like the trust fixtures
+above.
+
+- `rsa3065-ca.pem`: a P-256 CA (`CA:TRUE`), the anchor. Its key was
+  deleted once it had signed the leaf.
+- `rsa3065-issued-cert.pem`: the leaf it signed for `rsa3065-key.pem`
+  (the pairing fixture above, 3065 bits), `DNS:rsa3065.zoxy.test`,
+  `CA:FALSE`, with both serverAuth and clientAuth, so one leaf can be
+  both an origin and a mutual-TLS client.
+
+Same warning: throwaway, committed on purpose, trusted by nothing
+outside these tests.
+
+```sh
+openssl ecparam -name prime256v1 -genkey -noout -out rsa3065-ca-key.pem
+openssl req -new -x509 -key rsa3065-ca-key.pem -subj "/CN=zoxy test RSA-3065 CA" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign" \
+  -not_before 20190101000000Z -not_after 20490101000000Z -out rsa3065-ca.pem
+openssl req -new -key rsa3065-key.pem -subj "/CN=rsa3065.zoxy.test" -out leaf.csr
+openssl x509 -req -in leaf.csr -CA rsa3065-ca.pem -CAkey rsa3065-ca-key.pem \
+  -set_serial 2 -not_before 20190101000000Z -not_after 20490101000000Z \
+  -extfile leaf.ext -out rsa3065-issued-cert.pem
+# leaf.ext: CA:FALSE, the SAN, serverAuth and clientAuth
+```
