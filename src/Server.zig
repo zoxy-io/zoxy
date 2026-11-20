@@ -20,6 +20,7 @@ const Balancer = @import("balancer.zig").Balancer;
 const config_module = @import("config.zig");
 const constants = @import("constants.zig");
 const counters_module = @import("counters.zig");
+const extension_metrics = @import("extension_metrics.zig");
 const conn_module = @import("net/Conn.zig");
 const stream_module = @import("net/Stream.zig");
 const health_module = @import("net/health.zig");
@@ -218,6 +219,10 @@ pub fn Server(comptime runtime: Runtime) type {
         /// also moves the matching bare counter, and `reconcile` holds
         /// the partitions equal.
         labeled: counters_module.Labeled,
+        /// The build's own counters and gauges (#435): one block per site
+        /// and metered type, handed into the serving calls made for it.
+        /// Empty in a build that meters nothing.
+        extension_metrics: ExtensionMetrics,
         /// Staging for the §8 exit tally: the
         /// full exposition — counters then labeled — no longer fits a
         /// fixed stack buffer once its length is the config's, so it is
@@ -442,6 +447,8 @@ pub fn Server(comptime runtime: Runtime) type {
         const Self = @This();
 
         pub const ConnType = conn_module.Conn(runtime);
+        /// The slots behind a build's own counters and gauges (#435).
+        pub const ExtensionMetrics = extension_metrics.Table(runtime.extensions);
         pub const StreamType = ConnType.StreamType;
         pub const AccessLogType = access_log_module.AccessLog(runtime);
         pub const Proxy = proxy.Proxy(runtime);
@@ -623,7 +630,8 @@ pub fn Server(comptime runtime: Runtime) type {
         pub fn metricsBytes(config: *const config_module.Config) u64 {
             assert(config.clusters.len >= 1);
             const keys = endpointKeysFor(config);
-            const tables = counters_module.Labeled.tableBytes(config, keys);
+            const tables = counters_module.Labeled.tableBytes(config, keys) +
+                ExtensionMetrics.tableBytes(config);
             const labeled_render = counters_module.Labeled.renderBytesMaxFor(config);
             const admin_response = admin_module.response_head.len +
                 counters_module.Counters.render_bytes_max + labeled_render;
@@ -1409,6 +1417,7 @@ pub fn Server(comptime runtime: Runtime) type {
             assert(keys.count >= 1);
             server.counters = .{};
             try server.labeled.init(arena, config, keys);
+            try server.extension_metrics.init(arena, config);
             server.dump_buffer = try arena.alloc(
                 u8,
                 counters_module.Counters.render_bytes_max + server.labeled.render_bytes_max,
@@ -4484,6 +4493,7 @@ pub fn Server(comptime runtime: Runtime) type {
                 .panicked = choice.panicked,
                 .now_ns = load.now_ns,
                 .random = &server.balancer.random,
+                .metrics = server.extension_metrics.picker(cluster_index),
             };
             const selection = server.config.clusters[cluster_index].pick.extension;
             const slot = callPicker(selection, &candidates, &input);
@@ -4627,6 +4637,9 @@ pub fn Server(comptime runtime: Runtime) type {
         pub fn evaluatePolicies(
             server: *Self,
             selections: []const extension.Selection,
+            /// The site's slots, parallel to `selections` (#435), or empty
+            /// in a build that meters nothing.
+            metrics: []const extension.Metrics,
             /// The site's view, whose `tag` each `proceed_with` that sets
             /// one overwrites, so the next policy reads it (#433). The
             /// caller keeps that tag whatever the verdict.
@@ -4634,7 +4647,12 @@ pub fn Server(comptime runtime: Runtime) type {
         ) ?extension.RejectStatus {
             assert(server.extensions_bound);
             assert(selections.len >= 1);
-            for (selections) |selection| {
+            assert(metrics.len == 0 or metrics.len == selections.len);
+            // Each policy's slots are its own: none outlives its call, so
+            // a later view of the request — a picker's — carries none.
+            defer request.metrics = .{};
+            for (selections, 0..) |selection, position| {
+                request.metrics = if (metrics.len == 0) .{} else metrics[position];
                 switch (callPolicy(selection, request)) {
                     .proceed => {},
                     .proceed_with => |proceed| {

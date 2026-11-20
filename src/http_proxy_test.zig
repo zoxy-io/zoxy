@@ -10248,3 +10248,42 @@ test "l7: an untagged request's line has no tag key (#433)" {
     try std.testing.expectEqual(@as(u32, 1), policy.evaluated);
     try bed.expectDrained();
 }
+
+test "l7: a metered policy counts apart at each site it runs at, and a picker at its cluster (#435)" {
+    // One instance on the listener and on the route: two sites, two sets
+    // of slots. The second request is refused at the listener, so the
+    // route never sees it.
+    var policy: ScriptedPolicy = .{ .reject_prefix = "/api/deny" };
+    var picker: ScriptedPicker = .{ .choice = .first };
+    const selected = [_]extension.Selection{extension.select(runtime.extensions.request_policies, &policy)};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 4350,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .route_prefix = "/api",
+        .request_policies = &selected,
+        .route_request_policies = &selected,
+        .pick = .{ .extension = extension.select(runtime.extensions.pickers, &picker) },
+    });
+    defer bed.tearDown();
+
+    bed.client.second_request = "GET /api/deny/x HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+    try bed.exchange("GET /api/ok HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    const metrics = &bed.server.extension_metrics;
+    const on_listener = metrics.listenerPolicies(0)[0];
+    try std.testing.expectEqual(@as(u64, 2), on_listener.counter(ScriptedPolicy, .evaluated));
+    try std.testing.expectEqual(@as(u64, 1), on_listener.counter(ScriptedPolicy, .rejected));
+    try std.testing.expectEqual(@as(u64, "/api/deny/x".len), on_listener.gauge(ScriptedPolicy, .path_bytes));
+    const on_route = metrics.routePolicies(0, 0)[0];
+    try std.testing.expectEqual(@as(u64, 1), on_route.counter(ScriptedPolicy, .evaluated));
+    try std.testing.expectEqual(@as(u64, 0), on_route.counter(ScriptedPolicy, .rejected));
+    try std.testing.expectEqual(@as(u64, "/api/ok".len), on_route.gauge(ScriptedPolicy, .path_bytes));
+    // The instance's own fields see both sites; the slots keep them apart.
+    try std.testing.expectEqual(@as(u32, 3), policy.evaluated);
+    const at_cluster = metrics.picker(0);
+    try std.testing.expectEqual(@as(u64, 1), at_cluster.counter(ScriptedPicker, .picks));
+    try std.testing.expectEqual(@as(u64, 0), at_cluster.counter(ScriptedPicker, .past_end));
+    try std.testing.expectEqual(@as(u64, picker.offered_count), at_cluster.gauge(ScriptedPicker, .offered));
+    try bed.expectDrained();
+}

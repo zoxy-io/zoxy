@@ -36,6 +36,17 @@ pub const ScriptedPicker = struct {
     pub const offered_max = 8;
     pub const path_bytes_max = 64;
 
+    /// Its own series (#435): every pick, the answers past the set that
+    /// earn the fallback, and how many candidates the last was offered.
+    pub const metrics_prefix = "scripted_picker";
+    pub const counters = .{
+        .picks = "Picks asked of the scripted picker.",
+        .past_end = "Picks it answered one past the set.",
+    };
+    pub const gauges = .{
+        .offered = "Candidates its last pick was offered.",
+    };
+
     pub const Choice = enum {
         /// Slot 0: the lowest endpoint index the set still holds.
         first,
@@ -83,12 +94,17 @@ pub const ScriptedPicker = struct {
             @memcpy(picker.path[0..kept], request.path[0..kept]);
             picker.path_len = @intCast(kept);
         }
-        return switch (picker.choice) {
+        const slot: u16 = switch (picker.choice) {
             .first => 0,
             .last => count - 1,
             .past_end => count,
             .by_entropy => @intCast(input.random.next() % (@as(u64, count) + 1)),
         };
+        assert(slot <= count);
+        input.metrics.add(ScriptedPicker, .picks, 1);
+        if (slot == count) input.metrics.add(ScriptedPicker, .past_end, 1);
+        input.metrics.set(ScriptedPicker, .offered, count);
+        return slot;
     }
 
     /// The last request's path, as recorded.

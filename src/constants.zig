@@ -142,6 +142,33 @@ comptime {
     assert(duration_buckets_ns.len >= 2);
 }
 
+/// The longest `metrics_prefix` a build's extension type declares, and
+/// the longest counter or gauge name (#435). Each series name is
+/// `zoxy_ext_<prefix>_<name>`, so the widest is a little over twice this:
+/// long enough to spell a type and a fact, short enough that a scrape's
+/// render bound is not dominated by names.
+pub const extension_metric_name_bytes_max: u32 = 64;
+
+/// The longest help text an extension's counter or gauge declares: one
+/// `# HELP` line, priced once per family in the render bound.
+pub const extension_metric_help_bytes_max: u32 = 256;
+
+/// The most counters one extension type declares, and apart from them
+/// the most gauges. Every site that selects the type reserves a cell for
+/// each, so this bounds what one selection can add to the banner.
+pub const extension_metrics_per_type_max: u32 = 64;
+
+comptime {
+    // A name must fit the rule it is held to — a letter, then more — and
+    // a help line must have room to say more than the name does.
+    assert(extension_metric_name_bytes_max >= 8);
+    assert(extension_metric_help_bytes_max >= extension_metric_name_bytes_max);
+    // A block's cells are indexed by a declared name's enum; a type's
+    // counters and gauges together stay a small index.
+    assert(extension_metrics_per_type_max >= 1);
+    assert(2 * extension_metrics_per_type_max <= std.math.maxInt(u16));
+}
+
 pub const proxy_header_bytes_max: u32 = 512;
 
 /// The longest PROXY header this proxy *sends* (#142 send): the spec's
