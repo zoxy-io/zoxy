@@ -400,6 +400,10 @@ pub const Verdict = union(enum) {
     /// Answer with this status from server memory, before any resource
     /// is taken or origin dialed — the filter reject's answer (§8).
     reject: RejectStatus,
+    /// Answer with one of the policy type's own `answers` (#431), by its
+    /// index there: built with `respond`, which names it. Served and
+    /// counted as a reject is, from the page rendered at startup.
+    respond: u16,
 };
 
 /// What a policy adds to a request it hands on.
@@ -507,6 +511,15 @@ pub const Answer = struct {
         value: []const u8,
     };
 };
+
+/// The verdict that answers with `Policy`'s answer `name` (#431). The
+/// name is checked against `Policy.answers` at compile time.
+pub fn respond(comptime Policy: type, comptime name: AnswerName(Policy)) Verdict {
+    comptime assert(hasAnswers(Policy));
+    const index: u16 = @backingInt(name);
+    comptime assert(index < answerCount(Policy));
+    return .{ .respond = index };
+}
 
 /// Whether `Policy` declares answers of its own.
 pub fn hasAnswers(comptime Policy: type) bool {

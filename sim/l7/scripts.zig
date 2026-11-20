@@ -120,9 +120,10 @@ pub const Script = enum(u8) {
     /// reject's own static set — and the origin must never see it.
     policy_reject,
     /// A GET of `/guarded/deny`: it routes to the guarded route, whose own
-    /// #417 policy rejects it with 403 — after the route is chosen, before
-    /// the request takes a relay buffer or an upstream slot. The golden
-    /// outcome is that 403, and the origin must never see the request.
+    /// #417 policy answers it with its own 403 page (#431) — after the
+    /// route is chosen, before the request takes a relay buffer or an
+    /// upstream slot. The golden outcome is that 403, and the origin must
+    /// never see the request.
     route_policy_reject,
     /// A GET under `/redirect`: a §7 filter answers 301 with a Location
     /// composed from the request's own host and path (#176), before any

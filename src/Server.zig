@@ -709,7 +709,10 @@ pub fn Server(comptime runtime: Runtime) type {
             server.date_second = server.nowUnix();
             shed.formatHttpDate(server.date_second, &server.date_line);
             server.static_sends_inflight = 0;
-            // A build's answer pages (#431) are stamped with zoxy's own.
+            // A build's answer pages (#431) are stamped with zoxy's own;
+            // `App` refuses a head buffer an HTTP/2 stream could not map
+            // the widest of them through.
+            if (AnswerTable.enabled) assert(AnswerTable.head_bytes_max <= config.limits.head_buffer_bytes);
             try server.answers.init(arena);
             server.initDateSlots();
             try server.conns.init(arena, options.conn_slots);
@@ -4678,8 +4681,20 @@ pub fn Server(comptime runtime: Runtime) type {
         /// null when every one handed the request on — and how many did
         /// before that reject, the ones it now owes a completion (#429).
         pub const PolicyRun = struct {
-            refused: ?extension.RejectStatus,
+            stop: ?Stop,
             proceeded: u16,
+
+            /// What stopped the request: a status from the static reject
+            /// set, or one of the stopping policy type's own answers (#431).
+            pub const Stop = union(enum) {
+                reject: extension.RejectStatus,
+                respond: Answered,
+            };
+
+            pub const Answered = struct {
+                policy_index: u8,
+                answer_index: u16,
+            };
         };
 
         /// Run `selections` over `request` in order (#417): the first
@@ -4710,10 +4725,20 @@ pub fn Server(comptime runtime: Runtime) type {
                     .proceed_with => |proceed| {
                         if (proceed.tag) |tag| request.tag = tag;
                     },
-                    .reject => |status| return .{ .refused = status, .proceeded = @intCast(position) },
+                    .reject => |status| return .{ .stop = .{ .reject = status }, .proceeded = @intCast(position) },
+                    .respond => |answer_index| {
+                        // `extension.respond` names a declared answer; a
+                        // verdict built by hand is held to the same.
+                        assert(answer_index < AnswerTable.countOf(selection.index));
+                        const answered: PolicyRun.Answered = .{
+                            .policy_index = selection.index,
+                            .answer_index = answer_index,
+                        };
+                        return .{ .stop = .{ .respond = answered }, .proceeded = @intCast(position) };
+                    },
                 }
             }
-            return .{ .refused = null, .proceeded = @intCast(selections.len) };
+            return .{ .stop = null, .proceeded = @intCast(selections.len) };
         }
 
         /// The policies of one phase that handed the request on (#429):

@@ -33,6 +33,34 @@ pub fn Table(comptime extensions: extension.Extensions) type {
         };
         pub const enabled = count >= 1;
 
+        /// The longest head any page carries — a closed, refusing variant
+        /// — which an HTTP/2 stream maps through scratch sized by
+        /// `head_buffer_bytes`: startup refuses a config whose head buffer
+        /// is smaller.
+        pub const head_bytes_max: u32 = blk: {
+            @setEvalBranchQuota(1000 + 8 * @as(u64, count) * (constants.extension_answer_headers_max *
+                constants.extension_answer_header_bytes_max + constants.extension_answer_body_bytes_max));
+            var widest: u32 = 0;
+            for (policies) |Policy| {
+                if (!extension.hasAnswers(Policy)) continue;
+                for (@typeInfo(@TypeOf(Policy.answers)).@"struct".field_names) |name| {
+                    const answer = @field(Policy.answers, name);
+                    const head = template(answer, .close, true).len - answer.body.len;
+                    widest = @max(widest, head);
+                }
+            }
+            break :blk widest;
+        };
+
+        /// How many answers the policy type listed at `policy_index`
+        /// declares: what a `respond` verdict's index is held below.
+        pub fn countOf(policy_index: u8) u16 {
+            // A build that lists no policy evaluates none.
+            if (comptime policies.len == 0) unreachable;
+            assert(policy_index < policies.len);
+            return counts[policy_index];
+        }
+
         /// How many answers each policy type declares.
         const counts: [policies.len]u16 = blk: {
             var collected: [policies.len]u16 = undefined;
@@ -101,6 +129,8 @@ pub fn Table(comptime extensions: extension.Extensions) type {
         /// The page answer `answer_index` of the policy type listed at
         /// `policy_index`, in the variant the listener asked for.
         pub fn get(table: *const Self, policy_index: u8, answer_index: u16, proxy_status: bool) *const StaticPage {
+            // A build with no answers is never asked for one.
+            if (comptime !enabled) unreachable;
             assert(policy_index < policies.len);
             assert(answer_index < counts[policy_index]);
             const index = offsets[policy_index] + answer_index;

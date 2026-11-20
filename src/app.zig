@@ -110,6 +110,7 @@ pub fn App(comptime extensions: extension.Extensions) type {
         fn resolveServed(arena: std.mem.Allocator, options: *const Options) !Config {
             const config = try config_module.resolve(arena, options);
             try refuseUnservedSelections(&config);
+            try refuseUnfitAnswers(&config);
             assert(config.clusters.len == options.clusters.len);
             assert(config.listeners.len >= 1);
             return config;
@@ -140,6 +141,17 @@ pub fn App(comptime extensions: extension.Extensions) type {
                     }
                 }
             }
+        }
+
+        /// A head buffer smaller than the widest page this build's policies
+        /// answer with (#431): an HTTP/2 stream maps a page's head through
+        /// scratch of that size, and a page that cannot fit would reset
+        /// the stream it answers rather than answer it.
+        fn refuseUnfitAnswers(config: *const Config) error{AnswerHeadOverBuffer}!void {
+            const Answers = @import("extension_answers.zig").Table(extensions);
+            assert(config.limits.head_buffer_bytes >= 1);
+            if (!Answers.enabled) return;
+            if (Answers.head_bytes_max > config.limits.head_buffer_bytes) return error.AnswerHeadOverBuffer;
         }
 
         fn refuseUnserved(selection: extension.Selection, listed_count: usize) error{ExtensionUnserved}!void {
@@ -661,4 +673,41 @@ test "App: a selection names the build's own type" {
     const selection = Built.policy(&policy);
     try std.testing.expectEqual(@as(u8, 0), selection.index);
     try std.testing.expect(selection.instance == @as(*anyopaque, &policy));
+}
+
+test "App: a head buffer smaller than the widest answer's head is refused at startup (#431)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Two long headers: a head past the smallest buffer a listener may
+    // configure, and well inside the default.
+    const long_bytes: [700]u8 = @splat('a');
+    const long: []const u8 = &long_bytes;
+    const Wide = struct {
+        pub const answers = .{
+            .wide = extension.Answer{
+                .status = 503,
+                .headers = &.{ .{ .name = "X-First", .value = long }, .{ .name = "X-Second", .value = long } },
+            },
+        };
+        pub fn evaluate(_: *@This(), _: *const extension.Request) extension.Verdict {
+            return .proceed;
+        }
+    };
+    const Built = App(.{ .request_policies = &.{Wide} });
+    const origin = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:9000");
+    const bind = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:8080");
+    var options: Options = .{
+        .listeners = &.{.{ .bind = .{ .ip = bind }, .protocol = .{ .l4 = .{ .target = .{ .cluster = "origin" } } } }},
+        .clusters = &.{.{ .name = "origin", .endpoints = &.{.{ .address = .{ .ip = origin } }}, .pick = .p2c }},
+        .timeouts = .{ .connect_ms = 1_000, .idle_ms = 5_000, .head_ms = 2_000, .tunnel_ms = 60_000, .health_interval_ms = 2_000 },
+        .limits = .{ .head_buffer_bytes = 1024 },
+    };
+    const small = try config_module.resolve(arena, &options);
+    try std.testing.expectError(error.AnswerHeadOverBuffer, Built.refuseUnfitAnswers(&small));
+    options.limits = .{};
+    const default = try config_module.resolve(arena, &options);
+    try Built.refuseUnfitAnswers(&default);
+    // A build whose policies declare none is never refused for it.
+    try App(.{}).refuseUnfitAnswers(&small);
 }

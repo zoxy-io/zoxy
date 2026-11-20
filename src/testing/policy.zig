@@ -15,6 +15,13 @@ pub const ScriptedPolicy = struct {
     /// nothing.
     reject_prefix: []const u8 = "",
     status: extension.RejectStatus = .forbidden,
+    /// The canonical-path prefix this instance answers with one of its
+    /// own `answers` (#431); empty answers nothing.
+    answer_prefix: []const u8 = "",
+    /// Which of its answers it gives there.
+    answer: extension.AnswerName(ScriptedPolicy) = .denied,
+    /// Requests it answered with one of its own pages.
+    answered: u32 = 0,
     /// The tag it sets on every request it hands on (#433), through
     /// `proceed_with`; null hands them on with a bare `proceed`.
     tag: ?u64 = null,
@@ -57,9 +64,34 @@ pub const ScriptedPolicy = struct {
         .completed = "Requests it handed on that have since ended.",
         .completed_ok = "Requests it handed on that the origin answered whole.",
         .completed_refused = "Requests it handed on that something after it refused.",
+        .answered = "Requests it answered with one of its own pages.",
     };
     pub const gauges = .{
         .path_bytes = "Bytes of the last request's canonical path.",
+    };
+
+    /// The body of its `denied` answer: a 403 page of its own, which a
+    /// harness may configure as its 403 error page too, so every 403 a
+    /// sweep sees carries one body whoever raised it.
+    pub const denied_body = "scripted-policy-denied\n";
+
+    /// Its own answers (#431): a refusal with a header of its own, a
+    /// maintenance notice with a body, and a redirect.
+    pub const answers = .{
+        .denied = extension.Answer{
+            .status = 403,
+            .headers = &.{.{ .name = "X-Scripted-Policy", .value = "denied" }},
+            .body = denied_body,
+        },
+        .maintenance = extension.Answer{
+            .status = 503,
+            .headers = &.{.{ .name = "Retry-After", .value = "120" }},
+            .body = "back soon\n",
+        },
+        .login = extension.Answer{
+            .status = 302,
+            .headers = &.{.{ .name = "Location", .value = "/login" }},
+        },
     };
 
     pub fn bind(
@@ -72,6 +104,7 @@ pub const ScriptedPolicy = struct {
         // neither.
         assert((site.route_index == null) == (site.cluster_index == null));
         assert(policy.reject_prefix.len <= path_bytes_max);
+        assert(policy.answer_prefix.len <= path_bytes_max);
         policy.binds += 1;
         // A server's clock starts afresh, and an instance a test reuses
         // across servers must not hold the last one's reading against it:
@@ -96,11 +129,28 @@ pub const ScriptedPolicy = struct {
         const kept = @min(request.path.len, path_bytes_max);
         @memcpy(policy.path[0..kept], request.path[0..kept]);
         policy.path_len = @intCast(kept);
-        if (policy.reject_prefix.len == 0) return policy.handOn(request);
-        if (!std.mem.startsWith(u8, request.path, policy.reject_prefix)) return policy.handOn(request);
+        if (startsWithNonEmpty(request.path, policy.answer_prefix)) {
+            policy.answered += 1;
+            request.metrics.add(ScriptedPolicy, .answered, 1);
+            return switch (policy.answer) {
+                inline else => |name| extension.respond(ScriptedPolicy, name),
+            };
+        }
+        if (!startsWithNonEmpty(request.path, policy.reject_prefix)) return policy.handOn(request);
         policy.rejected += 1;
         request.metrics.add(ScriptedPolicy, .rejected, 1);
         return .{ .reject = policy.status };
+    }
+
+    fn startsWithNonEmpty(path: []const u8, prefix: []const u8) bool {
+        assert(path.len >= 1);
+        return prefix.len != 0 and std.mem.startsWith(u8, path, prefix);
+    }
+
+    /// What it handed on: every request it neither rejected nor answered.
+    pub fn handedOn(policy: *const ScriptedPolicy) u32 {
+        assert(policy.rejected + policy.answered <= policy.evaluated);
+        return policy.evaluated - policy.rejected - policy.answered;
     }
 
     /// One completion per request it handed on (#429), its times in
@@ -111,7 +161,7 @@ pub const ScriptedPolicy = struct {
         // A site's routed request names its cluster; a route's always is.
         if (done.route_index != null) assert(done.cluster_index != null);
         policy.completions += 1;
-        assert(policy.completions <= policy.evaluated - policy.rejected);
+        assert(policy.completions <= policy.handedOn());
         policy.last = done.*;
         done.metrics.add(ScriptedPolicy, .completed, 1);
         switch (done.outcome) {

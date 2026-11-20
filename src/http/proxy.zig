@@ -824,8 +824,17 @@ pub fn Proxy(comptime runtime: Runtime) type {
             const run = server.evaluatePolicies(selections, metrics, view);
             stream.log.tag = view.tag;
             server.notePoliciesProceeded(stream, route_index, run.proceeded);
-            const status = run.refused orelse return false;
-            respondPolicy(server, stream, status);
+            const stop = run.stop orelse return false;
+            switch (stop) {
+                .reject => |status| respondPolicy(server, stream, status),
+                .respond => |answered| answerWithPage(
+                    server,
+                    stream,
+                    server.answers.get(answered.policy_index, answered.answer_index, stream.conn.proxy_status),
+                    "l7_policy_rejected",
+                    .rejected,
+                ),
+            }
             return true;
         }
 
@@ -4838,6 +4847,19 @@ pub fn Proxy(comptime runtime: Runtime) type {
             stream: *StreamType,
             page: *const config_module.Config.StaticPage,
         ) void {
+            answerWithPage(server, stream, page, "l7_responded", .responded);
+        }
+
+        /// Answer from a page rendered at startup: a filter's `respond`
+        /// (#159), or a policy's own answer (#431), which is counted and
+        /// logged as the refusal it is.
+        fn answerWithPage(
+            server: *ServerType,
+            stream: *StreamType,
+            page: *const config_module.Config.StaticPage,
+            comptime counter: []const u8,
+            outcome: access_log.Outcome,
+        ) void {
             assert(stream.phase == .reading_head);
             // `respond`'s own contract: both data ops free, so the send
             // and any lingering drain have their completions.
@@ -4858,9 +4880,9 @@ pub fn Proxy(comptime runtime: Runtime) type {
             releaseForStaticResponse(server, stream);
             ServerType.clearRequestDeadline(stream);
             server.storeExchangeDeadline(stream, server.idleTimeoutMs());
-            server.counters.increment("l7_responded");
+            server.counters.increment(counter);
             stream.log.status = page.status;
-            stream.log.outcome = .responded;
+            stream.log.outcome = outcome;
             // The same four brakes every static answer honors (§7, §8):
             // the client's own ask, the drain, relay pressure and the
             // #237 cap.

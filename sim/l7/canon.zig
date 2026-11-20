@@ -148,12 +148,14 @@ pub const sticky_set_cookie_value =
 pub const sticky_set_cookie_value_secure = sticky_set_cookie_value ++ "; Secure";
 
 /// The #159 configured bodies. `error_page_body` is the harness's page
-/// for `403` — the one status a script earns from a filter reject — so
-/// every 403 in the sweep must carry exactly these bytes; `respond_body`
-/// is what the `/respond` rule answers `200` with. Both are served from
+/// for `403` — the status a script earns from a filter reject — so every
+/// 403 in the sweep must carry exactly these bytes; `respond_body` is
+/// what the `/respond` rule answers `200` with. Both are served from
 /// immutable memory by the static path, which is what lets the client
-/// demand them under every schedule the adversary produces.
-pub const error_page_body = "sim-403-page\n";
+/// demand them under every schedule the adversary produces. The 403 page
+/// is the route policy's own `denied` answer's body (#431), so the 403
+/// that policy answers with carries the same bytes as every other.
+pub const error_page_body = zoxy.testing.ScriptedPolicy.denied_body;
 pub const respond_body = "sim-respond-body\n";
 pub const page_content_type = "text/plain";
 

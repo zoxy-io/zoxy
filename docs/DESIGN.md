@@ -1602,7 +1602,8 @@ extensions they list.
   not surface.
 - **The startup sequence**, written once in `app.zig`:
   0. resolve the options, and refuse a selection the build does not
-     list (`ExtensionUnserved`);
+     list (`ExtensionUnserved`) or a head buffer smaller than the widest
+     answer the build's policies declare (`AnswerHeadOverBuffer`);
   1. price the config and print the banner (§5);
   2. take the fd budget, open the log sink, load every certificate;
   3. build the loop and the server, bind the extensions, hand over the
@@ -1664,9 +1665,19 @@ lists do not reach is refused at step zero (`ExtensionUnserved`).
   - per route, run once the route is chosen and before any resource is
     taken for it;
   - `evaluate(*P, *const Request) Verdict` returns `proceed`;
-    `proceed_with`, which proceeds and may set the request's tag; or
+    `proceed_with`, which proceeds and may set the request's tag;
     `reject` with a status from the static reject set: 400, 403, 404 or
-    429. The first reject wins;
+    429; or `respond`, one of the type's own answers. The first reject
+    or answer wins;
+  - answers (#431) are the type's `pub const answers`, a struct literal
+    of `extension.Answer`s by name: a status from 300 to 599, headers, a
+    body and its type, and `extension.respond(Self, .name)` gives one.
+    Every page is static, rendered at startup in four variants — kept or
+    closed, with or without the listener's `Proxy-Status` — and priced
+    in the banner as `policy answers`. A redirect that needs a
+    `Location` carries one, and the headers that frame a response or
+    name who sent it stay zoxy's: a declaration that breaks either is a
+    compile error;
   - an optional
     `bind(*P, *const extension.PolicySite, *const extension.Startup) !void`
     runs once per site;
@@ -1682,10 +1693,10 @@ lists do not reach is refused at step zero (`ExtensionUnserved`).
     policy's, the route phase's, and a picker's on every try. The
     access log records a non-zero tag as the number `tag`. Each
     keep-alive request and each HTTP/2 stream starts at zero;
-  - a reject answers with the static response, logs outcome
-    `rejected`, carries Proxy-Status `http_request_denied` where the
-    listener sends it, and counts `l7_policy_rejected`. A retry or a
-    replay does not evaluate again;
+  - a reject, or an answer, is sent from server memory before any
+    resource is taken, logs outcome `rejected`, carries Proxy-Status
+    `http_request_denied` where the listener sends it, and counts
+    `l7_policy_rejected`. A retry or a replay does not evaluate again;
   - an optional
     `complete(*P, *const extension.RequestCompletion) void` (#429) hears
     how a request it handed on ended, exactly once, at the moment its

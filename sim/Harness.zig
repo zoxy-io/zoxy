@@ -471,7 +471,9 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
     harness.policy_selections = .{
         zoxy.extension.select(runtime.extensions.request_policies, &harness.policy_listener),
     };
-    harness.policy_route = .{ .reject_prefix = l7.canon.route_policy_path, .expect_tag = policy_tag };
+    // The route's policy answers with its own 403 page (#431), where the
+    // listener's rejects from the static set: one arm per phase.
+    harness.policy_route = .{ .answer_prefix = l7.canon.route_policy_path, .expect_tag = policy_tag };
     harness.route_policy_selections = .{
         zoxy.extension.select(runtime.extensions.request_policies, &harness.policy_route),
     };
@@ -2875,7 +2877,7 @@ pub fn verify(harness: *Harness) !void {
     }
     // #429: every request either policy handed on completed, exactly once.
     for ([_]*const zoxy.testing.ScriptedPolicy{ &harness.policy_listener, &harness.policy_route }) |policy| {
-        if (policy.completions != policy.evaluated - policy.rejected) return error.PolicyNotCompleted;
+        if (policy.completions != policy.handedOn()) return error.PolicyNotCompleted;
     }
     if (!harness.io.sockets.isFullyReleased()) return error.SocketLeak;
     // §7: no malformed byte may ever reach an origin.
