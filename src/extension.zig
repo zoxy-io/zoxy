@@ -123,6 +123,10 @@ pub const Request = struct {
     /// The verified client certificate's SHA-256 in lowercase hex, when
     /// the listener asked for one and the client presented it (#304).
     client_cert_sha256: ?[]const u8,
+    /// The same certificate's URI and DNS subjectAltNames (#432): the
+    /// identity it names — a SPIFFE ID, a host — which survives a reissue
+    /// where the fingerprint does not. Empty with no verified client.
+    client_cert_names: ClientCertNames = .{},
     /// The listener the request arrived on, by config index.
     listener_index: u16,
     /// The cluster the route chose, or null before routing has run.
@@ -143,6 +147,25 @@ pub const Request = struct {
     /// evaluated for (#435). Empty for a type that declares none, and in
     /// the request a picker is shown, whose are `PickInput.metrics`.
     metrics: Metrics = .{},
+};
+
+/// A verified client certificate's names, as a policy reads them (#432).
+pub const ClientCertNames = struct {
+    /// URI and DNS subjectAltNames, in the leaf's order.
+    names: []const ClientCertName = &.{},
+    /// The leaf named more than a connection keeps
+    /// (`client_cert_names_max` names in `client_cert_names_bytes_max`
+    /// bytes): `names` are the leaf's own, but not all of them. A policy
+    /// that authorizes on the absence of a name must refuse on this.
+    truncated: bool = false,
+};
+
+pub const ClientCertName = struct {
+    kind: Kind,
+    /// A URI as the leaf states it; a DNS name lowercased.
+    value: []const u8,
+
+    pub const Kind = enum { uri, dns };
 };
 
 /// The picker contract (§7). A picker type declares

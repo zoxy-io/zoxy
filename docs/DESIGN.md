@@ -325,6 +325,14 @@ listener parses it.
     on every request as `X-Client-Cert-SHA256`, and the access log as
     `client_cert_sha256`. An inbound copy of that header is stripped on
     every listener, and no filter may set or remove it.
+  - *Names* (#432). The verified leaf's URI and DNS subjectAltNames, in
+    its order — a SPIFFE ID, a host — are kept in the TLS engine for a
+    build's policies, which see them on every request; no header
+    carries them. A DNS name is kept lowercased. A connection keeps
+    `client_cert_names_max` (8) of them within
+    `client_cert_names_bytes_max` (512) bytes; a leaf naming more is
+    kept to what fits, and the request view says it was truncated. A
+    policy that authorizes on a name's absence must refuse on that.
   - *Not checked:* revocation, which is unbounded work, and extended key
     usage. Short-lived certificates from a dedicated CA are the answer.
 - **Alerts.** `no_application_protocol` and `certificate_required` are
@@ -1689,7 +1697,8 @@ lists do not reach is refused at step zero (`ExtensionUnserved`).
     sorted it, not the order the options stated the routes in;
   - the request view holds the method, the canonical host, path and
     query, the parsed headers, the client address, the verified client
-    certificate's fingerprint when there is one, the listener, the tag,
+    certificate's fingerprint and URI and DNS names (§4) when there is
+    one, the listener, the tag,
     and the loop's `now_ns` (#429), the clock a picker reads, for a
     policy that times a window or refills a bucket. At the route phase
     it also holds the chosen cluster;

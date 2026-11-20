@@ -157,6 +157,8 @@ pub const RenderScratch = struct {
     forwarded: [constants.forwarded_value_bytes_max]u8,
     hops: [max_forwards_digits_max]u8,
     client_cert: [render.client_cert_hex_bytes]u8,
+    /// The verified client's names as a request view lends them (#432).
+    client_names: [constants.client_cert_names_max]extension.ClientCertName,
     sticky: [sticky_value_bytes_max]u8,
     head: render.HeadScratch,
 };
@@ -1471,9 +1473,10 @@ pub fn Proxy(comptime runtime: Runtime) type {
         }
 
         /// The request as an extension reads it (#417): the parsed head and
-        /// the canonical keys routing computed. It aliases both, and the
-        /// render scratch for the certificate's hex, so it lives exactly as
-        /// long as the call it is built for.
+        /// the canonical keys routing computed. It aliases both, the render
+        /// scratch for the certificate's hex and its names' list, and the
+        /// TLS engine for those names' bytes, so it lives exactly as long
+        /// as the call it is built for.
         fn requestView(
             stream: *const StreamType,
             request: *const parser.RequestHead,
@@ -1494,6 +1497,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
                 .headers = request.headers,
                 .client = clientAddressOf(stream),
                 .client_cert_sha256 = planClientCert(stream, &scratch.client_cert),
+                .client_cert_names = planClientNames(stream, &scratch.client_names),
                 .listener_index = stream.conn.listener_index,
                 .cluster_index = cluster_index,
                 .tag = stream.log.tag,
@@ -2102,6 +2106,27 @@ pub fn Proxy(comptime runtime: Runtime) type {
             stream.l7.request_leg = .sending_head;
             server.storeExchangeDeadline(stream, server.idleTimeoutMs());
             armRequestHeadSend(server, stream);
+        }
+
+        /// The verified client's names as a request view carries them
+        /// (#432), built in the caller's scratch for the call's length.
+        fn planClientNames(
+            stream: *const StreamType,
+            out: *[constants.client_cert_names_max]extension.ClientCertName,
+        ) extension.ClientCertNames {
+            const engine = stream.conn.tls orelse return .{};
+            const names = engine.clientNames() orelse return .{};
+            assert(names.count <= out.len);
+            for (out[0..names.count], 0..) |*name, index| {
+                name.* = .{
+                    .kind = switch (names.entries[index].kind) {
+                        .uri => .uri,
+                        .dns => .dns,
+                    },
+                    .value = names.value(index),
+                };
+            }
+            return .{ .names = out[0..names.count], .truncated = names.truncated };
         }
 
         /// The verified client's certificate fingerprint as lowercase hex

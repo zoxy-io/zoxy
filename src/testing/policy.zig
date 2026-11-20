@@ -6,6 +6,7 @@
 
 const std = @import("std");
 
+const constants = @import("../constants.zig");
 const extension = @import("../extension.zig");
 
 const assert = std.debug.assert;
@@ -33,6 +34,13 @@ pub const ScriptedPolicy = struct {
     route_raw: ?u16 = null,
     /// Requests it chose a route for.
     rerouted: u32 = 0,
+    /// The URI subjectAltName every request's verified client must carry
+    /// (#432); empty requires none. A request without it is rejected.
+    require_client_uri: []const u8 = "",
+    /// The last request's client names: how many it carried, and whether
+    /// its leaf named more than the connection kept.
+    seen_client_names: u8 = 0,
+    seen_client_names_truncated: bool = false,
     /// The edits it hands on with every request it proceeds with (#424).
     edits: []const extension.Edit = &.{},
     /// `route_name`'s index on each listener the instance is bound to.
@@ -155,6 +163,8 @@ pub const ScriptedPolicy = struct {
         const kept = @min(request.path.len, path_bytes_max);
         @memcpy(policy.path[0..kept], request.path[0..kept]);
         policy.path_len = @intCast(kept);
+        policy.seen_client_names = @intCast(request.client_cert_names.names.len);
+        policy.seen_client_names_truncated = request.client_cert_names.truncated;
         if (startsWithNonEmpty(request.path, policy.answer_prefix)) {
             policy.answered += 1;
             request.metrics.add(ScriptedPolicy, .answered, 1);
@@ -162,10 +172,26 @@ pub const ScriptedPolicy = struct {
                 inline else => |name| extension.respond(ScriptedPolicy, name),
             };
         }
-        if (!startsWithNonEmpty(request.path, policy.reject_prefix)) return policy.handOn(request);
+        if (!startsWithNonEmpty(request.path, policy.reject_prefix) and policy.clientAdmitted(request)) {
+            return policy.handOn(request);
+        }
         policy.rejected += 1;
         request.metrics.add(ScriptedPolicy, .rejected, 1);
         return .{ .reject = policy.status };
+    }
+
+    /// Whether the request's verified client names `require_client_uri`,
+    /// or nothing is required of it.
+    fn clientAdmitted(policy: *const ScriptedPolicy, request: *const extension.Request) bool {
+        const names = request.client_cert_names.names;
+        assert(names.len <= constants.client_cert_names_max);
+        if (policy.require_client_uri.len == 0) return true;
+        for (names) |name| {
+            assert(name.value.len >= 1);
+            if (name.kind != .uri) continue;
+            if (std.mem.eql(u8, name.value, policy.require_client_uri)) return true;
+        }
+        return false;
     }
 
     fn startsWithNonEmpty(path: []const u8, prefix: []const u8) bool {

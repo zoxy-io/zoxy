@@ -198,6 +198,100 @@ pub fn dnsNames(
     return names.items;
 }
 
+/// A verified client leaf's names (#432): its subjectAltName URIs and DNS
+/// names in the leaf's order, copied into fixed storage — they outlive the
+/// handshake bytes they were read from — up to `client_cert_names_max` of
+/// them within `client_cert_names_bytes_max` bytes. The kept names are a
+/// prefix of the leaf's: the first that does not fit ends them, and
+/// `truncated` says so, so a policy that needs every name knows it does
+/// not have them.
+pub const ClientNames = struct {
+    bytes: [constants.client_cert_names_bytes_max]u8 = undefined,
+    entries: [constants.client_cert_names_max]Entry = undefined,
+    count: u8 = 0,
+    bytes_used: u16 = 0,
+    truncated: bool = false,
+
+    pub const Kind = enum(u8) { uri, dns };
+
+    pub const Entry = struct {
+        kind: Kind,
+        start: u16,
+        len: u16,
+    };
+
+    /// The bytes of entry `index`, valid as long as these names are.
+    pub fn value(names: *const ClientNames, index: usize) []const u8 {
+        assert(index < names.count);
+        const entry = names.entries[index];
+        assert(entry.start + entry.len <= names.bytes_used);
+        return names.bytes[entry.start..][0..entry.len];
+    }
+
+    fn keep(names: *ClientNames, kind: Kind, name: []const u8) void {
+        assert(name.len >= 1);
+        if (names.count == names.entries.len or name.len > names.bytes.len - names.bytes_used) {
+            names.truncated = true;
+            return;
+        }
+        // A DNS name compares without regard to case (RFC 4343), so it is
+        // kept lowercased, as #297's selection reads one; a URI as given.
+        const kept = names.bytes[names.bytes_used..][0..name.len];
+        switch (kind) {
+            .uri => @memcpy(kept, name),
+            .dns => for (kept, name) |*byte, original| {
+                byte.* = std.ascii.toLower(original);
+            },
+        }
+        names.entries[names.count] = .{ .kind = kind, .start = names.bytes_used, .len = @intCast(name.len) };
+        names.count += 1;
+        names.bytes_used += @intCast(name.len);
+    }
+};
+
+/// Read a verified client leaf's URI and DNS names into `names` (#432).
+/// The leaf already verified, so its framing is sound, but its extension
+/// contents are read with explicit bounds all the same: a name that does
+/// not frame ends the read, and is reported as a truncation — the names
+/// kept are still the leaf's, and a policy is told it may lack some.
+pub fn clientNames(leaf_der: []const u8, names: *ClientNames) void {
+    names.* = .{};
+    const leaf = parsed(leaf_der) orelse {
+        names.truncated = true;
+        return;
+    };
+    const san = leaf.subjectAltName();
+    if (san.len == 0) return;
+    const general_names = Tlv.read(san, 0, san.len) orelse {
+        names.truncated = true;
+        return;
+    };
+    var cursor = general_names.start;
+    var seen: u32 = 0;
+    while (cursor < general_names.end) : (seen += 1) {
+        if (seen == constants.tls_certificate_names_max) break;
+        const name = Tlv.read(san, cursor, general_names.end) orelse {
+            names.truncated = true;
+            return;
+        };
+        assert(name.end > cursor);
+        cursor = name.end;
+        if (name.end == name.start) continue;
+        // `[6] IMPLICIT IA5String` and `[2] IMPLICIT IA5String`: a
+        // uniformResourceIdentifier and a dNSName (RFC 5280 §4.2.1.6).
+        switch (name.tag) {
+            0x86 => names.keep(.uri, san[name.start..name.end]),
+            0x82 => names.keep(.dns, san[name.start..name.end]),
+            else => {},
+        }
+        // A prefix, never a list with a gap in it: a shorter name after
+        // one that did not fit is not kept either.
+        if (names.truncated) return;
+    }
+    if (cursor < general_names.end) names.truncated = true;
+    assert(names.count <= constants.client_cert_names_max);
+}
+
 /// Each certificate signed by the next, each issuer a CA, and the last
 /// anchored — the path half both verdicts share.
 fn pathVerifies(
@@ -488,6 +582,49 @@ fn fuzzChain(context: void, smith: *testing.Smith) !void {
     _ = verifyClientChain(anchors, &.{input[0..input_len]}, now_2030);
     // #297's walk of the SAN, a third path over the same bytes. Errors
     // are verdicts; only a panic or an overrun is a finding.
+    // #432's walk keeps a client's URI and DNS names in fixed storage: no
+    // error to return, so every input must leave it within its bounds.
+    var client_names: ClientNames = undefined;
+    clientNames(input[0..input_len], &client_names);
+    assert(client_names.count <= constants.client_cert_names_max);
+    assert(client_names.bytes_used <= constants.client_cert_names_bytes_max);
     const names = dnsNames(fixed.allocator(), input[0..input_len]) catch return;
     assert(names.len <= constants.tls_certificate_names_max);
+}
+
+const names_ca_pem = @embedFile("testdata/names-ca.pem");
+const names_client_pem = @embedFile("testdata/names-client-cert.pem");
+const names_many_pem = @embedFile("testdata/names-many-cert.pem");
+
+test "trust: a client leaf's URI and DNS names are kept in its order, its IP skipped (#432)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const anchors = try parseAnchors(arena, names_ca_pem);
+    const leaf = try firstDer(arena, names_client_pem);
+    try testing.expect(verifyClientChain(anchors, &.{leaf}, now_2030));
+    var names: ClientNames = undefined;
+    clientNames(leaf, &names);
+    try testing.expectEqual(@as(u8, 3), names.count);
+    try testing.expect(!names.truncated);
+    try testing.expectEqual(ClientNames.Kind.uri, names.entries[0].kind);
+    try testing.expectEqualStrings("spiffe://zoxy.test/ns/edge/sa/reports", names.value(0));
+    try testing.expectEqual(ClientNames.Kind.dns, names.entries[1].kind);
+    try testing.expectEqualStrings("workload.zoxy.test", names.value(1));
+    try testing.expectEqualStrings("urn:zoxy:tenant:acme", names.value(2));
+}
+
+test "trust: a leaf naming more than a connection keeps is kept to what fits, and says so (#432)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var names: ClientNames = undefined;
+    clientNames(try firstDer(arena, names_many_pem), &names);
+    try testing.expectEqual(@as(u8, constants.client_cert_names_max), names.count);
+    try testing.expect(names.truncated);
+    try testing.expectEqualStrings("host-00-with-a-long-enough-label.many.zoxy.test", names.value(0));
+    // A leaf with no subjectAltName names nothing, and lacks nothing.
+    clientNames(try firstDer(arena, client_leaf_pem), &names);
+    try testing.expectEqual(@as(u8, 0), names.count);
+    try testing.expect(!names.truncated);
 }
