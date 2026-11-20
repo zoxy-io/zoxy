@@ -1230,8 +1230,10 @@ pub fn accessLogLineBytes(header_count: u32) u32 {
     // `,"client_cert_sha256":"…"` — a SHA-256 in hex (#304).
     const client_cert: u32 = ",\"client_cert_sha256\":\"\"".len + 2 * std.crypto.hash.sha2.Sha256.digest_length;
     const number = 20; // a u64 at its widest
+    // `,"tag":…` — a build's request tag (#433), a u64.
+    const tag: u32 = ",\"tag\":".len + number;
     const numbers = 4; // duration, bytes in, bytes out, status
-    const fixed = scaffolding + timestamp + address + upstream_address + client_cert + numbers * number +
+    const fixed = scaffolding + timestamp + address + upstream_address + client_cert + tag + numbers * number +
         @as(u32, access_log_method_bytes_max) + @as(u32, cluster_name_bytes_max) +
         6 * @as(u32, host_bytes_max) + 6 * @as(u32, access_log_path_bytes_max);
     // Per named header: the quoted key, the escaped value at JSON's

@@ -4436,6 +4436,7 @@ pub fn Server(comptime runtime: Runtime) type {
                 .request_headers = logged.request,
                 .response_headers = logged.response,
                 .client_cert_sha256 = clientCertHex(stream.conn, &client_cert_hex),
+                .tag = stream.log.tag,
             };
             // A duration is never negative once saturated, and a line
             // always names a start: both are what `renderLine` prints

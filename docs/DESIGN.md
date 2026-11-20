@@ -1213,6 +1213,7 @@ Rules the table follows:
     - duration and byte counts;
     - cluster and endpoint;
     - `client_cert_sha256`;
+    - `tag`, a build's request tag (§13), on a line that has one;
     - any request or response headers the operator named: copied,
       truncated with a mark, names lowercased, first value only.
   - **TLS byte counts.** For TLS-terminated HTTP/1.1, the response-head
@@ -1663,7 +1664,8 @@ lists do not reach is refused at step zero (`ExtensionUnserved`).
   - the tag (#433) is one `u64` per request, zero until a policy sets
     it. The later write wins, and a tag set before a later reject
     stays. Every later view of the request carries it: the next
-    policy's, the route phase's, and a picker's on every try. Each
+    policy's, the route phase's, and a picker's on every try. The
+    access log records a non-zero tag as the number `tag`. Each
     keep-alive request and each HTTP/2 stream starts at zero;
   - a reject answers with the static response, logs outcome
     `rejected`, carries Proxy-Status `http_request_denied` where the

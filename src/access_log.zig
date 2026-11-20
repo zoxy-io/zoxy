@@ -159,6 +159,11 @@ pub const Record = struct {
     /// origin received. Omitted otherwise, so a deployment without
     /// mutual TLS writes the line it always did.
     client_cert_sha256: ?[]const u8 = null,
+    /// The tag a build's request policy set on the request (#433), on
+    /// any line that carries one. Omitted at zero, which is no tag — so
+    /// a build whose policies set none, and the stock binary, which has
+    /// no policies, write the line they always did.
+    tag: u64 = 0,
 };
 
 /// One direction's logged headers: the configured names and the values
@@ -229,6 +234,11 @@ fn renderInto(record: *const Record, writer: *std.Io.Writer) std.Io.Writer.Error
         // Hex digits only, so nothing here needs escaping.
         assert(hex.len >= 1);
         try writer.print(",\"client_cert_sha256\":\"{s}\"", .{hex});
+    }
+    if (record.tag != 0) {
+        // A number, as the build set it: a tag is the build's own
+        // identifier, and its meaning lives in the build.
+        try writer.print(",\"tag\":{d}", .{record.tag});
     }
     if (record.kind == .http) {
         try renderHttpFields(record, writer);
@@ -669,6 +679,30 @@ test "access log: an HTTP line carries every field, exactly once" {
     );
 }
 
+test "access log: a tagged line carries its tag, and an untagged one is unchanged (#433)" {
+    var buffer: [constants.access_log_line_bytes_max]u8 = undefined;
+    var entry = testRecord();
+    entry.tag = 7;
+    const line = try renderLine(&entry, &buffer);
+
+    try testing.expectEqualStrings(
+        "{\"time\":\"2026-07-31T09:14:22.481Z\",\"kind\":\"http\",\"outcome\":\"ok\"," ++
+            "\"client\":\"10.1.2.3:52344\",\"tag\":7,\"method\":\"GET\",\"host\":\"api.example.com\"," ++
+            "\"path\":\"/v1/items\",\"status\":200,\"upstream_reused\":true," ++
+            "\"upstream_replayed\":false,\"duration_us\":1873,\"bytes_in\":142," ++
+            "\"bytes_out\":4096,\"cluster\":\"api\",\"upstream\":\"10.0.0.7:8080\"}\n",
+        line,
+    );
+    // The widest tag is still a JSON number a consumer reads whole.
+    entry.tag = std.math.maxInt(u64);
+    const widest = try renderLine(&entry, &buffer);
+    try testing.expect(std.mem.indexOf(u8, widest, ",\"tag\":18446744073709551615,") != null);
+    // Zero is no tag: no key at all, not `"tag":0`.
+    entry.tag = 0;
+    const untagged = try renderLine(&entry, &buffer);
+    try testing.expect(std.mem.indexOf(u8, untagged, "tag") == null);
+}
+
 test "access log: an L4 line omits the request fields and names no status" {
     var buffer: [constants.access_log_line_bytes_max]u8 = undefined;
     var entry = testRecord();
@@ -796,6 +830,7 @@ test "access log: a line at every cap still fits the bound (#140)" {
     entry.duration_ns = std.math.maxInt(u64);
     entry.bytes_in = std.math.maxInt(u64);
     entry.bytes_out = std.math.maxInt(u64);
+    entry.tag = std.math.maxInt(u64);
     // Split across the directions the way a config's two lists are, so
     // the wrapper objects are both paid for.
     const split = constants.access_log_headers_max / 2;
@@ -878,6 +913,7 @@ test "access log: the line bound holds at every field's maximum" {
         .status = 999,
         .upstream_reused = true,
         .upstream_replayed = true,
+        .tag = std.math.maxInt(u64),
     };
     var buffer: [constants.access_log_line_bytes_max]u8 = undefined;
     const line = try renderLine(&entry, &buffer);

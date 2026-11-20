@@ -125,8 +125,9 @@ pub const Request = struct {
     /// What an earlier phase worked out about this request (#433): the
     /// tag the last policy to set one left, or zero while none has. A
     /// policy sets it with `proceed_with`. Every later view of the same
-    /// request carries it: the next policy's, the route phase's, a
-    /// picker's on the first try and on a retry.
+    /// request carries it — the next policy's, the route phase's, a
+    /// picker's on the first try and on a retry — and the access log
+    /// records it as `tag`.
     tag: u64,
 };
 
@@ -305,8 +306,8 @@ pub const Proceed = struct {
     /// it arrived with. The later write wins: a route's policy may
     /// overwrite what a listener's set, and reads the current tag in
     /// `Request.tag` if it would rather keep it. A tag set before a
-    /// later policy rejects stays the request's. Zero clears it: zero is
-    /// no tag, as before any was set.
+    /// later policy rejects stays the request's, and the rejected line
+    /// records it. Zero clears it: zero is no tag, as before any was set.
     tag: ?u64 = null,
 };
 
