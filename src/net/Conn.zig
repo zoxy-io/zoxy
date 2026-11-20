@@ -133,6 +133,8 @@ pub fn Conn(comptime runtime: Runtime) type {
         /// The listener's #417 request policies, installed like its
         /// filters; empty on every l4 listener.
         request_policies: []const extension.Selection,
+        /// The listener's #424 response policies, run on each response head.
+        response_policies: []const extension.Selection,
         /// Whether this listener takes h2c by prior knowledge (#275): a
         /// plaintext connection whose first octets are HTTP/2's preface
         /// speaks HTTP/2. Handed over at admission like the tables beside
@@ -360,6 +362,7 @@ pub fn Conn(comptime runtime: Runtime) type {
             // listener's real tables (§7); L4 never reads them.
             conn.listener_index = 0;
             conn.request_policies = &.{};
+            conn.response_policies = &.{};
             conn.routes = &.{};
             conn.sni_routes = &.{};
             conn.request_filters = &.{};

@@ -515,6 +515,8 @@ pub fn Server(comptime runtime: Runtime) type {
             /// The listener's #417 request policies, handed over the same
             /// way and run ahead of the filters.
             request_policies: []const extension.Selection,
+            /// The listener's #424 response policies, the same way.
+            response_policies: []const extension.Selection,
             /// The listener's #175 response filter rules, handed over the
             /// same way so the response re-render can apply its edits.
             response_filters: []const filter.ResponseRule,
@@ -1738,6 +1740,7 @@ pub fn Server(comptime runtime: Runtime) type {
                     .keepalive_requests = listener_config.keepalive_requests,
                     .request_filters = listener_config.request_filters,
                     .request_policies = listener_config.request_policies,
+                    .response_policies = listener_config.response_policies,
                     .response_filters = listener_config.response_filters,
                     .forwarded = listener_config.forwarded,
                     .proxy_status = listener_config.proxy_status,
@@ -2775,6 +2778,7 @@ pub fn Server(comptime runtime: Runtime) type {
             conn.sni_routes = listener.sni_routes;
             conn.request_filters = listener.request_filters;
             conn.request_policies = listener.request_policies;
+            conn.response_policies = listener.response_policies;
             conn.response_filters = listener.response_filters;
             conn.upgrades = listener.upgrades;
             conn.h2c = listener.h2c;
@@ -4607,15 +4611,30 @@ pub fn Server(comptime runtime: Runtime) type {
                     assert(selection.index < runtime.extensions.request_policies.len);
                     selects = true;
                 }
+                // A response policy reads a response, which an l4 listener
+                // relays none of (#424).
+                if (listener.response_policies.len >= 1) assert(listener.protocol == .http);
+                for (listener.response_policies) |selection| {
+                    assert(selection.index < runtime.extensions.response_policies.len);
+                    selects = true;
+                }
                 for (listener.routes) |*route| {
-                    if (route.request_policies.len >= 1) assert(listener.protocol == .http);
+                    if (route.request_policies.len + route.response_policies.len >= 1) {
+                        assert(listener.protocol == .http);
+                    }
                     for (route.request_policies) |selection| {
                         assert(selection.index < runtime.extensions.request_policies.len);
                         selects = true;
                     }
+                    for (route.response_policies) |selection| {
+                        assert(selection.index < runtime.extensions.response_policies.len);
+                        selects = true;
+                    }
                 }
             }
-            if (runtime.extensions.pickers.len == 0 and runtime.extensions.request_policies.len == 0) {
+            if (runtime.extensions.pickers.len == 0 and runtime.extensions.request_policies.len == 0 and
+                runtime.extensions.response_policies.len == 0)
+            {
                 assert(!selects);
             }
             return selects;
@@ -4648,7 +4667,12 @@ pub fn Server(comptime runtime: Runtime) type {
                     .cluster_index = null,
                     .routes = listener.routes,
                 };
-                for (listener.request_policies) |selection| try bindPolicy(selection, &site, startup);
+                for (listener.request_policies) |selection| {
+                    try bindFrom(runtime.extensions.request_policies, selection, &site, startup);
+                }
+                for (listener.response_policies) |selection| {
+                    try bindFrom(runtime.extensions.response_policies, selection, &site, startup);
+                }
                 try bindRoutePolicies(listener, @intCast(index), startup);
             }
             server.extensions_bound = true;
@@ -4670,18 +4694,81 @@ pub fn Server(comptime runtime: Runtime) type {
                     .cluster_index = route.cluster_index,
                     .routes = listener.routes,
                 };
-                for (route.request_policies) |selection| try bindPolicy(selection, &site, startup);
+                for (route.request_policies) |selection| {
+                    try bindFrom(runtime.extensions.request_policies, selection, &site, startup);
+                }
+                for (route.response_policies) |selection| {
+                    try bindFrom(runtime.extensions.response_policies, selection, &site, startup);
+                }
             }
         }
 
-        fn bindPolicy(
+        /// Run the route's and the listener's response policies over a
+        /// response head (#424), copying their edits for the render; false
+        /// when one asked for an edit zoxy refuses. Nothing at all in a
+        /// build that lists none.
+        pub fn evaluateResponsePolicies(server: *Self, stream: *const StreamType, response: *const parser.ResponseHead) bool {
+            if (comptime runtime.extensions.response_policies.len == 0) return true;
+            const conn = stream.conn;
+            assert(stream.route_index < conn.routes.len);
+            const route = &conn.routes[stream.route_index];
+            server.policy_edits.resetResponse();
+            if (route.response_policies.len + conn.response_policies.len == 0) return true;
+            const view: extension.Response = .{
+                .status = response.status,
+                .headers = response.headers,
+                .listener_index = conn.listener_index,
+                .route_index = stream.route_index,
+                .cluster_index = stream.cluster_index,
+                .tag = stream.log.tag,
+                .now_ns = server.io.nowNs(),
+            };
+            if (!server.runResponsePolicies(route.response_policies, &view, true)) return false;
+            return server.runResponsePolicies(conn.response_policies, &view, false);
+        }
+
+        fn runResponsePolicies(
+            server: *Self,
+            selections: []const extension.Selection,
+            view: *const extension.Response,
+            route_phase: bool,
+        ) bool {
+            assert(view.status >= 100);
+            assert(view.listener_index < server.config.listeners.len);
+            assert(selections.len <= std.math.maxInt(u16));
+            for (selections) |selection| {
+                const verdict = callResponsePolicy(selection, view);
+                const bound = PolicyEdits.responseEditBytesOf(selection);
+                server.policy_edits.takeResponse(route_phase, verdict.edits, bound) catch {
+                    server.counters.increment("l7_response_policy_edit_refused");
+                    return false;
+                };
+            }
+            return true;
+        }
+
+        fn callResponsePolicy(selection: extension.Selection, view: *const extension.Response) extension.ResponseVerdict {
+            assert(selection.index < runtime.extensions.response_policies.len);
+            inline for (runtime.extensions.response_policies, 0..) |Policy, index| {
+                if (selection.index == index) {
+                    const policy: *Policy = @ptrCast(@alignCast(selection.instance));
+                    return Policy.evaluate(policy, view);
+                }
+            }
+            unreachable;
+        }
+
+        /// Bind one request or response policy (#417, #424) at its site,
+        /// through the list its selection indexes.
+        fn bindFrom(
+            comptime list: []const type,
             selection: extension.Selection,
             site: *const extension.PolicySite,
             startup: *const extension.Startup,
         ) anyerror!void {
-            assert(selection.index < runtime.extensions.request_policies.len);
+            assert(selection.index < list.len);
             assert(site.listener_index < std.math.maxInt(u16));
-            inline for (runtime.extensions.request_policies, 0..) |Policy, index| {
+            inline for (list, 0..) |Policy, index| {
                 if (selection.index == index) {
                     if (comptime !@hasDecl(Policy, "bind")) return;
                     const policy: *Policy = @ptrCast(@alignCast(selection.instance));
@@ -4799,10 +4886,14 @@ pub fn Server(comptime runtime: Runtime) type {
             }
         }
 
-        /// The cluster routing chose, for the completions a request owes.
-        pub fn notePoliciesRouted(server: *Self, stream: *StreamType, cluster_index: u16) void {
-            if (comptime !ConnType.completes_policies) return;
+        /// The route and cluster routing chose: for the response policies a
+        /// response meets (#424), and the completions a request owes (#429).
+        pub fn noteRouted(server: *Self, stream: *StreamType, route_index: u16, cluster_index: u16) void {
+            assert(route_index < stream.conn.routes.len);
             assert(cluster_index < server.config.clusters.len);
+            // #424: whose response policies the response head meets.
+            stream.route_index = route_index;
+            if (comptime !ConnType.completes_policies) return;
             stream.policies.routed = true;
             stream.policies.cluster_index = cluster_index;
         }

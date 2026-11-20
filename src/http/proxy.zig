@@ -151,7 +151,9 @@ pub const RenderScratch = struct {
     host: [constants.host_bytes_max]u8,
     /// The filters' edits and a build's policies' (#424), composed.
     request_edits: [constants.request_edits_max]filter.AppliedHeaderEdit,
-    response_edits: [constants.response_edits_max]filter.AppliedHeaderEdit,
+    /// The response filters' edits, a build's response policies' (#424)
+    /// and the #178 stamp.
+    response_edits: [constants.response_render_edits_max]filter.AppliedHeaderEdit,
     forwarded: [constants.forwarded_value_bytes_max]u8,
     hops: [max_forwards_digits_max]u8,
     client_cert: [render.client_cert_hex_bytes]u8,
@@ -1271,7 +1273,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             };
             const routed = &conn.routes[route_index];
             stream.cluster_index = routed.cluster_index;
-            server.notePoliciesRouted(stream, routed.cluster_index);
+            server.noteRouted(stream, route_index, routed.cluster_index);
             // #417: the route's own policies, now that the cluster is
             // known, and still before the first resource below.
             if (routed.request_policies.len >= 1) {
@@ -2928,12 +2930,22 @@ pub fn Proxy(comptime runtime: Runtime) type {
             stream: *const StreamType,
             response: *const parser.ResponseHead,
             verdict: StickyVerdict,
-            buffer: *[constants.response_edits_max]filter.AppliedHeaderEdit,
+            buffer: *[constants.response_render_edits_max]filter.AppliedHeaderEdit,
             scratch: *[sticky_value_bytes_max]u8,
         ) []const filter.AppliedHeaderEdit {
             const conn = stream.conn;
-            const edits = responseEdits(stream, response, buffer[0..constants.header_edits_max]);
-            assert(edits.len <= constants.header_edits_max);
+            // #424: the route's response policies' edits, the filters', the
+            // listener's policies' — the order they run in on the way out.
+            const policy = server.policy_edits.responseEditsOf();
+            const filter_room = buffer[policy.route.len..][0..constants.header_edits_max];
+            const filtered = responseEdits(stream, response, filter_room);
+            assert(filtered.len <= constants.header_edits_max);
+            const edits = if (policy.route.len + policy.listener.len == 0)
+                filtered
+            else
+                policy_edits_module.compose(policy.route, filtered, policy.listener, buffer[0 .. buffer.len - 1]);
+            // A prefix of `buffer`, so the stamp's slot follows it.
+            assert(edits.len < buffer.len);
             switch (verdict) {
                 .none, .followed => return edits,
                 .assigned, .repicked => {},
@@ -3326,10 +3338,12 @@ pub fn Proxy(comptime runtime: Runtime) type {
             assert(stream.phase == .exchanging);
             assert(stream.l7.response_leg == .awaiting_head);
             assert(stream.l7.request_head_vacated);
-            const upstream = stream.upstream.?;
             // Not every status reaching here is *the* response: a tunnel,
             // an interim and an uninvited switch all divert first.
             if (!dispatchByStatus(server, stream, response)) return;
+            // #424: a build's response policies read the head and edit it;
+            // an edit zoxy refuses fails it as an unrenderable head does.
+            if (!server.evaluateResponsePolicies(stream, response)) return upstreamFailed(server, stream);
 
             // The #237 cap applies where the response's persistence is
             // decided, not at the turnaround: §8's rule is that a close is
@@ -3369,6 +3383,23 @@ pub fn Proxy(comptime runtime: Runtime) type {
                 return;
             };
             assert(rendered.len >= 1);
+            feedExcessAndCommit(server, stream, response, verdict, @intCast(rendered.len));
+        }
+
+        /// After the head renders: the framing tracker fed over the body
+        /// excess that arrived with it, what rides the head on staged, and
+        /// the response committed. Split from `renderResponse` for the
+        /// length limit; same callback, so the render's bytes are live.
+        fn feedExcessAndCommit(
+            server: *ServerType,
+            stream: *StreamType,
+            response: *const parser.ResponseHead,
+            verdict: StickyVerdict,
+            rendered_len: u32,
+        ) void {
+            assert(rendered_len >= 1);
+            assert(stream.l7.response_leg == .awaiting_head);
+            const upstream = stream.upstream.?;
             stream.l7.response_framing = framingFromParsed(response.framing);
 
             // Feed the framing tracker over the body excess that arrived
@@ -3389,7 +3420,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             const head_write_len = coalesceResponseExcess(
                 server,
                 stream,
-                @intCast(rendered.len),
+                rendered_len,
                 excess[0..fed.forward_len],
             );
 

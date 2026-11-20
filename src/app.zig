@@ -105,6 +105,15 @@ pub fn App(comptime extensions: extension.Extensions) type {
             return selection;
         }
 
+        /// One response-policy selection for a listener's or a route's
+        /// list (#424): `instance` must point at a response-policy type
+        /// this build lists.
+        pub fn responsePolicy(instance: anytype) extension.Selection {
+            const selection = extension.select(extensions.response_policies, instance);
+            assert(selection.index < extensions.response_policies.len);
+            return selection;
+        }
+
         /// The options as this build can serve them: resolved, and every
         /// selection one of the build's own lists reaches.
         fn resolveServed(arena: std.mem.Allocator, options: *const Options) !Config {
@@ -136,9 +145,15 @@ pub fn App(comptime extensions: extension.Extensions) type {
                 for (listener.request_policies) |selection| {
                     try refuseUnserved(selection, extensions.request_policies.len);
                 }
+                for (listener.response_policies) |selection| {
+                    try refuseUnserved(selection, extensions.response_policies.len);
+                }
                 for (listener.routes) |*route| {
                     for (route.request_policies) |selection| {
                         try refuseUnserved(selection, extensions.request_policies.len);
+                    }
+                    for (route.response_policies) |selection| {
+                        try refuseUnserved(selection, extensions.response_policies.len);
                     }
                 }
             }
@@ -163,6 +178,8 @@ pub fn App(comptime extensions: extension.Extensions) type {
             assert(config.listeners.len >= 1);
             const shape = Edits.shapeOf(config);
             if (shape.edits > constants.policy_edits_max) return error.PolicyEditsOverLimit;
+            // The same bound on the way out (#424).
+            if (Edits.responseShapeOf(config).edits > constants.policy_edits_max) return error.PolicyEditsOverLimit;
         }
 
         fn refuseUnserved(selection: extension.Selection, listed_count: usize) error{ExtensionUnserved}!void {

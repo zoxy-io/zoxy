@@ -471,6 +471,10 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
         /// the L7 path `routeRequest` overwrites it with the request
         /// path's cluster once the head parses (§7).
         cluster_index: u16,
+        /// The route the request took (#424), set with `cluster_index` at
+        /// routing: whose response policies its response head meets. Not
+        /// in `l7`, so the §7 replay keeps it.
+        route_index: u16,
         /// The leased upstream slot during an L7 exchange; released at
         /// teardown alongside the conn slot (§5). Null outside exchanges
         /// and on the whole L4 path.
@@ -854,6 +858,7 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
             // resolves one (`finishAdmission`); on the L7 path `routeRequest`
             // overwrites it per request anyway (§7).
             stream.cluster_index = 0;
+            stream.route_index = 0;
             // The field defaults are `reset`'s values; a recycled slot
             // needs both the scalars and the (unread) capture arrays, and
             // this sets them in one write. The clock stays at zero: an L4
