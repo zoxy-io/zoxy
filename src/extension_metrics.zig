@@ -45,6 +45,8 @@ pub fn Table(comptime extensions: extension.Extensions) type {
 
         /// Whether this build meters anything.
         pub const enabled = families.len >= 1;
+        /// The build's metered types, in render order.
+        pub const metered_types = families;
 
         /// Every site's blocks, in walk order: clusters, then each
         /// listener's own list and its routes' lists in turn.
@@ -317,6 +319,24 @@ pub fn Table(comptime extensions: extension.Extensions) type {
                 if (policyFamily(earlier) == family) return index;
             }
             return position;
+        }
+
+        /// `Family`'s counter `name` summed over every site that selects
+        /// it: what a census, or a build's own test, asks of a counter.
+        pub fn counterTotal(
+            table: *const Self,
+            comptime Family: type,
+            comptime name: extension.CounterName(Family),
+        ) u64 {
+            const family = comptime extension.familyIndex(extensions, Family);
+            var sum: u64 = 0;
+            for (table.blocks) |block| {
+                if (block.family != family) continue;
+                const value = block.counters[@backingInt(name)];
+                assert(sum <= std.math.maxInt(u64) - value);
+                sum += value;
+            }
+            return sum;
         }
 
         /// A cluster's picker slots.
@@ -640,6 +660,10 @@ test "extension metrics: one block per site and metered type, priced as init tak
     const guarded = table.routePolicies(0, 0);
     try testing.expectEqual(@as(usize, 1), guarded.len);
     try testing.expectEqual(@as(u64, 0), guarded[0].counter(TestMetered, .seen));
+    guarded[0].add(TestMetered, .seen, 4);
+    // A family's total spans its sites.
+    try testing.expectEqual(@as(u64, 7), table.counterTotal(TestMetered, .seen));
+    try testing.expectEqual(@as(u64, 0), table.counterTotal(TestPicker, .picks));
     try testing.expectEqual(@as(usize, 0), table.routePolicies(0, 1).len);
 }
 

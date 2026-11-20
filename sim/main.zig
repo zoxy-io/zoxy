@@ -580,6 +580,29 @@ fn entryFor(name: []const u8) ?*const Uncovered {
     return null;
 }
 
+/// The sweep's metered extension counters (#435), one entry each: the
+/// type, the name, and the series the endpoint renders it as.
+const ExtensionMetrics = @FieldType(Harness, "server").ExtensionMetrics;
+const ExtensionCounter = struct {
+    Family: type,
+    name: []const u8,
+    series: []const u8,
+};
+const extension_counters: []const ExtensionCounter = blk: {
+    var collected: []const ExtensionCounter = &.{};
+    for (ExtensionMetrics.metered_types) |Family| {
+        const Name = zoxy.extension.CounterName(Family);
+        for (@typeInfo(Name).@"enum".field_names) |name| {
+            collected = collected ++ [_]ExtensionCounter{.{
+                .Family = Family,
+                .name = name,
+                .series = zoxy.extension.metric_prefix ++ Family.metrics_prefix ++ "_" ++ name,
+            }};
+        }
+    }
+    break :blk collected;
+};
+
 /// What every counter totalled across a swept range, and the coverage
 /// verdict those totals carry (§9).
 ///
@@ -600,6 +623,10 @@ const Census = struct {
     /// independently — `close` is delivered by exactly one call site in
     /// the tree, so no counter's silence would have named it.
     ops: [std.enums.values(SimIo.OpKind).len]u64 = @splat(0),
+    /// The scripted extensions' own counters (#435), summed over sites:
+    /// the metered calls asked whether they ever counted. A counter no
+    /// seed moves is a metered path the sweep never walks.
+    extension_totals: [extension_counters.len]u64 = @splat(0),
     /// Marked request bodies (#373) the origin checked and found whole:
     /// the one oracle that reads HTTP/2 request bodies, asked whether it
     /// ever ran. No counter says so, since a body that arrives whole is
@@ -621,6 +648,12 @@ const Census = struct {
             // As the counter loop above: a wrap would read as an op going
             // quiet, which is the one thing this table exists to notice.
             assert(census.ops[@backingInt(kind)] >= before);
+        }
+        inline for (extension_counters, &census.extension_totals) |counter, *total| {
+            const before = total.*;
+            const name = @field(zoxy.extension.CounterName(counter.Family), counter.name);
+            total.* += harness.server.extension_metrics.counterTotal(counter.Family, name);
+            assert(total.* >= before);
         }
         const bodies_before = census.bodies_verified;
         census.bodies_verified += harness.origin_http.bodies_verified;
@@ -676,7 +709,27 @@ const Census = struct {
             assert(fired == Counters.names.len - uncovered.len + allowed_fired);
         }
         const ops_held = census.verifyOps();
-        return census.verifyBodies() and ops_held and held;
+        const extensions_held = census.verifyExtensionCounters();
+        return census.verifyBodies() and ops_held and extensions_held and held;
+    }
+
+    /// Every counter the scripted extensions declare moved somewhere in
+    /// the range — the census a build can hold its own counters to.
+    /// `past_end` rides on the picker's draws, on the quarter of seeds
+    /// that select one; a range of `census_iterations_min` seeds carries
+    /// thousands of those picks, and a given range always draws the same.
+    fn verifyExtensionCounters(census: *const Census) bool {
+        var held = true;
+        inline for (extension_counters, census.extension_totals) |counter, total| {
+            if (total == 0) {
+                std.debug.print(
+                    "sim census: {s} never fired in this sweep; widen a scenario that reaches it\n",
+                    .{counter.series},
+                );
+                held = false;
+            }
+        }
+        return held;
     }
 
     /// Some marked body must reach its origin whole in the range: an
@@ -866,9 +919,10 @@ fn checkCensus(options: *const Sweep, census: *const Census) bool {
         return true;
     }
     if (!census.verify(options.iterations)) return false;
-    std.debug.print("sim: census ok, {d} counter(s) fired, {d} exempt; {d} seam op(s), {d} exempt; {d} body(ies) verified\n", .{
+    std.debug.print("sim: census ok, {d} counter(s) fired, {d} exempt; {d} extension counter(s) fired; {d} seam op(s), {d} exempt; {d} body(ies) verified\n", .{
         Counters.names.len - uncovered.len,
         uncovered.len,
+        extension_counters.len,
         std.enums.values(SimIo.OpKind).len - 1 - uncovered_ops.len,
         uncovered_ops.len,
         census.bodies_verified,

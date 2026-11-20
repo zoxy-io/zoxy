@@ -20,6 +20,10 @@
 //! Each obeys the contract every extension does: run to completion, no
 //! allocation, no clock, no syscall, nothing kept from a view past the
 //! call — so the simulator replays a seed exactly with them in it.
+//!
+//! `LeastInFlight` and `TenantGuard` also count what they do in series of
+//! their own (#435), which the metrics endpoint renders once per cluster
+//! and per listener: `zoxy_ext_least_in_flight_picks{cluster="api"}`.
 
 const std = @import("std");
 
@@ -40,11 +44,12 @@ pub const tenant_header = "x-tenant";
 /// The endpoint with the fewest requests in flight; among equals, the one
 /// offered first, so the choice is a function of what zoxy offered.
 pub const LeastInFlight = struct {
-    /// Picks made, across every cluster the instance serves. A `u64`, as
-    /// every counter is (§8): a long-lived edge would wrap a narrower one.
-    picks: u64 = 0,
     /// Clusters that selected this instance.
     clusters: u16 = 0,
+
+    pub const metrics_prefix = "least_in_flight";
+    pub const counters = .{ .picks = "Picks the least-in-flight picker made." };
+    pub const gauges = .{ .chosen_in_flight = "Requests in flight at the endpoint the last pick chose." };
 
     pub fn bind(
         picker: *LeastInFlight,
@@ -61,7 +66,7 @@ pub const LeastInFlight = struct {
         candidates: *const zoxy.extension.Candidates,
         input: *const zoxy.extension.PickInput,
     ) u16 {
-        _ = input;
+        assert(picker.clusters >= 1);
         const count = candidates.count();
         assert(count >= 1);
         var best: u16 = 0;
@@ -70,7 +75,9 @@ pub const LeastInFlight = struct {
             if (candidates.inFlight(slot) < candidates.inFlight(best)) best = slot;
         }
         assert(best < count);
-        picker.picks += 1;
+        // Per cluster: zoxy hands each cluster's pick that cluster's slots.
+        input.metrics.add(LeastInFlight, .picks, 1);
+        input.metrics.set(LeastInFlight, .chosen_in_flight, candidates.inFlight(best));
         return best;
     }
 };
@@ -98,16 +105,21 @@ pub const PathAffinity = struct {
 /// A request names its tenant, or is refused before anything else looks
 /// at it.
 pub const TenantGuard = struct {
-    refused: u64 = 0,
+    /// The header a request names its tenant in.
+    header: []const u8 = tenant_header,
+
+    pub const metrics_prefix = "tenant_guard";
+    pub const counters = .{ .refused = "Requests refused for naming no tenant." };
 
     pub fn evaluate(guard: *TenantGuard, request: *const zoxy.extension.Request) zoxy.extension.Verdict {
         assert(request.cluster_index == null); // The listener phase.
+        assert(guard.header.len >= 1);
         for (request.headers) |header| {
-            if (std.ascii.eqlIgnoreCase(header.name, tenant_header) and header.value.len >= 1) {
+            if (std.ascii.eqlIgnoreCase(header.name, guard.header) and header.value.len >= 1) {
                 return .proceed;
             }
         }
-        guard.refused += 1;
+        request.metrics.add(TenantGuard, .refused, 1);
         return .{ .reject = .forbidden };
     }
 };

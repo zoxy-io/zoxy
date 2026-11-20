@@ -1708,7 +1708,9 @@ asserted at the seam wherever zoxy can see them:
 **Testing a build.** `zoxy.testing.Bed(extensions)` runs a build's
 options and extensions over the simulator. It puts an origin on every
 endpoint, each answering with its own address, drives HTTP clients, and
-ends with a drained, reconciled server. `expectNoAllocationAfterStartup`
+ends with a drained, reconciled server. `Bed.counter(Type, .name)`
+reads one of the build's own counters, summed over the sites that
+select the type, as the run left it. `expectNoAllocationAfterStartup`
 is §9's gate over the build's own scenario, run twice: first counted,
 then with every allocation and resize past startup failing. The second
 run must also replay the first's delivery trace, and a clock or private
@@ -1716,10 +1718,13 @@ randomness breaks that.
 
 zoxy's own simulator runs scripted extensions (`ScriptedPicker`,
 `ScriptedPolicy`), so every dispatch arm, the fallback and both policy
-phases are in the census. An embedder's own functions are theirs to
+phases are in the census, and every counter the scripted types declare
+must fire across the sweep. An embedder's own functions are theirs to
 cover with the bed. `examples/edge` is a working build:
 - two picker types, one instance selected by two clusters;
 - both policy phases;
+- series of its own: a counter and a gauge for a picker, and a counter
+  for a policy;
 - its own bed tests and a live smoke.
 
 CI builds, tests and smokes it against a fetched package.
