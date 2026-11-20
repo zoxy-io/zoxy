@@ -938,7 +938,11 @@ gates startup.
     - `tcp` dials;
     - `http` sends `GET path` and expects a status, judged by the data
       path's own parser;
-    - `grpc` calls `grpc.health.v1` on the HTTP/2 origin pool.
+    - `grpc` calls `grpc.health.v1` on the HTTP/2 origin pool;
+    - `extension`, in code only, is a build's own kind (#436, §13):
+      zoxy dials and holds the deadline, and the type speaks the
+      origin's protocol in rounds. Plaintext, like `http`: refused on a
+      TLS cluster (`ClusterTlsExtensionCheck`).
   - **Verdicts.** `fall` misses eject; `rise` passes restore.
   - **The prober.** One prober runs, with as many probes in flight as
     there are checked endpoints, up to 16. Sweeps run end to start every
@@ -1626,7 +1630,7 @@ extensions they list.
 
 **Extensions.** A build lists types:
 `Extensions{ .pickers, .request_policies, .response_policies,
-.connection_policies }`. Dispatch is a comptime
+.connection_policies, .probes }`. Dispatch is a comptime
 switch over the list, not a function pointer, and with empty lists
 every extension call compiles out, as in the stock binary. An instance
 carries its parameters and its state. A selection is the type's index
@@ -1746,6 +1750,32 @@ lists do not reach is refused at step zero (`ExtensionUnserved`).
     loop-clock times the request began and ended, and the policy's own
     metrics: what a rate or concurrency limit counts back down by.
 
+- **Probes** (#436), a cluster's check kind, selected with `App.probe`
+  as the check's `kind`:
+  - the type declares `reply_bytes_max` (1 to 64 KiB) and two calls,
+    `request(*P, round) []const u8` and
+    `judge(*P, round, reply) ProbeJudgement`. A probe starts at round 0:
+    zoxy sends the round's request — empty for a protocol whose server
+    speaks first — and asks `judge` of the round's reply each time more
+    arrives. `pass` and `fail` decide; `read_more` waits; `next` sends
+    the next round's request and judges its reply from empty;
+  - rounds are bounded by `health_check_rounds_max` (4), so a greeting
+    and its answer fit — MySQL counts a client that hangs up after the
+    greeting against the prober's host — and a judge that keeps asking
+    fails the probe, counting `health_probe_rounds_exhausted`. A reply
+    that fills `reply_bytes_max` undecided fails, as an oversize head
+    does. A round's request past the http probe's own bound fails the
+    probe and counts `health_probe_request_oversize` — a later round's
+    may be built from what the origin sent, so its length is not the
+    build's alone to promise;
+  - zoxy owns the dial, the deadline, the bytes on the wire, `fall` and
+    `rise`. One instance serves every probe of its cluster, which run
+    concurrently, so a probe's round is zoxy's to keep: the instance
+    holds configuration and what its probes share. An optional
+    `bind(*P, *const ClusterSite, *const Startup) !void` runs per cluster;
+  - each probe slot is the wider of the head buffer and the widest
+    declared reply, priced in the head scratch. A probe declares no
+    metrics yet.
 - **Connection policies** (#425), an ordered list per listener of
   either protocol and per SNI route, selected with
   `App.connectionPolicy`:

@@ -55,6 +55,9 @@ pub const Extensions = struct {
     /// Connection policies a listener may select (#425): they admit or
     /// refuse each connection before a handshake, a peek or a first head.
     connection_policies: []const type = &.{},
+    /// Health-check kinds a cluster may select (#436): they speak an
+    /// origin's own protocol over a probe's connection.
+    probes: []const type = &.{},
 };
 
 /// What a server is built from: the Io backend (§4) and the build's
@@ -582,6 +585,80 @@ pub const ConnectionProceed = struct {
     tag: ?u64 = null,
 };
 
+/// The health-check contract for a build's own kind (#436). zoxy owns the
+/// dial, the probe's deadline, the bytes on the wire, `fall` and `rise`;
+/// the type owns the protocol, in rounds:
+///
+///     pub const reply_bytes_max: u32 = 512;
+///     pub fn request(self: *P, round: u8) []const u8
+///     pub fn judge(self: *P, round: u8, reply: []const u8) ProbeJudgement
+///
+/// A probe begins at round 0: zoxy sends `request(round)` — empty for a
+/// protocol whose server speaks first, and within
+/// `health_check_request_bytes_max`, past which the probe fails and counts
+/// `health_probe_request_oversize` — and calls `judge` with the round's
+/// reply so far each time more arrives. One instance serves every probe of
+/// its cluster, and they run concurrently, so a probe's progress is its
+/// round, which zoxy keeps: the instance holds configuration and what its
+/// probes share. An optional `bind(*P, *const ClusterSite, *const
+/// Startup) !void` runs once per cluster that selects it.
+pub const ProbeJudgement = enum {
+    /// The endpoint answered as a healthy one does.
+    pass,
+    fail,
+    /// The reply is incomplete: read more. A reply that fills
+    /// `reply_bytes_max` with no verdict fails.
+    read_more,
+    /// The round is answered: send the next round's request and judge its
+    /// reply from empty. Past `health_check_rounds_max` rounds the probe
+    /// fails and counts `health_probe_rounds_exhausted`.
+    next,
+};
+
+/// Refuse, at compile time, a check-kind type that does not meet the
+/// probe contract (#436).
+pub fn assertProbe(comptime Probe: type) void {
+    const name = @typeName(Probe);
+    if (!@hasDecl(Probe, "reply_bytes_max")) {
+        @compileError(name ++ " is listed as a probe but declares no `pub const reply_bytes_max`");
+    }
+    const bound: u32 = Probe.reply_bytes_max;
+    if (bound == 0 or bound > constants.health_probe_reply_bytes_max) {
+        @compileError(name ++ ".reply_bytes_max must be 1 to health_probe_reply_bytes_max");
+    }
+    if (!@hasDecl(Probe, "request") or !@hasDecl(Probe, "judge")) {
+        @compileError(name ++ " is listed as a probe but declares no `pub fn request` and `pub fn judge`");
+    }
+    const request_fn = @typeInfo(@TypeOf(Probe.request)).@"fn";
+    const request_ok = request_fn.param_types.len == 2 and
+        request_fn.param_types[0] == *Probe and
+        request_fn.param_types[1] == u8 and
+        request_fn.return_type == []const u8;
+    if (!request_ok) @compileError(name ++ ".request must be `fn (*" ++ name ++ ", u8) []const u8`");
+    const judge_fn = @typeInfo(@TypeOf(Probe.judge)).@"fn";
+    const judge_ok = judge_fn.param_types.len == 3 and
+        judge_fn.param_types[0] == *Probe and
+        judge_fn.param_types[1] == u8 and
+        judge_fn.param_types[2] == []const u8 and
+        judge_fn.return_type == ProbeJudgement;
+    if (!judge_ok) {
+        @compileError(name ++ ".judge must be `fn (*" ++ name ++ ", u8, []const u8) extension.ProbeJudgement`");
+    }
+    if (@hasDecl(Probe, "bind")) assertBind(Probe, ClusterSite);
+    if (isMetered(Probe)) @compileError(name ++ " is a probe, which declares no metrics yet");
+}
+
+/// The widest reply any listed probe declares (#436), or 0 for none: what
+/// widens the prober's per-probe buffer past the head buffer.
+pub fn probeReplyBytesMax(comptime extensions: Extensions) u32 {
+    comptime {
+        var widest: u32 = 0;
+        for (extensions.probes) |Probe| widest = @max(widest, Probe.reply_bytes_max);
+        assert(widest <= constants.health_probe_reply_bytes_max);
+        return widest;
+    }
+}
+
 /// How a connection a policy let on ended (#425). A connection policy may
 /// declare
 ///
@@ -1063,6 +1140,13 @@ pub fn assertExtensions(comptime extensions: Extensions) void {
     comptime assert(extensions.request_policies.len <= list_types_max);
     comptime assert(extensions.response_policies.len <= list_types_max);
     comptime assert(extensions.connection_policies.len <= list_types_max);
+    comptime assert(extensions.probes.len <= list_types_max);
+    inline for (extensions.probes, 0..) |Probe, index| {
+        assertProbe(Probe);
+        inline for (extensions.probes[index + 1 ..]) |Later| {
+            if (Probe == Later) @compileError(@typeName(Probe) ++ " is listed twice as a probe");
+        }
+    }
     inline for (extensions.connection_policies, 0..) |Policy, index| {
         assertConnectionPolicy(Policy);
         inline for (extensions.connection_policies[index + 1 ..]) |Later| {

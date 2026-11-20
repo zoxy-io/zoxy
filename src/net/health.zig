@@ -31,6 +31,12 @@
 //! refused. What a probe costs did not change, only how many of them the
 //! prober waits for at once.
 //!
+//! An `extension` check (#436) is a build's own kind over the same legs:
+//! the dial and the deadline are zoxy's, and the type speaks the origin's
+//! protocol in rounds — each a request, maybe empty, and a reply judged
+//! as it arrives — up to `health_check_rounds_max`. A probe's round is
+//! kept here, on the probe, since one instance serves them all.
+//!
 //! One probe's legs still run in sequence — dial, then send, then recv —
 //! which is what keeps the reservation closed-form whichever kind is
 //! configured (`health_probe_ops_max` ring ops and one fd *per probe*,
@@ -58,7 +64,8 @@
 
 const std = @import("std");
 
-const Runtime = @import("../extension.zig").Runtime;
+const extension = @import("../extension.zig");
+const Runtime = extension.Runtime;
 const config_module = @import("../config.zig");
 const constants = @import("../constants.zig");
 const Io = @import("../io/io.zig");
@@ -198,10 +205,14 @@ pub fn Checker(comptime runtime: Runtime) type {
             /// once every armed op has drained (the §5 release
             /// discipline).
             pending_verdict: Verdict,
-            /// The http probe's socket, held across its send and recv legs.
-            /// Null for a tcp probe, which closes inline in the dial's own
-            /// delivery — it wanted the SYN/ACK, not a connection.
+            /// The http or extension probe's socket, held across its send
+            /// and recv legs. Null for a tcp probe, which closes inline in
+            /// the dial's own delivery — it wanted the SYN/ACK, not a
+            /// connection.
             socket: ?IoType.Socket,
+            /// An extension probe's round (#436): which request went out
+            /// and which reply is being judged.
+            round: u8,
             /// Whether this probe's socket has been shut down already. Data
             /// ops are never canceled (§4/§5): a deadline or a drain that
             /// must end an armed send or recv shuts the socket down instead,
@@ -211,11 +222,12 @@ pub fn Checker(comptime runtime: Runtime) type {
             request: [constants.health_check_request_bytes_max]u8,
             request_len: u32,
             request_sent: u32,
-            /// The response head as it accumulates. Sized at init to what the
-            /// data path's own parser accepts (`limits.head_buffer_bytes`),
-            /// so a head this proxy would forward is never one the probe
-            /// rejects for being too big — a relation that followed the size
-            /// into the config.
+            /// The response head, or an extension's round reply, as it
+            /// accumulates. Sized at init to at least what the data path's
+            /// own parser accepts (`limits.head_buffer_bytes`), so a head
+            /// this proxy would forward is never one the probe rejects for
+            /// being too big — and widened to the widest reply a build's
+            /// check kind declares (#436, `Server.probeBufferBytes`).
             response: []u8,
             response_len: u32,
             armed: Armed,
@@ -261,8 +273,7 @@ pub fn Checker(comptime runtime: Runtime) type {
                 probe: *Probe,
                 arena: std.mem.Allocator,
                 checker: *Self,
-                /// The probe's response buffer size — `limits.head_buffer_bytes`,
-                /// so the probe accepts exactly the heads the data path does.
+                /// The probe's response buffer size: `Server.probeBufferBytes`.
                 response_bytes: u32,
             ) error{OutOfMemory}!void {
                 assert(response_bytes >= constants.head_buffer_bytes_min);
@@ -272,6 +283,7 @@ pub fn Checker(comptime runtime: Runtime) type {
                 probe.target_endpoint = 0;
                 probe.pending_verdict = .none;
                 probe.socket = null;
+                probe.round = 0;
                 probe.shutdown_done = false;
                 probe.request_len = 0;
                 probe.request_sent = 0;
@@ -317,6 +329,7 @@ pub fn Checker(comptime runtime: Runtime) type {
                 const check = &cluster.check.?;
                 probe.target_cluster = cluster_index;
                 probe.target_endpoint = endpoint_index;
+                probe.round = 0;
                 server.counters.increment("health_probes_sent");
                 // The concurrency witness (#132): this probe is starting
                 // beside a sibling that has not settled. Counted at the
@@ -397,16 +410,17 @@ pub fn Checker(comptime runtime: Runtime) type {
                 const checker = probe.checker;
                 assert(probe.armed.connect);
                 probe.armed.connect = false;
-                const http_check = checker.state == .probing and
+                const kind = checker.checkOf(probe.target_cluster).kind;
+                const speaks = checker.state == .probing and
                     probe.pending_verdict == .none and
-                    checker.checkOf(probe.target_cluster).kind == .http;
+                    (kind == .http or kind == .extension);
                 if (result) |socket| {
-                    if (http_check) {
-                        // The http probe's dial is the beginning of the
-                        // probe, not its verdict: the socket is stored and
-                        // carries the request and response legs.
+                    if (speaks) {
+                        // An http or extension probe's dial is the beginning
+                        // of the probe, not its verdict: the socket is
+                        // stored and carries the request and response legs.
                         probe.socket = socket;
-                        probe.beginRequest(socket);
+                        if (kind == .http) probe.beginRequest(socket) else probe.beginRound(socket, 0);
                         probe.settle();
                         return;
                     }
@@ -489,6 +503,46 @@ pub fn Checker(comptime runtime: Runtime) type {
                 probe.armSend(socket);
             }
 
+            /// An extension probe's round `round` (#436): the type's request,
+            /// copied into the probe's own buffer, then its reply read from
+            /// empty. An empty request is a protocol whose server speaks
+            /// first, and the round only reads.
+            fn beginRound(probe: *Probe, socket: IoType.Socket, round: u8) void {
+                const checker = probe.checker;
+                assert(checker.state == .probing);
+                assert(round < constants.health_check_rounds_max);
+                assert(!probe.armed.send);
+                assert(!probe.armed.recv);
+                const bytes = callProbeRequest(checker.checkOf(probe.target_cluster).probe.?, round);
+                // Past the bound (`health_check_request_bytes_max`), the
+                // probe fails rather than the proxy: a later round's request
+                // may be built from what the origin sent, so its length is
+                // not the build's alone to promise.
+                if (bytes.len > probe.request.len) {
+                    checker.server.counters.increment("health_probe_request_oversize");
+                    probe.pending_verdict = .fail;
+                    return;
+                }
+                @memcpy(probe.request[0..bytes.len], bytes);
+                probe.round = round;
+                probe.request_len = @intCast(bytes.len);
+                probe.request_sent = 0;
+                probe.response_len = 0;
+                if (bytes.len == 0) probe.armRecv(socket) else probe.armSend(socket);
+            }
+
+            /// How much of the response buffer a reply may fill: the whole
+            /// head buffer for an http probe, the type's own declared
+            /// bound for an extension one (#436).
+            fn replyCap(probe: *const Probe) u32 {
+                const check = probe.checker.checkOf(probe.target_cluster);
+                if (check.kind != .extension) return @intCast(probe.response.len);
+                const cap = probeReplyBytes(check.probe.?);
+                assert(cap >= 1);
+                assert(cap <= probe.response.len);
+                return cap;
+            }
+
             fn armSend(probe: *Probe, socket: IoType.Socket) void {
                 const checker = probe.checker;
                 assert(checker.state == .probing);
@@ -551,11 +605,12 @@ pub fn Checker(comptime runtime: Runtime) type {
                 const checker = probe.checker;
                 assert(checker.state == .probing);
                 assert(!probe.armed.recv);
-                assert(probe.response_len < probe.response.len);
+                const cap = probe.replyCap();
+                assert(probe.response_len < cap);
                 probe.armed.recv = true;
                 checker.server.io.recv(
                     socket,
-                    probe.response[probe.response_len..],
+                    probe.response[probe.response_len..cap],
                     &probe.op_recv,
                     Probe,
                     probe,
@@ -585,14 +640,16 @@ pub fn Checker(comptime runtime: Runtime) type {
                     return;
                 };
                 probe.response_len += received;
-                assert(probe.response_len <= probe.response.len);
+                assert(probe.response_len <= probe.replyCap());
                 if (probe.pending_verdict == .none) {
                     probe.judgeResponse();
                 }
-                if (probe.pending_verdict == .none) {
-                    // The head is still arriving. A full buffer with no head
-                    // in it is the §7 oversize-head verdict, not a shortfall.
-                    if (probe.response_len == probe.response.len) {
+                // Undecided, and no next round armed: the reply is still
+                // arriving. A full buffer with no verdict in it is the §7
+                // oversize-head verdict, not a shortfall — and the same
+                // for an extension's reply at its declared bound (#436).
+                if (probe.pending_verdict == .none and !probe.armed.send and !probe.armed.recv) {
+                    if (probe.response_len == probe.replyCap()) {
                         probe.pending_verdict = .fail;
                     } else {
                         probe.armRecv(probe.socket.?);
@@ -601,11 +658,47 @@ pub fn Checker(comptime runtime: Runtime) type {
                 probe.settle();
             }
 
-            /// Judge what has arrived so far, leaving the verdict `.none`
-            /// while the head is merely incomplete. The head parser is the
-            /// data path's own (§7), so a probe accepts exactly the responses
-            /// this proxy would forward — and nothing it would reject.
+            /// Judge what has arrived so far, by the check's kind.
             fn judgeResponse(probe: *Probe) void {
+                assert(probe.pending_verdict == .none);
+                switch (probe.checker.checkOf(probe.target_cluster).kind) {
+                    .http => probe.judgeHead(),
+                    .extension => probe.judgeReply(),
+                    // Neither reads a reply over the probe's socket.
+                    .tcp, .grpc => unreachable,
+                }
+            }
+
+            /// An extension probe's judge over the round's reply so far
+            /// (#436): a verdict, more to read, or the next round — begun
+            /// here, so its first leg is armed when this returns.
+            fn judgeReply(probe: *Probe) void {
+                const checker = probe.checker;
+                assert(probe.pending_verdict == .none);
+                assert(probe.round < constants.health_check_rounds_max);
+                const selection = checker.checkOf(probe.target_cluster).probe.?;
+                const reply = probe.response[0..probe.response_len];
+                switch (callProbeJudge(selection, probe.round, reply)) {
+                    .pass => probe.pending_verdict = .pass,
+                    .fail => probe.pending_verdict = .fail,
+                    .read_more => {},
+                    .next => {
+                        const next_round = probe.round + 1;
+                        if (next_round == constants.health_check_rounds_max) {
+                            checker.server.counters.increment("health_probe_rounds_exhausted");
+                            probe.pending_verdict = .fail;
+                            return;
+                        }
+                        probe.beginRound(probe.socket.?, next_round);
+                    },
+                }
+            }
+
+            /// An http probe's head so far, leaving the verdict `.none`
+            /// while it is merely incomplete. The head parser is the data
+            /// path's own (§7), so a probe accepts exactly the responses
+            /// this proxy would forward — and nothing it would reject.
+            fn judgeHead(probe: *Probe) void {
                 assert(probe.checker.state == .probing);
                 assert(probe.pending_verdict == .none);
                 const expect_status = probe.checker.checkOf(probe.target_cluster).http.?.expect_status;
@@ -694,8 +787,8 @@ pub fn Checker(comptime runtime: Runtime) type {
                     return;
                 }
                 if ((probe.armed.send or probe.armed.recv) and !probe.shutdown_done) {
-                    // A data leg exists only for an http probe, which is the
-                    // only kind that holds a socket to shut down.
+                    // A data leg exists only for an http or extension probe,
+                    // the kinds that hold a socket to shut down.
                     assert(probe.socket != null);
                     probe.shutdown_done = true;
                     probe.checker.server.io.shutdown(probe.socket.?, .both);
@@ -815,8 +908,9 @@ pub fn Checker(comptime runtime: Runtime) type {
             arena: std.mem.Allocator,
             server: *ServerType,
             keys: upstream.EndpointKeys,
-            /// The probe's response buffer size — `limits.head_buffer_bytes`,
-            /// so the probe accepts exactly the heads the data path does.
+            /// Each probe's response buffer size: `Server.probeBufferBytes`,
+            /// at least `limits.head_buffer_bytes`, so a probe accepts every
+            /// head the data path does.
             response_bytes: u32,
         ) error{OutOfMemory}!void {
             assert(keys.count >= 1);
@@ -1154,6 +1248,42 @@ pub fn Checker(comptime runtime: Runtime) type {
                 assert(dispatched <= checker.probes.len);
             }
             if (checker.busyProbes() == 0) checker.rest();
+        }
+
+        /// The selected check kind's request for `round` (#436), by the
+        /// comptime list.
+        fn callProbeRequest(selection: extension.Selection, round: u8) []const u8 {
+            assert(selection.index < runtime.extensions.probes.len);
+            assert(round < constants.health_check_rounds_max);
+            inline for (runtime.extensions.probes, 0..) |Kind, index| {
+                if (selection.index == index) {
+                    const instance: *Kind = @ptrCast(@alignCast(selection.instance));
+                    return Kind.request(instance, round);
+                }
+            }
+            unreachable;
+        }
+
+        /// The selected check kind's judgement of `round`'s reply so far.
+        fn callProbeJudge(selection: extension.Selection, round: u8, reply: []const u8) extension.ProbeJudgement {
+            assert(selection.index < runtime.extensions.probes.len);
+            assert(round < constants.health_check_rounds_max);
+            inline for (runtime.extensions.probes, 0..) |Kind, index| {
+                if (selection.index == index) {
+                    const instance: *Kind = @ptrCast(@alignCast(selection.instance));
+                    return Kind.judge(instance, round, reply);
+                }
+            }
+            unreachable;
+        }
+
+        /// The selected check kind's declared reply bound.
+        fn probeReplyBytes(selection: extension.Selection) u32 {
+            assert(selection.index < runtime.extensions.probes.len);
+            inline for (runtime.extensions.probes, 0..) |Kind, index| {
+                if (selection.index == index) return Kind.reply_bytes_max;
+            }
+            unreachable;
         }
 
         /// The cluster's resolved check policy. Only a checked cluster is

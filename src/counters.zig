@@ -495,6 +495,15 @@ pub const Counters = struct {
     /// eject an endpoint. Neither streak moves. A deployment that sees it
     /// rise has sized the pool below its endpoints.
     health_probes_skipped: Value = Value.init(0),
+    /// A build's check kind (#436) asked for another round past
+    /// `health_check_rounds_max`, and the probe failed at the bound: a
+    /// protocol the kind does not finish in time, or a judge that never
+    /// decides. Its fails are counted with every other probe's too.
+    health_probe_rounds_exhausted: Value = Value.init(0),
+    /// A build's check kind (#436) asked to send a round's request past
+    /// `health_check_request_bytes_max`, and the probe failed rather than
+    /// sending a cut one.
+    health_probe_request_oversize: Value = Value.init(0),
     /// Endpoints ejected from balancing (§7), whatever decided it. Their
     /// parked connections are closed at the transition (§5,
     /// `health_parked_closed`).

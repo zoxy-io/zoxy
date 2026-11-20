@@ -89,6 +89,14 @@ pub fn App(comptime extensions: extension.Extensions) type {
             };
         }
 
+        /// A cluster's check kind (#436): `instance` must point at a probe
+        /// type this build lists.
+        pub fn probe(instance: anytype) Options.Cluster.Check.Kind {
+            const selection = extension.select(extensions.probes, instance);
+            assert(selection.index < extensions.probes.len);
+            return .{ .extension = selection };
+        }
+
         /// A cluster's pick: `instance`, which must point at a picker type
         /// this build lists — a compile error otherwise.
         pub fn picker(instance: anytype) Options.Cluster.Pick {
@@ -149,6 +157,8 @@ pub fn App(comptime extensions: extension.Extensions) type {
                     .extension => |selection| try refuseUnserved(selection, extensions.pickers.len),
                     .rr, .p2c, .hash => {},
                 }
+                const checked = cluster.check orelse continue;
+                if (checked.probe) |selection| try refuseUnserved(selection, extensions.probes.len);
             }
             for (config.listeners) |*listener| {
                 for (listener.connection_policies) |selection| {

@@ -116,6 +116,9 @@ pub const testing = struct {
     /// A request policy that refuses one path prefix and records what it
     /// evaluated (#417).
     pub const ScriptedPolicy = @import("testing/policy.zig").ScriptedPolicy;
+    /// A health-check kind that sends scripted rounds and expects each
+    /// echoed (#436).
+    pub const ScriptedProbe = @import("testing/probe.zig").ScriptedProbe;
     /// A connection policy that answers every connection with one
     /// scripted verdict (#425).
     pub const ScriptedConnectionPolicy = @import("testing/connection_policy.zig").ScriptedConnectionPolicy;

@@ -403,6 +403,18 @@ const uncovered = [_]Uncovered{
             "header zoxy writes itself, and splits one with CRLF",
     },
     .{
+        .name = "health_probe_request_oversize",
+        .why = .unreached,
+        .reason = "the harness's check kind sends short, fixed requests " ++
+            "(#436); server_test sends one past the bound",
+    },
+    .{
+        .name = "health_probe_rounds_exhausted",
+        .why = .unreached,
+        .reason = "no sim cluster selects a build's check kind yet (#436); " ++
+            "server_test drives a kind past `health_check_rounds_max`",
+    },
+    .{
         .name = "l7_response_policy_edit_refused",
         .why = .unreached,
         .reason = "the harness's response policy adds a fixed, valid " ++
