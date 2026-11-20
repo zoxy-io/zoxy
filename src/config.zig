@@ -949,6 +949,13 @@ pub const ValidationError = error{
     RouteHostNotCanonical,
     RouteHostWildcard,
     RouteDuplicate,
+    /// A route's name is empty or past `route_name_bytes_max` (#430).
+    RouteNameInvalid,
+    /// Two routes of one listener share a name, which a policy could not
+    /// route by (#430).
+    RouteNameDuplicate,
+    /// A listener states more routes than a `u16` route index can name.
+    RoutesOverLimit,
     ListenerMaxBodyBytesOutOfRange,
     ListenerTlsWithSniRoutes,
     ListenerTlsClientCaInvalid,
@@ -3442,6 +3449,11 @@ fn resolveRoutes(
     if (stated.len == 0) {
         return error.RoutesEmpty;
     }
+    // No bound but the index type: every route index — the sort's
+    // permutation, a policy's `routeNamed`, the #435 slots — is a `u16`.
+    if (stated.len > std.math.maxInt(u16)) {
+        return error.RoutesOverLimit;
+    }
     const routes = try arena.alloc(router.Route, stated.len);
     for (stated, 0..) |route_stated, index| {
         try validateRoutePrefix(route_stated.prefix, head_buffer_bytes);
@@ -3450,6 +3462,7 @@ fn resolveRoutes(
             try resolveRouteHeader(raw)
         else
             null;
+        try validateRouteName(stated[0..index], route_stated.name);
         for (stated[0..index]) |previous| {
             // Earlier routes already passed validateRouteHost, so their raw
             // host equals its canonical form — a byte compare is sound.
@@ -3470,6 +3483,7 @@ fn resolveRoutes(
             .header = header,
             .cluster_index = try clusterIndexOf(clusters, route_stated.cluster),
             .request_policies = route_stated.request_policies,
+            .name = route_stated.name,
         };
     }
     // Host, then header, then prefix (§7, #302): the router's linear scan
@@ -3495,6 +3509,22 @@ fn resolveRoutes(
     }
     assert(sorted.len >= 1);
     return sorted;
+}
+
+/// A route's optional name (#430): within its bound, and unique among the
+/// routes of its listener stated before it.
+fn validateRouteName(
+    earlier: []const Options.Listener.Route,
+    name: ?[]const u8,
+) ValidationError!void {
+    // Within the routes bound `resolveRoutes` already holds.
+    assert(earlier.len < std.math.maxInt(u16));
+    const given = name orelse return;
+    if (given.len == 0 or given.len > constants.route_name_bytes_max) return error.RouteNameInvalid;
+    for (earlier) |previous| {
+        const other = previous.name orelse continue;
+        if (std.mem.eql(u8, other, given)) return error.RouteNameDuplicate;
+    }
 }
 
 /// The comparator over indices, so an exact tie can fall back to the
@@ -4572,4 +4602,64 @@ test "config: listeners written as options meet the loader's rules (#417)" {
         .protocol = .{ .l4 = .{ .target = .{ .routes = &.{.{ .cluster = "origin" }} } } },
     };
     try std.testing.expectError(error.ListenerTlsWithSniRoutes, resolveListeners(arena, &[_]Options.Listener{sni_tls}, clusters, head_bytes, &.{}));
+}
+
+test "config: a route's name rides its route through the sort, and a listener's names are unique (#430)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const clusters = try resolveClusters(arena, &[_]Options.Cluster{.{
+        .name = "origin",
+        .endpoints = &.{.{ .address = .{ .ip = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:9000") } }},
+        .pick = .p2c,
+    }});
+    const head_bytes = constants.head_buffer_bytes_min;
+    const named = struct {
+        fn listener(routes: []const Options.Listener.Route) !Options.Listener {
+            return .{
+                .bind = .{ .ip = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:8080") },
+                .protocol = .{ .http = .{
+                    .target = .{ .routes = routes },
+                    .max_body_bytes = 0,
+                    .keepalive_requests = 0,
+                } },
+            };
+        }
+    };
+    const routes = [_]Options.Listener.Route{
+        .{ .prefix = "/", .cluster = "origin", .name = "fallback" },
+        .{ .prefix = "/api/v2", .cluster = "origin", .name = "api-v2" },
+        .{ .prefix = "/static", .cluster = "origin" },
+    };
+    const listeners = try resolveListeners(arena, &[_]Options.Listener{try named.listener(&routes)}, clusters, head_bytes, &.{});
+    // Sorted most specific first, and each keeps the name it was given.
+    try std.testing.expectEqualStrings("/api/v2", listeners[0].routes[0].prefix);
+    try std.testing.expectEqualStrings("api-v2", listeners[0].routes[0].name.?);
+    try std.testing.expect(listeners[0].routes[1].name == null);
+    try std.testing.expectEqualStrings("fallback", listeners[0].routes[2].name.?);
+    const site: extension_module.PolicySite = .{
+        .listener_index = 0,
+        .route_index = null,
+        .cluster_index = null,
+        .routes = listeners[0].routes,
+    };
+    try std.testing.expectEqual(@as(?u16, 0), site.routeNamed("api-v2"));
+    try std.testing.expectEqual(@as(?u16, 2), site.routeNamed("fallback"));
+    try std.testing.expectEqual(@as(?u16, null), site.routeNamed("static"));
+
+    const twice = [_]Options.Listener.Route{
+        .{ .prefix = "/a", .cluster = "origin", .name = "same" },
+        .{ .prefix = "/b", .cluster = "origin", .name = "same" },
+    };
+    try std.testing.expectError(error.RouteNameDuplicate, resolveListeners(arena, &[_]Options.Listener{try named.listener(&twice)}, clusters, head_bytes, &.{}));
+    const empty = [_]Options.Listener.Route{.{ .prefix = "/", .cluster = "origin", .name = "" }};
+    try std.testing.expectError(error.RouteNameInvalid, resolveListeners(arena, &[_]Options.Listener{try named.listener(&empty)}, clusters, head_bytes, &.{}));
+    const long_bytes: [constants.route_name_bytes_max + 1]u8 = @splat('r');
+    const long = [_]Options.Listener.Route{.{ .prefix = "/", .cluster = "origin", .name = &long_bytes }};
+    try std.testing.expectError(error.RouteNameInvalid, resolveListeners(arena, &[_]Options.Listener{try named.listener(&long)}, clusters, head_bytes, &.{}));
+    // One past what a `u16` route index names is refused before any route
+    // is read.
+    const too_many = try arena.alloc(Options.Listener.Route, @as(usize, std.math.maxInt(u16)) + 1);
+    @memset(too_many, .{ .prefix = "/", .cluster = "origin" });
+    try std.testing.expectError(error.RoutesOverLimit, resolveListeners(arena, &[_]Options.Listener{try named.listener(too_many)}, clusters, head_bytes, &.{}));
 }
