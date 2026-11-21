@@ -8,7 +8,9 @@
 //! with `200` and its own address, which is how a response says which
 //! endpoint a pick chose, and with the `x-edge-tenant` lines it was sent,
 //! which is how a response says what the edge forwarded. Each also names
-//! its software in `X-Powered-By`, which the edge must drop. Usage:
+//! its software in `X-Powered-By`, which the edge must drop. The auth
+//! service is one more, answering `403` for the one tenant it refuses;
+//! and each origin counts the health probes it was sent. Usage:
 //! `zoxy-edge-smoke <zoxy-edge> <log>`.
 //!
 //! Bounded in wall-clock time by a watchdog: a proxy that stops answering
@@ -34,7 +36,10 @@ const response_bytes_max = 4096;
 const tenant_lines_bytes_max = 128;
 /// The most of the proxy's log a failing run prints.
 const log_bytes_max = 64 * 1024;
-/// The whole run's wall-clock bound, generous beside the second or so it
+/// How long the run waits for the first health probe: the stock sweep
+/// interval, two seconds, holds the first sweep anywhere inside it.
+const probe_wait_ms = 4000;
+/// The whole run's wall-clock bound, generous beside the seconds it
 /// takes.
 const deadline_s = 120;
 
@@ -59,14 +64,17 @@ pub fn main(init: std.process.Init) !u8 {
     var app_next: Origin = undefined;
     var static_a: Origin = undefined;
     var static_b: Origin = undefined;
-    try app.start(io);
+    var auth: Origin = undefined;
+    try app.start(io, null);
     defer app.stop();
-    try app_next.start(io);
+    try app_next.start(io, null);
     defer app_next.stop();
-    try static_a.start(io);
+    try static_a.start(io, null);
     defer static_a.stop();
-    try static_b.start(io);
+    try static_b.start(io, null);
     defer static_b.stop();
+    try auth.start(io, "tenant=blocked ");
+    defer auth.stop();
 
     const listen_port, const control_port = try freePorts(io);
     const listen = try std.fmt.allocPrint(arena, "127.0.0.1:{d}", .{listen_port});
@@ -74,7 +82,7 @@ pub fn main(init: std.process.Init) !u8 {
     const static_list = try std.fmt.allocPrint(arena, "{s},{s}", .{ static_a.label(), static_b.label() });
     // The pre-flight first: it resolves the options and asks the box for
     // what a start would, and binds nothing.
-    try expectCheckPasses(io, &.{ args[1], "--check", listen, control, app.label(), static_list });
+    try expectCheckPasses(io, &.{ args[1], "--check", listen, control, app.label(), static_list, auth.label() });
     // The pre-flight's own process was waited for; it never gets a pid
     // the watchdog would have to know.
 
@@ -83,7 +91,7 @@ pub fn main(init: std.process.Init) !u8 {
     const log_file = try Io.Dir.cwd().createFile(io, log_path, .{ .read = true });
     defer log_file.close(io);
     var child = try std.process.spawn(io, .{
-        .argv = &.{ args[1], listen, control, app.label(), static_list },
+        .argv = &.{ args[1], listen, control, app.label(), static_list, auth.label() },
         .stdout = .{ .file = log_file },
         .stderr = .{ .file = log_file },
     });
@@ -98,6 +106,7 @@ pub fn main(init: std.process.Init) !u8 {
     var passed = exercise(io, listen_port, &app, &static_a, &static_b);
     // Last, since it moves the application to `app_next` for good.
     passed = exerciseControl(io, listen_port, control_port, &app_next) and passed;
+    passed = awaitProbe(io, &static_a, &static_b) and passed;
     try std.posix.kill(child.id.?, .TERM);
     const term = try child.wait(io);
     running = false;
@@ -108,8 +117,8 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
     std.debug.print("zoxy-edge smoke: routes, pickers, both policy phases, the tenant's challenge, " ++
-        "header and tag, the response headers under a connection cap, and a live endpoint update over XevIo, " ++
-        "clean drain\n", .{});
+        "header and tag, the response headers under a connection cap, a consult, a live endpoint update " ++
+        "and a probe of the build's own kind over XevIo, clean drain\n", .{});
     return 0;
 }
 
@@ -135,6 +144,11 @@ fn exercise(io: Io, port: u16, app: *const Origin, static_a: *const Origin, stat
         "X-Saw-Tenant: acme\r\n",
     ) and passed;
     passed = expectBody(io, port, "GET /search?q=zig HTTP/1.1\r\n" ++ tenant, &buffer, app.label()) and passed;
+    // The account route asks the auth service first (#437): `acme` is let
+    // on, and the tenant it refuses is answered `403`.
+    passed = expectBody(io, port, "GET /account HTTP/1.1\r\n" ++ tenant, &buffer, app.label()) and passed;
+    const blocked = "GET /account HTTP/1.1\r\nHost: edge\r\nx-tenant: blocked\r\nConnection: close\r\n\r\n";
+    passed = expectStatus(io, port, blocked, &buffer, "403") and passed;
     // One path, one endpoint, twice.
     var first: [64]u8 = undefined;
     const first_body = bodyOf(exchange(io, port, "GET /static/app.js HTTP/1.1\r\n" ++ tenant, &buffer));
@@ -178,6 +192,20 @@ fn exerciseControl(io: Io, port: u16, control_port: u16, next: *const Origin) bo
     passed = expectStatus(io, control_port, garbled, &buffer, "400") and passed;
     passed = expectBody(io, port, "GET /orders HTTP/1.1\r\n" ++ tenant, &buffer, next.label()) and passed;
     return passed;
+}
+
+/// The static cluster's check kind (#436) probed its endpoints: within
+/// one sweep interval and its offset, or the prober never ran it.
+fn awaitProbe(io: Io, static_a: *const Origin, static_b: *const Origin) bool {
+    const poll_ms = 25;
+    var waited_ms: u32 = 0;
+    while (waited_ms < probe_wait_ms) : (waited_ms += poll_ms) {
+        const probes = static_a.probes.load(.acquire) + static_b.probes.load(.acquire);
+        if (probes >= 1) return true;
+        io.sleep(Io.Duration.fromNanoseconds(poll_ms * std.time.ns_per_ms), .awake) catch return false;
+    }
+    std.debug.print("FAIL: no health probe reached a static origin in {d} ms\n", .{probe_wait_ms});
+    return false;
 }
 
 /// `line`, CRLF and all, somewhere in the response's head.
@@ -317,18 +345,25 @@ fn awaitListening(io: Io, port: u16) !void {
 }
 
 /// One live origin: a task that accepts, answers one request with `200`
-/// and its own address, and closes.
+/// and its own address — or `403`, to a request line naming `deny` — and
+/// closes.
 const Origin = struct {
     io: Io,
     listener: Io.net.Server,
     port: u16,
     label_buffer: [32]u8,
     label_len: u8,
+    /// What a request line names for this origin to refuse it, or null.
+    deny: ?[]const u8,
+    /// `GET /healthz` requests it answered: the health probes.
+    probes: std.atomic.Value(u32),
     group: Io.Group,
     stopping: std.atomic.Value(bool),
 
-    fn start(origin: *Origin, io: Io) !void {
+    fn start(origin: *Origin, io: Io, deny: ?[]const u8) !void {
         origin.io = io;
+        origin.deny = deny;
+        origin.probes = .init(0);
         origin.group = .init;
         origin.stopping = .init(false);
         var address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
@@ -374,11 +409,17 @@ const Origin = struct {
         // the edge set, and two would be a forgery it let through.
         var tenants: [tenant_lines_bytes_max]u8 = undefined;
         var tenants_len: usize = 0;
+        var denied = false;
         var lines: u32 = 0;
         // Read to the blank line that ends the head; no body is read.
         while (lines < head_bytes_max / 2) : (lines += 1) {
             const line = (reader.interface.takeDelimiter('\n') catch return) orelse return;
             if (line.len == 0 or (line.len == 1 and line[0] == '\r')) break;
+            if (lines == 0) {
+                if (std.mem.startsWith(u8, line, "GET /healthz ")) _ = origin.probes.fetchAdd(1, .acq_rel);
+                if (origin.deny) |deny| denied = std.mem.indexOf(u8, line, deny) != null;
+                continue;
+            }
             const name = "x-edge-tenant:";
             if (line.len < name.len or !std.ascii.eqlIgnoreCase(line[0..name.len], name)) continue;
             const value = std.mem.trim(u8, line[name.len..], " \t\r");
@@ -391,6 +432,11 @@ const Origin = struct {
         assert(tenants_len <= tenants.len);
         var write_buffer: [512]u8 = undefined;
         var writer = stream.writer(origin.io, &write_buffer);
+        if (denied) {
+            writer.interface.writeAll("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch return;
+            writer.interface.flush() catch return;
+            return;
+        }
         writer.interface.print(
             "HTTP/1.1 200 OK\r\nX-Powered-By: zoxy-edge-smoke\r\nX-Saw-Tenant: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
             .{ tenants[0..tenants_len], origin.label_len, origin.label() },
