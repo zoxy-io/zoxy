@@ -19,6 +19,10 @@ processes behind `SO_REUSEPORT`, never threads sharing memory.
 - **HTTP/2** — to clients, over TLS by ALPN or in the clear by prior
   knowledge; each stream is routed, filtered and balanced like an HTTP/1.1
   request, to the same pooled upstreams; checked against h2spec at merge
+- **HTTP/3** — to clients, over QUIC on a TLS listener's own port, advertised
+  with `Alt-Svc`; requests take the HTTP/2 path from there, and the whole of
+  it runs under the simulator's datagram adversary; checked against h3spec
+  at merge
 - **Balancing** — power-of-two-choices, round-robin, or rendezvous hashing
   for client stickiness
 - **Health checks** — active TCP or HTTP probes, per cluster
