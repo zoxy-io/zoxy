@@ -92,6 +92,13 @@ pub fn Driver(comptime runtime: Runtime) type {
             }
             if (slot.quic.timeout()) |due| {
                 if (due <= now) slot.quic.onTimeout(now);
+            } else if (slot.quic.state == .handshaking and now >= unheardDeadline(server, conn)) {
+                // Its window is past and it has still heard nothing it could
+                // open: nothing ever will happen on it, and it holds a slot.
+                // A closed transport without a timer is `settle`'s teardown.
+                assert(conn.h2_streams == null);
+                server.counters.increment("deadline_expired");
+                return server.beginTeardown(conn);
             }
             slot.driving = true;
             expireExchanges(server, conn, now);
@@ -103,6 +110,14 @@ pub fn Driver(comptime runtime: Runtime) type {
             if (conn.armed.deadline) return;
             if (conn.armed.deadline_cancel) return;
             server.armDeadline(conn);
+        }
+
+        /// When a connection whose transport has heard nothing it could open
+        /// — an Initial the network corrupted, or a spoofed one — is given
+        /// up: one idle window from its birth.
+        fn unheardDeadline(server: *const ServerType, conn: *const ConnType) u64 {
+            assert(conn.birth_ns != 0);
+            return conn.birth_ns + @as(u64, server.idleTimeoutMs()) * std.time.ns_per_ms;
         }
 
         /// Each exchange past its deadline gets §8's verdict. Taken before
@@ -203,6 +218,9 @@ pub fn Driver(comptime runtime: Runtime) type {
             assert(!slot.driving);
             if (conn.isTearingDown()) return server.continueTeardown(conn);
             if (slot.quic.isClosed()) return server.beginTeardown(conn);
+            // Outside every read, so a drained stream's octets are dropped
+            // here and never inside the read that borrowed them.
+            slot.discardDrains();
             closeIfDrained(conn);
             if (slot.quic.wantsSend()) Endpoint.queue(server, conn);
             if (conn.state != .h3) return;
@@ -228,7 +246,10 @@ pub fn Driver(comptime runtime: Runtime) type {
         /// than the armed target re-bases it; later is found lazily (§4).
         fn refreshDeadline(server: *ServerType, conn: *ConnType) void {
             const slot = conn.h3.?;
-            var deadline_ns: u64 = slot.quic.timeout() orelse std.math.maxInt(u64);
+            // A transport that has never opened a packet has armed no timer
+            // of its own: one idle window from the connection's birth, which
+            // nothing it is sent can push later (`expire`).
+            var deadline_ns: u64 = slot.quic.timeout() orelse unheardDeadline(server, conn);
             const streams_max = conn.multiplexedMax();
             var cursor = conn.h2_streams;
             var visited: u32 = 0;
@@ -247,8 +268,9 @@ pub fn Driver(comptime runtime: Runtime) type {
                     deadline_ns = @min(deadline_ns, cap);
                 }
             }
-            // The transport always has its idle timer, so a target exists.
-            assert(deadline_ns != std.math.maxInt(u64));
+            // A target always exists: the transport's, or the unheard window.
+            assert(deadline_ns != 0);
+            assert(deadline_ns >= conn.birth_ns);
             const earlier = deadline_ns < conn.deadline_ns;
             conn.deadline_ns = @max(deadline_ns, 1);
             if (earlier) server.rebaseTimer(conn);
@@ -281,8 +303,8 @@ pub fn Driver(comptime runtime: Runtime) type {
         /// Read what a stream has, as far as its exchange can take a body:
         /// in as many reads as that takes, because the transport raises no
         /// second event for octets left unread. A new request stream is read
-        /// for its HEADERS alone — its body waits for the exchange it opens
-        /// — and one whose exchange is gone is read to its end and dropped.
+        /// for its HEADERS alone, and its body waits for the exchange it
+        /// opens.
         fn readStream(server: *ServerType, conn: *ConnType, id: u64) void {
             const slot = conn.h3.?;
             var reads: u32 = 0;
@@ -290,6 +312,10 @@ pub fn Driver(comptime runtime: Runtime) type {
             // the loop, and the stream's receive buffer bounds the rest.
             while (reads <= constants.h3_stream_receive_bytes) : (reads += 1) {
                 if (Half.over(conn)) return;
+                // Asked each turn: an exchange its own read just answered —
+                // a static answer, staged inside the open — let the stream go
+                // mid-loop, and what is left of it is not the session's.
+                if (slot.draining(id)) return slot.discard(id);
                 var events: [events_max]h3.http3.Event = undefined;
                 const room = readRoom(conn, id);
                 const read = slot.session.receive(&slot.quic, id, &events, room) catch {
@@ -313,16 +339,17 @@ pub fn Driver(comptime runtime: Runtime) type {
             unreachable;
         }
 
-        /// How much request body a read of `id` may report.
+        /// How much request body a read of `id` may report. A stream with no
+        /// exchange is read for its HEADERS alone, whatever else arrived on
+        /// it — streams arrive out of order, so one the session has not seen
+        /// may be below one it has. One whose exchange ended while its
+        /// request was still arriving was told to stop (`Half.stopClient`,
+        /// `Half.reset`), and the client's RESET_STREAM releases what is left.
         fn readRoom(conn: *ConnType, id: u64) u64 {
-            const slot = conn.h3.?;
             // A control or QPACK stream is the session's to read whole.
             if (!stream_id.kindOf(id).bidirectional()) return std.math.maxInt(u64);
-            if (Shared.findH3(conn, @intCast(id))) |stream| return Shared.dataRoom(stream);
-            // Below the next request the session expects is a stream it has
-            // seen: its exchange is done, and what is left is dropped.
-            if (id < slot.session.next_request) return std.math.maxInt(u64);
-            return 0;
+            const stream = Shared.findH3(conn, @intCast(id)) orelse return 0;
+            return Shared.dataRoomAtOnce(stream);
         }
 
         fn onEvent(server: *ServerType, conn: *ConnType, id: u64, event: *const h3.http3.Event, rest: []const h3.http3.Event) void {
@@ -373,6 +400,7 @@ pub fn Driver(comptime runtime: Runtime) type {
             const slot = conn.h3.?;
             if (!stream_id.kindOf(id).bidirectional()) return;
             slot.session.release(id);
+            if (slot.draining(id)) slot.drained(id);
             const stream = Shared.findH3(conn, @intCast(id)) orelse return;
             server.endSharedStream(stream);
         }
@@ -385,6 +413,7 @@ pub fn Driver(comptime runtime: Runtime) type {
             if (!stream_id.kindOf(id).bidirectional()) return;
             const stream = Shared.findH3(conn, @intCast(id)) orelse return;
             slot.session.cancel(&slot.quic, id, .request_cancelled);
+            slot.drain(id);
             server.endSharedStream(stream);
         }
 

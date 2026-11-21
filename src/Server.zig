@@ -2901,6 +2901,10 @@ pub fn Server(comptime runtime: Runtime) type {
             server.storeDeadline(conn, server.idleTimeoutMs());
             server.armDeadline(conn);
             assert(conn.armed.deadline);
+            // The listener's connection policies, as every connection it
+            // admits meets them, before its handshake (#425). A refusal
+            // has begun the teardown; its Initial goes unanswered.
+            if (!server.admittedByPolicies(conn)) return null;
             return conn;
         }
 
@@ -4563,8 +4567,10 @@ pub fn Server(comptime runtime: Runtime) type {
                 assert(conn.stream.armedCount() == 0);
                 // Benign, as `shed.closeWithRst`'s: the refusal must close
                 // either way, and a failed option leaves the client a FIN.
-                // `conn_policy_reset` counts the decision, not the wire.
-                server.io.setLingerRst(conn.clientSocket()) catch {};
+                // `conn_policy_reset` counts the decision, not the wire. A
+                // QUIC connection has no socket to reset: its refusal is
+                // the silence its client's Initial meets (#449).
+                if (conn.client_socket) |socket| server.io.setLingerRst(socket) catch {};
             } else if (conn.client_socket) |socket| {
                 server.io.shutdown(socket, .both);
             }

@@ -127,7 +127,7 @@ pub const Plan = struct {
 
     /// The HTTP/1.1 script whose statuses this stream may hear: a POST's
     /// is the sized POST's — `get`'s, and the #236 body cap's 413.
-    fn scriptOf(plan: Plan) scripts.Script {
+    pub fn scriptOf(plan: Plan) scripts.Script {
         return switch (plan.ask) {
             .get => .get,
             .consult_get => .consult_get,
@@ -136,7 +136,7 @@ pub const Plan = struct {
     }
 
     /// The path this stream asks for.
-    fn path(plan: Plan) []const u8 {
+    pub fn path(plan: Plan) []const u8 {
         assert(canon.consult_prefix.len >= 1);
         assert(!std.mem.startsWith(u8, get_path, canon.consult_prefix));
         return if (plan.ask == .consult_get) canon.consult_prefix else get_path;
@@ -152,7 +152,7 @@ pub const body_frames_max: u8 = 4;
 
 /// The bodies an origin answers `get` with, as DATA carries them: the
 /// chunked one dechunked.
-const canonical_bodies = [_][]const u8{
+pub const canonical_bodies = [_][]const u8{
     canon.sized_body,
     "chunked-body-16b",
     canon.until_close_body,

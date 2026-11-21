@@ -28,6 +28,13 @@ const assert = std.debug.assert;
 pub const requests_max: u32 = 4;
 /// An answer's body kept at most; past it the octets are counted, not kept.
 pub const body_bytes_max: u32 = 4096;
+/// A request's body at most: it goes in the same write as its head, and
+/// the two fit one stream's send buffer.
+pub const request_body_bytes_max: u32 = 8 * 1024;
+/// Header fields one request carries beside its four pseudo-fields.
+pub const request_headers_max: u32 = 8;
+/// A field as h3 and HPACK alike hold one.
+pub const Field = h3.qpack.Field;
 /// How often the transport's timers are looked at.
 const tick_ns: u64 = 2 * std.time.ns_per_ms;
 /// Events one read of a stream reports at most.
@@ -36,7 +43,7 @@ const events_max: u32 = 8;
 pub const ClientQuic = quic.Connection(.{
     .streams_max = 16,
     .stream_receive_octets = 16 * 1024,
-    .stream_send_octets = 8 * 1024,
+    .stream_send_octets = 16 * 1024,
 });
 const ClientHttp3 = h3.Http3(.{ .requests_max = requests_max, .unidirectional_max = 4 });
 
@@ -44,7 +51,12 @@ pub const Request = struct {
     method: []const u8 = "GET",
     path: []const u8 = "/",
     authority: []const u8 = "localhost",
+    /// Further fields, after the pseudo-fields.
+    headers: []const Field = &.{},
     body: []const u8 = &.{},
+    /// A field section sent as it is, in place of the one the fields above
+    /// encode to: what a test of the server's QPACK decoder sends.
+    raw_section: ?[]const u8 = null,
 };
 
 pub const Answer = struct {
@@ -201,13 +213,20 @@ pub fn TestClient(comptime IoType: type) type {
             const control_octets = client.http3.writeControl(&control) catch unreachable; // SETTINGS fit.
             _ = client.quic.write(quic.stream_id.make(.client_unidirectional, 0), control[0..control_octets], false) catch {};
             for (client.requests, 0..) |*request, index| {
-                var frames: [2048]u8 = undefined;
-                var octets = client.http3.writeHeaders(&frames, &.{
-                    .{ .name = ":method", .value = request.method },
-                    .{ .name = ":scheme", .value = "https" },
-                    .{ .name = ":authority", .value = request.authority },
-                    .{ .name = ":path", .value = request.path },
-                }) catch unreachable; // Four short fields.
+                assert(request.headers.len <= request_headers_max);
+                assert(request.body.len <= request_body_bytes_max);
+                var fields: [4 + request_headers_max]Field = undefined;
+                fields[0] = .{ .name = ":method", .value = request.method };
+                fields[1] = .{ .name = ":scheme", .value = "https" };
+                fields[2] = .{ .name = ":authority", .value = request.authority };
+                fields[3] = .{ .name = ":path", .value = request.path };
+                @memcpy(fields[4..][0..request.headers.len], request.headers);
+                var frames: [request_body_bytes_max + 2048]u8 = undefined;
+                var octets = if (request.raw_section) |section| raw: {
+                    const header = h3.frame.writeHeader(&frames, .headers, section.len) catch unreachable; // A short section.
+                    @memcpy(frames[header..][0..section.len], section);
+                    break :raw header + section.len;
+                } else client.http3.writeHeaders(&frames, fields[0 .. 4 + request.headers.len]) catch unreachable; // Short fields.
                 if (request.body.len >= 1) {
                     octets += ClientHttp3.writeData(frames[octets..], request.body.len) catch unreachable;
                     @memcpy(frames[octets..][0..request.body.len], request.body);
@@ -248,7 +267,10 @@ pub fn TestClient(comptime IoType: type) type {
                     ) catch return;
                     for (decoded.fields) |field| {
                         if (!std.mem.eql(u8, field.name, ":status")) continue;
-                        answer.status = std.fmt.parseInt(u16, field.value, 10) catch 0;
+                        const status = std.fmt.parseInt(u16, field.value, 10) catch 0;
+                        // An interim head (RFC 9110 §15.2) is not the answer:
+                        // the final one is still to come.
+                        if (status >= 200) answer.status = status;
                     }
                 },
                 .data => |data| {
@@ -270,6 +292,13 @@ pub fn TestClient(comptime IoType: type) type {
             const index = id / 4;
             if (index >= client.requests.len) return null;
             return &client.answers[@intCast(index)];
+        }
+
+        /// The run is ending with this client still going: close now, and
+        /// let go of the socket once the close is out.
+        pub fn abandon(client: *Self) void {
+            if (client.done) return;
+            client.close();
         }
 
         fn close(client: *Self) void {

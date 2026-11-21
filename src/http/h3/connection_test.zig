@@ -94,10 +94,10 @@ const Bed = struct {
     client_tls_live: bool,
 
     /// Packet protection's libcrypto contexts are the process's, made at
-    /// startup (`QuicCrypto.init`); a test makes them for its own span.
+    /// startup (`QuicCrypto.init`) and kept: a test makes them if nothing
+    /// before it did, and leaves them for whatever runs next.
     fn create() !*Bed {
-        try QuicCrypto.init();
-        errdefer QuicCrypto.deinit();
+        _ = try QuicCrypto.ensure();
         const bed = try testing.allocator.create(Bed);
         errdefer testing.allocator.destroy(bed);
         bed.arena_state = .init(testing.allocator);
@@ -116,7 +116,6 @@ const Bed = struct {
         bed.credentials.deinit();
         bed.arena_state.deinit();
         testing.allocator.destroy(bed);
-        QuicCrypto.deinit();
     }
 
     /// The client's first flight, and the server connection it starts.

@@ -161,100 +161,44 @@ const Uncovered = struct {
 /// serves both kinds at once, and what stops the table rotting into stale
 /// excuses.
 const uncovered = [_]Uncovered{
-    // #449's HTTP/3 rungs, until the sweep runs an HTTP/3 client: no seed
-    // binds a QUIC listener yet. src/http/h3/server_test.zig drives a
-    // request through the whole server under the simulator — endpoint,
-    // handshake, session, exchange, origin, drain — and the next slice
-    // puts that client in the sweep, deleting these as they fire.
+    // #449's HTTP/3 rungs the sweep's conforming clients cannot reach.
     .{
-        .name = "h3_admitted",
-        .why = .unreached,
-        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
-    },
-    .{
-        .name = "h3_handshakes",
-        .why = .unreached,
-        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
-    },
-    .{
-        .name = "h3_shed_connections",
-        .why = .unreached,
-        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
-    },
-    .{
-        .name = "h3_shed_tls_engines",
-        .why = .unreached,
-        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
+        .name = "h3_protocol_errors",
+        .why = .must_stay_zero,
+        .reason = "the sweep's HTTP/3 clients conform and the datagram adversary's corruption " ++
+            "fails the AEAD, so a protocol error here is the server misreading a stream — " ++
+            "as it was when a stream its own read had answered was read again as a new request",
     },
     .{
         .name = "h3_shed_tls_crypto",
         .why = .unreached,
-        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
-    },
-    .{
-        .name = "h3_shed_streams",
-        .why = .unreached,
-        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
-    },
-    .{
-        .name = "h3_protocol_errors",
-        .why = .unreached,
-        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
+        .reason = "shed_tls_crypto's reason, at the QUIC rung: libcrypto refusing a key " ++
+            "derivation needs the fixed heap exhausted, which no scenario reaches",
     },
     .{
         .name = "h3_qpack_failures",
         .why = .unreached,
-        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
+        .reason = "the sweep's clients encode with h3's own QPACK; src/http/h3/server_test.zig " ++
+            "sends a section that does not decode",
     },
     .{
         .name = "h3_malformed_requests",
         .why = .unreached,
-        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
-    },
-    .{
-        .name = "h3_packets_lost",
-        .why = .unreached,
-        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
-    },
-    .{
-        .name = "h3_idle_closed",
-        .why = .unreached,
-        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
+        .reason = "the sweep's clients send well-formed fields; src/http/h3/server_test.zig " ++
+            "sends an uppercase field name",
     },
     .{
         .name = "h3_events_overflowed",
         .why = .unreached,
-        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
-    },
-    .{
-        .name = "h3_datagrams_dropped",
-        .why = .unreached,
-        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
+        .reason = "h3 sizes a connection's event queue past what one datagram's packets can " ++
+            "raise, and a pass polls it after every datagram; the rung exists so a queue that " ++
+            "did overflow is read again rather than lost",
     },
     .{
         .name = "h3_version_negotiations",
         .why = .unreached,
-        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
-    },
-    .{
-        .name = "h3_retries",
-        .why = .unreached,
-        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
-    },
-    .{
-        .name = "h3_stateless_resets",
-        .why = .unreached,
-        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
-    },
-    .{
-        .name = "h3_tokens_refused",
-        .why = .unreached,
-        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
-    },
-    .{
-        .name = "h3_migration_dropped",
-        .why = .unreached,
-        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
+        .reason = "the sweep's clients speak QUIC v1, and a corrupted version reaches it only " ++
+            "with the datagram still 1200 octets; src/http/h3/server_test.zig sends one",
     },
     // §7 HTTP/2 to the origin. The sweep's origins speak HTTP/1.1 — the
     // byte-exact integrity oracle reads their wire — and no cluster it
@@ -663,25 +607,6 @@ const uncovered_ops = [_]struct { kind: SimIo.OpKind, reason: []const u8 }{
             "every serving path closes synchronously via closeNow — and the " ++
             "sweep configures no admin listener; src/admin_test.zig covers it, " ++
             "and the Tier-0.5 live gate delivers real ones through its scrapes",
-    },
-    // #449's datagram seam, until the sweep runs a QUIC listener: no seed
-    // binds a UDP socket yet. src/io/contract_test.zig drives all three on
-    // both backends, the SimIo adversary's drop, duplicate, corrupt and
-    // rebind fates included.
-    .{
-        .kind = .recv_from,
-        .reason = "no seed binds a QUIC listener yet (#449); src/io/contract_test.zig " ++
-            "echoes datagrams on both backends",
-    },
-    .{
-        .kind = .send_to,
-        .reason = "no seed binds a QUIC listener yet (#449); src/io/contract_test.zig " ++
-            "echoes datagrams on both backends",
-    },
-    .{
-        .kind = .datagram_cancel,
-        .reason = "no seed binds a QUIC listener yet (#449); src/io/contract_test.zig " ++
-            "cancels an armed receive on both backends",
     },
 };
 

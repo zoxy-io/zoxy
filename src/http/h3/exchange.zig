@@ -153,6 +153,7 @@ pub fn Half(comptime runtime: Runtime) type {
                 scratch.giveBackDecode();
                 server.counters.increment("h3_shed_streams");
                 slot.session.cancel(&slot.quic, id, .request_rejected);
+                slot.drain(id);
                 return;
             };
             assert(stream.h3_id == id);
@@ -187,12 +188,14 @@ pub fn Half(comptime runtime: Runtime) type {
                 error.MessageError => {
                     server.counters.increment("h3_malformed_requests");
                     slot.session.cancel(&slot.quic, id, .message_error);
+                    slot.drain(id);
                 },
                 // Past this side's bound, not the client's error: refused
                 // as a request, before a slot was spent on it.
                 error.TooLarge => {
                     server.counters.increment("l7_headers_too_large");
                     slot.session.cancel(&slot.quic, id, .excessive_load);
+                    slot.drain(id);
                 },
             }
         }
@@ -298,9 +301,12 @@ pub fn Half(comptime runtime: Runtime) type {
             assert(stream.mux == .h3);
             const slot = stream.conn.h3.?;
             const id = stream.h3_id;
-            const transport = slot.quic.findStream(id) orelse return slot.session.release(id);
-            if (transport.receive_state != .receiving) return slot.session.release(id);
-            slot.quic.stopSending(id, @backingInt(ApplicationCode.no_error)) catch {};
+            if (slot.quic.findStream(id)) |transport| {
+                if (transport.receive_state == .receiving) {
+                    slot.quic.stopSending(id, @backingInt(ApplicationCode.no_error)) catch {};
+                }
+            }
+            slot.drain(id);
         }
 
         /// The exchange is abandoned after it began — an origin that broke
@@ -311,6 +317,7 @@ pub fn Half(comptime runtime: Runtime) type {
             assert(stream.mux == .h3);
             const slot = stream.conn.h3.?;
             slot.session.cancel(&slot.quic, stream.h3_id, .internal_error);
+            slot.drain(stream.h3_id);
         }
 
         /// A body frame reached the origin: its stream is read for the room,
