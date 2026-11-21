@@ -25,8 +25,8 @@ name: Nightly simulation
 # remainder is never revisited. Now a shard censuses its own slice
 # instead of stopping, and `fail-fast: false` keeps the siblings running,
 # so a *failing* night still reports its whole block. Sharding also buys
-# the block size back in wall clock: 4M seeds finish in the time 1M used
-# to take.
+# the block size back in wall clock: the night's 4M seeds take one
+# shard's time, whatever the shard count.
 
 on:
   schedule:
@@ -37,11 +37,11 @@ on:
       seeds:
         description: "Seeds per shard"
         required: false
-        default: "1000000"
+        default: "500000"
       shards:
         description: "Parallel shards (block = shards x seeds)"
         required: false
-        default: "4"
+        default: "8"
       start_seed:
         description: "First seed (blank = continue the nightly range)"
         required: false
@@ -81,8 +81,8 @@ jobs:
       - name: Compute seed range
         id: range
         env:
-          SEEDS: ${{ inputs.seeds || '1000000' }}
-          SHARDS: ${{ inputs.shards || '4' }}
+          SEEDS: ${{ inputs.seeds || '500000' }}
+          SHARDS: ${{ inputs.shards || '8' }}
           START_OVERRIDE: ${{ inputs.start_seed }}
           RUN_NUMBER: ${{ github.run_number }}
           # The tiling epoch: run EPOCH_RUN sweeps the block starting at
@@ -153,9 +153,17 @@ jobs:
         shard: ${{ fromJson(needs.plan.outputs.shard_list) }}
     # Measured on this runner 2026-07-29 (run #3): 1M seeds in 717 s, so
     # ~1400 seeds/s in Debug — a shared runner is not slower than the dev
-    # box here. A 1M shard is ~12 min; the cap is headroom, not a target,
-    # and a shard that hits it should shrink `seeds` rather than run
-    # longer. `keep-going` never runs past the end of its own slice.
+    # box here. The cap is headroom, not a target, and a shard that hits
+    # it should shrink `seeds` rather than run longer. `keep-going` never
+    # runs past the end of its own slice.
+    #
+    # Seeds grew dearer since: by runs #138 and #139 (2026-11-21) a 1M
+    # shard took 60 to 75 min, and HTTP/3's population (#449) — real QUIC
+    # and TLS handshakes in Debug — costs another 28% a seed (20,000 seeds:
+    # 58 s before, 74 s after, on the dev box). That is 77 to 96 min a
+    # shard, and run #140's four were all cancelled at the cap. So the
+    # night is 8 shards of 500k: the same 4M block, so the tiling is
+    # unchanged, at 40 to 50 min a shard.
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
@@ -164,7 +172,7 @@ jobs:
       # deliberately share one cache key (no `cache-key: shard`): they build
       # the identical Debug binary, so the first shard to finish saves the
       # next night's warm build and packages, and the rest find the key
-      # taken and skip — one entry instead of four copies of the same one.
+      # taken and skip — one entry instead of a copy per shard.
       - name: Install Zig
         uses: mlugg/setup-zig@v2
 
