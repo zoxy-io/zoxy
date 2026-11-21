@@ -4683,8 +4683,10 @@ pub fn Server(comptime runtime: Runtime) type {
         }
 
         /// Whether `config` selects a request policy that consults (#437),
-        /// at a listener or at one of its routes.
-        fn selectsConsultingPolicy(config: *const config_module.Config) bool {
+        /// at a listener or at one of its routes: what a build must
+        /// reserve consult slots for, which `App` refuses at step zero and
+        /// `bindExtensions` again for a server composed by hand.
+        pub fn selectsConsultingPolicy(config: *const config_module.Config) bool {
             if (comptime !extension.listsConsultingPolicy(runtime.extensions.request_policies)) return false;
             assert(config.listeners.len >= 1);
             for (config.listeners) |*listener| {

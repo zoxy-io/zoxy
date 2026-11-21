@@ -147,6 +147,7 @@ pub fn App(comptime extensions: extension.Extensions) type {
             try refuseUnfitAnswers(&config);
             try refuseUnfitHandlers(&config);
             try refuseOverEditing(&config);
+            try refuseConsultsUnslotted(&config);
             assert(config.clusters.len == options.clusters.len);
             assert(config.listeners.len >= 1);
             return config;
@@ -228,6 +229,19 @@ pub fn App(comptime extensions: extension.Extensions) type {
             if (shape.edits > constants.policy_edits_max) return error.PolicyEditsOverLimit;
             // The same bound on the way out (#424).
             if (Edits.responseShapeOf(config).edits > constants.policy_edits_max) return error.PolicyEditsOverLimit;
+        }
+
+        /// A consulting policy selected with no consult slot to consult
+        /// from (#437), which would fail every request it sees. Here at
+        /// step zero, so `--check` refuses what a start would; the server
+        /// refuses it again at bind, for a build that composes one by hand.
+        fn refuseConsultsUnslotted(config: *const Config) error{ConsultSlotsRequired}!void {
+            assert(config.listeners.len >= 1);
+            // `resolve` has held the slots under the upstream slots each
+            // consult takes one of.
+            assert(config.limits.consult_slots <= config.limits.upstream_slots);
+            if (config.limits.consult_slots >= 1) return;
+            if (ServerType.selectsConsultingPolicy(config)) return error.ConsultSlotsRequired;
         }
 
         fn refuseUnserved(selection: extension.Selection, listed_count: usize) error{ExtensionUnserved}!void {
@@ -786,4 +800,45 @@ test "App: a head buffer smaller than the widest answer's head is refused at sta
     try Built.refuseUnfitAnswers(&default);
     // A build whose policies declare none is never refused for it.
     try App(.{}).refuseUnfitAnswers(&small);
+}
+
+test "App: a consulting policy with no consult slot is refused at step zero, as `--check` sees it (#437)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const defaults = @import("defaults.zig");
+    const Consulting = @import("testing/consult.zig").ScriptedConsult(.closed);
+    const Built = App(.{ .request_policies = &.{Consulting} });
+    var policy: Consulting = .{ .cluster_name = "origin" };
+    const origin = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:9000");
+    const bind = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:8080");
+    const routes = [_]Options.Listener.Route{.{ .prefix = "/", .cluster = "origin" }};
+    const selections = [_]extension.Selection{Built.policy(&policy)};
+    var options: Options = .{
+        .listeners = &.{.{ .bind = .{ .ip = bind }, .protocol = .{ .http = .{
+            .target = .{ .routes = &routes },
+            .request_policies = &selections,
+            .max_body_bytes = defaults.max_body_bytes,
+            .keepalive_requests = defaults.keepalive_requests,
+        } } }},
+        .clusters = &.{.{ .name = "origin", .endpoints = &.{.{ .address = .{ .ip = origin } }}, .pick = .p2c }},
+        .timeouts = defaults.timeouts,
+        .limits = .{},
+    };
+    try std.testing.expectError(error.ConsultSlotsRequired, Built.resolveServed(arena, &options));
+    options.limits = .{ .consult_slots = 1 };
+    _ = try Built.resolveServed(arena, &options);
+    // A selection at a route counts as one at the listener does.
+    const guarded = [_]Options.Listener.Route{.{ .prefix = "/", .cluster = "origin", .request_policies = &selections }};
+    options.listeners = &.{.{ .bind = .{ .ip = bind }, .protocol = .{ .http = .{
+        .target = .{ .routes = &guarded },
+        .max_body_bytes = defaults.max_body_bytes,
+        .keepalive_requests = defaults.keepalive_requests,
+    } } }};
+    options.limits = .{};
+    try std.testing.expectError(error.ConsultSlotsRequired, Built.resolveServed(arena, &options));
+    // A build that lists the type but selects none of it reserves nothing.
+    options.listeners = &.{.{ .bind = .{ .ip = bind }, .protocol = .{ .l4 = .{ .target = .{ .cluster = "origin" } } } }};
+    options.limits = .{};
+    _ = try Built.resolveServed(arena, &options);
 }
