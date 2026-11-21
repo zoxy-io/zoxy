@@ -1537,6 +1537,11 @@ external binaries. They and the speed gates run at merge.
       with zoxy's, including SNI selection and an RSA-PSS handshake;
     - the ALPN refusal, through a hand-written ClientHello;
     - h2c, and h2 and HTTPS origins;
+    - HTTP/3 over the TLS listener's QUIC binding, three requests on one
+      connection. Its client is zoxy's own test client over the real
+      backend, run as a process of its own (`smoke/h3_probe.zig`). So the
+      leg proves the shipped build serves HTTP/3 on a real kernel; agreeing
+      with an independent implementation is h3spec's job;
     - sticky cookies, bodies, an allowlist, gRPC probes;
     - `--check`;
     - the watchdog.
