@@ -860,6 +860,37 @@ pub const Config = struct {
                 extension,
             };
 
+            /// The kinds a config may name: every one but a build's own
+            /// (#436), which is selected in code. Apart from `Kind`, as
+            /// `Pick.Builtin` is apart from `Pick`, so the loader's closed
+            /// vocabulary and the schema's enum stay what they were before
+            /// `extension` existed — the schema advertising a kind the
+            /// loader refuses was 1.1.0's first cut.
+            pub const Builtin = enum(u2) {
+                tcp,
+                http,
+                grpc,
+
+                pub fn kind(builtin: Builtin) Kind {
+                    return switch (builtin) {
+                        .tcp => .tcp,
+                        .http => .http,
+                        .grpc => .grpc,
+                    };
+                }
+
+                comptime {
+                    for (@typeInfo(Builtin).@"enum".field_names) |name| {
+                        assert(@hasField(Kind, name));
+                    }
+                    assert(@typeInfo(Builtin).@"enum".field_names.len + 1 ==
+                        @typeInfo(Kind).@"enum".field_names.len);
+                    // And the one it leaves out is the build's own.
+                    assert(!@hasField(Builtin, "extension"));
+                    assert(@hasField(Kind, "extension"));
+                }
+            };
+
             pub const Http = struct {
                 /// Canonical origin-form path, validated at load exactly
                 /// like a route prefix — the probe sends it verbatim.

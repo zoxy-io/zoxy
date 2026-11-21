@@ -325,15 +325,14 @@ fn pickOf(pick_json: *const PickJson) ParseError!Options.Cluster.Pick {
 /// timeout as one probe's budget.
 fn checkOf(check_json: ?CheckJson, connect_ms: u32) ParseError!?Options.Cluster.Check {
     const check = check_json orelse return null;
-    const kind = std.meta.stringToEnum(Config.Cluster.Check.Kind, check.type) orelse
+    // The JSON vocabulary: a build's own kind (#436) is selected in code,
+    // so `extension` is as unknown here as a misspelling.
+    const kind = std.meta.stringToEnum(Config.Cluster.Check.Builtin, check.type) orelse
         return error.ClusterCheckTypeUnknown;
     if (kind != .grpc and check.service != null) return error.ClusterCheckServiceWithoutGrpc;
     const http_fields = check.path != null or check.host != null or check.expect_status != null;
     const stated: Options.Cluster.Check.Kind = switch (kind) {
         .tcp => if (http_fields) return error.ClusterCheckHttpFieldOnTcp else .tcp,
-        // A build's own kind (#436) is selected in code; a file cannot
-        // name one.
-        .extension => return error.ClusterCheckTypeUnknown,
         .http => .{ .http = .{
             .path = check.path orelse return error.ClusterCheckPathMissing,
             .host = check.host,
@@ -352,7 +351,7 @@ fn checkOf(check_json: ?CheckJson, connect_ms: u32) ParseError!?Options.Cluster.
             break :blk .{ .grpc = .{ .service = check.service orelse "" } };
         },
     };
-    assert(stated == kind);
+    assert(stated == kind.kind());
     return .{
         .kind = stated,
         .fall = check.fall,
@@ -2867,7 +2866,7 @@ pub const CheckJson = struct {
     pub const schema_fields = .{
         .type = .{
             .desc = "What a probe checks: tcp (the port accepts a connection), http (a request for `path` gets the expected status) or grpc (an HTTP/2 cluster's grpc.health.v1 service answers SERVING).",
-            .enum_type = Config.Cluster.Check.Kind,
+            .enum_type = Config.Cluster.Check.Builtin,
         },
         .fall = .{
             .desc = "Consecutive failed probes that eject an endpoint from balancing.",
@@ -4738,6 +4737,9 @@ test "config: a check block rejects every shape it cannot run" {
     ;
     // A typo in the vocabulary must not silently probe as tcp.
     try expectParseError(error.ClusterCheckTypeUnknown, head ++ "{\"type\":\"htp\"}" ++ tail);
+    // Nor may a file name a build's own kind (#436), which is selected in
+    // code: to JSON it is as unknown as the typo.
+    try expectParseError(error.ClusterCheckTypeUnknown, head ++ "{\"type\":\"extension\"}" ++ tail);
     // Thresholds are counts of probes: zero would eject or restore on no
     // evidence at all, and the ceiling keeps the u8 streaks from wrapping.
     try expectParseError(error.ClusterCheckThresholdOutOfRange, head ++ "{\"fall\":0}" ++ tail);

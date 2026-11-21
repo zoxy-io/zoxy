@@ -751,6 +751,27 @@ test "json schema: pick accepts both spellings, and only the object names hash" 
     );
 }
 
+test "json schema: a check's type names only the kinds a file may (#436)" {
+    var buffer: [128 * 1024]u8 = undefined;
+    const text = try renderInto(&buffer);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
+    defer parsed.deinit();
+
+    const clusters = parsed.value.object.get("properties").?.object.get("clusters").?.object;
+    const cluster_schema = clusters.get("additionalProperties").?.object;
+    const check = cluster_schema.get("properties").?.object.get("check").?.object;
+    const kinds = check.get("properties").?.object.get("type").?.object.get("enum").?.array;
+    // Exactly the builtin kinds, and never `extension`: a build's own kind
+    // is selected in code, and the loader refuses the string.
+    try std.testing.expectEqual(
+        @typeInfo(zoxy.config.Config.Cluster.Check.Builtin).@"enum".field_names.len,
+        kinds.items.len,
+    );
+    for (kinds.items) |kind| {
+        try std.testing.expect(!std.mem.eql(u8, kind.string, "extension"));
+    }
+}
+
 test "json schema: response filter status bounds and class vocabulary" {
     var buffer: [128 * 1024]u8 = undefined;
     const text = try renderInto(&buffer);

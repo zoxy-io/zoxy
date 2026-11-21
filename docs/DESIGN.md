@@ -998,7 +998,9 @@ gates startup.
     - `extension`, in code only, is a build's own kind (#436, §13):
       zoxy dials and holds the deadline, and the type speaks the
       origin's protocol in rounds. Plaintext, like `http`: refused on a
-      TLS cluster (`ClusterTlsExtensionCheck`).
+      TLS cluster (`ClusterTlsExtensionCheck`). The JSON vocabulary is
+      the other three (`Check.Builtin`), as the schema's enum is: a
+      file that names `extension` is refused as an unknown type.
   - **Verdicts.** `fall` misses eject; `rise` passes restore.
   - **The prober.** One prober runs, with as many probes in flight as
     there are checked endpoints, up to 16. Sweeps run end to start every
