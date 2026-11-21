@@ -523,7 +523,7 @@
         // libcrypto's (§4). Its one dependency is hpack, the same pin h2
         // carries.
         //
-        // Audit for 160c690, 2026-11-21 (zoxy-io/h3#8), nine commits on
+        // Audit for 6a9884e, 2026-11-21 (zoxy-io/h3#8), ten commits on
         // f6bfb94, each reviewed and gated in h3's three build legs:
         //   - a comptime packet-protection backend (`Config.crypto`), its
         //     contract stated and checked, with RFC 9001 appendix A as a
@@ -536,16 +536,21 @@
         //   - `Http3Server`, RFC 9114's server side over one connection;
         //   - a remotely reachable double credit release when a client
         //     reset a stream before its data was read, found by h3's
-        //     fuzzer and fixed.
+        //     fuzzer and fixed;
+        //   - a server connection built in place (`initServer(self, …)`),
+        //     never through the stack: by value it put two copies of a
+        //     connection in one frame, and h3spec's first connection
+        //     overflowed the interop server's stack. zoxy's connections
+        //     live in a startup pool and are initialized where they lie.
         // Not yet run on this commit: h3spec, by hand (see h3's
         // docs/VERIFICATION.md). The interop matrix's loopback cases and
-        // h3's 4096-seed simulator pass. 160c690 is the head of PR #8,
+        // h3's 4096-seed simulator pass. 6a9884e is on PR #8's branch,
         // open and unmerged when pinned: h3 merges with a merge commit,
         // which keeps it reachable, but the pin moves to the merged tree's
         // commit — re-audited if the tree differs — before a release.
         .h3 = .{
-            .url = "git+https://github.com/zoxy-io/h3#160c690650789ed55436bd1dadd07fa4d904c33c",
-            .hash = "h3-0.0.0-RBkp8rBtGgCJu7G4rfkTat1_lIhZFIppTmPhX4gRu481",
+            .url = "git+https://github.com/zoxy-io/h3#6a9884e6a14d329c0afbe253a06a26995d526dae",
+            .hash = "h3-0.0.0-RBkp8o-BGgDkvbUVemN0C-RBTmt0kuAZhikTMrFjt4cb",
         },
         // libcrypto, built by Zig rather than found on the system.
         //

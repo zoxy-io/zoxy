@@ -184,6 +184,8 @@ test {
     _ = @import("tls/engine_test.zig");
     _ = @import("tls/QuicCrypto.zig");
     _ = @import("http/h3/crypto.zig");
+    _ = @import("http/h3/Connection.zig");
+    _ = @import("http/h3/connection_test.zig");
     _ = tls.TestClient;
     _ = @import("mem/Pool.zig");
     _ = @import("net/Conn.zig");
