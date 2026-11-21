@@ -60,6 +60,8 @@ const pending_ops_max: u32 = constants.inFlightOps(
     listeners_max,
     constants.health_probe_concurrency_max,
     h2_origin_connections_max,
+    // Its datagram ops are counted on their own, below.
+    0,
 ) + udp_pending_ops_max;
 const pending_signals_max: u8 = 8;
 

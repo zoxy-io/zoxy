@@ -19,6 +19,7 @@ const relay = @import("relay.zig");
 const stream_module = @import("Stream.zig");
 const TlsEngine = @import("../tls/Engine.zig");
 const H2Slot = @import("../http/h2/Connection.zig").Slot;
+const H3Slot = @import("../http/h3/Connection.zig").Slot;
 
 const assert = std.debug.assert;
 
@@ -45,7 +46,11 @@ pub fn Conn(comptime runtime: Runtime) type {
         /// that argument where it is made.
         stream: *StreamType,
         state: State,
-        client_socket: IoType.Socket,
+        /// The accepted socket this connection's octets travel on, or null
+        /// on a QUIC connection (#449), whose datagrams travel on its
+        /// listener's endpoint. Every stream path asks `clientSocket`,
+        /// which says a socket is there.
+        client_socket: ?IoType.Socket,
         /// The §5 tunnel buffer this connection has claimed (#180), held
         /// from the moment its upgrade request is admitted until the
         /// tunnel closes — or until the exchange fails before `101`, in
@@ -144,6 +149,16 @@ pub fn Conn(comptime runtime: Runtime) type {
         /// or null on any connection that does not speak HTTP/2. Held for
         /// the connection's life once taken, and returned at teardown.
         h2: ?*H2Slot,
+        /// This connection's HTTP/3 slot (#449) — its QUIC transport and
+        /// HTTP/3 session, from the §5 pool — or null on any connection
+        /// that does not speak HTTP/3. A connection that does was never a
+        /// socket: it began with a QUIC Initial on its listener's endpoint,
+        /// and its datagrams travel on that endpoint's UDP socket.
+        h3: ?*H3Slot,
+        /// Its place in its endpoint's queue of connections with a
+        /// datagram to send (#449): served in turn, one datagram each.
+        quic_send_next: ?*Self,
+        quic_send_queued: bool,
         /// The exchanges this HTTP/2 connection is multiplexing (#275), each
         /// on a shared stream slot: the head of the list `Stream.h2_next`
         /// links. Empty on every other connection, whose one exchange is
@@ -297,6 +312,11 @@ pub fn Conn(comptime runtime: Runtime) type {
             /// said, the admission stream carries its socket I/O, and the
             /// multiplexed exchanges run on streams of their own.
             h2,
+            /// Speaking HTTP/3 (#449): the transport and session in `h3`
+            /// decide what is said, the listener's QUIC endpoint carries its
+            /// datagrams, and the exchanges run on shared streams as
+            /// HTTP/2's do. The admission stream carries nothing.
+            h3,
             /// Teardown begun: sockets shut down, pending ops draining.
             /// The delivery that empties the armed set closes both fds
             /// synchronously and releases the slot (§5) — there is no
@@ -322,6 +342,30 @@ pub fn Conn(comptime runtime: Runtime) type {
             assert((conn.state == .l7) == (conn.stream.phase != .none));
         }
 
+        /// The most exchanges this connection multiplexes at once — the
+        /// bound on every walk of `h2_streams` — or zero on one that
+        /// multiplexes none. HTTP/2's is what its session advertised.
+        /// HTTP/3's is the shared pool's ceiling, not the request streams a
+        /// client may open: an exchange ending on its own stays linked until
+        /// its forced ops deliver, while the transport has already retired
+        /// its stream and given the client the credit for another.
+        pub fn multiplexedMax(conn: *const Self) u32 {
+            if (conn.h2) |slot| {
+                assert(conn.h3 == null);
+                return slot.session.config.concurrent_streams_max;
+            }
+            if (conn.h3 != null) return constants.stream_slots_max;
+            assert(conn.h2_streams == null);
+            return 0;
+        }
+
+        /// The accepted socket, on every connection that has one: all but
+        /// HTTP/3's, which reach no path that reads or writes a socket.
+        pub fn clientSocket(conn: *const Self) IoType.Socket {
+            assert(conn.h3 == null);
+            return conn.client_socket.?;
+        }
+
         /// True once teardown has begun.
         pub fn isTearingDown(conn: *const Self) bool {
             return conn.state == .tearing_down;
@@ -338,6 +382,7 @@ pub fn Conn(comptime runtime: Runtime) type {
                 .relaying,
                 .l7,
                 .h2,
+                .h3,
                 => true,
                 .tearing_down => false,
             };
@@ -370,7 +415,7 @@ pub fn Conn(comptime runtime: Runtime) type {
         pub fn prepare(
             conn: *Self,
             server: *ServerType,
-            client_socket: IoType.Socket,
+            client_socket: ?IoType.Socket,
             engine: ?*TlsEngine,
             state: State,
             protocol: config_module.Config.Listener.Protocol,
@@ -405,6 +450,9 @@ pub fn Conn(comptime runtime: Runtime) type {
             conn.request_filters = &.{};
             conn.h2c = false;
             conn.h2 = null;
+            conn.h3 = null;
+            conn.quic_send_next = null;
+            conn.quic_send_queued = false;
             conn.h2_streams = null;
             conn.response_filters = &.{};
             conn.upgrades = .{};

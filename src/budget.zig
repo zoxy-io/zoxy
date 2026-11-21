@@ -24,6 +24,8 @@ const Io = @import("io/io.zig");
 const RelayBuffer = @import("net/relay.zig").RelayBuffer;
 const Server = @import("Server.zig").Server;
 const TlsEngine = @import("tls/Engine.zig");
+const H3Slot = @import("http/h3/Connection.zig").Slot;
+const H3Scratch = @import("http/h3/exchange.zig").Scratch;
 const upstream_module = @import("net/upstream.zig");
 
 const assert = std.debug.assert;
@@ -87,6 +89,7 @@ pub fn Budget(comptime runtime: Runtime) type {
                     access_log_files,
                     health_probes,
                     config.limits.h2_origin_connections,
+                    ServerType.quicListenerCount(config),
                 ),
                 .cq_entries = constants.completionQueueDepthFor(
                     config.limits.conn_slots,
@@ -94,6 +97,7 @@ pub fn Budget(comptime runtime: Runtime) type {
                     listeners_count,
                     health_probes,
                     config.limits.h2_origin_connections,
+                    ServerType.quicListenerCount(config),
                     config.limits.cq_fill_eighths,
                 ),
             };
@@ -187,6 +191,16 @@ pub fn Budget(comptime runtime: Runtime) type {
                 // together: a session pool, and a head per shared stream.
                 .h2_connections = limits.h2_connections,
                 .h2_session_bytes = ServerType.h2SessionBytes(&limits),
+                // Zero unless a listener serves QUIC (#449): the pool, its
+                // owner table, an endpoint per binding, and the scratch.
+                .quic_connections = limits.quic_connections,
+                .h3_slot_bytes = if (limits.quic_connections == 0)
+                    0
+                else
+                    @sizeOf(H3Slot) + @sizeOf(?*anyopaque),
+                .quic_endpoints = ServerType.quicListenerCount(config),
+                .quic_endpoint_bytes = if (limits.quic_connections == 0) 0 else ServerType.QuicEndpoint.bytes,
+                .h3_scratch_bytes = if (limits.quic_connections == 0) 0 else H3Scratch.bytes,
                 .stream_head_buffers = limits.stream_slots,
                 .stream_head_buffer_bytes = if (limits.stream_slots == 0)
                     0
@@ -325,6 +339,7 @@ pub fn Budget(comptime runtime: Runtime) type {
                 @intCast(config.listeners.len),
                 config.healthProbes(),
                 limits.h2_origin_connections,
+                ServerType.quicListenerCount(config),
             );
             const access_log_bytes = constants.accessLogBytes(limits.access_log_buffer_bytes);
             const sizes = poolSizesFor(config);
@@ -500,6 +515,7 @@ pub fn Budget(comptime runtime: Runtime) type {
             assert(sizes.upstream_tls_sessions == 0 or sizes.upstream_tls_session_bytes > 0);
             try emit(sink,
                 \\          + h2 sessions {d} x {d} B + stream heads {d} x {d} B
+                \\          + h3 connections {d} x {d} B + quic endpoints {d} x {d} B + h3 scratch {d} B
                 \\          + h2 origins {d} x {d} B + origin streams {d} x {d} B
                 \\          + https origin sessions {d} x {d} B
                 \\          + config arena {d} KiB (measured, not closed-form)
@@ -509,6 +525,11 @@ pub fn Budget(comptime runtime: Runtime) type {
                 sizes.h2_session_bytes,
                 sizes.stream_head_buffers,
                 sizes.stream_head_buffer_bytes,
+                sizes.quic_connections,
+                sizes.h3_slot_bytes,
+                sizes.quic_endpoints,
+                sizes.quic_endpoint_bytes,
+                sizes.h3_scratch_bytes,
                 sizes.h2_origin_connections,
                 sizes.h2_origin_bytes,
                 sizes.h2_origin_streams,

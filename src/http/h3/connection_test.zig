@@ -148,6 +148,8 @@ const Bed = struct {
             .retry = null,
             .idle_timeout_ms = 30_000,
             .stateless_reset_token = @splat(0x7e),
+            .endpoint_index = 0,
+            .peer = .{ .ip4 = .loopback(4433) },
         });
         try bed.engine.init(&.{
             .x25519_seed = @splat(0x42),

@@ -62,7 +62,7 @@ pub fn Relay(comptime runtime: Runtime) type {
                     const conn = stream.conn;
                     return switch (direction) {
                         .client_to_upstream => stream.upstream_socket.?,
-                        .upstream_to_client => conn.client_socket,
+                        .upstream_to_client => conn.clientSocket(),
                     };
                 }
 

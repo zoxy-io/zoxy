@@ -1,0 +1,404 @@
+//! An HTTP/3 client over the Io seam's datagrams (#449), for zoxy's own
+//! tests and the simulator's HTTP/3 clients: one QUIC connection — h3's
+//! client transport with its `std.crypto` default, and zssl's QUIC client
+//! for its handshake (`QuicClient`) — a few requests sent at once when the
+//! handshake confirms, and their answers kept. zoxy serves HTTP/3 and
+//! never dials it, so nothing on the serving path uses this.
+//!
+//! Its I/O is the simplest that is correct: one receive and one send in
+//! flight on its own UDP socket, and a fixed tick that fires the
+//! transport's timers once due — late by up to a tick, which a probe
+//! timeout or an acknowledgement delay forgives. Once every answer is in,
+//! it closes the connection with H3_NO_ERROR, sends that, and lets go of
+//! its socket; the server reads the close and runs its own closing period.
+
+const std = @import("std");
+const h3 = @import("h3");
+
+const Io = @import("../../io/io.zig");
+const TlsEngine = @import("../../tls/Engine.zig");
+const QuicClient = @import("../../tls/QuicClient.zig");
+const Connection = @import("Connection.zig");
+
+const quic = h3.quic;
+const IpAddress = std.Io.net.IpAddress;
+const assert = std.debug.assert;
+
+/// Requests one client sends.
+pub const requests_max: u32 = 4;
+/// An answer's body kept at most; past it the octets are counted, not kept.
+pub const body_bytes_max: u32 = 4096;
+/// How often the transport's timers are looked at.
+const tick_ns: u64 = 2 * std.time.ns_per_ms;
+/// Events one read of a stream reports at most.
+const events_max: u32 = 8;
+
+pub const ClientQuic = quic.Connection(.{
+    .streams_max = 16,
+    .stream_receive_octets = 16 * 1024,
+    .stream_send_octets = 8 * 1024,
+});
+const ClientHttp3 = h3.Http3(.{ .requests_max = requests_max, .unidirectional_max = 4 });
+
+pub const Request = struct {
+    method: []const u8 = "GET",
+    path: []const u8 = "/",
+    authority: []const u8 = "localhost",
+    body: []const u8 = &.{},
+};
+
+pub const Answer = struct {
+    status: u16 = 0,
+    body: [body_bytes_max]u8 = undefined,
+    body_len: u32 = 0,
+    /// The stream's FIN arrived after the answer.
+    finished: bool = false,
+    /// The server reset the stream instead.
+    reset: bool = false,
+
+    pub fn bodyBytes(answer: *const Answer) []const u8 {
+        return answer.body[0..@min(answer.body_len, body_bytes_max)];
+    }
+};
+
+pub fn TestClient(comptime IoType: type) type {
+    return struct {
+        const Self = @This();
+
+        io: *IoType,
+        socket: IoType.UdpSocket,
+        server: IpAddress,
+        quic: ClientQuic,
+        tls: QuicClient,
+        http3: ClientHttp3,
+        requests: []const Request,
+        answers: [requests_max]Answer,
+        receive_buffer: [2048]u8,
+        receive_completion: IoType.DatagramCompletion,
+        receive_cancel: IoType.Completion,
+        receiving: bool,
+        cancel_armed: bool,
+        send_buffer: [ClientQuic.datagram_octets]u8,
+        send_completion: IoType.DatagramCompletion,
+        sending: bool,
+        timer_completion: IoType.Completion,
+        timing: bool,
+        decode_scratch: [4096]u8,
+        decode_storage: [4096]u8,
+        decode_fields: [32]h3.qpack.Field,
+        requested: bool,
+        /// The connection is closed and its last datagram queued: what is
+        /// armed is let go of, and the socket closes once nothing is.
+        closing: bool,
+        done: bool,
+        on_done: *const fn (*anyopaque) void,
+        context: *anyopaque,
+
+        /// Bind, begin the handshake, and send the first flight. In place:
+        /// the transport is hundreds of KiB and every op points into it.
+        pub fn start(
+            client: *Self,
+            io: *IoType,
+            server: IpAddress,
+            requests: []const Request,
+            seed: [64]u8,
+            on_done: *const fn (*anyopaque) void,
+            context: *anyopaque,
+        ) !void {
+            assert(requests.len >= 1);
+            assert(requests.len <= requests_max);
+            // Field by field: the client is hundreds of KiB, and a literal of
+            // it could be built on the stack before it is copied in.
+            client.io = io;
+            client.socket = try io.udpBind(.{ .ip4 = .loopback(0) });
+            client.server = server;
+            client.http3 = .init(.client);
+            client.requests = requests;
+            client.answers = @splat(.{});
+            client.receive_completion = .{};
+            client.receive_cancel = .{};
+            client.receiving = false;
+            client.cancel_armed = false;
+            client.send_completion = .{};
+            client.sending = false;
+            client.timer_completion = .{};
+            client.timing = false;
+            client.requested = false;
+            client.closing = false;
+            client.done = false;
+            client.on_done = on_done;
+            client.context = context;
+            client.quic.initInPlace(.{
+                .side = .client,
+                .original_destination = try .init(seed[0..8]),
+                .source = try .init(seed[8..16]),
+                // The server's three streams in; the requests and this side's
+                // control stream out.
+                .advertised = .{
+                    .max_streams_bidirectional = 0,
+                    .max_streams_unidirectional = 3,
+                    .streams_opened_max = @intCast(requests.len + 1),
+                },
+            });
+            var parameters: [ClientQuic.local_transport_parameters_octets_max]u8 = undefined;
+            const sink = client.engineSink();
+            try client.tls.init(&.{
+                .server_name = "localhost",
+                .transport_parameters = try client.quic.localTransportParameters(&parameters),
+                .seed = seed,
+            }, &sink);
+            client.armReceive();
+            client.armTimer();
+            client.flush();
+        }
+
+        // -- the transport --
+
+        fn drive(client: *Self) void {
+            if (client.closing) return client.flush();
+            client.pumpTls() catch return client.close();
+            var polled: u32 = 0;
+            while (client.quic.poll()) |event| : (polled += 1) {
+                assert(polled < 4096);
+                switch (event) {
+                    .stream_readable => |id| client.readStream(id),
+                    .stream_reset => |reset| if (reset.stream < client.requests.len * 4) {
+                        client.answers[@intCast(reset.stream / 4)].reset = true;
+                    },
+                    .closed => return client.close(),
+                    else => {},
+                }
+            }
+            if (client.quic.handshakeConfirmed() and !client.requested) client.sendRequests();
+            if (client.answered()) return client.close();
+            client.flush();
+        }
+
+        fn pumpTls(client: *Self) !void {
+            const sink = client.engineSink();
+            for ([_]quic.crypto.Level{ .initial, .handshake, .one_rtt }) |level| {
+                const available = client.quic.cryptoOut(level);
+                if (available.len == 0) continue;
+                try client.tls.deliver(Connection.engineLevel(level), available, &sink);
+                client.quic.cryptoConsumed(level, available.len);
+            }
+        }
+
+        fn answered(client: *const Self) bool {
+            if (!client.requested) return false;
+            for (client.answers[0..client.requests.len]) |*answer| {
+                if (!answer.finished and !answer.reset) return false;
+            }
+            return true;
+        }
+
+        /// The requests, all at once, each on the next client stream, and
+        /// this side's control stream before them.
+        fn sendRequests(client: *Self) void {
+            assert(!client.requested);
+            client.requested = true;
+            var control: [64]u8 = undefined;
+            const control_octets = client.http3.writeControl(&control) catch unreachable; // SETTINGS fit.
+            _ = client.quic.write(quic.stream_id.make(.client_unidirectional, 0), control[0..control_octets], false) catch {};
+            for (client.requests, 0..) |*request, index| {
+                var frames: [2048]u8 = undefined;
+                var octets = client.http3.writeHeaders(&frames, &.{
+                    .{ .name = ":method", .value = request.method },
+                    .{ .name = ":scheme", .value = "https" },
+                    .{ .name = ":authority", .value = request.authority },
+                    .{ .name = ":path", .value = request.path },
+                }) catch unreachable; // Four short fields.
+                if (request.body.len >= 1) {
+                    octets += ClientHttp3.writeData(frames[octets..], request.body.len) catch unreachable;
+                    @memcpy(frames[octets..][0..request.body.len], request.body);
+                    octets += request.body.len;
+                }
+                const id = quic.stream_id.make(.client_bidirectional, @intCast(index));
+                _ = client.quic.write(id, frames[0..octets], true) catch {
+                    client.answers[index].reset = true;
+                };
+            }
+        }
+
+        fn readStream(client: *Self, id: u64) void {
+            var reads: u32 = 0;
+            while (reads < 64) : (reads += 1) {
+                var events: [events_max]h3.http3.Event = undefined;
+                const read = client.http3.receive(id, client.quic.readable(id), client.quic.readableFin(id), &events) catch {
+                    return client.close();
+                };
+                for (events[0..read.events]) |*event| client.onEvent(event);
+                if (read.consumed >= 1) client.quic.consume(id, read.consumed) catch {};
+                if (read.consumed == 0 and read.events == 0) return;
+            }
+        }
+
+        fn onEvent(client: *Self, event: *const h3.http3.Event) void {
+            switch (event.*) {
+                .headers => |headers| {
+                    const answer = client.answerFor(headers.stream) orelse return;
+                    if (headers.trailers) return;
+                    const decoded = h3.http3_server.decodeSection(
+                        headers.section,
+                        .{ .kind = .response },
+                        1 << 16,
+                        &client.decode_scratch,
+                        &client.decode_storage,
+                        &client.decode_fields,
+                    ) catch return;
+                    for (decoded.fields) |field| {
+                        if (!std.mem.eql(u8, field.name, ":status")) continue;
+                        answer.status = std.fmt.parseInt(u16, field.value, 10) catch 0;
+                    }
+                },
+                .data => |data| {
+                    const answer = client.answerFor(data.stream) orelse return;
+                    const room = body_bytes_max -| answer.body_len;
+                    const kept = @min(room, data.payload.len);
+                    @memcpy(answer.body[answer.body_len..][0..kept], data.payload[0..kept]);
+                    answer.body_len += @intCast(data.payload.len);
+                },
+                .finished => |id| if (client.answerFor(id)) |answer| {
+                    answer.finished = true;
+                },
+                .settings, .goaway => {},
+            }
+        }
+
+        fn answerFor(client: *Self, id: u64) ?*Answer {
+            if (!quic.stream_id.kindOf(id).bidirectional()) return null;
+            const index = id / 4;
+            if (index >= client.requests.len) return null;
+            return &client.answers[@intCast(index)];
+        }
+
+        fn close(client: *Self) void {
+            if (!client.closing) {
+                client.closing = true;
+                client.quic.closeApplication(@backingInt(quic.error_code.Application.no_error));
+            }
+            client.flush();
+        }
+
+        // -- I/O --
+
+        fn flush(client: *Self) void {
+            if (client.sending) return;
+            if (client.done) return;
+            const octets = client.quic.send(&client.send_buffer, client.io.nowNs()) catch 0;
+            if (octets == 0) return client.finishIfClosed();
+            client.sending = true;
+            client.io.sendTo(client.socket, client.send_buffer[0..octets], &client.server, &client.send_completion, Self, client, onSent);
+        }
+
+        fn onSent(client: *Self, result: Io.SendToError!u32) void {
+            assert(client.sending);
+            client.sending = false;
+            _ = result catch {};
+            client.flush();
+        }
+
+        fn armReceive(client: *Self) void {
+            assert(!client.receiving);
+            client.receiving = true;
+            client.io.recvFrom(client.socket, &client.receive_buffer, &client.receive_completion, Self, client, onReceive);
+        }
+
+        fn onReceive(client: *Self, result: Io.RecvFromError!Io.Datagram) void {
+            assert(client.receiving);
+            client.receiving = false;
+            if (client.closing) return client.finishIfClosed();
+            const datagram = result catch return client.close();
+            if (datagram.len >= 1) {
+                client.quic.receive(client.receive_buffer[0..datagram.len], client.io.nowNs()) catch {};
+            }
+            client.armReceive();
+            client.drive();
+        }
+
+        fn armTimer(client: *Self) void {
+            assert(!client.timing);
+            client.timing = true;
+            client.io.timerStart(&client.timer_completion, tick_ns, Self, client, onTick);
+        }
+
+        fn onTick(client: *Self, result: Io.TimerError!void) void {
+            assert(client.timing);
+            client.timing = false;
+            _ = result catch {};
+            if (client.closing) return client.finishIfClosed();
+            const now = client.io.nowNs();
+            if (client.quic.timeout()) |due| {
+                if (due <= now) client.quic.onTimeout(now);
+            }
+            client.armTimer();
+            client.drive();
+        }
+
+        /// The close is sent: the receive is let go of, and the socket
+        /// closes once the last op is in.
+        fn finishIfClosed(client: *Self) void {
+            if (!client.closing) return;
+            if (client.done) return;
+            if (client.sending) return;
+            if (client.quic.wantsSend()) return client.flush();
+            if (client.receiving) {
+                if (!client.cancel_armed) {
+                    client.cancel_armed = true;
+                    client.io.datagramCancel(&client.receive_completion, &client.receive_cancel, Self, client, onReceiveCancel);
+                }
+                return;
+            }
+            if (client.cancel_armed) return; // Its delivery comes back here.
+            if (client.timing) return; // The tick's own delivery comes back here.
+            client.done = true;
+            client.io.udpClose(client.socket);
+            client.tls.deinit();
+            client.on_done(client.context);
+        }
+
+        fn onReceiveCancel(client: *Self) void {
+            assert(client.cancel_armed);
+            client.cancel_armed = false;
+            client.finishIfClosed();
+        }
+
+        fn engineSink(client: *Self) TlsEngine.QuicSink {
+            return .{
+                .ctx = &client.quic,
+                .crypto = sinkCrypto,
+                .secret = sinkSecret,
+                .transportParameters = sinkParameters,
+                .connected = sinkConnected,
+            };
+        }
+    };
+}
+
+fn sinkCrypto(ctx: *anyopaque, level: TlsEngine.QuicLevel, bytes: []const u8) error{QuicSinkRefused}!void {
+    const connection: *ClientQuic = @ptrCast(@alignCast(ctx));
+    connection.cryptoIn(Connection.transportLevel(level), bytes) catch return error.QuicSinkRefused;
+}
+
+fn sinkSecret(ctx: *anyopaque, given: *const TlsEngine.QuicSecret) error{QuicSinkRefused}!void {
+    const connection: *ClientQuic = @ptrCast(@alignCast(ctx));
+    const held = quic.crypto.Secret.init(given.bytes) catch return error.QuicSinkRefused;
+    const level = Connection.transportLevel(given.level);
+    const suite = Connection.suiteOf(given.suite);
+    const installed = switch (given.direction) {
+        .send => connection.installSecret(level, .send, &held, suite),
+        .receive => connection.installSecret(level, .receive, &held, suite),
+    };
+    installed catch return error.QuicSinkRefused;
+}
+
+fn sinkParameters(ctx: *anyopaque, bytes: []const u8) error{QuicSinkRefused}!void {
+    const connection: *ClientQuic = @ptrCast(@alignCast(ctx));
+    connection.transportParametersIn(bytes) catch return error.QuicSinkRefused;
+}
+
+/// A client's handshake is confirmed by HANDSHAKE_DONE, not its own TLS
+/// stack (RFC 9001 §4.1.2).
+fn sinkConnected(ctx: *anyopaque) void {
+    _ = ctx;
+}

@@ -161,6 +161,101 @@ const Uncovered = struct {
 /// serves both kinds at once, and what stops the table rotting into stale
 /// excuses.
 const uncovered = [_]Uncovered{
+    // #449's HTTP/3 rungs, until the sweep runs an HTTP/3 client: no seed
+    // binds a QUIC listener yet. src/http/h3/server_test.zig drives a
+    // request through the whole server under the simulator — endpoint,
+    // handshake, session, exchange, origin, drain — and the next slice
+    // puts that client in the sweep, deleting these as they fire.
+    .{
+        .name = "h3_admitted",
+        .why = .unreached,
+        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
+    },
+    .{
+        .name = "h3_handshakes",
+        .why = .unreached,
+        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
+    },
+    .{
+        .name = "h3_shed_connections",
+        .why = .unreached,
+        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
+    },
+    .{
+        .name = "h3_shed_tls_engines",
+        .why = .unreached,
+        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
+    },
+    .{
+        .name = "h3_shed_tls_crypto",
+        .why = .unreached,
+        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
+    },
+    .{
+        .name = "h3_shed_streams",
+        .why = .unreached,
+        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
+    },
+    .{
+        .name = "h3_protocol_errors",
+        .why = .unreached,
+        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
+    },
+    .{
+        .name = "h3_qpack_failures",
+        .why = .unreached,
+        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
+    },
+    .{
+        .name = "h3_malformed_requests",
+        .why = .unreached,
+        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
+    },
+    .{
+        .name = "h3_packets_lost",
+        .why = .unreached,
+        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
+    },
+    .{
+        .name = "h3_idle_closed",
+        .why = .unreached,
+        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
+    },
+    .{
+        .name = "h3_events_overflowed",
+        .why = .unreached,
+        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
+    },
+    .{
+        .name = "h3_datagrams_dropped",
+        .why = .unreached,
+        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
+    },
+    .{
+        .name = "h3_version_negotiations",
+        .why = .unreached,
+        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
+    },
+    .{
+        .name = "h3_retries",
+        .why = .unreached,
+        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
+    },
+    .{
+        .name = "h3_stateless_resets",
+        .why = .unreached,
+        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
+    },
+    .{
+        .name = "h3_tokens_refused",
+        .why = .unreached,
+        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
+    },
+    .{
+        .name = "h3_migration_dropped",
+        .why = .unreached,
+        .reason = "no sweep seed runs an HTTP/3 client yet (#449); src/http/h3/server_test.zig drives one",
+    },
     // §7 HTTP/2 to the origin. The sweep's origins speak HTTP/1.1 — the
     // byte-exact integrity oracle reads their wire — and no cluster it
     // builds is h2c, so nothing here dials an HTTP/2 origin. The leg and

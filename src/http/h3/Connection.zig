@@ -89,6 +89,17 @@ pub const Slot = struct {
     /// engine reports only that the sink refused, and the close code is
     /// the sink's to know.
     refusal: ?TransportCode,
+    /// The listener whose endpoint carries this connection's datagrams.
+    endpoint_index: u16,
+    /// The client's address, the one it began from: where every datagram
+    /// goes, and the only one a datagram is taken from.
+    peer: std.Io.net.IpAddress,
+    /// The ID this side minted, which the client addresses it by and
+    /// which names this slot (`Endpoint.find`).
+    local: ConnectionId,
+    /// A driver pass is running: what an exchange stages now goes out when
+    /// it ends, and a teardown it decides on waits for it.
+    driving: bool,
 
     pub const Start = struct {
         /// The packet that starts the connection: its Destination
@@ -104,6 +115,9 @@ pub const Slot = struct {
         idle_timeout_ms: u64,
         /// RFC 9000 §10.3's token for `source`.
         stateless_reset_token: [16]u8,
+        /// Whose endpoint, and the client's address on it.
+        endpoint_index: u16,
+        peer: std.Io.net.IpAddress,
     };
 
     /// Begin a connection in this slot, from the Initial that starts it.
@@ -129,6 +143,10 @@ pub const Slot = struct {
         slot.session = .init();
         slot.original = if (start.retry) |retried| retried.original_destination else start.initial_destination;
         slot.refusal = null;
+        slot.endpoint_index = start.endpoint_index;
+        slot.peer = start.peer;
+        slot.local = start.source;
+        slot.driving = false;
         const encoded = slot.quic.localTransportParameters(&slot.parameters) catch return error.NoSpaceLeft;
         slot.parameters_len = @intCast(encoded.len);
         assert(slot.parameters_len >= 1);

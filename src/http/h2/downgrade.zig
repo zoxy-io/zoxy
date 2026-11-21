@@ -38,10 +38,20 @@ const h2 = @import("h2");
 
 const constants = @import("../../constants.zig");
 const parser = @import("../parser.zig");
-const Session = @import("Session.zig");
 
 const hpack = h2.hpack;
 const assert = std.debug.assert;
+
+/// A request as a multiplexed protocol delivered it (#275, #449): its
+/// decoded field section, HTTP/2's HPACK or HTTP/3's QPACK — the same
+/// `Field` either way — what it declared as its length, and whether the
+/// section was the whole request.
+pub const Request = struct {
+    fields: []const hpack.Field,
+    content_length: ?u64,
+    /// The head was the whole request: no body, no trailers follow.
+    end_stream: bool,
+};
 
 pub const Error = error{
     /// A request HTTP/1.1 cannot carry, or §7 refuses: 400.
@@ -57,7 +67,7 @@ pub const Error = error{
 /// the caller's to keep for the exchange — unlike the request's fields,
 /// which are the session's only until its next `step`.
 pub fn requestHead(
-    request: *const Session.Step.Request,
+    request: *const Request,
     head: []u8,
     storage: *parser.HeaderStorage,
 ) Error!parser.RequestHead {
@@ -176,7 +186,7 @@ fn writeRequestLine(writer: *Writer, pseudo: *const Pseudo) error{Overflow}!void
 /// holds to the number. HTTP/1.1's §7 refuses any repeat, because there the
 /// header *is* the framing — so the claim goes upstream said once, as the
 /// number it was read as.
-fn writeFields(writer: *Writer, request: *const Session.Step.Request, pseudo: *const Pseudo) error{Overflow}!void {
+fn writeFields(writer: *Writer, request: *const Request, pseudo: *const Pseudo) error{Overflow}!void {
     const before = writer.len;
     assert(before >= 1);
     const host_replaced = pseudo.authority != null;
@@ -210,7 +220,7 @@ fn writeFields(writer: *Writer, request: *const Session.Step.Request, pseudo: *c
 
 /// A body follows, and nothing says how long: HTTP/1.1 is told it is
 /// chunked, and the relay chunks it.
-fn needsChunked(request: *const Session.Step.Request) bool {
+fn needsChunked(request: *const Request) bool {
     if (request.end_stream) return false;
     return request.content_length == null;
 }
@@ -289,8 +299,7 @@ const Fixture = struct {
 
     fn mapInto(fixture: *Fixture, fields: []const hpack.Field, end_stream: bool, head_len: usize) !parser.RequestHead {
         const content_length = try validated(fields);
-        const request: Session.Step.Request = .{
-            .stream = 1,
+        const request: Request = .{
             .fields = fields,
             .content_length = content_length,
             .end_stream = end_stream,
@@ -488,7 +497,7 @@ test "downgrade: a pseudo-header list the validator would never pass is refused,
     for (lists) |fields| {
         var buffer: [256]u8 = undefined;
         var storage: parser.HeaderStorage = undefined;
-        const request: Session.Step.Request = .{ .stream = 1, .fields = fields, .content_length = null, .end_stream = true };
+        const request: Request = .{ .fields = fields, .content_length = null, .end_stream = true };
         try testing.expectError(error.Malformed, requestHead(&request, &buffer, &storage));
     }
 }
@@ -521,8 +530,7 @@ test "downgrade: the fuzz oracle holds on the directed cases, so it is not vacuo
     for (cases) |case| {
         var fixture: Fixture = .{};
         const parsed = try fixture.map(case.fields, case.end_stream);
-        const request: Session.Step.Request = .{
-            .stream = 1,
+        const request: Request = .{
             .fields = case.fields,
             .content_length = try validated(case.fields),
             .end_stream = case.end_stream,
@@ -569,8 +577,7 @@ fn fuzzDowngrade(context: void, smith: *std.testing.Smith) !void {
     const control = source.byte();
     const count = buildFields(&source, control, &fields);
     const content_length = validated(fields[0..count]) catch return;
-    const request: Session.Step.Request = .{
-        .stream = 1,
+    const request: Request = .{
         .fields = fields[0..count],
         .content_length = content_length,
         .end_stream = control & 0x80 != 0,
@@ -634,7 +641,7 @@ fn buildFields(source: *Source, control: u8, fields: *[fuzz_fields_max]hpack.Fie
 /// whole header walk against what the mapping promises — the Host that
 /// routed, every other field in order and octet for octet, one cookie and
 /// one content-length line, and the framing that follows.
-fn checkMapped(request: *const Session.Step.Request, parsed: *const parser.RequestHead) void {
+fn checkMapped(request: *const Request, parsed: *const parser.RequestHead) void {
     const fields = request.fields;
     const authority = pseudoValue(fields, ":authority");
     assert(std.mem.eql(u8, parsed.method_token, pseudoValue(fields, ":method").?));
@@ -683,7 +690,7 @@ fn checkMapped(request: *const Session.Step.Request, parsed: *const parser.Reque
     checkFraming(request, parsed, index);
 }
 
-fn checkFraming(request: *const Session.Step.Request, parsed: *const parser.RequestHead, walked: usize) void {
+fn checkFraming(request: *const Request, parsed: *const parser.RequestHead, walked: usize) void {
     if (request.content_length) |length| {
         assert(parsed.framing.content_length == length);
         assert(walked == parsed.headers.len);

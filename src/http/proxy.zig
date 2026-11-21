@@ -231,7 +231,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             assert(destination.len >= 1);
             stream.arm(&stream.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.recv(
-                conn.client_socket,
+                conn.clientSocket(),
                 destination,
                 &stream.op_data_client_to_upstream.completion,
                 StreamType,
@@ -489,7 +489,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             assert(stream.head_len == 0);
             stream.arm(&stream.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.recvGroup(
-                conn.client_socket,
+                conn.clientSocket(),
                 &stream.op_data_client_to_upstream.completion,
                 StreamType,
                 stream,
@@ -507,7 +507,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             const into = headRecvBuffer(server, stream);
             stream.arm(&stream.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.recv(
-                conn.client_socket,
+                conn.clientSocket(),
                 into,
                 &stream.op_data_client_to_upstream.completion,
                 StreamType,
@@ -3932,7 +3932,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             assert(bytes.len >= 1);
             stream.arm(&stream.op_data_upstream_to_client, "data_upstream_to_client");
             server.io.send(
-                conn.client_socket,
+                conn.clientSocket(),
                 bytes,
                 &stream.op_data_upstream_to_client.completion,
                 StreamType,
@@ -4731,7 +4731,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             assert(stream.l7.pending_verdict == .none);
             assert(headExpiryAnswerable(stream));
             stream.l7.pending_verdict = .request_timeout;
-            server.io.shutdown(conn.client_socket, .read);
+            server.io.shutdown(conn.clientSocket(), .read);
         }
 
         /// Begin the §8 request-deadline verdict. Ops are never canceled
@@ -5718,7 +5718,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             const conn = stream.conn;
             assert(stream.phase == .responding);
             stream.moveTo(.draining_request);
-            server.io.shutdown(conn.client_socket, .write);
+            server.io.shutdown(conn.clientSocket(), .write);
             armDrainRecv(server, stream);
         }
 
@@ -5733,7 +5733,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             assert(stream.head_buffer_id == StreamType.head_buffer_none);
             stream.arm(&stream.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.recv(
-                conn.client_socket,
+                conn.clientSocket(),
                 server.drainSink(),
                 &stream.op_data_client_to_upstream.completion,
                 StreamType,

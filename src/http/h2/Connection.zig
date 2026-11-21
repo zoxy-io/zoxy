@@ -440,7 +440,7 @@ pub fn Driver(comptime runtime: Runtime) type {
             slot.receiving = true;
             stream.arm(&stream.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.recv(
-                conn.client_socket,
+                conn.clientSocket(),
                 if (conn.tls) |engine| engine.recvBuffer() else slot.session.recvBuffer(),
                 &stream.op_data_client_to_upstream.completion,
                 StreamType,
@@ -524,7 +524,7 @@ pub fn Driver(comptime runtime: Runtime) type {
             slot.sending = @intCast(staged.len);
             stream.arm(&stream.op_data_upstream_to_client, "data_upstream_to_client");
             server.io.send(
-                conn.client_socket,
+                conn.clientSocket(),
                 staged,
                 &stream.op_data_upstream_to_client.completion,
                 StreamType,
