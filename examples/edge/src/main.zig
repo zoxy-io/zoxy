@@ -2,11 +2,12 @@
 //! configured entirely in code — its extensions and its options are
 //! `edge.zig`; this file is only its command line.
 //!
-//!     zoxy-edge [--check] LISTEN CONTROL APP STATIC AUTH
+//!     zoxy-edge [--check] LISTEN CONTROL METRICS APP STATIC AUTH
 //!
 //! LISTEN is the `IP:port` to accept on, and CONTROL the control plane's,
 //! which belongs where only operators reach — loopback, say — since it
-//! asks no credentials and moves the application's traffic. APP, STATIC
+//! asks no credentials and moves the application's traffic. METRICS is
+//! the metrics listener's, for a Prometheus scraper. APP, STATIC
 //! and AUTH are comma-separated `IP:port` lists, at most
 //! `edge.endpoints_max` each: the application's endpoints, the
 //! static-content ones, and the auth service `/account` consults.
@@ -49,19 +50,20 @@ pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
     assert(args.len >= 1);
-    const check = args.len == 7 and std.mem.eql(u8, args[1], "--check");
+    const check = args.len == 8 and std.mem.eql(u8, args[1], "--check");
     const positional = if (check) args[2..] else args[1..];
-    if (positional.len != 5) {
-        std.debug.print("usage: zoxy-edge [--check] LISTEN CONTROL APP STATIC AUTH\n", .{});
+    if (positional.len != 6) {
+        std.debug.print("usage: zoxy-edge [--check] LISTEN CONTROL METRICS APP STATIC AUTH\n", .{});
         return 2;
     }
     const arena_before = init.arena.queryCapacity();
     const plan: edge.Plan = .{
         .listen = try address(positional[0]),
         .control = try address(positional[1]),
-        .app = try addresses(arena, positional[2]),
-        .static = try addresses(arena, positional[3]),
-        .auth = try addresses(arena, positional[4]),
+        .metrics = try address(positional[2]),
+        .app = try addresses(arena, positional[3]),
+        .static = try addresses(arena, positional[4]),
+        .auth = try addresses(arena, positional[5]),
         .log_requests = true,
     };
     const options = try edge.options(arena, &instances, &plan);

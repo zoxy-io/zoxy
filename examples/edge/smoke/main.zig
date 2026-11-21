@@ -36,6 +36,9 @@ const response_bytes_max = 4096;
 const tenant_lines_bytes_max = 128;
 /// The most of the proxy's log a failing run prints.
 const log_bytes_max = 64 * 1024;
+/// The widest scrape this run reads back: zoxy's counters and the
+/// build's series, a few hundred lines.
+const scrape_bytes_max = 1024 * 1024;
 /// How long the run waits for the first health probe: the stock sweep
 /// interval, two seconds, holds the first sweep anywhere inside it.
 const probe_wait_ms = 4000;
@@ -76,13 +79,14 @@ pub fn main(init: std.process.Init) !u8 {
     try auth.start(io, "tenant=blocked ");
     defer auth.stop();
 
-    const listen_port, const control_port = try freePorts(io);
+    const listen_port, const control_port, const metrics_port = try freePorts(io);
     const listen = try std.fmt.allocPrint(arena, "127.0.0.1:{d}", .{listen_port});
     const control = try std.fmt.allocPrint(arena, "127.0.0.1:{d}", .{control_port});
+    const metrics = try std.fmt.allocPrint(arena, "127.0.0.1:{d}", .{metrics_port});
     const static_list = try std.fmt.allocPrint(arena, "{s},{s}", .{ static_a.label(), static_b.label() });
     // The pre-flight first: it resolves the options and asks the box for
     // what a start would, and binds nothing.
-    try expectCheckPasses(io, &.{ args[1], "--check", listen, control, app.label(), static_list, auth.label() });
+    try expectCheckPasses(io, &.{ args[1], "--check", listen, control, metrics, app.label(), static_list, auth.label() });
     // The pre-flight's own process was waited for; it never gets a pid
     // the watchdog would have to know.
 
@@ -91,7 +95,7 @@ pub fn main(init: std.process.Init) !u8 {
     const log_file = try Io.Dir.cwd().createFile(io, log_path, .{ .read = true });
     defer log_file.close(io);
     var child = try std.process.spawn(io, .{
-        .argv = &.{ args[1], listen, control, app.label(), static_list, auth.label() },
+        .argv = &.{ args[1], listen, control, metrics, app.label(), static_list, auth.label() },
         .stdout = .{ .file = log_file },
         .stderr = .{ .file = log_file },
     });
@@ -107,6 +111,7 @@ pub fn main(init: std.process.Init) !u8 {
     // Last, since it moves the application to `app_next` for good.
     passed = exerciseControl(io, listen_port, control_port, &app_next) and passed;
     passed = awaitProbe(io, &static_a, &static_b) and passed;
+    passed = expectSeries(io, arena, metrics_port, listen) and passed;
     try std.posix.kill(child.id.?, .TERM);
     const term = try child.wait(io);
     running = false;
@@ -118,7 +123,7 @@ pub fn main(init: std.process.Init) !u8 {
     }
     std.debug.print("zoxy-edge smoke: routes, pickers, both policy phases, the tenant's challenge, " ++
         "header and tag, the response headers under a connection cap, a consult, a live endpoint update " ++
-        "and a probe of the build's own kind over XevIo, clean drain\n", .{});
+        "and a probe of the build's own kind over XevIo, its own series scraped, clean drain\n", .{});
     return 0;
 }
 
@@ -206,6 +211,53 @@ fn awaitProbe(io: Io, static_a: *const Origin, static_b: *const Origin) bool {
     }
     std.debug.print("FAIL: no health probe reached a static origin in {d} ms\n", .{probe_wait_ms});
     return false;
+}
+
+/// The build's own series on the metrics listener (#435), each at the
+/// site that selected its type, after what `exercise` asked: a picker's
+/// per cluster, a listener policy's per listener, a route policy's per
+/// route — each moved, and so rendered with a value past zero.
+fn expectSeries(io: Io, arena: std.mem.Allocator, metrics_port: u16, listen: []const u8) bool {
+    assert(metrics_port != 0);
+    const buffer = arena.alloc(u8, scrape_bytes_max) catch return false;
+    const scrape = exchange(io, metrics_port, "GET /metrics HTTP/1.1\r\nHost: edge\r\nConnection: close\r\n\r\n", buffer);
+    assert(scrape.len <= buffer.len);
+    if (scrape.len == 0) {
+        std.debug.print("FAIL: the metrics listener answered nothing\n", .{});
+        return false;
+    }
+    // A route is labelled by what it matches (#435).
+    const account_denied = std.fmt.allocPrint(
+        arena,
+        "zoxy_ext_account_guard_denied{{listener=\"{s}\",route=\"/account\"}} ",
+        .{listen},
+    ) catch return false;
+    const prefixes = [_][]const u8{
+        "zoxy_ext_least_in_flight_picks{cluster=\"api\"} ",
+        "zoxy_ext_least_in_flight_completed{cluster=\"search\"} ",
+        "zoxy_ext_tenant_guard_refused{listener=\"",
+        "zoxy_ext_connection_cap_open{listener=\"",
+        account_denied,
+    };
+    var passed = true;
+    for (prefixes) |prefix| {
+        const at = std.mem.indexOf(u8, scrape, prefix) orelse {
+            std.debug.print("FAIL: no '{s}' series in the scrape\n", .{prefix});
+            passed = false;
+            continue;
+        };
+        const line_end = std.mem.indexOfScalarPos(u8, scrape, at, '\n') orelse scrape.len;
+        const line = scrape[at..line_end];
+        // The gauge reads zero once every connection is released; every
+        // counter here moved.
+        const is_gauge = std.mem.indexOf(u8, prefix, "_open{") != null;
+        if (!is_gauge and std.mem.endsWith(u8, line, " 0")) {
+            std.debug.print("FAIL: '{s}' never moved\n", .{line});
+            passed = false;
+        }
+    }
+    if (!passed) std.debug.print("--- the scrape ---\n{s}\n", .{scrape});
+    return passed;
 }
 
 /// `line`, CRLF and all, somewhere in the response's head.
@@ -313,18 +365,25 @@ fn expectCheckPasses(io: Io, argv: []const []const u8) !void {
     }
 }
 
-/// Two loopback ports nothing listens on, as the kernel picks them —
+/// Three loopback ports nothing listens on, as the kernel picks them —
 /// held open together, so it cannot pick one twice.
-fn freePorts(io: Io) !struct { u16, u16 } {
+fn freePorts(io: Io) !struct { u16, u16, u16 } {
     var address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var first = try address.listen(io, .{ .mode = .stream });
     defer first.deinit(io);
     var second = try address.listen(io, .{ .mode = .stream });
     defer second.deinit(io);
-    const ports = .{ first.socket.address.getPort(), second.socket.address.getPort() };
+    var third = try address.listen(io, .{ .mode = .stream });
+    defer third.deinit(io);
+    const ports = .{
+        first.socket.address.getPort(),
+        second.socket.address.getPort(),
+        third.socket.address.getPort(),
+    };
     assert(ports[0] != 0);
-    assert(ports[1] != 0);
-    assert(ports[0] != ports[1]);
+    assert(ports[1] != ports[0]);
+    assert(ports[2] != ports[0]);
+    assert(ports[2] != ports[1]);
     return ports;
 }
 

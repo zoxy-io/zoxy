@@ -47,10 +47,10 @@
 //! allocation, no clock, no syscall, nothing kept from a view past the
 //! call — so the simulator replays a seed exactly with them in it.
 //!
-//! `LeastInFlight`, `TenantGuard` and `ConnectionCap` also count what they
-//! do in series of their own (#435), which the metrics endpoint renders
-//! once per cluster and per listener:
-//! `zoxy_ext_least_in_flight_picks{cluster="api"}`.
+//! `LeastInFlight`, `TenantGuard`, `ConnectionCap` and `AccountGuard`
+//! also count what they do in series of their own (#435), which the
+//! binary's metrics listener renders beside zoxy's, once per cluster, per
+//! listener and per route: `zoxy_ext_least_in_flight_picks{cluster="api"}`.
 
 const std = @import("std");
 
@@ -584,6 +584,10 @@ pub const Plan = struct {
     /// The control plane's own listener: bind it where only operators
     /// reach, loopback say, since what it answers changes the edge.
     control: std.Io.net.IpAddress,
+    /// The metrics listener (§8), which renders zoxy's counters and the
+    /// build's own series (#435) to any request, or null for none — as in
+    /// the simulator tests, which read the series directly.
+    metrics: ?std.Io.net.IpAddress = null,
     /// The application's endpoints: the `api` and `search` clusters both
     /// draw on them.
     app: []const std.Io.net.IpAddress,
@@ -682,6 +686,7 @@ pub fn options(
         .listeners = listeners,
         .clusters = clusters,
         .access_log = if (plan.log_requests) .{ .sink = .stdout } else null,
+        .admin = if (plan.metrics) |bind| .{ .bind = bind } else null,
         .timeouts = zoxy.defaults.timeouts,
         .limits = limits: {
             var limits = zoxy.defaults.limits;
