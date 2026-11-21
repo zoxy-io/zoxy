@@ -4,7 +4,8 @@
 //! it needs none: the endpoints arrive from its command line, which is
 //! the "discovery" a build does before its options exist.
 //!
-//! The build lists two picker types and two request policies:
+//! The build lists two picker types, two request policies, a response
+//! policy and a connection policy:
 //!
 //! - `LeastInFlight` picks the endpoint with the fewest requests in
 //!   flight. One instance serves both the `api` and `search` clusters, so
@@ -21,14 +22,22 @@
 //!   it; and it counts the request in flight until it completes (#429).
 //! - `ReadOnly`, on the `/static` route, refuses anything but a read once
 //!   the route is chosen and before any connection is taken for it.
+//! - `SecurityHeaders`, on the listener's way out (#424), sets the
+//!   headers a browser-facing edge owes every response an origin sends,
+//!   and drops the one that names the origin's software.
+//! - `ConnectionCap`, on the listener (#425), holds the client
+//!   connections open at once to a cap. One past it is closed before a
+//!   byte of it is read, which no request policy could do: they meet a
+//!   connection only once a head arrives.
 //!
 //! Each obeys the contract every extension does: run to completion, no
 //! allocation, no clock, no syscall, nothing kept from a view past the
 //! call — so the simulator replays a seed exactly with them in it.
 //!
-//! `LeastInFlight` and `TenantGuard` also count what they do in series of
-//! their own (#435), which the metrics endpoint renders once per cluster
-//! and per listener: `zoxy_ext_least_in_flight_picks{cluster="api"}`.
+//! `LeastInFlight`, `TenantGuard` and `ConnectionCap` also count what they
+//! do in series of their own (#435), which the metrics endpoint renders
+//! once per cluster and per listener:
+//! `zoxy_ext_least_in_flight_picks{cluster="api"}`.
 
 const std = @import("std");
 
@@ -39,6 +48,8 @@ const assert = std.debug.assert;
 pub const extensions: zoxy.Extensions = .{
     .pickers = &.{ LeastInFlight, PathAffinity },
     .request_policies = &.{ TenantGuard, ReadOnly },
+    .response_policies = &.{SecurityHeaders},
+    .connection_policies = &.{ConnectionCap},
 };
 
 pub const App = zoxy.App(extensions);
@@ -248,6 +259,77 @@ pub const ReadOnly = struct {
     }
 };
 
+/// What every response leaving the edge carries, whatever its origin
+/// sent (#424): edits the response filters could state too, here in code
+/// beside the build's other policies. They see the origin's final head
+/// only — the edge's own pages, `TenantGuard`'s challenge among them,
+/// are zoxy's and never shown to a response policy.
+pub const SecurityHeaders = struct {
+    /// Responses it edited: its own count, since a response policy
+    /// declares no metrics yet.
+    edited: u64 = 0,
+
+    const edits = [_]zoxy.extension.Edit{
+        .{ .set = .{ .name = "x-content-type-options", .value = "nosniff" } },
+        .{ .set = .{ .name = "x-frame-options", .value = "DENY" } },
+        .{ .remove = "x-powered-by" },
+    };
+
+    /// What its edits copy, which the stream's scratch is priced by.
+    pub const edit_bytes_max = blk: {
+        var total: u32 = 0;
+        for (edits) |edit| total += edit.bytes();
+        break :blk total;
+    };
+
+    comptime {
+        assert(edits.len <= zoxy.extension.edits_per_verdict_max);
+    }
+
+    pub fn evaluate(policy: *SecurityHeaders, response: *const zoxy.extension.Response) zoxy.extension.ResponseVerdict {
+        // A final response: interim and upgrade responses divert first.
+        assert(response.status >= 200);
+        assert(response.status != 101);
+        policy.edited += 1;
+        return .{ .edits = &edits };
+    }
+};
+
+/// At most `connections_max` client connections open on its listener at
+/// once (#425). Past that, a new one is closed with a FIN before its
+/// first byte is read: no handshake, no request head, no request policy.
+/// It counts a connection up when it lets it on, and `complete` counts it
+/// down at the connection's release.
+pub const ConnectionCap = struct {
+    connections_max: u32 = 1024,
+    /// Connections it let on that have not been released.
+    open: u32 = 0,
+
+    pub const metrics_prefix = "connection_cap";
+    pub const counters = .{ .refused = "Connections closed for the listener being at its cap." };
+    pub const gauges = .{ .open = "Client connections open on the listener." };
+
+    pub fn evaluate(cap: *ConnectionCap, connection: *const zoxy.extension.Connection) zoxy.extension.ConnectionVerdict {
+        assert(connection.route_index == null); // The listener's phase.
+        assert(cap.open <= cap.connections_max);
+        if (cap.open == cap.connections_max) {
+            connection.metrics.add(ConnectionCap, .refused, 1);
+            return .reject;
+        }
+        cap.open += 1;
+        connection.metrics.set(ConnectionCap, .open, cap.open);
+        return .proceed;
+    }
+
+    /// Heard once for each connection it let on, at its release.
+    pub fn complete(cap: *ConnectionCap, done: *const zoxy.extension.ConnectionCompletion) void {
+        assert(cap.open >= 1);
+        assert(done.done_ns >= done.started_ns);
+        cap.open -= 1;
+        done.metrics.set(ConnectionCap, .open, cap.open);
+    }
+};
+
 /// The build's extension instances: options select these by address, so
 /// they live as long as the server does.
 pub const Instances = struct {
@@ -255,6 +337,8 @@ pub const Instances = struct {
     path_affinity: PathAffinity = .{},
     tenant_guard: TenantGuard = .{},
     read_only: ReadOnly = .{},
+    security_headers: SecurityHeaders = .{},
+    connection_cap: ConnectionCap = .{},
 };
 
 /// What the command line discovered.
@@ -270,10 +354,12 @@ pub const Plan = struct {
     log_requests: bool = false,
 };
 
-/// zoxy-edge's options: one HTTP listener guarded by `TenantGuard`, with
-/// `/static` read-only and path-affine, `/search` and everything else to
-/// the application through one shared `LeastInFlight`. Allocated in
-/// `arena`, which the caller keeps for as long as the options run.
+/// zoxy-edge's options: one HTTP listener, its connections capped by
+/// `ConnectionCap`, its requests guarded by `TenantGuard` and its
+/// responses edited by `SecurityHeaders`, with `/static` read-only and
+/// path-affine, `/search` and everything else to the application through
+/// one shared `LeastInFlight`. Allocated in `arena`, which the caller
+/// keeps for as long as the options run.
 pub fn options(
     arena: std.mem.Allocator,
     instances: *Instances,
@@ -295,9 +381,17 @@ pub fn options(
         .protocol = .{ .http = .{
             .target = .{ .routes = routes },
             .request_policies = try arena.dupe(zoxy.extension.Selection, &.{App.policy(&instances.tenant_guard)}),
+            .response_policies = try arena.dupe(
+                zoxy.extension.Selection,
+                &.{App.responsePolicy(&instances.security_headers)},
+            ),
             .max_body_bytes = zoxy.defaults.max_body_bytes,
             .keepalive_requests = zoxy.defaults.keepalive_requests,
         } },
+        .connection_policies = try arena.dupe(
+            zoxy.extension.Selection,
+            &.{App.connectionPolicy(&instances.connection_cap)},
+        ),
     }});
     const app = try endpoints(arena, plan.app);
     const clusters = try arena.dupe(zoxy.Options.Cluster, &.{
