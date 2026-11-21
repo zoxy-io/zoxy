@@ -44,6 +44,8 @@ const work_directory = ".zig-cache/zoxy-smoke";
 const config_path = work_directory ++ "/zoxy.json";
 const access_log_path = work_directory ++ "/access.log";
 const zoxy_log_path = work_directory ++ "/zoxy.log";
+/// The HTTP/3 probe's one line of verdict (#449).
+const h3_probe_log_path = work_directory ++ "/h3-probe.log";
 /// #311's leg runs a second proxy of its own, so it needs its own config
 /// and its own output: the point of that leg is a process that *dies*,
 /// and it must not be the one every other verdict here is reading.
@@ -364,9 +366,13 @@ const https_loop_handshakes: u32 = 1;
 const exchanges_per_pass: u32 =
     @as(u32, keep_alive_connections) * requests_per_connection + large_requests;
 const http_exchanges: u32 = load_passes * exchanges_per_pass;
+/// The #449 leg's requests, all on one QUIC connection to the terminating
+/// listener's binding — the probe's own count (smoke/h3_probe.zig).
+const h3_requests: u32 = 3;
 const access_log_lines_expected: u32 = http_exchanges + sticky_exchanges +
     body_exchanges + allowlist_exchanges + h2c_exchanges + h2_origin_exchanges +
-    h2_tls_lines + https_loop_lines + tls_requests + tls_sni_requests + tls_rsa_requests + l4_connections;
+    h2_tls_lines + https_loop_lines + tls_requests + tls_sni_requests + tls_rsa_requests +
+    h3_requests + l4_connections;
 
 /// What the resident set may grow by between the two passes. Measured at
 /// exactly zero, run after run — the tolerance is headroom for page
@@ -449,8 +455,9 @@ const zoxy_limits = .{
     .upstream_slots = 16,
     // One more each for the loops into this proxy's own TLS listeners —
     // the §7 leg's `h2` one, and the #296 leg's parked HTTPS connection,
-    // held open beside the https leg's own.
-    .tls_engines = 4,
+    // held open beside the https leg's own — and one for the HTTP/3 leg's
+    // QUIC connection, which holds an engine for its life (#449).
+    .tls_engines = 5,
     // The #275 leg's streams, with room to spare.
     .stream_slots = 16,
 };
@@ -614,6 +621,7 @@ const Stage = enum {
     https_request,
     https_close_notify,
     https_scrape,
+    h3_leg,
     watchdog_leg,
     drain,
     verdicts,
@@ -638,6 +646,7 @@ const Stage = enum {
             .https_request => "an https request",
             .https_close_notify => "the https close_notify",
             .https_scrape => "the https leg's scrape",
+            .h3_leg => "the HTTP/3 leg (#449)",
             .drain => "the drain",
             .verdicts => "reading back the verdicts",
         };
@@ -661,6 +670,9 @@ fn enterStage(stage: Stage) void {
 
 const Flags = struct {
     zoxy_path: []const u8 = "zig-out/bin/zoxy",
+    /// The HTTP/3 leg's client (#449), `smoke/h3_probe.zig`. The build
+    /// always hands it over; a hand run without it fails the leg, saying so.
+    h3_probe_path: ?[]const u8 = null,
 };
 
 /// The ports zoxy is told to bind. Kernel-assigned rather than fixed: a
@@ -747,6 +759,13 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     // Last, so its scrape sees the whole run — and so a wedged handshake
     // cannot cost the legs above their verdicts.
     const tls_ok = try tlsPassed(arena, io, &ports);
+    // After the TLS leg, whose scrape is the whole run's for TCP: QUIC
+    // accepts no socket, and its connection is counted apart. And after
+    // the identity scrape above, whose flow identity has no HTTP/3 term —
+    // `admitted == completed + in_use` would read one connection over once
+    // this leg's has completed.
+    enterStage(.h3_leg);
+    const h3_ok = try h3Passed(arena, io, &ports, flags.h3_probe_path);
 
     // Its own proxy, its own port, and it ends by killing it — so it runs
     // after every leg that needs the main child alive, and before the
@@ -764,7 +783,7 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     const memory_ok = memoryPassed(&memory);
     const drain_ok = drainPassed(drained_cleanly);
     const passed = log_ok and counters.passed and sticky_ok and bodies_ok and
-        allowlist_ok and h2c_ok and origin_legs_ok and tls_ok and memory_ok and
+        allowlist_ok and h2c_ok and origin_legs_ok and tls_ok and h3_ok and memory_ok and
         drain_ok and check_ok and watchdog_ok;
     return report(io, &lines, &counters, &memory, passed);
 }
@@ -914,7 +933,8 @@ fn accessLogPassed(lines: *const LogCounts) bool {
     // and a log that told them apart would be the defect.
     const http_lines_expected = http_exchanges + sticky_exchanges +
         body_exchanges + allowlist_exchanges + h2c_exchanges + h2_origin_exchanges +
-        h2_tls_lines + https_loop_lines + tls_requests + tls_sni_requests + tls_rsa_requests;
+        h2_tls_lines + https_loop_lines + tls_requests + tls_sni_requests + tls_rsa_requests +
+        h3_requests;
     assert(access_log_lines_expected == http_lines_expected + l4_connections);
     var passed = true;
     if (lines.http != http_lines_expected) {
@@ -2207,6 +2227,59 @@ fn bigEndian2(comptime value: usize) [2]u8 {
     return .{ @intCast(value >> 8), @intCast(value & 0xff) };
 }
 
+/// The #449 leg: the probe — zoxy's own HTTP/3 client over the real
+/// backend, its own process — asks the terminating listener's QUIC binding
+/// for `h3_requests` answers on one connection, and must print `h3: ok`;
+/// then the scrape must count that one connection admitted and
+/// handshaken, and none shed.
+fn h3Passed(arena: std.mem.Allocator, io: Io, ports: *const Ports, probe_path: ?[]const u8) !bool {
+    assert(ports.tls != 0);
+    assert(ports.admin != 0);
+    const path = probe_path orelse {
+        std.debug.print("smoke: no --h3-probe, so no HTTP/3 leg\n", .{});
+        return false;
+    };
+    const port_text = try std.fmt.allocPrint(arena, "{d}", .{ports.tls});
+    const log_file = try Io.Dir.cwd().createFile(io, h3_probe_log_path, .{});
+    const spawned = std.process.spawn(io, .{
+        .argv = &.{ path, "--port", port_text },
+        .stdout = .{ .file = log_file },
+        .stderr = .{ .file = log_file },
+    });
+    // The child holds its own descriptor for the file from here on.
+    log_file.close(io);
+    var child = try spawned;
+    // Bounded by the probe's own deadline, well inside the run's
+    // watchdog; a watchdog that fires first names this leg, and a probe
+    // it leaves behind ends at that deadline on its own.
+    const term = try child.wait(io);
+    const said = try Io.Dir.cwd().readFileAlloc(io, h3_probe_log_path, arena, .limited(64 * 1024));
+    const expected = try std.fmt.allocPrint(arena, "h3: ok {d}\n", .{h3_requests});
+    var passed = true;
+    const exited_ok = switch (term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (!exited_ok or std.mem.indexOf(u8, said, expected) == null) {
+        std.debug.print("FAIL: the HTTP/3 probe said: {s}\n", .{said});
+        passed = false;
+    }
+    const scrape = try scrape_module.parse(try scrape_module.fetch(arena, io, ports.admin));
+    const counts = [_]struct { name: []const u8, want: u64 }{
+        .{ .name = "h3_admitted", .want = 1 },
+        .{ .name = "h3_handshakes", .want = 1 },
+        .{ .name = "h3_shed_connections", .want = 0 },
+        .{ .name = "h3_protocol_errors", .want = 0 },
+    };
+    for (counts) |count| {
+        const got = counterOf(&scrape, count.name) orelse 0;
+        if (got == count.want) continue;
+        std.debug.print("FAIL: {s} is {d}, not {d}\n", .{ count.name, got, count.want });
+        passed = false;
+    }
+    return passed;
+}
+
 /// One response off the terminated listener. The same framing the
 /// plaintext legs demand — a decrypted head that reframed the body would
 /// fail here exactly as a cleartext one does — plus the absence of the
@@ -2580,6 +2653,11 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
         refused_path,
         ports.l4,
         ports.tls,
+        // The QUIC binding takes the TLS listener's number on UDP, which
+        // nothing reserved: the kernel handed the number out free for TCP,
+        // and a UDP socket already holding it fails the start loudly, as a
+        // bind, never as a verdict.
+        ports.tls,
         tls_cert_path,
         tls_key_path,
         tls_sni_cert_path,
@@ -2677,7 +2755,8 @@ const config_template =
     \\          "h2c": true }} }},
     \\        {{ "bind": "127.0.0.1:{d}", "l4": {{ "cluster": "origin" }} }},
     \\        {{ "bind": "127.0.0.1:{d}",
-    \\          "http": {{ "routes": [{{ "host": "127.0.0.1", "prefix": "/", "cluster": "origin" }}] }},
+    \\          "http": {{ "routes": [{{ "host": "127.0.0.1", "prefix": "/", "cluster": "origin" }}],
+    \\                    "quic": {{ "bind": "127.0.0.1:{d}" }} }},
     \\          "tls": {{ "cert": "{s}", "key": "{s}",
     \\                   "certificates": [{{ "cert": "{s}", "key": "{s}" }},
     \\                                    {{ "cert": "{s}", "key": "{s}" }}] }} }},
@@ -3009,8 +3088,12 @@ fn parseFlags(args: []const [:0]const u8) !Flags {
             index += 1;
             if (index == args.len) return error.InvalidArguments;
             flags.zoxy_path = args[index];
+        } else if (std.mem.eql(u8, args[index], "--h3-probe")) {
+            index += 1;
+            if (index == args.len) return error.InvalidArguments;
+            flags.h3_probe_path = args[index];
         } else {
-            std.debug.print("usage: smoke [--zoxy path]\n", .{});
+            std.debug.print("usage: smoke [--zoxy path] [--h3-probe path]\n", .{});
             return error.InvalidArguments;
         }
     }

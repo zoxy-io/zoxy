@@ -391,9 +391,26 @@ pub fn build(b: *std.Build) void {
     smoke_exe.root_module.addAnonymousImport("tls_rsa_key_pem", .{
         .root_source_file = b.path("src/tls/testdata/rsa2048-key.pem"),
     });
+    // The HTTP/3 leg's client (#449): zoxy's own test client over the real
+    // io_uring backend, a process of its own, so the harness above still
+    // links nothing of zssl or libcrypto — it spawns this as it spawns the
+    // proxy, and judges the line it prints.
+    const h3_probe_exe = b.addExecutable(.{
+        .name = "zoxy-smoke-h3",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("smoke/h3_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zoxy", .module = zoxy_module },
+            },
+        }),
+    });
     const smoke_run = b.addRunArtifact(smoke_exe);
     smoke_run.addArg("--zoxy");
     smoke_run.addArtifactArg(exe);
+    smoke_run.addArg("--h3-probe");
+    smoke_run.addArtifactArg(h3_probe_exe);
     smoke_run.addPassthruArgs();
     const smoke_step = b.step("smoke", "Tier-0.5 live gate: the real binary against a live origin");
     smoke_step.dependOn(&smoke_run.step);
@@ -474,6 +491,8 @@ pub fn build(b: *std.Build) void {
     const smoke_release_run = b.addRunArtifact(smoke_exe);
     smoke_release_run.addArg("--zoxy");
     smoke_release_run.addArtifactArg(release_zoxy);
+    smoke_release_run.addArg("--h3-probe");
+    smoke_release_run.addArtifactArg(h3_probe_exe);
     smoke_release_run.addPassthruArgs();
     smoke_release_run.step.dependOn(&smoke_run.step);
     const smoke_release_step = b.step(

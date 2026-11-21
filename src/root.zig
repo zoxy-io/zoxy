@@ -68,6 +68,9 @@ pub const http = struct {
     };
 };
 pub const Io = @import("io/io.zig");
+/// The production backend (§4), for a tool that drives the seam on a real
+/// kernel outside the server: the live gate's HTTP/3 probe (#449).
+pub const XevIo = @import("io/XevIo.zig");
 pub const Pool = @import("mem/Pool.zig").Pool;
 pub const RelayBuffer = @import("net/relay.zig").RelayBuffer;
 pub const UpstreamHeadBuffer = @import("net/upstream.zig").HeadBuffer;
