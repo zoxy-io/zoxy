@@ -2435,6 +2435,11 @@ pub fn Server(comptime runtime: Runtime) type {
                 server.h2_origins.isFullyReleased() and
                 server.h2_origin_staging.isFullyReleased() and
                 server.head_buffers_in_use == 0 and
+                // #437: a slot is a stream's from `begin` until its
+                // `consulted` returns, so an idle server holds none — and
+                // a leaked one would read only as a later consult's
+                // `slots_exhausted`, never as a leak.
+                server.consult_slots.busyCount() == 0 and
                 server.admin.isQuiescent() and
                 server.access_log.isQuiescent() and
                 server.health.isQuiescent();

@@ -120,7 +120,8 @@ pub const redirect_location = "https://sim/redirect";
 pub const policy_prefix = "/policy";
 
 /// The path prefix the harness's consulting listener policy (#437) asks
-/// the http cluster about, which only the `consult_get` script asks for.
+/// the http cluster about, which only the `consult_get` script and the
+/// HTTP/2 streams that ask the same (`h2_client.Ask`) ask for.
 pub const consult_prefix = "/consult";
 
 /// The prefix of the http chain's guarded route (#417), and the one path

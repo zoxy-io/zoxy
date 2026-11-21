@@ -415,12 +415,6 @@ const uncovered = [_]Uncovered{
             "within its bound (#437); src/http_proxy_test.zig sends one past it",
     },
     .{
-        .name = "l7_policy_consult_slots_exhausted",
-        .why = .unreached,
-        .reason = "the sweep's consults never hold every consult slot at once " ++
-            "(#437); src/http_proxy_test.zig has a second consult find the one slot held",
-    },
-    .{
         .name = "endpoints_parked_closed",
         .why = .unreached,
         .reason = "while the sim's churn departs only the refusing endpoint, " ++

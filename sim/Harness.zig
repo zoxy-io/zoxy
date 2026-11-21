@@ -81,6 +81,10 @@ const exchanges_max: u32 = @as(u32, clients_max) * H2Client.streams_max + tls_cl
 /// a pressure-announced close or a shortened deadline — correct behavior,
 /// but not the script's exact transcript.
 const clean_pool_capacity: u32 = 2 * exchanges_max;
+/// An adversarial seed's consult slots (#437): fewer than one HTTP/2
+/// client's streams, so a connection that consults on every one of them
+/// holds the pool and the next meets its wall (`slots_exhausted`).
+const adversarial_consult_slots: u32 = 2;
 /// Bytes each terminating client echoes. Small: what this population is
 /// for is the handshake and the transform, not throughput.
 const tls_token_bytes: u8 = 24;
@@ -191,9 +195,11 @@ comptime {
     assert(clean_pool_capacity <= zoxy.constants.conn_slots_max);
     assert(clean_pool_capacity <= zoxy.constants.relay_buffers_max);
     assert(clean_pool_capacity <= zoxy.constants.upstream_slots_max);
-    // A clean seed's consult slots (#437), one per client, within the
-    // upstream slots each consult holds one of.
-    assert(clients_max + tls_clients_max <= clean_pool_capacity);
+    // A clean seed's consult slots (#437), one per exchange, within the
+    // upstream slots each consult holds one of — and an adversarial
+    // seed's, fewer than one HTTP/2 client's streams.
+    assert(exchanges_max <= clean_pool_capacity);
+    assert(adversarial_consult_slots < H2Client.streams_max);
 }
 
 io: SimIo,
@@ -433,8 +439,9 @@ picker_http: bool,
 /// tags each one `policy_tag` (#433).
 policy_listener: zoxy.testing.ScriptedPolicy,
 /// #437's consulting policy, after it on both http listeners: it asks the
-/// http cluster about the requests `consult_get` sends, and fails open,
-/// so the adversary's breakage leaves those requests `get`'s outcomes.
+/// http cluster about the requests `consult_get` sends, and the HTTP/2
+/// streams that ask the same (`drawH2Plan`), and fails open, so the
+/// adversary's breakage leaves those requests `get`'s outcomes.
 policy_consult: zoxy.testing.ScriptedConsultOpenPolicy,
 policy_selections: [2]zoxy.extension.Selection,
 /// #434's handler, on a route of both http chains: it answers what it
@@ -446,6 +453,9 @@ probe_l4: zoxy.testing.ScriptedProbe,
 /// Which check the L4 cluster's draw becomes (#436), from its own stream
 /// so no other draw moves: see `l4Check`.
 probe_l4_coin: u8,
+/// Which of the HTTP/2 population's GETs consult (#437), from its own
+/// stream for the same reason: see `drawH2Plan`.
+h2_consult_prng: std.Random.DefaultPrng,
 /// #424's response policy, on every http listener: it adds a header to
 /// every response head and holds each to carrying the listener's tag.
 response_policy: zoxy.testing.ScriptedResponsePolicy,
@@ -534,6 +544,7 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
     // #436: its own stream, as the pickers', so the shared one is unmoved.
     var probe_prng = std.Random.DefaultPrng.init(seed ^ 0x0436_0436_0436_0436);
     harness.probe_l4_coin = probe_prng.random().uintLessThan(u8, probe_coin_sides);
+    harness.h2_consult_prng = std.Random.DefaultPrng.init(seed ^ 0x0437_0437_0437_0437);
     harness.policy_listener = .{
         .reject_prefix = l7.canon.policy_prefix,
         .tag = policy_tag,
@@ -2078,7 +2089,8 @@ fn deriveInitOptions(harness: *const Harness, random: std.Random) ServerSim.Init
             .relay_buffers = 1,
             .upstream_slots = 1,
             // #437: no more than the one upstream slot every consult holds,
-            // which is also what lets a consult meet that slot's wall.
+            // which is also what lets a consult meet that slot's wall — and
+            // a second consult the one consult slot's.
             .consult_slots = 1,
             .head_buffers = harness.head_buffers,
             // Clamped, because a starved seed's slot count is drawn from
@@ -2123,9 +2135,9 @@ fn deriveInitOptions(harness: *const Harness, random: std.Random) ServerSim.Init
             .conn_slots = if (harness.clean) clean_pool_capacity else 2 * clients_max,
             .relay_buffers = if (harness.clean) clean_pool_capacity else clients_max,
             .upstream_slots = if (harness.clean) clean_pool_capacity else 2 * clients_max,
-            // #437: every client's consult on a clean seed, and fewer than
-            // the population on an adversarial one, which meets the wall.
-            .consult_slots = if (harness.clean) clients_max + tls_clients_max else 2,
+            // #437: every exchange's consult on a clean seed, since an
+            // HTTP/2 client's streams consult side by side.
+            .consult_slots = if (harness.clean) exchanges_max else adversarial_consult_slots,
             .head_buffers = harness.head_buffers,
             .upstream_head_buffers = if (harness.clean)
                 clean_pool_capacity
@@ -2248,19 +2260,23 @@ fn prepareH2Client(harness: *Harness, random: std.Random) void {
     // Its lines need the staging `h2_rapid_reset` sized for them.
     if (mode == .rapid_reset and !harness.h2_rapid_reset) mode = .exchange;
     var plans: [H2Client.streams_max]l7.H2Plan = @splat(.{});
-    for (plans[0..streams]) |*plan| plan.* = drawH2Plan(random);
+    for (plans[0..streams]) |*plan| plan.* = drawH2Plan(random, harness.h2_consult_prng.random());
     client.prepare(&harness.io, httpBindAddress(), plans[0..streams], salt, harness.clean, mode);
     client.on_ended = clientEndedHook;
     client.context = harness;
 }
 
-/// One stream's request (#373): half are `get`'s GET, and half POST a
-/// marked body, its length declared or not. A body is short or up to the
-/// largest, evenly, so seeds meet both one small frame and frames past a
-/// small relay buffer's room. It is cut into up to `h2_body_frames_max`
-/// DATA frames.
-fn drawH2Plan(random: std.Random) l7.H2Plan {
-    if (random.boolean()) return .{};
+/// One stream's request (#373): half are a GET, and half POST a marked
+/// body, its length declared or not. A GET is `get`'s or `consult_get`'s
+/// (#437), evenly, by a coin from `consult_random`, so no other draw of
+/// the seed's moves for it. A body is short or up to the largest, evenly,
+/// so seeds meet both one small frame and frames past a small relay
+/// buffer's room. It is cut into up to `h2_body_frames_max` DATA frames.
+fn drawH2Plan(random: std.Random, consult_random: std.Random) l7.H2Plan {
+    if (random.boolean()) {
+        const ask: l7.H2Ask = if (consult_random.boolean()) .consult_get else .get;
+        return .{ .ask = ask };
+    }
     const ask: l7.H2Ask = if (random.boolean()) .post_declared else .post_undeclared;
     const short_bytes_max: u32 = 64;
     const span = if (random.boolean()) short_bytes_max else l7.h2_body_bytes_max;
