@@ -1459,7 +1459,7 @@ external binaries. They and the speed gates run at merge.
 | unit + fuzz corpus | `zig build test` | every change | every unit test; each fuzz target's corpus |
 | libcrypto heap proof | `zig build tls-heap-proof` | every change | fixed-heap hooks, the per-certificate cost and reuse across sequential handshakes |
 | lint | `zig build lint` | every change | the boundaries and Tiger Style rules a reader would miss |
-| simulation | `zig build sim` | every change (4096 seeds); nightly (4 × 1M) | the real data path under an adversary; every counter and op reached |
+| simulation | `zig build sim` | every change (4096 seeds); nightly (8 × 500k) | the real data path under an adversary; every counter and op reached |
 | live gate | `zig build smoke`, `smoke-release` | every change | the shipped binary, on a real kernel, judged by equalities |
 | a dependent's build | `zig build`, `test`, `smoke` in `examples/edge` | every change (CI's consumer job) | a build on the fetched package runs, its own extensions held to `zoxy.testing`'s gate (§13) |
 | HTTP/2 conformance | `zig build h2spec` | at merge | an independent RFC 9113 implementation agrees, except §12's deviations |
