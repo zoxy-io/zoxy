@@ -31,6 +31,7 @@
 const std = @import("std");
 
 const config = @import("config.zig");
+const constants = @import("constants.zig");
 const extension = @import("extension.zig");
 const filter = @import("http/filter.zig");
 const parser = @import("http/parser.zig");
@@ -77,7 +78,7 @@ pub const Listener = struct {
     pub const Protocol = union(config.Config.Listener.Protocol) {
         /// A byte relay.
         l4: L4,
-        /// A reverse proxy for HTTP/1.1, and HTTP/2 where offered.
+        /// A reverse proxy for HTTP/1.1, and HTTP/2 and HTTP/3 where offered.
         http: Http,
     };
 
@@ -140,6 +141,21 @@ pub const Listener = struct {
         /// Also take HTTP/2 by prior knowledge on a plaintext socket
         /// (#275); a TLS listener offers `h2` in its ALPN instead.
         h2c: bool = false,
+        /// Also serve HTTP/3 over QUIC on a UDP address (#449), with this
+        /// listener's routes, policies and certificates; null for none.
+        /// QUIC is always TLS 1.3, so the listener must have `tls`.
+        quic: ?Quic = null,
+    };
+
+    /// A listener's QUIC binding (#449).
+    pub const Quic = struct {
+        /// The UDP address HTTP/3 is served on: an IP literal and port
+        /// (never `unix:`).
+        bind: io.Address,
+        /// RFC 7838 Alt-Svc max-age in seconds, advertised on this
+        /// listener's TCP responses so clients learn of the QUIC binding;
+        /// 0 advertises nothing.
+        alt_svc_max_age_s: u32 = constants.alt_svc_max_age_s_default,
     };
 
     pub const Forwarded = config.Config.Listener.Forwarded;
@@ -470,6 +486,10 @@ pub const Limits = struct {
     tunnels: ?u32 = null,
     h2_connections: ?u32 = null,
     h2_streams: ?u32 = null,
+    /// The HTTP/3 connections served at once (#449), each holding a TLS
+    /// engine for its life; null is zoxy's default where a listener has a
+    /// `quic` binding, and the key is refused where none does.
+    quic_connections: ?u32 = null,
     upstream_h2_connections: ?u32 = null,
     upstream_h2_streams: ?u32 = null,
     upstream_tls_sessions: ?u32 = null,

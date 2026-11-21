@@ -318,15 +318,24 @@ pub const Config = struct {
         /// Zero exactly when no listener allows any upgrade.
         tunnels: u32 = 0,
         /// The §5 HTTP/2 session pool and the shared stream pool its
-        /// multiplexed exchanges draw from (#275). Zero exactly when no
-        /// listener speaks HTTP/2 — `h2` in `tls.alpn`, or `http.h2c`.
-        /// Where one does, `limits.h2_connections` defaults to
-        /// `constants.h2_connections_default` (capped at conn slots) and
+        /// multiplexed exchanges draw from (#275). The sessions are zero
+        /// exactly when no listener speaks HTTP/2 — `h2` in `tls.alpn`, or
+        /// `http.h2c`. Where one does, `limits.h2_connections` defaults to
+        /// `constants.h2_connections_default` (capped at conn slots). The
+        /// streams are zero exactly when no listener speaks HTTP/2 or
+        /// HTTP/3, which multiplex on the same pool; where one does,
         /// `limits.h2_streams` is required: a count of concurrent
         /// exchanges is a capacity decision, not something a connection
         /// count implies.
         h2_connections: u32 = 0,
         stream_slots: u32 = 0,
+        /// The §5 QUIC connection pool (#449): the HTTP/3 connections
+        /// served at once, each holding a TLS engine for its whole life.
+        /// Zero exactly when no listener has a `quic` binding. Where one
+        /// does, `limits.quic_connections` defaults to
+        /// `constants.quic_connections_default`, capped at the conn slots
+        /// and the engines, and may exceed neither.
+        quic_connections: u32 = 0,
         /// The §5 pools an HTTP/2 origin draws on (§7): connections to
         /// `h2c` clusters' endpoints, each a client session many exchanges
         /// share, and the staging buffers those exchanges' streams hold
@@ -452,6 +461,13 @@ pub const Config = struct {
         /// preface speaks HTTP/2 (`http.h2c`). A TLS listener negotiates
         /// HTTP/2 by ALPN instead, and is refused the key.
         h2c: bool = false,
+        /// Where this listener also serves HTTP/3 over QUIC (#449,
+        /// `http.quic`), or null for nowhere. One listener, two sockets:
+        /// the binding shares the listener's routes, filters, policies and
+        /// certificates, so a TCP listener without `tls` is refused one.
+        /// The two binds are independent — the usual shape is the same
+        /// address and port on TCP and UDP.
+        quic: ?Quic = null,
         /// Whether refusals name their RFC 9209 cause on the wire
         /// (#300). Per listener and off by default, on `forwarded`'s
         /// reasoning: the header states which of *this proxy's* limits a
@@ -608,6 +624,16 @@ pub const Config = struct {
         /// `optional` completes it unauthenticated. Either way a
         /// certificate that *is* presented must verify (#304).
         pub const ClientVerify = enum { required, optional };
+
+        /// A listener's QUIC binding (#449), resolved: an IP and port,
+        /// because QUIC rides UDP datagrams and a socket file carries
+        /// none, and the max-age its TCP responses advertise it under.
+        pub const Quic = struct {
+            bind_address: std.Io.net.IpAddress,
+            /// The RFC 7838 `Alt-Svc` max-age in seconds, at most
+            /// `constants.alt_svc_max_age_s_max`; 0 advertises nothing.
+            alt_svc_max_age_s: u32,
+        };
     };
 
     /// A slot of a cluster that takes endpoints while it serves (#428).
@@ -1129,6 +1155,22 @@ pub const ValidationError = error{
     LimitH2ConnectionsOverConnSlots,
     LimitH2ConnectionsWithoutHttp2,
     ListenerH2cOnTls,
+    LimitQuicConnectionsOutOfRange,
+    LimitQuicConnectionsOverConnSlots,
+    /// More QUIC connections than TLS engines (#449): each holds one for
+    /// its whole life, so the excess could never complete a handshake.
+    LimitQuicConnectionsOverTlsEngines,
+    LimitQuicConnectionsWithoutQuic,
+    /// A `quic` binding on a listener without `tls` (#449): QUIC is always
+    /// TLS 1.3, and the binding presents the listener's certificates.
+    ListenerQuicWithoutTls,
+    /// A `quic` bind that is a `unix:` path (#449): QUIC rides UDP
+    /// datagrams, which a socket file does not carry here.
+    ListenerQuicBindNotIp,
+    /// Two listeners' `quic` binds on one IP and port (#449); a TCP bind
+    /// may share one, since the protocols' ports are distinct.
+    ListenerQuicBindDuplicate,
+    ListenerQuicAltSvcMaxAgeOutOfRange,
     LimitUpstreamH2ConnectionsOutOfRange,
     LimitUpstreamH2ConnectionsWithoutHttp2,
     LimitUpstreamH2StreamsOutOfRange,
@@ -1620,15 +1662,17 @@ const FeaturePools = struct {
     tunnels: u32,
     h2_connections: u32,
     stream_slots: u32,
+    quic_connections: u32,
 };
 
 /// The pools a *feature* switches on: TLS engines, reserved exactly when
 /// some listener terminates; #180's tunnels, exactly when some listener
-/// allows an upgrade; and #275's HTTP/2 sessions and shared streams,
-/// exactly when some listener speaks HTTP/2. Their own group because each
-/// is zero for a deployment that asked for none of it — which is what
-/// makes each feature free — and each is bounded by the conn slots above
-/// or a ceiling of its own.
+/// allows an upgrade; #275's HTTP/2 sessions, exactly when some listener
+/// speaks HTTP/2; #449's QUIC connections, exactly when some listener has
+/// a `quic` binding; and the shared streams both of those multiplex on.
+/// Their own group because each is zero for a deployment that asked for
+/// none of it — which is what makes each feature free — and each is
+/// bounded by the conn slots above or a ceiling of its own.
 fn resolveFeaturePools(
     requested: *const Options.Limits,
     conn_slots: u32,
@@ -1644,35 +1688,50 @@ fn resolveFeaturePools(
         conn_slots,
         features.upgrades,
     );
-    const stream_slots = try resolveStreamSlots(requested.h2_streams, features.http2);
+    // A listener speaking both counts twice, which is harmless: the
+    // resolver asks only whether anything multiplexes at all.
+    const stream_slots = try resolveStreamSlots(requested.h2_streams, features.http2 + features.quic);
     const h2_connections = try resolveH2Connections(
         requested.h2_connections,
         conn_slots,
         features.http2,
     );
-    assert((stream_slots == 0) == (h2_connections == 0));
+    // After the engines, which every QUIC connection holds one of.
+    const quic_connections = try resolveQuicConnections(
+        requested.quic_connections,
+        conn_slots,
+        tls_engines,
+        features.quic,
+    );
+    // A QUIC-only deployment has stream slots and no HTTP/2 session.
+    assert((stream_slots == 0) == (h2_connections == 0 and quic_connections == 0));
+    assert(quic_connections <= tls_engines);
     return .{
         .tls_engines = tls_engines,
         .tunnels = tunnels,
         .h2_connections = h2_connections,
         .stream_slots = stream_slots,
+        .quic_connections = quic_connections,
     };
 }
 
-/// The shared stream pool HTTP/2 multiplexes (#275): required — and only
-/// legal — where a listener speaks HTTP/2, on `tunnels`' reasoning: how
-/// many exchanges run at once is a capacity decision, not something a
-/// connection count implies, and every one is charged its ring ops (§8).
-fn resolveStreamSlots(requested: ?u32, http2_listeners_count: u32) ValidationError!u32 {
+/// The shared stream pool HTTP/2 and HTTP/3 multiplex (#275, #449):
+/// required — and only legal — where a listener speaks either, on
+/// `tunnels`' reasoning: how many exchanges run at once is a capacity
+/// decision, not something a connection count implies, and every one is
+/// charged its ring ops (§8). The key and its errors keep HTTP/2's name,
+/// which is the one the pool shipped under.
+fn resolveStreamSlots(requested: ?u32, multiplexing_count: u32) ValidationError!u32 {
     const stream_slots = requested orelse {
-        if (http2_listeners_count >= 1) return error.LimitH2StreamsRequired;
+        if (multiplexing_count >= 1) return error.LimitH2StreamsRequired;
         return 0;
     };
-    if (http2_listeners_count == 0) return error.LimitH2StreamsWithoutHttp2;
+    if (multiplexing_count == 0) return error.LimitH2StreamsWithoutHttp2;
     if (stream_slots < 1 or stream_slots > constants.stream_slots_max) {
         return error.LimitH2StreamsOutOfRange;
     }
     assert(stream_slots >= 1);
+    assert(multiplexing_count >= 1);
     return stream_slots;
 }
 
@@ -1696,6 +1755,39 @@ fn resolveH2Connections(
     if (h2_connections > conn_slots) return error.LimitH2ConnectionsOverConnSlots;
     assert(h2_connections <= conn_slots);
     return h2_connections;
+}
+
+/// The QUIC connection pool (#449), shaped like `resolveH2Connections`: a
+/// connection per HTTP/3 client, defaulting to `quic_connections_default`
+/// where a listener has a `quic` binding, and zero otherwise. Bounded by
+/// the conn slots, and by the TLS engines too — a QUIC connection holds
+/// one for its whole life, so a pool past the engines would admit
+/// connections that could never finish a handshake. A binding implies
+/// `tls` (`countListenerFeatures`), so the engine pool is never empty
+/// here and the default never zero.
+fn resolveQuicConnections(
+    requested: ?u32,
+    conn_slots: u32,
+    tls_engines: u32,
+    quic_listeners_count: u32,
+) ValidationError!u32 {
+    assert(conn_slots >= 1);
+    assert(tls_engines <= conn_slots);
+    if (quic_listeners_count == 0) {
+        if (requested != null) return error.LimitQuicConnectionsWithoutQuic;
+        return 0;
+    }
+    assert(tls_engines >= 1);
+    const quic_connections = requested orelse
+        @min(constants.quic_connections_default, conn_slots, tls_engines);
+    if (quic_connections < 1 or quic_connections > constants.quic_connections_max) {
+        return error.LimitQuicConnectionsOutOfRange;
+    }
+    if (quic_connections > conn_slots) return error.LimitQuicConnectionsOverConnSlots;
+    if (quic_connections > tls_engines) return error.LimitQuicConnectionsOverTlsEngines;
+    assert(quic_connections >= 1);
+    assert(quic_connections <= tls_engines);
+    return quic_connections;
 }
 
 /// The two head pools (§5), which exist only for an HTTP listener: the
@@ -1735,6 +1827,7 @@ fn assertPoolsFitConnSlots(slots: SlotCounts, head_buffers: u32, feature_pools: 
     assert(head_buffers <= slots.conn_slots);
     assert(feature_pools.tls_engines <= slots.conn_slots);
     assert(feature_pools.tunnels <= slots.conn_slots);
+    assert(feature_pools.quic_connections <= slots.conn_slots);
 }
 
 /// The relay buffer's width against what the listeners ask of it — split
@@ -1833,6 +1926,7 @@ fn resolveLimits(
         .tunnels = feature_pools.tunnels,
         .h2_connections = feature_pools.h2_connections,
         .stream_slots = feature_pools.stream_slots,
+        .quic_connections = feature_pools.quic_connections,
         .h2_origin_connections = origin_pools.connections,
         .h2_origin_streams = origin_pools.streams,
         .upstream_tls_sessions = origin_pools.upstream_tls_sessions,
@@ -2726,10 +2820,50 @@ fn resolveListeners(
             return error.ListenerBindDuplicate;
         }
     }
+    try rejectDuplicateQuicBinds(arena, listeners);
 
     assert(listeners.len == stated.len);
     assert(order.len == listeners.len);
     return listeners;
+}
+
+/// Duplicate QUIC binds (#449), sorted for the reason the TCP binds above
+/// are. A set of their own: a UDP port is not a TCP one, so a binding on
+/// its own listener's TCP address — the usual shape — is no duplicate.
+/// Two bindings on one UDP address are, and are refused at load rather
+/// than left to fail at bind, or to share datagrams between two
+/// listeners' routes if the kernel let both sockets have the port.
+fn rejectDuplicateQuicBinds(
+    arena: std.mem.Allocator,
+    listeners: []const Config.Listener,
+) ResolveError!void {
+    assert(listeners.len >= 1);
+    assert(listeners.len <= std.math.maxInt(u16));
+    var bound: u16 = 0;
+    for (listeners) |*listener| bound += @intFromBool(listener.quic != null);
+    if (bound <= 1) return;
+    const order = try arena.alloc(u16, bound);
+    var next: u16 = 0;
+    for (listeners, 0..) |*listener, index| {
+        if (listener.quic == null) continue;
+        order[next] = @intCast(index);
+        next += 1;
+    }
+    assert(next == bound);
+    const ByQuicBind = struct {
+        listeners: []const Config.Listener,
+        fn lessThan(ctx: @This(), a: u16, b: u16) bool {
+            return bindOrder(ctx.listeners[a].quic.?.bind_address) <
+                bindOrder(ctx.listeners[b].quic.?.bind_address);
+        }
+    };
+    std.mem.sort(u16, order, ByQuicBind{ .listeners = listeners }, ByQuicBind.lessThan);
+    for (order[1..], order[0 .. order.len - 1]) |current, previous| {
+        const current_bind = &listeners[current].quic.?.bind_address;
+        if (current_bind.eql(&listeners[previous].quic.?.bind_address)) {
+            return error.ListenerQuicBindDuplicate;
+        }
+    }
 }
 
 /// One listener's whole resolution — split from `resolveListeners`
@@ -2807,6 +2941,7 @@ fn resolveHttpListener(
         .keepalive_requests = http.keepalive_requests,
         .proxy_status = http.proxy_status,
         .h2c = try resolveH2c(http.h2c, tls),
+        .quic = try resolveQuic(&http.quic, &tls),
     };
 }
 
@@ -2818,6 +2953,34 @@ fn resolveH2c(h2c: bool, tls: ?Config.Listener.Tls) ValidationError!bool {
     if (h2c and tls != null) return error.ListenerH2cOnTls;
     assert(!h2c or tls == null);
     return h2c;
+}
+
+/// A listener's QUIC binding (#449): an IP and port, and a max-age within
+/// its ceiling. QUIC is TLS 1.3 by construction, so a binding needs the
+/// listener's certificates; `countListenerFeatures` refused one without
+/// them before any pool was sized, which makes the check here the
+/// postcondition restated, as `resolveH2c`'s is.
+fn resolveQuic(
+    quic: *const ?Options.Listener.Quic,
+    tls: *const ?Config.Listener.Tls,
+) ValidationError!?Config.Listener.Quic {
+    const stated = if (quic.*) |*stated| stated else return null;
+    if (tls.* == null) return error.ListenerQuicWithoutTls;
+    // A datagram socket on a path would be a different transport, and one
+    // no QUIC client dials.
+    const bind_address = switch (stated.bind) {
+        .ip => |ip| ip,
+        .unix => return error.ListenerQuicBindNotIp,
+    };
+    if (stated.alt_svc_max_age_s > constants.alt_svc_max_age_s_max) {
+        return error.ListenerQuicAltSvcMaxAgeOutOfRange;
+    }
+    assert(tls.* != null);
+    assert(stated.alt_svc_max_age_s <= constants.alt_svc_max_age_s_max);
+    return .{
+        .bind_address = bind_address,
+        .alt_svc_max_age_s = stated.alt_svc_max_age_s,
+    };
 }
 
 /// An `l4` listener: which cluster (or which table of them) it relays to,
@@ -4296,7 +4459,7 @@ fn rejectUpgradeClusters(
     }
 }
 
-/// How many listeners ask for each of the four features whose pools and
+/// How many listeners ask for each of the features whose pools and
 /// buffers are sized before any listener resolves. Split from `resolve`
 /// for the length limit, and it reads better whole: the counts taken on
 /// one rule.
@@ -4305,8 +4468,9 @@ fn rejectUpgradeClusters(
 /// resolver's to say, later and per listener. Counting on usability here
 /// would size a pool against blocks that might yet be refused, and report
 /// a limits error for a config whose real fault is a bad name or a
-/// duplicate offer. The one rule judged here is h2c beside TLS, because it
-/// decides whether a pool exists at all.
+/// duplicate offer. The two rules judged here are h2c beside TLS and a
+/// QUIC binding without it, because each decides whether a pool exists
+/// at all.
 const ListenerFeatures = struct {
     http: u32 = 0,
     tls: u32 = 0,
@@ -4317,6 +4481,9 @@ const ListenerFeatures = struct {
     /// Listeners speaking HTTP/2 (#275) — h2c, or `h2` in `tls.alpn` —
     /// what decides whether the HTTP/2 pools exist.
     http2: u32 = 0,
+    /// Listeners with a `quic` binding (#449) — what decides whether the
+    /// QUIC connection pool exists, and with `http2`, the shared streams.
+    quic: u32 = 0,
 };
 
 fn countListenerFeatures(listeners: []const Options.Listener) ResolveError!ListenerFeatures {
@@ -4338,6 +4505,14 @@ fn countListenerFeatures(listeners: []const Options.Listener) ResolveError!Liste
                 // for it is told the specific thing it got wrong first.
                 if (http.h2c and listener.tls != null) return error.ListenerH2cOnTls;
                 if (speaksHttp2(listener, http)) features.http2 += 1;
+                // QUIC is TLS 1.3 by construction, and the binding
+                // presents this listener's certificates: refused here for
+                // h2c's reason, so the engine pool it would draw on is
+                // never sized for a listener that has none to give it.
+                if (http.quic != null) {
+                    if (listener.tls == null) return error.ListenerQuicWithoutTls;
+                    features.quic += 1;
+                }
             },
             .l4 => |*l4| {
                 if (l4.target == .routes) features.sni += 1;
@@ -4353,6 +4528,8 @@ fn countListenerFeatures(listeners: []const Options.Listener) ResolveError!Liste
     assert(features.upgrades <= listeners.len);
     assert(features.sni <= listeners.len);
     assert(features.http2 <= features.http);
+    assert(features.quic <= features.http);
+    assert(features.quic <= features.tls);
     return features;
 }
 
@@ -4770,6 +4947,72 @@ test "config: listeners written as options meet the loader's rules (#417)" {
         .protocol = .{ .l4 = .{ .target = .{ .routes = &.{.{ .cluster = "origin" }} } } },
     };
     try std.testing.expectError(error.ListenerTlsWithSniRoutes, resolveListeners(arena, &[_]Options.Listener{sni_tls}, clusters, head_bytes, &.{}));
+}
+
+test "config: a QUIC binding written as options meets the loader's rules (#449)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const clusters = try resolveClusters(arena, &[_]Options.Cluster{.{
+        .name = "origin",
+        .endpoints = &.{.{ .address = .{ .ip = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:9000") } }},
+        .pick = .p2c,
+    }});
+    const head_bytes = constants.head_buffer_bytes_min;
+    const udp = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:8443");
+    const bound: Options.Listener = .{
+        .bind = .{ .ip = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:8443") },
+        .tls = .{ .cert_pem = "cert", .key_pem = "key", .label = "test" },
+        .protocol = .{ .http = .{
+            .target = .{ .cluster = "origin" },
+            .max_body_bytes = 1 << 20,
+            .keepalive_requests = 1000,
+            .quic = .{ .bind = .{ .ip = udp } },
+        } },
+    };
+    const listeners = try resolveListeners(arena, &[_]Options.Listener{bound}, clusters, head_bytes, &.{});
+    const binding = listeners[0].quic.?;
+    try std.testing.expect(binding.bind_address.eql(&udp));
+    try std.testing.expectEqual(constants.alt_svc_max_age_s_default, binding.alt_svc_max_age_s);
+
+    // Counted only beside TLS, which it is refused without before any
+    // pool is sized — and again by its own resolver, for code that
+    // resolves listeners alone.
+    const features = try countListenerFeatures(&[_]Options.Listener{bound});
+    try std.testing.expectEqual(@as(u32, 1), features.quic);
+    try std.testing.expectEqual(@as(u32, 0), features.http2);
+    var plaintext = bound;
+    plaintext.tls = null;
+    try std.testing.expectError(error.ListenerQuicWithoutTls, countListenerFeatures(&[_]Options.Listener{plaintext}));
+    try std.testing.expectError(error.ListenerQuicWithoutTls, resolveListeners(arena, &[_]Options.Listener{plaintext}, clusters, head_bytes, &.{}));
+    var socket_file = bound;
+    socket_file.protocol.http.quic = .{ .bind = .{ .unix = "/run/zoxy.sock" } };
+    try std.testing.expectError(error.ListenerQuicBindNotIp, resolveListeners(arena, &[_]Options.Listener{socket_file}, clusters, head_bytes, &.{}));
+    var remembered = bound;
+    remembered.protocol.http.quic = .{ .bind = .{ .ip = udp }, .alt_svc_max_age_s = constants.alt_svc_max_age_s_max + 1 };
+    try std.testing.expectError(error.ListenerQuicAltSvcMaxAgeOutOfRange, resolveListeners(arena, &[_]Options.Listener{remembered}, clusters, head_bytes, &.{}));
+    var twin = bound;
+    twin.bind = .{ .ip = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:9443") };
+    try std.testing.expectError(error.ListenerQuicBindDuplicate, resolveListeners(arena, &[_]Options.Listener{ bound, twin }, clusters, head_bytes, &.{}));
+
+    // QUIC alone: the shared streams without an HTTP/2 session, and the
+    // pool within the engines every connection holds one of.
+    const pools = try resolveFeaturePools(&.{ .h2_streams = 8, .tls_engines = 16 }, 1024, features);
+    try std.testing.expectEqual(@as(u32, 0), pools.h2_connections);
+    try std.testing.expectEqual(@as(u32, 8), pools.stream_slots);
+    try std.testing.expectEqual(@as(u32, 16), pools.quic_connections);
+    try std.testing.expectError(
+        error.LimitQuicConnectionsOverTlsEngines,
+        resolveFeaturePools(&.{ .h2_streams = 8, .tls_engines = 16, .quic_connections = 17 }, 1024, features),
+    );
+    try std.testing.expectError(
+        error.LimitQuicConnectionsOutOfRange,
+        resolveFeaturePools(&.{ .h2_streams = 8, .quic_connections = constants.quic_connections_max + 1 }, 1024, features),
+    );
+    try std.testing.expectError(
+        error.LimitH2StreamsRequired,
+        resolveFeaturePools(&.{}, 1024, features),
+    );
 }
 
 test "config: a route's name rides its route through the sort, and a listener's names are unique (#430)" {

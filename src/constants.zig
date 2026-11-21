@@ -700,6 +700,47 @@ comptime {
     assert(@as(u64, conn_slots_max) + stream_slots_max <= std.math.maxInt(u32));
 }
 
+/// `limits.quic_connections`' default when a listener serves HTTP/3
+/// (#449), and never more than the conn slots or the TLS engines the
+/// config resolves: a QUIC connection holds an engine for its whole life.
+/// Far below `h2_connections_default` because h3 sizes a connection at
+/// compile time, every stream's buffers inside it (the `h3_*` block
+/// below), so each one in the pool is priced whole whether or not its
+/// streams are in use.
+pub const quic_connections_default: u32 = 64;
+
+/// The ceiling on `limits.quic_connections` (#449): the c10k ceiling conn
+/// slots carry, on `tunnels_max`'s reasoning. A QUIC connection is a
+/// client connection, so a pool larger than the connections the budget
+/// prices describes a proxy that cannot exist. The loader holds it to the
+/// effective conn slots and engines as well; this is the comptime half.
+pub const quic_connections_max: u32 = conn_slots_max;
+
+/// The RFC 7838 `Alt-Svc` max-age a QUIC binding advertises on its
+/// listener's TCP responses unless told otherwise (#449): a day, long
+/// enough that a returning client tries HTTP/3 first, and short enough
+/// that clients stop trying within a day of the binding's removal.
+pub const alt_svc_max_age_s_default: u32 = 86400;
+
+/// The ceiling on a binding's `alt_svc_max_age_s` (#449): a year. A client
+/// keeps the advertisement that long, so past it a typo would have clients
+/// knocking on a UDP port for longer than any deployment plans ahead.
+pub const alt_svc_max_age_s_max: u32 = 365 * 24 * 60 * 60;
+
+comptime {
+    // A stock config resolves to the default itself, uncapped: the
+    // default conn slots and engine pool both cover it. And the ceiling
+    // is one the budget's c10k bound prices.
+    assert(quic_connections_default >= 1);
+    assert(quic_connections_default <= conn_slots_default);
+    assert(quic_connections_default <= tls_engines_default);
+    assert(quic_connections_default <= quic_connections_max);
+    assert(quic_connections_max <= conn_slots_max);
+    // A default of zero would advertise nothing, and the ceiling bounds it.
+    assert(alt_svc_max_age_s_default >= 1);
+    assert(alt_svc_max_age_s_default <= alt_svc_max_age_s_max);
+}
+
 /// HTTP/3's per-connection shape (#449). h3 sizes a connection at compile
 /// time — every stream's buffers are arrays inside it — so these are what
 /// one QUIC connection costs, and `limits.quic_connections` multiplies it.
