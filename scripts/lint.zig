@@ -57,6 +57,11 @@ const boundaries = [_]Boundary{
         .message = "h2 is imported only under src/http/h2/ — the HTTP/2 framing boundary (#275)",
     },
     .{
+        .needle = "@import(\"h3\")",
+        .confined_to = "http/h3/",
+        .message = "h3 is imported only under src/http/h3/ — the QUIC and HTTP/3 boundary (#449)",
+    },
+    .{
         .needle = "@import(\"xev\")",
         .confined_to = "io/",
         .message = "xev may only be imported under src/io/ (DESIGN.md §4)",
@@ -405,6 +410,13 @@ test "lintLine: hparse import is confined to the http parser wrapper" {
     try std.testing.expect(lintLine("const hparse = @import(\"hparse\");", "http/proxy.zig") != null);
     // Not even src/io/ may reach around the wrapper.
     try std.testing.expect(lintLine("const hparse = @import(\"hparse\");", "io/XevIo.zig") != null);
+}
+
+test "lintLine: h3 import is confined to the QUIC and HTTP/3 directory (#449)" {
+    try std.testing.expect(lintLine("const h3 = @import(\"h3\");", "http/h3/Session.zig") == null);
+    try std.testing.expect(lintLine("const h3 = @import(\"h3\");", "http/h2/Session.zig") != null);
+    try std.testing.expect(lintLine("const h3 = @import(\"h3\");", "tls/QuicCrypto.zig") != null);
+    try std.testing.expect(lintLine("const h3 = @import(\"h3\");", "Server.zig") != null);
 }
 
 test "lintLine: h2 import is confined to the HTTP/2 session" {
