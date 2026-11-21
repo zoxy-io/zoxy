@@ -830,3 +830,260 @@ test "engine: a session with no verified client has no names (#432)" {
     try bed.handshake();
     try std.testing.expect(bed.engine.clientNames() == null);
 }
+
+/// One side of a QUIC handshake in memory (#449): the CRYPTO bytes owed
+/// to the other side, per level, and what this side was handed.
+const QuicSide = struct {
+    owed: [3][4096]u8 = undefined,
+    owed_len: [3]u32 = .{ 0, 0, 0 },
+    send_secrets: [3]?[48]u8 = .{ null, null, null },
+    receive_secrets: [3]?[48]u8 = .{ null, null, null },
+    tickets: u8 = 0,
+    peer_parameters: [64]u8 = undefined,
+    peer_parameters_len: u8 = 0,
+    connected: bool = false,
+
+    fn sink(side: *QuicSide) Engine.QuicSink {
+        return .{
+            .ctx = side,
+            .crypto = crypto,
+            .secret = secret,
+            .transportParameters = transportParameters,
+            .connected = connectedHook,
+        };
+    }
+
+    fn crypto(ctx: *anyopaque, level: Engine.QuicLevel, bytes: []const u8) error{QuicSinkRefused}!void {
+        const side: *QuicSide = @ptrCast(@alignCast(ctx));
+        side.owe(level, bytes);
+    }
+
+    fn owe(side: *QuicSide, level: Engine.QuicLevel, bytes: []const u8) void {
+        const index = @backingInt(level);
+        assert(side.owed_len[index] + bytes.len <= side.owed[index].len);
+        @memcpy(side.owed[index][side.owed_len[index]..][0..bytes.len], bytes);
+        side.owed_len[index] += @intCast(bytes.len);
+    }
+
+    fn secret(ctx: *anyopaque, given: *const Engine.QuicSecret) error{QuicSinkRefused}!void {
+        const side: *QuicSide = @ptrCast(@alignCast(ctx));
+        side.keep(given);
+    }
+
+    fn keep(side: *QuicSide, given: *const Engine.QuicSecret) void {
+        assert(given.bytes.len <= 48);
+        var copy: [48]u8 = @splat(0);
+        @memcpy(copy[0..given.bytes.len], given.bytes);
+        const index = @backingInt(given.level);
+        switch (given.direction) {
+            .send => side.send_secrets[index] = copy,
+            .receive => side.receive_secrets[index] = copy,
+        }
+    }
+
+    fn transportParameters(ctx: *anyopaque, bytes: []const u8) error{QuicSinkRefused}!void {
+        const side: *QuicSide = @ptrCast(@alignCast(ctx));
+        assert(bytes.len <= side.peer_parameters.len);
+        @memcpy(side.peer_parameters[0..bytes.len], bytes);
+        side.peer_parameters_len = @intCast(bytes.len);
+    }
+
+    fn connectedHook(ctx: *anyopaque) void {
+        const side: *QuicSide = @ptrCast(@alignCast(ctx));
+        side.connected = true;
+    }
+
+    /// What this side owes at `level`, taken.
+    fn take(side: *QuicSide, level: Engine.QuicLevel, into: []u8) []u8 {
+        const index = @backingInt(level);
+        const len = side.owed_len[index];
+        @memcpy(into[0..len], side.owed[index][0..len]);
+        side.owed_len[index] = 0;
+        return into[0..len];
+    }
+};
+
+/// A QUIC handshake in memory (#449): a QUIC-mode engine, zssl's QUIC
+/// client, and what each owes the other by level. The engine is the
+/// server; nothing here protects packets, which is h3's job.
+const QuicBed = struct {
+    arena_state: std.heap.ArenaAllocator,
+    credentials: Credentials,
+    engine: Engine,
+    plaintext: [Engine.plaintext_bytes_min]u8,
+    body_plaintext: [Engine.plaintext_bytes_min]u8,
+    reassembly: [16 * 1024]u8,
+    client: zssl.ClientHandshake,
+    client_out: [zssl.ClientHandshake.out_bytes_min]u8,
+    server: QuicSide,
+    client_side: QuicSide,
+    /// CRYPTO bytes the server has not yet taken: a ClientHello still
+    /// arriving waits here, as h3's reassembly holds it.
+    unread: [4096]u8,
+    unread_len: u32,
+
+    const server_parameters = "\x04\x04\x80\x10\x00\x00";
+    const client_parameters = "\x05\x04\x80\x08\x00\x00";
+
+    /// Allocated: an engine and its buffers outgrow a test's stack.
+    fn create(certificates: []const certificate_set.Choice, tickets: ?*const Tickets_) !*QuicBed {
+        const bed = try std.testing.allocator.create(QuicBed);
+        errdefer std.testing.allocator.destroy(bed);
+        bed.arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        bed.credentials = try Credentials.load(bed.arena_state.allocator(), cert_pem, key_pem, .{});
+        bed.engine.bindPlaintext(&bed.plaintext, &bed.body_plaintext, constants.head_buffer_bytes_default);
+        try bed.engine.init(&.{
+            .x25519_seed = @splat(0x42),
+            .random = @splat(0x43),
+            .credentials = if (certificates.len > 0) certificates[0].credentials else &bed.credentials,
+            .certificates = certificates,
+            .tickets = tickets,
+            .now_unix = 1_900_000_000,
+            .quic = .{ .transport_parameters = server_parameters },
+        });
+        bed.server = .{};
+        bed.client_side = .{};
+        bed.unread_len = 0;
+        assert(bed.engine.isQuic());
+        return bed;
+    }
+
+    fn connectAs(bed: *QuicBed, server_name: []const u8) void {
+        bed.client = zssl.ClientHandshake.init(&.{
+            .client_random = @splat(0x52),
+            .x25519_private = @splat(0x51),
+            .server_name = server_name,
+            .alpn_protocols = Engine.quic_alpn,
+            .certificate_policy = .insecure_no_verification,
+            .reassembly = &bed.reassembly,
+            .quic = .{ .transport_parameters = client_parameters },
+        });
+        const hello = bed.client.startCrypto();
+        bed.client_side.owe(hello.level, hello.bytes);
+    }
+
+    fn destroy(bed: *QuicBed) void {
+        bed.client.deinit();
+        bed.engine.deinit();
+        bed.credentials.deinit();
+        bed.arena_state.deinit();
+        std.testing.allocator.destroy(bed);
+    }
+
+    /// Hand the server `bytes` at `level` behind whatever it left
+    /// untaken, keeping what it does not take for the next delivery.
+    fn deliverToServer(bed: *QuicBed, level: Engine.QuicLevel, bytes: []const u8) !void {
+        assert(bed.unread_len + bytes.len <= bed.unread.len);
+        @memcpy(bed.unread[bed.unread_len..][0..bytes.len], bytes);
+        bed.unread_len += @intCast(bytes.len);
+        const sink = bed.server.sink();
+        const taken = try bed.engine.quicCrypto(level, bed.unread[0..bed.unread_len], &sink);
+        // All or nothing: a hello still arriving is taken none of.
+        try std.testing.expect(taken == 0 or taken == bed.unread_len);
+        if (taken == bed.unread_len) bed.unread_len = 0;
+    }
+
+    fn deliverToClient(bed: *QuicBed, level: Engine.QuicLevel, bytes: []const u8) !void {
+        var next = try bed.client.handleCrypto(level, bytes, &bed.client_out);
+        while (next) |event| : (next = try bed.client.drainCrypto(&bed.client_out)) {
+            switch (event) {
+                .crypto => |crypto| bed.client_side.owe(crypto.level, crypto.bytes),
+                .secret => |given| bed.client_side.keep(&given),
+                .transport_parameters => |body| {
+                    @memcpy(bed.client_side.peer_parameters[0..body.len], body);
+                    bed.client_side.peer_parameters_len = @intCast(body.len);
+                },
+                .ticket => bed.client_side.tickets += 1,
+                .connected => bed.client_side.connected = true,
+            }
+        }
+    }
+
+    /// One exchange each way, every level in order.
+    fn round(bed: *QuicBed) !void {
+        var scratch: [4096]u8 = undefined;
+        for (std.enums.values(Engine.QuicLevel)) |level| {
+            const bytes = bed.client_side.take(level, &scratch);
+            if (bytes.len > 0) try bed.deliverToServer(level, bytes);
+        }
+        for (std.enums.values(Engine.QuicLevel)) |level| {
+            const bytes = bed.server.take(level, &scratch);
+            if (bytes.len > 0) try bed.deliverToClient(level, bytes);
+        }
+    }
+
+    fn handshake(bed: *QuicBed) !void {
+        var rounds: u8 = 0;
+        while (!(bed.client_side.connected and bed.server.connected)) : (rounds += 1) {
+            try std.testing.expect(rounds < rounds_max);
+            try bed.round();
+        }
+        try std.testing.expect(bed.engine.isConnected());
+    }
+
+    /// What one side sends with is what the other receives with, at both
+    /// levels and both ways; and each side's transport parameters reached
+    /// the other verbatim.
+    fn expectAgreement(bed: *const QuicBed) !void {
+        try std.testing.expectEqualStrings(client_parameters, bed.server.peer_parameters[0..bed.server.peer_parameters_len]);
+        try std.testing.expectEqualStrings(server_parameters, bed.client_side.peer_parameters[0..bed.client_side.peer_parameters_len]);
+        for ([_]Engine.QuicLevel{ .handshake, .application }) |level| {
+            const index = @backingInt(level);
+            try std.testing.expectEqualSlices(u8, &bed.server.send_secrets[index].?, &bed.client_side.receive_secrets[index].?);
+            try std.testing.expectEqualSlices(u8, &bed.client_side.send_secrets[index].?, &bed.server.receive_secrets[index].?);
+        }
+    }
+};
+
+const Tickets_ = @import("Tickets.zig");
+
+test "engine: QUIC mode completes a handshake at the message level, every secret agreeing (#449)" {
+    const bed = try QuicBed.create(&.{}, null);
+    defer bed.destroy();
+    bed.connectAs("spike.zoxy.test");
+    try bed.handshake();
+    try bed.expectAgreement();
+}
+
+test "engine: QUIC mode chooses a certificate by name from a ClientHello delivered in pieces (#449, #297)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var default_credentials = try Credentials.load(arena, cert_pem, key_pem, .{});
+    defer default_credentials.deinit();
+    var origin_credentials = try Credentials.load(arena, origin_cert_pem, origin_key_pem, .{});
+    defer origin_credentials.deinit();
+    const choices = [_]certificate_set.Choice{
+        .{ .credentials = &default_credentials, .names = try trust.dnsNames(arena, default_credentials.chain[0]), .schemes = default_credentials.schemes() },
+        .{ .credentials = &origin_credentials, .names = try trust.dnsNames(arena, origin_credentials.chain[0]), .schemes = origin_credentials.schemes() },
+    };
+    const bed = try QuicBed.create(&choices, null);
+    defer bed.destroy();
+    bed.connectAs("origin.zoxy.test");
+    // The hello's first half decides nothing and is taken none of; the
+    // rest completes it, the name chooses, and the handshake runs.
+    var scratch: [4096]u8 = undefined;
+    const hello = bed.client_side.take(.initial, &scratch);
+    try std.testing.expect(hello.len > 2);
+    try bed.deliverToServer(.initial, hello[0 .. hello.len / 2]);
+    try std.testing.expectEqual(@as(u32, @intCast(hello.len / 2)), bed.unread_len);
+    try bed.deliverToServer(.initial, hello[hello.len / 2 ..]);
+    try std.testing.expectEqual(@as(u32, 0), bed.unread_len);
+    try bed.handshake();
+    try std.testing.expectEqual(@as(usize, 1), bed.engine.chosenCertificate());
+    try bed.expectAgreement();
+}
+
+test "engine: a QUIC session ticket reaches the client as an application-level message (#449)" {
+    var tickets: Tickets_ = undefined;
+    tickets.init();
+    tickets.rotate(@splat(0x61), 1_900_000_000);
+    const bed = try QuicBed.create(&.{}, &tickets);
+    defer bed.destroy();
+    bed.connectAs("spike.zoxy.test");
+    try bed.handshake();
+    const message = try bed.engine.quicSessionTicket("n", 7, @splat(0x62));
+    try std.testing.expect(message.len >= 1);
+    try bed.deliverToClient(.application, message);
+    try std.testing.expectEqual(@as(u8, 1), bed.client_side.tickets);
+}

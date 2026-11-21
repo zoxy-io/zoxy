@@ -153,6 +153,11 @@ chosen_certificate: usize,
 handshake_seed: [32]u8,
 handshake_random: [32]u8,
 handshake_alpn: []const []const u8,
+/// QUIC mode (#449): this endpoint's transport parameters, copied, for
+/// the EncryptedExtensions zssl writes — zero-length when the engine
+/// terminates TLS over TCP instead.
+quic_transport_parameters: [zssl.quic.transport_parameters_bytes_max]u8,
+quic_transport_parameters_len: u16,
 handshake_client_auth: ?ClientAuth,
 
 /// What a drive step hands back *synchronously*: plaintext the caller
@@ -215,7 +220,10 @@ comptime {
 
 /// Where zssl assembles the server flight before sealing it: the chain
 /// plus EncryptedExtensions, CertificateVerify and Finished around it.
-const flight_scratch_bytes: usize = @as(usize, constants.tls_cert_chain_bytes_max) + 1024;
+const flight_scratch_bytes: usize = @max(
+    @as(usize, constants.tls_cert_chain_bytes_max) + 1024,
+    zssl.ServerHandshake.quic_flight_bytes_min,
+);
 
 /// A ServerHello record, generously: the fixed fields plus the largest
 /// key share in play (X25519MLKEM768's is ~1.1 KiB).
@@ -320,6 +328,48 @@ pub const Config = struct {
     /// when it holds more than one; empty otherwise. Borrowed like
     /// `credentials`.
     certificates: []const certificate_set.Choice = &.{},
+    /// QUIC mode (#449, RFC 9001 §4), or null for TLS over TCP. The
+    /// engine then runs the handshake at the message level — no records,
+    /// no record protection — and hands its traffic secrets out to the
+    /// QUIC connection, which protects packets itself; `alpn_protocols`
+    /// is ignored for `quic_alpn`.
+    quic: ?Quic = null,
+};
+
+/// What QUIC mode needs beyond TLS over TCP (#449).
+pub const Quic = struct {
+    /// This endpoint's transport parameters (RFC 9000 §18), encoded:
+    /// copied at `init`, so the caller's need not outlive it.
+    transport_parameters: []const u8,
+};
+
+/// The one protocol a QUIC listener offers (RFC 9114 §3.1).
+pub const quic_alpn: []const []const u8 = &.{"h3"};
+
+/// zssl's QUIC vocabulary, re-exported so the QUIC endpoint — outside
+/// `src/tls/`, where zssl may not be imported — can name it: the
+/// encryption levels CRYPTO bytes and secrets belong to.
+pub const QuicLevel = zssl.quic.Level;
+/// A traffic secret, borrowed: valid until the engine's next call.
+pub const QuicSecret = zssl.quic.Secret;
+/// The suite a secret is for, named as h3 names its own.
+pub const QuicCipherSuite = zssl.cipher_suite.CipherSuite;
+/// Every refusal a QUIC handshake can answer.
+pub const QuicError = zssl.quic.HandshakeError;
+/// The code a failed handshake closes the connection with (RFC 9001
+/// §4.8): CRYPTO_ERROR's 0x100 plus the alert, or PROTOCOL_VIOLATION.
+pub const quicErrorCode = zssl.quic.errorCode;
+
+/// Where a QUIC handshake's output goes (#449): CRYPTO bytes to frame at a
+/// level, a traffic secret to install, the client's transport
+/// parameters, and the handshake's confirmation. Every slice is borrowed
+/// and valid only for the call. An error from the sink ends the handshake.
+pub const QuicSink = struct {
+    ctx: *anyopaque,
+    crypto: *const fn (ctx: *anyopaque, level: QuicLevel, bytes: []const u8) error{QuicSinkRefused}!void,
+    secret: *const fn (ctx: *anyopaque, secret: *const QuicSecret) error{QuicSinkRefused}!void,
+    transportParameters: *const fn (ctx: *anyopaque, bytes: []const u8) error{QuicSinkRefused}!void,
+    connected: *const fn (ctx: *anyopaque) void,
 };
 
 pub const ClientAuth = struct {
@@ -394,6 +444,14 @@ pub fn init(engine: *Engine, config: *const Config) !void {
     if (config.certificates.len > 0) assert(config.certificates[0].credentials == config.credentials);
     engine.certificate_chosen = config.certificates.len == 0;
     engine.chosen_certificate = 0;
+    engine.quic_transport_parameters_len = 0;
+    if (config.quic) |quic| {
+        assert(quic.transport_parameters.len >= 1);
+        assert(quic.transport_parameters.len <= engine.quic_transport_parameters.len);
+        @memcpy(engine.quic_transport_parameters[0..quic.transport_parameters.len], quic.transport_parameters);
+        engine.quic_transport_parameters_len = @intCast(quic.transport_parameters.len);
+        engine.handshake_alpn = quic_alpn;
+    }
     engine.startHandshake(config.credentials);
     engine.records = .init(&engine.record_storage);
     engine.outbox_len = 0;
@@ -435,6 +493,9 @@ fn startHandshake(engine: *Engine, credentials: *const Credentials) void {
         .alpn_protocols = engine.handshake_alpn,
         .reassembly = &engine.reassembly,
         .flight = &engine.flight,
+        .quic = if (engine.isQuic()) .{
+            .transport_parameters = engine.quic_transport_parameters[0..engine.quic_transport_parameters_len],
+        } else null,
         // Offered only when this deployment can actually open one. A
         // lookup that always answers null would work too, but saying so
         // in the config keeps "resumption is off" a single readable fact
@@ -504,6 +565,93 @@ pub fn deinit(engine: *Engine) void {
 
 pub fn isConnected(engine: *const Engine) bool {
     return engine.hs.state == .connected;
+}
+
+/// Whether this engine runs QUIC's handshake (#449) rather than TLS over
+/// TCP.
+pub fn isQuic(engine: *const Engine) bool {
+    assert(engine.quic_transport_parameters_len <= engine.quic_transport_parameters.len);
+    return engine.quic_transport_parameters_len > 0;
+}
+
+/// Feed QUIC CRYPTO bytes received at `level`, in order (#449): every
+/// event they produce goes to `sink` before this returns. Answers how many
+/// of `bytes` were taken — all of them, or none while the ClientHello is
+/// still arriving on a listener with certificates to choose between,
+/// since the choice reads the whole hello before zssl reads a byte. The
+/// caller leaves untaken bytes where they are and feeds them again with
+/// more. An error, zssl's or the sink's, ends the handshake: the engine
+/// takes no more bytes, and the connection closes with `quicErrorCode`.
+pub fn quicCrypto(engine: *Engine, level: QuicLevel, bytes: []const u8, sink: *const QuicSink) !usize {
+    assert(engine.isQuic());
+    assert(bytes.len >= 1);
+    if (!engine.certificate_chosen) {
+        // Only the Initial level can carry the hello; a peer whose first
+        // bytes arrive anywhere else is refused, as zssl refuses them.
+        if (level != .initial) return error.UnexpectedMessage;
+        const hello = zssl.quic.firstMessage(bytes) orelse return 0;
+        engine.chooseQuicCertificate(hello);
+    }
+    var next_event = try engine.hs.handleCrypto(level, bytes, &engine.out);
+    // Bounded: `drainCrypto` answers null once the step's events are
+    // out, and a step's are a flight's — a handful, each named below.
+    while (next_event) |event| : (next_event = try engine.hs.drainCrypto(&engine.out)) {
+        switch (event) {
+            .crypto => |crypto| try sink.crypto(sink.ctx, crypto.level, crypto.bytes),
+            .secret => |secret| try sink.secret(sink.ctx, &secret),
+            .transport_parameters => |parameters| try sink.transportParameters(sink.ctx, parameters),
+            .connected => sink.connected(sink.ctx),
+        }
+    }
+    return bytes.len;
+}
+
+/// `chooseCertificate` for QUIC (#449): the hello is a bare handshake
+/// message, whole, rather than the first record's fragment.
+fn chooseQuicCertificate(engine: *Engine, hello_message: []const u8) void {
+    assert(!engine.certificate_chosen);
+    assert(engine.certificates.len >= 2);
+    const hello: client_hello.Hello = switch (client_hello.parseMessage(hello_message)) {
+        .need_more => unreachable, // A whole message, by `firstMessage`.
+        .invalid => .{ .server_name = null },
+        .ok => |hello| hello,
+    };
+    engine.certificate_chosen = true;
+    const chosen = certificate_set.select(engine.certificates, &hello);
+    assert(chosen < engine.certificates.len);
+    if (chosen == 0) return;
+    engine.chosen_certificate = chosen;
+    engine.hs.deinit();
+    engine.startHandshake(engine.certificates[chosen].credentials);
+}
+
+/// A NewSessionTicket for a QUIC client (#449): the bare message, which
+/// the caller frames as CRYPTO at the application level at once — it
+/// lives in the engine's `out` buffer, valid only until the engine's next
+/// call. Sealed exactly as `sendSessionTicket` seals one over TCP, and
+/// never with early data.
+pub fn quicSessionTicket(
+    engine: *Engine,
+    ticket_nonce: []const u8,
+    age_add: u32,
+    seal_nonce: [Tickets.nonce_bytes]u8,
+) ![]const u8 {
+    assert(engine.isQuic());
+    assert(engine.isConnected());
+    assert(ticket_nonce.len >= 1);
+    const tickets = engine.tickets orelse return error.NoTicketKeys;
+    var psk_buffer: [Tickets.psk_bytes_max]u8 = undefined;
+    const psk = engine.hs.resumptionPsk(ticket_nonce, &psk_buffer);
+    var ticket: [Tickets.ticket_bytes]u8 = undefined;
+    const sealed = try tickets.seal(&ticket, psk, engine.hs.cipherSuite(), engine.now_unix, seal_nonce);
+    const message = try engine.hs.sendNewSessionTicket(&.{
+        .lifetime_s = constants.tls_ticket_lifetime_s,
+        .age_add = age_add,
+        .ticket_nonce = ticket_nonce,
+        .ticket = sealed,
+    }, &engine.out);
+    assert(message.len >= 1);
+    return message;
 }
 
 /// Where the next read's ciphertext goes. Reading straight into the
@@ -748,6 +896,8 @@ pub fn sendClose(engine: *Engine) !void {
 /// was: the client offered no ALPN, or the listener advertises none (an
 /// `l4` one). Valid from the moment the ClientHello is answered.
 pub fn alpnSelected(engine: *const Engine) ?alpn.Protocol {
+    // QUIC's one protocol is h3, which no TCP offer may name (#449).
+    assert(!engine.isQuic());
     const token = engine.hs.alpnSelected() orelse return null;
     assert(token.len >= 1);
     // Only canonical tokens are ever configured, so a selection — which
