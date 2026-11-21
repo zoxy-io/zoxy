@@ -224,14 +224,18 @@
         //
         // The two are two zssl commits apart: v3.0.1 pins 827c7e5, and
         // this file moved to 5f5c582 for #271's server-side ALPN, then to
-        // 69fa0aa for zoxy-io/zssl#23 (see the zssl record). Harmless for
+        // 69fa0aa for zoxy-io/zssl#23, then to 10464cb for #449's QUIC
+        // mode (see the zssl record). Harmless for
         // the reason it was harmless before: neither binary holds both —
         // the harnesses link zrk's, the proxy under test is a separate
         // process linking this one — and both reach the one
         // zoxy-io/openssl 0377b65. Of the commits between them, 5f5c582
         // touches only the server, which zrk never runs, and 69fa0aa
         // refuses a peer's RSA key of 8k+1 bits, which zrk's client never
-        // meets: the bench serves only `cert.pem`, a P-256 leaf. The
+        // meets: the bench serves only `cert.pem`, a P-256 leaf. 10464cb's
+        // QUIC mode adds machines zrk's TCP path never calls, and refuses
+        // a TCP ClientHello carrying QUIC's transport parameters, which
+        // zrk's TCP client never sends. The
         // optimize-mode collision that keeps `zoxy-profile-harness` off
         // the `zoxy` module (see build.zig) is unaffected and still
         // reason enough on its own. Bring them together when zrk next moves.
@@ -555,6 +559,35 @@
         // gates are the evidence, and the paragraphs below are the
         // record of reading them.
         //
+        // Re-audit for 10464cb, 2026-11-21 (zoxy-io/zoxy#449): six commits
+        // on, zoxy-io/zssl#25, QUIC mode for this proxy's HTTP/3.
+        //
+        //   - QUIC mode (RFC 9001 §4) is the same two machines with record
+        //     framing, record protection and ChangeCipherSpec bypassed:
+        //     `handleCrypto`/`drainCrypto` take and give CRYPTO bytes by
+        //     level and hand out traffic secrets, so the negotiation, HRR,
+        //     PSK, client-auth and ticket code is the TCP code. §8's rules
+        //     hold: transport parameters (0x39) and ALPN mandatory, no
+        //     0-RTT, a TLS KeyUpdate refused, no legacy session id.
+        //     `quic.firstMessage` lets SNI choose a certificate first, as
+        //     over TCP (`Engine.quicCrypto`).
+        //   - Packet and header protection from libcrypto, held to RFC 9001
+        //     appendix A octet for octet, with `rekey`, the whole AES block
+        //     and the ChaCha20 keystream for h3's per-call backend
+        //     (`src/tls/QuicCrypto.zig`): nine contexts made at startup,
+        //     rekeyed per packet, nothing allocated after.
+        //   - Over TCP, one behaviour changes, as §8.2 requires: a
+        //     ClientHello carrying extension 0x39 is refused,
+        //     unsupported_extension. No TCP client sends one.
+        //
+        // What it costs a TLS listener: a TLS engine grows 95200 -> 96304
+        // B — the flight scratch to zssl's QUIC floor (+516), the
+        // transport parameters' copy (+514), and zssl's own new handshake
+        // state — measured on `zoxy --check`. Gates on the zssl
+        // side: tests 216/216 in Debug and ReleaseSafe, interop five legs,
+        // BoGo 462 at its new floor (8 QUIC-on-TCP cases now run),
+        // tlsfuzzer 22/22, TLS-Anvil on zoxy-io/zssl#25.
+        //
         // Re-audit for 69fa0aa, 2026-11-20 (zoxy-io/zoxy#441): one commit
         // on, zoxy-io/zssl#23's fix, written because this proxy reached it.
         //
@@ -734,8 +767,8 @@
         // RFC 8446 §4.3.2's CertificateRequest, RFC 5705 exporters, and
         // 0-RTT with the strike register RFC 8446 §8.2 needs.
         .zssl = .{
-            .url = "git+https://github.com/zoxy-io/zssl#69fa0aa38ed855c83b849ec3c09ad6da5d83c9d0",
-            .hash = "zssl-0.0.1-5ocyiNskEQD_TW-05znrFJyYb4IfNYBNOwVana4P8ZSx",
+            .url = "git+https://github.com/zoxy-io/zssl#10464cbda2cb87f953f89fb7229c048eece6dc9a",
+            .hash = "zssl-0.0.1-5ocyiMYpFABwKB-iaPFKQMz68QEYZP40-qFlKizjEkvt",
         },
     },
     // What a dependent receives (#417). `src` is the library and

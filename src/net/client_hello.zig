@@ -134,6 +134,19 @@ pub fn parse(bytes: []const u8) Parsed {
     return parsed;
 }
 
+/// Judge one whole handshake message as a ClientHello (#449). QUIC's
+/// CRYPTO frames carry handshake messages with no TLS record around them
+/// (RFC 9001 §4), so the header `parse` strips is absent; zssl's
+/// `quic.firstMessage` finds the message's end. Never `need_more`: the
+/// caller hands a whole message or nothing.
+pub fn parseMessage(message: []const u8) Parsed {
+    assert(message.len >= 1);
+    if (message.len > constants.client_hello_bytes_max) return .invalid;
+    const parsed = parseHandshake(message);
+    assert(parsed != .need_more);
+    return parsed;
+}
+
 fn parseHello(bytes: []const u8) Parsed {
     if (bytes.len == 0) {
         return .need_more;
@@ -714,4 +727,25 @@ test "client_hello: every truncation and every single-byte mutation is total" {
             checkParse(scratch[0..valid.len]);
         }
     }
+}
+
+test "client_hello: a bare handshake message parses as a record's fragment does (#449)" {
+    // QUIC's CRYPTO stream carries the hello without a record header:
+    // the same hello, its record stripped, must give the same verdict.
+    var extension_buffer: [128]u8 = undefined;
+    const extensions = sniExtension(&extension_buffer, "api.example.com");
+    var builder: Builder = .{};
+    const record = builder.hello(extensions);
+    const message = record[record_header_bytes..];
+    const from_record = parse(record);
+    const from_message = parseMessage(message);
+    try testing.expect(from_record == .ok);
+    try testing.expect(from_message == .ok);
+    try testing.expectEqualStrings(from_record.ok.server_name.?, from_message.ok.server_name.?);
+    // Not a ClientHello, or a length that lies, is invalid — never "more".
+    var wrong_type: [512]u8 = undefined;
+    @memcpy(wrong_type[0..message.len], message);
+    wrong_type[0] = 2;
+    try testing.expect(parseMessage(wrong_type[0..message.len]) == .invalid);
+    try testing.expect(parseMessage(message[0 .. message.len - 1]) == .invalid);
 }
