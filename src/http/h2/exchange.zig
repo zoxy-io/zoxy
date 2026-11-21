@@ -623,13 +623,30 @@ pub fn Exchange(comptime runtime: Runtime) type {
             if (Proxy.readsHandlerBody(stream)) return std.math.maxInt(u32);
             if (!forwarding(stream)) return 0;
             const body = &stream.h2_body;
-            if (body.payload_start != 0) return bodyRoom(stream);
-            // Before the first payload its headroom is not yet reserved,
-            // which `bodyRoom` asserts it is.
+            if (body.payload_start >= headroom(stream)) return bodyRoom(stream);
+            // A chunked body before its first payload: its headroom is not
+            // yet reserved, which `bodyRoom` asserts it is. A declared one's
+            // headroom is zero, so it never reaches here.
+            assert(body.payload_start == 0);
+            assert(body.payload_len == 0);
             const capacity: u32 = @intCast(stream.relay_buffer.?.client_to_upstream.len);
             const tail: u32 = if (stream.l7.request_framing == .chunked) chunk_tail_bytes else 0;
             assert(capacity > headroom(stream) + tail);
             return capacity - headroom(stream) - tail;
+        }
+
+        /// What one HTTP/3 read may report at once (#449): `dataRoom`, less
+        /// what framing the first of it takes from the rest. A chunked body
+        /// whose leg is pumping and has no frame in flight frames its first
+        /// payload as it lands, and that frame's size line and CRLF come out
+        /// of the room the rest of the read was counted against — once,
+        /// since every payload after it gathers behind the frame in flight.
+        pub fn dataRoomAtOnce(stream: *const StreamType) u32 {
+            const room = dataRoom(stream);
+            if (stream.l7.request_framing != .chunked) return room;
+            if (stream.h2_body.inFlight()) return room;
+            const framing: u32 = render.chunk_prefix_bytes_max + @as(u32, render.chunk_suffix.len);
+            return room -| framing;
         }
 
         /// Request body octets into a forwarding exchange's buffer, as far as

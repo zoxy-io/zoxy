@@ -19,7 +19,7 @@ comptime {
 }
 
 test "h3 crypto: libcrypto's backend passes h3's conformance suite (RFC 9001 appendix A)" {
-    try Backend.init();
-    defer Backend.deinit();
+    const made = try Backend.ensure();
+    defer if (made) Backend.deinit();
     try h3.quic.crypto.conformance.check(Backend);
 }

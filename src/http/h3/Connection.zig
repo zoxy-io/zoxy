@@ -100,6 +100,14 @@ pub const Slot = struct {
     /// A driver pass is running: what an exchange stages now goes out when
     /// it ends, and a teardown it decides on waits for it.
     driving: bool,
+    /// Request streams released from the session while their request was
+    /// still arriving or unread: whatever arrives on them is consumed and
+    /// dropped at the transport, since the session would read it as a new
+    /// request. Until their FIN, or the client's RESET_STREAM. None is
+    /// retired in the transport meanwhile, so at most the request streams
+    /// a client may have open.
+    drains: [requests_max]u64,
+    drains_len: u8,
 
     pub const Start = struct {
         /// The packet that starts the connection: its Destination
@@ -147,10 +155,78 @@ pub const Slot = struct {
         slot.peer = start.peer;
         slot.local = start.source;
         slot.driving = false;
+        slot.drains_len = 0;
         const encoded = slot.quic.localTransportParameters(&slot.parameters) catch return error.NoSpaceLeft;
         slot.parameters_len = @intCast(encoded.len);
         assert(slot.parameters_len >= 1);
         assert(slot.quic.state == .handshaking);
+    }
+
+    /// Release request stream `id` from the session, and drop at the
+    /// transport whatever of it is still to come: its exchange is done
+    /// with it.
+    pub fn drain(slot: *Slot, id: u64) void {
+        // A request stream: client-initiated and bidirectional.
+        assert(id % 4 == 0);
+        slot.session.release(id);
+        const transport = slot.quic.findStream(id) orelse return;
+        // Read to its end: nothing more will arrive on it.
+        if (transport.receive_state == .data_read) return;
+        if (transport.receive_state == .reset) return;
+        if (slot.draining(id)) return;
+        assert(slot.drains_len < slot.drains.len);
+        slot.drains[slot.drains_len] = id;
+        slot.drains_len += 1;
+    }
+
+    /// Asked of any stream a read reaches, a control stream's included.
+    pub fn draining(slot: *const Slot, id: u64) bool {
+        assert(slot.drains_len <= slot.drains.len);
+        assert(slot.drains.len == requests_max);
+        for (slot.drains[0..slot.drains_len]) |listed| {
+            if (listed == id) return true;
+        }
+        return false;
+    }
+
+    /// Consume and drop what stream `id` has, once it is draining — and
+    /// let it go once its FIN is read or the client reset it. Never inside
+    /// a read of the stream, whose `consume` would then take octets twice.
+    pub fn discard(slot: *Slot, id: u64) void {
+        assert(slot.draining(id));
+        const transport = slot.quic.findStream(id) orelse return slot.drained(id);
+        if (transport.receive_state == .reset) return slot.drained(id);
+        const readable = slot.quic.readable(id);
+        const finished = slot.quic.readableFin(id);
+        if (readable.len >= 1) slot.quic.consume(id, readable.len) catch unreachable; // All of what was readable.
+        if (finished) slot.drained(id);
+    }
+
+    /// Every draining stream offered `discard`: one whose last octets were
+    /// already buffered when it was let go raises no further event to be
+    /// read on, and would otherwise hold its transport slot and the
+    /// client's stream credit until the connection ends.
+    pub fn discardDrains(slot: *Slot) void {
+        assert(slot.drains_len <= slot.drains.len);
+        var index: u32 = slot.drains_len;
+        // Backwards: `drained` moves the last entry into the slot it frees.
+        while (index > 0) {
+            index -= 1;
+            slot.discard(slot.drains[index]);
+        }
+        assert(slot.drains_len <= slot.drains.len);
+    }
+
+    /// Stream `id` is done draining: its FIN read, or the client reset it.
+    pub fn drained(slot: *Slot, id: u64) void {
+        assert(slot.drains_len <= slot.drains.len);
+        for (slot.drains[0..slot.drains_len], 0..) |listed, index| {
+            if (listed != id) continue;
+            slot.drains[index] = slot.drains[slot.drains_len - 1];
+            slot.drains_len -= 1;
+            assert(!slot.draining(id));
+            return;
+        }
     }
 
     /// The transport parameters the engine's QUIC config carries.

@@ -97,6 +97,16 @@ pub fn initialized() bool {
     return contexts != null;
 }
 
+/// The contexts made unless something earlier in the process made them
+/// already — a server's `start` makes them once and keeps them — and
+/// whether this call did, so a test unmakes only what it made.
+pub fn ensure() error{LibcryptoFailed}!bool {
+    if (initialized()) return false;
+    try init();
+    assert(initialized());
+    return true;
+}
+
 fn packetKey(
     suite: zssl.cipher_suite.CipherSuite,
     key: []const u8,
@@ -232,8 +242,8 @@ pub fn hkdfSha384Expand(out: []u8, prk: *const [48]u8, info: []const u8) void {
 }
 
 test "QuicCrypto: every suite round-trips in place, refuses a forgery, and rekeys between keys" {
-    try init();
-    defer deinit();
+    const made = try ensure();
+    defer if (made) deinit();
     const ad = "a QUIC packet header";
     const nonce: [12]u8 = @splat(0x07);
     var tag: [16]u8 = undefined;
@@ -258,8 +268,8 @@ test "QuicCrypto: every suite round-trips in place, refuses a forgery, and rekey
 }
 
 test "QuicCrypto: the header block and keystream are libcrypto's AES and ChaCha20" {
-    try init();
-    defer deinit();
+    const made = try ensure();
+    defer if (made) deinit();
     const key16: [16]u8 = @splat(0x33);
     const in: [16]u8 = @splat(0x44);
     var ours: [16]u8 = undefined;

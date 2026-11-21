@@ -225,3 +225,90 @@ test "h3 server: a request answered on the spot — a 400 staged while it opens 
     try std.testing.expectEqualStrings("hello", bed.client.answers[1].bodyBytes());
     try std.testing.expectEqual(@as(u32, 1), bed.origin.answered);
 }
+
+test "h3 server: an uppercase field name is H3_MESSAGE_ERROR on its stream, and its sibling is answered" {
+    // RFC 9114 §4.2: a field name with an uppercase character is malformed,
+    // which cancels the request it is on and nothing else.
+    const bed = try Bed.create(3);
+    defer bed.destroy();
+    try bed.run(&.{
+        .{ .path = "/a", .headers = &.{.{ .name = "X-Upper", .value = "1" }} },
+        .{ .path = "/hello" },
+    });
+    try std.testing.expect(bed.client.answers[0].reset);
+    try std.testing.expectEqual(@as(u16, 0), bed.client.answers[0].status);
+    try std.testing.expectEqual(@as(u16, 200), bed.client.answers[1].status);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("h3_malformed_requests"));
+}
+
+test "h3 server: a field section that does not decode closes the connection with QPACK's error" {
+    // RFC 9204 §2.2: a representation naming a dynamic table entry the
+    // server never offered (it advertises a capacity of zero) cannot decode.
+    const bed = try Bed.create(4);
+    defer bed.destroy();
+    try bed.run(&.{.{ .raw_section = &.{ 0x00, 0x00, 0x80 } }});
+    try std.testing.expectEqual(@as(u16, 0), bed.client.answers[0].status);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("h3_qpack_failures"));
+    try std.testing.expectEqual(@as(u32, 0), bed.origin.answered);
+}
+
+/// A long-header datagram in a version this server does not speak, sent
+/// from a socket of its own, and the Version Negotiation it earns read.
+const VersionProbe = struct {
+    io: *SimIo,
+    socket: SimIo.UdpSocket,
+    datagram: [1200]u8,
+    send_completion: SimIo.DatagramCompletion,
+    receive_completion: SimIo.DatagramCompletion,
+    answer: [256]u8,
+    answer_len: u32,
+    bed: *Bed,
+
+    fn start(probe: *VersionProbe, bed: *Bed) !void {
+        probe.io = &bed.sim_io;
+        probe.bed = bed;
+        probe.answer_len = 0;
+        probe.send_completion = .{};
+        probe.receive_completion = .{};
+        probe.socket = try probe.io.udpBind(.{ .ip4 = .loopback(0) });
+        @memset(&probe.datagram, 0);
+        // Long header, Initial type bits; version 0x0a0a0a0a (RFC 9000 §15's
+        // reserved pattern); an eight-octet destination and source.
+        probe.datagram[0] = 0xc0;
+        std.mem.writeInt(u32, probe.datagram[1..5], 0x0a0a_0a0a, .big);
+        probe.datagram[5] = 8;
+        @memset(probe.datagram[6..14], 0x11);
+        probe.datagram[14] = 8;
+        @memset(probe.datagram[15..23], 0x22);
+        const server = loopback(listen_port);
+        probe.io.recvFrom(probe.socket, &probe.answer, &probe.receive_completion, VersionProbe, probe, onAnswer);
+        probe.io.sendTo(probe.socket, &probe.datagram, &server, &probe.send_completion, VersionProbe, probe, onSent);
+    }
+
+    fn onSent(probe: *VersionProbe, result: Io.SendToError!u32) void {
+        const sent = result catch 0;
+        assert(sent == probe.datagram.len);
+    }
+
+    fn onAnswer(probe: *VersionProbe, result: Io.RecvFromError!Io.Datagram) void {
+        const datagram = result catch return;
+        probe.answer_len = datagram.len;
+        probe.io.udpClose(probe.socket);
+        probe.bed.origin.stop();
+        probe.bed.server.beginDrain();
+    }
+};
+
+test "h3 server: a datagram in a version it does not speak is answered with Version Negotiation" {
+    const bed = try Bed.create(5);
+    defer bed.destroy();
+    const probe = try std.testing.allocator.create(VersionProbe);
+    defer std.testing.allocator.destroy(probe);
+    try probe.start(bed);
+    try bed.sim_io.run();
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("h3_version_negotiations"));
+    // RFC 9000 §17.2.1: version zero, and the client's IDs echoed swapped.
+    try std.testing.expect(probe.answer_len >= 7);
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, probe.answer[1..5], .big));
+    try std.testing.expect(bed.server.isIdle());
+}

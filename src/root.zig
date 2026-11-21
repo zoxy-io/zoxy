@@ -61,6 +61,11 @@ pub const http = struct {
             pub const field_block_frames_max = Session.field_block_frames_max;
         };
     };
+    /// The HTTP/3 client the simulator's HTTP/3 population drives (#449):
+    /// zoxy serves HTTP/3 and never dials it, so nothing else uses it.
+    pub const h3 = struct {
+        pub const TestClient = @import("http/h3/TestClient.zig");
+    };
 };
 pub const Io = @import("io/io.zig");
 pub const Pool = @import("mem/Pool.zig").Pool;
