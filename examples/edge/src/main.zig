@@ -56,6 +56,7 @@ pub fn main(init: std.process.Init) !u8 {
         .listen = try address(positional[0]),
         .app = try addresses(arena, positional[1]),
         .static = try addresses(arena, positional[2]),
+        .log_requests = true,
     };
     const options = try edge.options(arena, &instances, &plan);
     const startup: edge.App.Startup = .{

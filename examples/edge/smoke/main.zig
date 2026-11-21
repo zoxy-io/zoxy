@@ -6,7 +6,9 @@
 //!
 //! Its own origins, in this process: three, each answering every request
 //! with `200` and its own address, which is how a response says which
-//! endpoint a pick chose. Usage: `zoxy-edge-smoke <zoxy-edge> <log>`.
+//! endpoint a pick chose, and with the `x-edge-tenant` lines it was sent,
+//! which is how a response says what the edge forwarded. Usage:
+//! `zoxy-edge-smoke <zoxy-edge> <log>`.
 //!
 //! Bounded in wall-clock time by a watchdog: a proxy that stops answering
 //! or never drains ends the run with its log printed, not as a CI timeout
@@ -25,6 +27,10 @@ const origin_requests_max: u32 = 1024;
 const head_bytes_max = 2048;
 /// The widest response this run reads back.
 const response_bytes_max = 4096;
+/// The `x-edge-tenant` values one request's head may carry to an origin,
+/// comma-joined: room for the one the edge sets, and for the forgery a
+/// broken edge would have let through beside it.
+const tenant_lines_bytes_max = 128;
 /// The most of the proxy's log a failing run prints.
 const log_bytes_max = 64 * 1024;
 /// The whole run's wall-clock bound, generous beside the second or so it
@@ -82,16 +88,18 @@ pub fn main(init: std.process.Init) !u8 {
         return err;
     };
 
-    const passed = exercise(io, listen_port, &app, &static_a, &static_b);
+    var passed = exercise(io, listen_port, &app, &static_a, &static_b);
     try std.posix.kill(child.id.?, .TERM);
     const term = try child.wait(io);
     running = false;
+    passed = expectTagLogged(io, arena, log_path) and passed;
     if (!passed or !term.success()) {
         if (!term.success()) std.debug.print("FAIL: zoxy-edge did not drain cleanly on SIGTERM: {any}\n", .{term});
         printLog(io, arena, log_path);
         return 1;
     }
-    std.debug.print("zoxy-edge smoke: routes, pickers and both policy phases over XevIo, clean drain\n", .{});
+    std.debug.print("zoxy-edge smoke: routes, pickers, both policy phases, the tenant's challenge, " ++
+        "header and tag over XevIo, clean drain\n", .{});
     return 0;
 }
 
@@ -103,6 +111,15 @@ fn exercise(io: Io, port: u16, app: *const Origin, static_a: *const Origin, stat
     // `api` and `search` pick through the one shared `LeastInFlight`, over
     // the one application endpoint.
     passed = expectBody(io, port, "GET /orders HTTP/1.1\r\n" ++ tenant, &buffer, app.label()) and passed;
+    // The tenant reaches the origin in the header the edge sets (#424),
+    // and a copy the client forged does not.
+    passed = expectHeader(
+        io,
+        port,
+        "GET /orders HTTP/1.1\r\nx-edge-tenant: forged\r\n" ++ tenant,
+        &buffer,
+        "X-Saw-Tenant: acme\r\n",
+    ) and passed;
     passed = expectBody(io, port, "GET /search?q=zig HTTP/1.1\r\n" ++ tenant, &buffer, app.label()) and passed;
     // One path, one endpoint, twice.
     var first: [64]u8 = undefined;
@@ -116,10 +133,41 @@ fn exercise(io: Io, port: u16, app: *const Origin, static_a: *const Origin, stat
         passed = false;
     }
     passed = expectBody(io, port, "GET /static/app.js HTTP/1.1\r\n" ++ tenant, &buffer, first[0..first_len]) and passed;
-    // A refusal at each phase.
+    // A refusal at each phase: the route's `403`, and the listener's own
+    // challenge (#431), to a request that names no tenant or one that is
+    // not a tenant name.
     passed = expectStatus(io, port, "POST /static/app.js HTTP/1.1\r\nContent-Length: 0\r\n" ++ tenant, &buffer, "403") and passed;
-    passed = expectStatus(io, port, "GET /orders HTTP/1.1\r\nHost: edge\r\nConnection: close\r\n\r\n", &buffer, "403") and passed;
+    const anonymous = "GET /orders HTTP/1.1\r\nHost: edge\r\nConnection: close\r\n\r\n";
+    passed = expectHeader(io, port, anonymous, &buffer, "WWW-Authenticate: Tenant realm=\"edge\"\r\n") and passed;
+    passed = expectStatus(io, port, anonymous, &buffer, "401") and passed;
+    const unnamed = "GET /orders HTTP/1.1\r\nHost: edge\r\nx-tenant: a b\r\nConnection: close\r\n\r\n";
+    passed = expectStatus(io, port, unnamed, &buffer, "401") and passed;
     return passed;
+}
+
+/// `line`, CRLF and all, somewhere in the response's head.
+fn expectHeader(io: Io, port: u16, request: []const u8, buffer: []u8, line: []const u8) bool {
+    const response = exchange(io, port, request, buffer);
+    const head_end = std.mem.indexOf(u8, response, "\r\n\r\n") orelse response.len;
+    if (std.mem.indexOf(u8, response[0..@min(head_end + 2, response.len)], line) != null) return true;
+    std.debug.print("FAIL: {s}expected the line '{s}', got:\n{s}\n", .{ request, line, response });
+    return false;
+}
+
+/// The access log (#433): `acme`'s requests carry its tag, the FNV-1a
+/// hash `TenantGuard` tags them with, as the number `tag`.
+fn expectTagLogged(io: Io, arena: std.mem.Allocator, log_path: []const u8) bool {
+    const bytes = Io.Dir.cwd().readFileAlloc(io, log_path, arena, .limited(log_bytes_max)) catch |err| {
+        std.debug.print("FAIL: the proxy's log could not be read: {s}\n", .{@errorName(err)});
+        return false;
+    };
+    // `"tag":` and a u64's twenty digits.
+    var expected: [32]u8 = undefined;
+    const tag = @max(std.hash.Fnv1a_64.hash("acme"), 1);
+    const field = std.fmt.bufPrint(&expected, "\"tag\":{d}", .{tag}) catch unreachable;
+    if (std.mem.indexOf(u8, bytes, field) != null) return true;
+    std.debug.print("FAIL: no access-log line carries {s}\n", .{field});
+    return false;
 }
 
 fn expectBody(io: Io, port: u16, request: []const u8, buffer: []u8, body: []const u8) bool {
@@ -270,17 +318,30 @@ const Origin = struct {
     fn answer(origin: *Origin, stream: Io.net.Stream) void {
         var read_buffer: [head_bytes_max]u8 = undefined;
         var reader = stream.reader(origin.io, &read_buffer);
+        // Every `x-edge-tenant` line's value, comma-joined: one is what
+        // the edge set, and two would be a forgery it let through.
+        var tenants: [tenant_lines_bytes_max]u8 = undefined;
+        var tenants_len: usize = 0;
         var lines: u32 = 0;
         // Read to the blank line that ends the head; no body is read.
         while (lines < head_bytes_max / 2) : (lines += 1) {
             const line = (reader.interface.takeDelimiter('\n') catch return) orelse return;
             if (line.len == 0 or (line.len == 1 and line[0] == '\r')) break;
+            const name = "x-edge-tenant:";
+            if (line.len < name.len or !std.ascii.eqlIgnoreCase(line[0..name.len], name)) continue;
+            const value = std.mem.trim(u8, line[name.len..], " \t\r");
+            const separator: usize = @intFromBool(tenants_len != 0);
+            if (tenants_len + separator + value.len > tenants.len) return;
+            if (separator == 1) tenants[tenants_len] = ',';
+            @memcpy(tenants[tenants_len + separator ..][0..value.len], value);
+            tenants_len += separator + value.len;
         }
-        var write_buffer: [256]u8 = undefined;
+        assert(tenants_len <= tenants.len);
+        var write_buffer: [512]u8 = undefined;
         var writer = stream.writer(origin.io, &write_buffer);
         writer.interface.print(
-            "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
-            .{ origin.label_len, origin.label() },
+            "HTTP/1.1 200 OK\r\nX-Saw-Tenant: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+            .{ tenants[0..tenants_len], origin.label_len, origin.label() },
         ) catch return;
         writer.interface.flush() catch return;
     }

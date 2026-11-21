@@ -52,6 +52,9 @@ fn isOneOf(body: []const u8, endpoints: []const std.Io.net.IpAddress) bool {
 /// The whole edge, once: both clusters behind the shared picker, the
 /// path-affine one twice on one path, and a refusal at each phase.
 fn exercise(bed: *Bed) !void {
+    // Every request it let on has completed, in the run before this one
+    // too: the count a limit would hold starts each run at zero.
+    try std.testing.expectEqual(@as(u32, 0), instances.tenant_guard.in_flight);
     const read_only_refusals_before = instances.read_only.refused;
 
     const orders = bed.request(0, "GET /orders HTTP/1.1\r\n" ++ tenant);
@@ -60,6 +63,7 @@ fn exercise(bed: *Bed) !void {
     const asset_again = bed.request(0, "GET /static/app.js HTTP/1.1\r\n" ++ tenant);
     const upload = bed.request(0, "POST /static/app.js HTTP/1.1\r\nContent-Length: 0\r\n" ++ tenant);
     const anonymous = bed.request(0, "GET /orders HTTP/1.1\r\nHost: edge\r\nConnection: close\r\n\r\n");
+    const two_tenants = bed.request(0, "GET /orders HTTP/1.1\r\nx-tenant: other\r\n" ++ tenant);
     try bed.run();
 
     // `api` and `search` both pick through the one `LeastInFlight`.
@@ -68,8 +72,11 @@ fn exercise(bed: *Bed) !void {
     try std.testing.expectEqual(@as(?u16, 200), search.status());
     try std.testing.expect(isOneOf(search.body(), &app_endpoints));
     // Counted by the build's own series (#435), which start at zero with
-    // each run: one pick in each cluster, summed.
+    // each run: one pick in each cluster, summed — and each pick heard
+    // its outcome once (#423), neither one failing.
     try std.testing.expectEqual(@as(u64, 2), bed.counter(edge.LeastInFlight, .picks));
+    try std.testing.expectEqual(@as(u64, 2), bed.counter(edge.LeastInFlight, .completed));
+    try std.testing.expectEqual(@as(u64, 0), bed.counter(edge.LeastInFlight, .failed));
 
     // One path, one endpoint, on the cluster `PathAffinity` serves.
     try std.testing.expectEqual(@as(?u16, 200), asset.status());
@@ -77,12 +84,20 @@ fn exercise(bed: *Bed) !void {
     try std.testing.expectEqualStrings(asset.body(), asset_again.body());
 
     // A write to the read-only route is refused once it is routed, and a
-    // request with no tenant before anything looks at it — neither one
-    // reaches an origin.
+    // request with no tenant is challenged before anything looks at it
+    // (#431) — neither one reaches an origin.
     try std.testing.expectEqual(@as(?u16, 403), upload.status());
     try std.testing.expectEqual(read_only_refusals_before + 1, instances.read_only.refused);
-    try std.testing.expectEqual(@as(?u16, 403), anonymous.status());
-    try std.testing.expectEqual(@as(u64, 1), bed.counter(edge.TenantGuard, .refused));
+    try std.testing.expectEqual(@as(?u16, 401), anonymous.status());
+    try std.testing.expect(std.mem.indexOf(u8, anonymous.response(), "WWW-Authenticate: Tenant realm=\"edge\"\r\n") != null);
+    // Nor does one that names two tenants: which one counts is not the
+    // edge's to guess.
+    try std.testing.expectEqual(@as(?u16, 401), two_tenants.status());
+    try std.testing.expectEqual(@as(u64, 2), bed.counter(edge.TenantGuard, .refused));
+    // Every request it let on completed once (#429) — the upload the
+    // route refused after it included — and none is still counted.
+    try std.testing.expectEqual(@as(u64, 5), bed.counter(edge.TenantGuard, .completed));
+    try std.testing.expectEqual(@as(u32, 0), instances.tenant_guard.in_flight);
     try std.testing.expectEqual(@as(u32, 2), answeredBy(bed, &app_endpoints));
     try std.testing.expectEqual(@as(u32, 2), answeredBy(bed, &static_endpoints));
 }

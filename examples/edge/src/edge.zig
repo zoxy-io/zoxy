@@ -8,12 +8,17 @@
 //!
 //! - `LeastInFlight` picks the endpoint with the fewest requests in
 //!   flight. One instance serves both the `api` and `search` clusters, so
-//!   what it counts is shared between them.
+//!   what it counts is shared between them. It hears how each pick turned
+//!   out (#423) and keeps the last time to the origin's first byte.
 //! - `PathAffinity` hashes the request path to an endpoint, so one path
 //!   keeps landing on one endpoint while the set holds still — the
 //!   `static` cluster's cache affinity.
-//! - `TenantGuard`, on the listener, refuses a request that names no
-//!   tenant, before the filters and the routing run.
+//! - `TenantGuard`, on the listener, answers a request that names no
+//!   tenant with a `401` challenge of its own (#431), before the filters
+//!   and the routing run. One it lets on carries its tenant as the
+//!   request's tag (#433), which the access log records, and upstream in
+//!   `x-edge-tenant`, set by the edge (#424) so a client cannot forge
+//!   it; and it counts the request in flight until it completes (#429).
 //! - `ReadOnly`, on the `/static` route, refuses anything but a read once
 //!   the route is chosen and before any connection is taken for it.
 //!
@@ -40,6 +45,11 @@ pub const App = zoxy.App(extensions);
 
 /// The header a request names its tenant in.
 pub const tenant_header = "x-tenant";
+/// The header the edge forwards the tenant upstream in: set by
+/// `TenantGuard`, which replaces any copy the client sent.
+pub const tenant_forward_header = "x-edge-tenant";
+/// The longest tenant name `TenantGuard` lets on.
+pub const tenant_bytes_max = 64;
 
 /// The endpoint with the fewest requests in flight; among equals, the one
 /// offered first, so the choice is a function of what zoxy offered.
@@ -48,8 +58,15 @@ pub const LeastInFlight = struct {
     clusters: u16 = 0,
 
     pub const metrics_prefix = "least_in_flight";
-    pub const counters = .{ .picks = "Picks the least-in-flight picker made." };
-    pub const gauges = .{ .chosen_in_flight = "Requests in flight at the endpoint the last pick chose." };
+    pub const counters = .{
+        .picks = "Picks the least-in-flight picker made.",
+        .completed = "Picks whose outcome was final.",
+        .failed = "Picks that ended in a failed dial, a timeout or an origin failure.",
+    };
+    pub const gauges = .{
+        .chosen_in_flight = "Requests in flight at the endpoint the last pick chose.",
+        .head_us = "Microseconds from the last answered pick to its response head.",
+    };
 
     pub fn bind(
         picker: *LeastInFlight,
@@ -80,6 +97,22 @@ pub const LeastInFlight = struct {
         input.metrics.set(LeastInFlight, .chosen_in_flight, candidates.inFlight(best));
         return best;
     }
+
+    /// How a pick turned out (#423), once per pick, once it is final: a
+    /// latency-steering picker would fold `head_ns - picked_ns` into a
+    /// per-endpoint average here; this one keeps the last.
+    pub fn complete(picker: *LeastInFlight, done: *const zoxy.extension.Completion) void {
+        assert(picker.clusters >= 1);
+        assert(done.done_ns >= done.picked_ns);
+        done.metrics.add(LeastInFlight, .completed, 1);
+        switch (done.outcome) {
+            .connect_failed, .timed_out, .failed => done.metrics.add(LeastInFlight, .failed, 1),
+            else => {},
+        }
+        const head_ns = done.head_ns orelse return;
+        assert(head_ns >= done.picked_ns);
+        done.metrics.set(LeastInFlight, .head_us, (head_ns - done.picked_ns) / std.time.ns_per_us);
+    }
 };
 
 /// One path, one endpoint: FNV-1a over the canonical path, modulo the
@@ -102,27 +135,101 @@ pub const PathAffinity = struct {
     }
 };
 
-/// A request names its tenant, or is refused before anything else looks
-/// at it.
+/// A request names its tenant, or is answered with a challenge before
+/// anything else looks at it. One it lets on is tagged with its tenant,
+/// forwards it in a header the edge sets, and is counted until it ends.
 pub const TenantGuard = struct {
     /// The header a request names its tenant in.
     header: []const u8 = tenant_header,
+    /// Requests let on that have not completed: what a concurrency limit
+    /// counts up on the way in and back down in `complete`.
+    in_flight: u32 = 0,
+    /// The last verdict's edit. A verdict outlives `evaluate`, so its
+    /// edits live here rather than on the stack; zoxy copies them as it
+    /// reads the verdict, before the next request's call.
+    edits: [1]zoxy.extension.Edit = undefined,
 
     pub const metrics_prefix = "tenant_guard";
-    pub const counters = .{ .refused = "Requests refused for naming no tenant." };
+    pub const counters = .{
+        .refused = "Requests answered with the tenant challenge.",
+        .completed = "Requests let on whose exchange has ended.",
+    };
+    pub const gauges = .{ .in_flight = "Requests let on whose exchange has not yet ended." };
+
+    /// Its own answer (#431), rendered once at startup: the static four
+    /// have no `401`, and a challenge names its scheme.
+    pub const answers = .{
+        .challenge = zoxy.extension.Answer{
+            .status = 401,
+            .headers = &.{.{ .name = "WWW-Authenticate", .value = "Tenant realm=\"edge\"" }},
+            .body = "name your tenant in x-tenant\n",
+        },
+    };
+    /// What one verdict's edits may copy (#424): the forwarded header and
+    /// the longest tenant.
+    pub const edit_bytes_max = tenant_forward_header.len + tenant_bytes_max;
 
     pub fn evaluate(guard: *TenantGuard, request: *const zoxy.extension.Request) zoxy.extension.Verdict {
         assert(request.cluster_index == null); // The listener phase.
         assert(guard.header.len >= 1);
-        for (request.headers) |header| {
-            if (std.ascii.eqlIgnoreCase(header.name, guard.header) and header.value.len >= 1) {
-                return .proceed;
-            }
-        }
-        request.metrics.add(TenantGuard, .refused, 1);
-        return .{ .reject = .forbidden };
+        const tenant = tenantOf(request, guard.header) orelse {
+            request.metrics.add(TenantGuard, .refused, 1);
+            return zoxy.extension.respond(TenantGuard, .challenge);
+        };
+        assert(tenant.len <= tenant_bytes_max);
+        guard.in_flight += 1;
+        request.metrics.set(TenantGuard, .in_flight, guard.in_flight);
+        // The value is the request's own, which zoxy still holds when it
+        // copies the edit; `set` replaces every copy the client sent. It
+        // must stay a valid field value within `edit_bytes_max`, which
+        // `tenantOf` guarantees: an edit zoxy refused would answer `400`
+        // without this request ever completing, and `in_flight` would
+        // count it forever.
+        guard.edits = .{.{ .set = .{ .name = tenant_forward_header, .value = tenant } }};
+        return .{ .proceed_with = .{ .tag = tenantTag(tenant), .edits = &guard.edits } };
+    }
+
+    /// How a request it let on ended (#429): exactly once, at its
+    /// access-log line, whatever ended it — the route's `ReadOnly`
+    /// refusing it included.
+    pub fn complete(guard: *TenantGuard, done: *const zoxy.extension.RequestCompletion) void {
+        assert(guard.in_flight >= 1);
+        assert(done.route_index == null); // It sits on the listener only.
+        guard.in_flight -= 1;
+        done.metrics.add(TenantGuard, .completed, 1);
+        done.metrics.set(TenantGuard, .in_flight, guard.in_flight);
     }
 };
+
+/// The tenant `header` names, when it names exactly one `TenantGuard`
+/// lets on: 1 to `tenant_bytes_max` letters, digits and dashes — a name
+/// that is safe in a header and in a URL as it stands. Two lines naming
+/// a tenant name none: which one an origin would read is not the edge's
+/// to guess.
+pub fn tenantOf(request: *const zoxy.extension.Request, header: []const u8) ?[]const u8 {
+    assert(header.len >= 1);
+    var tenant: ?[]const u8 = null;
+    for (request.headers) |line| {
+        if (!std.ascii.eqlIgnoreCase(line.name, header)) continue;
+        if (tenant != null) return null;
+        const value = line.value;
+        if (value.len == 0 or value.len > tenant_bytes_max) return null;
+        for (value) |octet| {
+            if (!std.ascii.isAlphanumeric(octet) and octet != '-') return null;
+        }
+        tenant = value;
+    }
+    if (tenant) |value| assert(value.len <= tenant_bytes_max);
+    return tenant;
+}
+
+/// A tenant's tag (#433): its FNV-1a hash, which the access log records
+/// as `"tag":N` and every later view of the request carries. Never zero,
+/// which would mean no tag.
+pub fn tenantTag(tenant: []const u8) u64 {
+    assert(tenant.len >= 1);
+    return @max(std.hash.Fnv1a_64.hash(tenant), 1);
+}
 
 /// The route this sits on is read-only: anything but `GET` and `HEAD` is
 /// refused once the route is chosen, before a connection is taken for it.
@@ -158,6 +265,9 @@ pub const Plan = struct {
     app: []const std.Io.net.IpAddress,
     /// The static-content endpoints.
     static: []const std.Io.net.IpAddress,
+    /// Log every request to standard output, its tenant's tag in it: the
+    /// binary does, and the simulator tests, which read no log, do not.
+    log_requests: bool = false,
 };
 
 /// zoxy-edge's options: one HTTP listener guarded by `TenantGuard`, with
@@ -202,6 +312,7 @@ pub fn options(
     return .{
         .listeners = listeners,
         .clusters = clusters,
+        .access_log = if (plan.log_requests) .{ .sink = .stdout } else null,
         .timeouts = zoxy.defaults.timeouts,
         .limits = zoxy.defaults.limits,
     };
