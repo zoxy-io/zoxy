@@ -24,9 +24,9 @@ zoxy --help                # usage summary (-h)
 zoxy --version             # print the version (-V)
 ```
 
-A release build prints its bare version, `zoxy 0.8.2`. A build from source
+A release build prints its bare version, `zoxy 1.1.0`. A build from source
 after a release adds a suffix that identifies it,
-`zoxy 0.8.2 (v0.8.2-5-gabc1234)`, plus `-dirty` if the tree had uncommitted
+`zoxy 1.1.0 (v1.1.0-5-gabc1234)`, plus `-dirty` if the tree had uncommitted
 changes, so the version in a bug report names the exact build. Packagers
 can name a build with `zig build -Dbuild-id=…`. The startup banner opens
 with the same line.
@@ -45,23 +45,26 @@ demand against `RLIMIT_NOFILE`. Then it exits without binding a port:
 
 ```console
 $ zoxy --check config.json
-zoxy 0.8.2
+zoxy 1.1.0
 budgets (DESIGN.md §5/§8; closed-form except where marked):
-  memory  total 47297 KiB = conn slots 1386 x 512 B + stream slots 1386 x 1552 B
+  memory  total 47879 KiB = conn slots 1386 x 576 B + stream slots 1386 x 1896 B
           + relay buffers 1386 x 32808 B
-          + upstream slots 1311 x 48 B + head buffers 0 x 8192 B (+ ring 0 B)
+          + upstream slots 1311 x 56 B + head buffers 0 x 8192 B (+ ring 0 B)
           + upstream head buffers 0 x 8216 B + head scratch 8192 B
           + access log 0 KiB (+ logged headers 0 B)
-          + endpoint tables 29 B (1 cluster(s) x 1 wide)
-          + labeled metrics 26450 B (tables, labels and render buffers)
+          + endpoint tables 81 B (1 cluster(s) x 1 wide)
+          + labeled metrics 39662 B (tables, labels and render buffers)
           + policy answers 0 B (a build's own pages, four variants each)
           + policy edits 0 B (a build's request edits, every stream slot)
           + consult slots 0 B (a build's consult requests and replies)
           + tunnels 0 x 0 B (their own relay buffers, never HTTP's)
           + tls engines 0 x 0 B (+ plaintext 0 B each, libcrypto heap 0 KiB)
-          + config arena 2 KiB (measured, not closed-form)
+          + h2 sessions 0 x 0 B + stream heads 0 x 0 B
+          + h2 origins 0 x 0 B + origin streams 0 x 0 B
+          + https origin sessions 0 x 0 B
+          + config arena 9 KiB (measured, not closed-form)
   fds     4093 required (asserted against RLIMIT_NOFILE)
-  ring    4096 entries, completion queue 8192, in-flight ops <= 6869
+  ring    4096 entries, completion queue 8192, in-flight ops <= 5559
   config  1 listener(s), 1 cluster(s), 0 error page(s), access log off
   rlimit  RLIMIT_NOFILE 1024 soft, 524288 hard (a start raises the soft limit to the fd budget)
   check   config.json: valid, and this box can start it
