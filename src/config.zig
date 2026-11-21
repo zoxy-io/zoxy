@@ -1164,6 +1164,10 @@ pub const ValidationError = error{
     /// A `quic` binding on a listener without `tls` (#449): QUIC is always
     /// TLS 1.3, and the binding presents the listener's certificates.
     ListenerQuicWithoutTls,
+    /// A `quic` binding that advertises itself on a listener whose response
+    /// filters already use every header edit (#449): its `Alt-Svc` is one
+    /// edit more. A max-age of zero advertises nothing and takes none.
+    ListenerQuicAltSvcOverEditLimit,
     /// A `quic` bind that is a `unix:` path (#449): QUIC rides UDP
     /// datagrams, which a socket file does not carry here.
     ListenerQuicBindNotIp,
@@ -2934,7 +2938,7 @@ fn resolveHttpListener(
         .request_filters = try resolveRequestFilters(arena, http.request_filters, head_buffer_bytes, bodies),
         .request_policies = http.request_policies,
         .response_policies = http.response_policies,
-        .response_filters = try resolveResponseFilters(arena, http.response_filters),
+        .response_filters = try resolveListenerResponseFilters(arena, http),
         .protocol = .http,
         .forwarded = http.forwarded,
         .proxy_protocol = null,
@@ -3342,6 +3346,47 @@ fn resolveResponseFilters(
     assert(rules.len == stated.len);
     return rules;
 }
+
+/// A listener's response rules (#175) and, on one whose QUIC binding names
+/// its port and an advertisement age, the rule that advertises it (#449):
+/// `Alt-Svc: h3=":<port>"; ma=<age>` on every answer relayed from an origin
+/// — over TCP and HTTP/3 alike — RFC 7838's way of telling a client the
+/// same origin speaks HTTP/3. Set rather than added: an origin's own
+/// Alt-Svc names its alternatives, not this proxy's. After the operator's
+/// rules, though a response policy's edit composes after every rule. It is
+/// one of the listener's response header edits, held to the same cap. A
+/// binding on port zero is given its port only when it binds, so it
+/// advertises none — and the port advertised is the one bound, which a
+/// port mapped in front of the proxy is not.
+fn resolveListenerResponseFilters(
+    arena: std.mem.Allocator,
+    http: *const Options.Listener.Http,
+) ResolveError![]const filter.ResponseRule {
+    const stated = try resolveResponseFilters(arena, http.response_filters);
+    const quic = http.quic orelse return stated;
+    if (quic.alt_svc_max_age_s == 0) return stated;
+    const port = switch (quic.bind) {
+        .ip => |ip| ip.getPort(),
+        .unix => return stated, // `resolveQuic` refuses it, by name.
+    };
+    if (port == 0) return stated;
+    var edits_total: u32 = 0;
+    for (stated) |*rule| edits_total += @intCast(rule.edits.len);
+    assert(edits_total <= constants.header_edits_max); // `resolveResponseFilters` held it.
+    if (edits_total + 1 > constants.header_edits_max) return error.ListenerQuicAltSvcOverEditLimit;
+    assert(edits_total + 1 <= constants.header_edits_max);
+    const value = try std.fmt.allocPrint(arena, "h3=\":{d}\"; ma={d}", .{ port, quic.alt_svc_max_age_s });
+    const edits = try arena.alloc(filter.AppliedHeaderEdit, 1);
+    edits[0] = .{ .kind = .set, .name = alt_svc_name, .value = value };
+    const rules = try arena.alloc(filter.ResponseRule, stated.len + 1);
+    @memcpy(rules[0..stated.len], stated);
+    rules[stated.len] = .{ .match = .{}, .edits = edits };
+    assert(rules[stated.len].edits.len == 1);
+    return rules;
+}
+
+/// RFC 7838 §3's field.
+pub const alt_svc_name = "Alt-Svc";
 
 fn resolveResponseMatch(
     arena: std.mem.Allocator,
@@ -4977,6 +5022,32 @@ test "config: a QUIC binding written as options meets the loader's rules (#449)"
     const binding = listeners[0].quic.?;
     try std.testing.expect(binding.bind_address.eql(&udp));
     try std.testing.expectEqual(constants.alt_svc_max_age_s_default, binding.alt_svc_max_age_s);
+    // Advertised on every answer (RFC 7838), set over whatever an origin
+    // said: the one response rule the binding brings.
+    try std.testing.expectEqual(@as(usize, 1), listeners[0].response_filters.len);
+    const advertised = listeners[0].response_filters[0];
+    try std.testing.expectEqual(@as(usize, 0), advertised.match.statuses.len);
+    try std.testing.expectEqual(filter.AppliedHeaderEdit.Kind.set, advertised.edits[0].kind);
+    try std.testing.expectEqualStrings(alt_svc_name, advertised.edits[0].name);
+    try std.testing.expectEqualStrings("h3=\":8443\"; ma=86400", advertised.edits[0].value);
+    // An age of zero advertises nothing; nor does a port the kernel picks.
+    var silent = bound;
+    silent.protocol.http.quic = .{ .bind = .{ .ip = udp }, .alt_svc_max_age_s = 0 };
+    const quiet = try resolveListeners(arena, &[_]Options.Listener{silent}, clusters, head_bytes, &.{});
+    try std.testing.expectEqual(@as(usize, 0), quiet[0].response_filters.len);
+    var ephemeral = bound;
+    ephemeral.protocol.http.quic = .{ .bind = .{ .ip = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0") } };
+    const unknown = try resolveListeners(arena, &[_]Options.Listener{ephemeral}, clusters, head_bytes, &.{});
+    try std.testing.expectEqual(@as(usize, 0), unknown[0].response_filters.len);
+    // A listener whose own rules take every edit has none left for it.
+    var edits: [constants.header_edits_max]Options.Listener.ResponseAction = undefined;
+    for (&edits) |*action| action.* = .{ .header_set = .{ .name = "X-Edit", .value = "1" } };
+    var full = bound;
+    full.protocol.http.response_filters = &.{.{ .actions = &edits }};
+    try std.testing.expectError(
+        error.ListenerQuicAltSvcOverEditLimit,
+        resolveListeners(arena, &[_]Options.Listener{full}, clusters, head_bytes, &.{}),
+    );
 
     // Counted only beside TLS, which it is refused without before any
     // pool is sized — and again by its own resolver, for code that
