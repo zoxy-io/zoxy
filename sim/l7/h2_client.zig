@@ -3,13 +3,16 @@
 //! oracle over every frame that came back.
 //!
 //! A stream asks what the HTTP/1.1 population's `get` script asks, or
-//! POSTs a body to the same path (#373), so the same origin answers them
-//! and the same canonical bodies judge them. A POST's body is marked, and
-//! the origin checks every octet of it. Its length is declared or not,
-//! which the proxy then forwards chunked. It goes in up to
-//! `body_frames_max` DATA frames, one per stream per turn after every
-//! head, so a frame held for its stream's room holds its siblings behind
-//! it.
+//! what its `consult_get` asks (#437), or POSTs a body to `get`'s path
+//! (#373), so the same origin answers them and the same canonical bodies
+//! judge them. A consult's GET parks on the listener's consulting policy
+//! first, and the streams of one connection park side by side: a few of
+//! them hold every consult slot a small pool has, which no pair of
+//! HTTP/1.1 clients meets but by chance. A POST's body is marked, and the
+//! origin checks every octet of it. Its length is declared or not, which
+//! the proxy then forwards chunked. It goes in up to `body_frames_max`
+//! DATA frames, one per stream per turn after every head, so a frame held
+//! for its stream's room holds its siblings behind it.
 //!
 //! The oracle is per stream, and holds on every seed: whatever came back
 //! is whole frames, each stream is answered at most once, with a status
@@ -57,7 +60,7 @@ pub const ClientError = error{
     /// A frame on a stream this client never opened, or a second final
     /// answer on one it did.
     StreamUnexpected,
-    /// A final status outside the `get` script's allowed set.
+    /// A final status outside its script's allowed set (`scriptOf`).
     StatusUnexpected,
     /// A 200 body that is not a canonical origin body, nor a prefix of
     /// one on a stream that was cut short.
@@ -100,9 +103,13 @@ pub const Mode = enum {
     };
 };
 
-/// What an exchange's stream asks (#373): `get`'s GET, or a POST whose
-/// body the origin checks octet by octet, its length declared or not.
-pub const Ask = enum(u8) { get, post_declared, post_undeclared };
+/// What an exchange's stream asks (#373): `get`'s GET, a POST whose
+/// body the origin checks octet by octet, its length declared or not, or
+/// `consult_get`'s GET under `canon.consult_prefix` (#437).
+pub const Ask = enum(u8) { get, post_declared, post_undeclared, consult_get };
+
+/// `get`'s path, which every stream asks for but a consult's.
+const get_path = "/sim";
 
 /// One stream's request: what it asks and, for a POST, its body's length
 /// and the DATA frames it is cut into, each at least one octet.
@@ -112,7 +119,27 @@ pub const Plan = struct {
     frames: u8 = 0,
 
     pub fn carriesBody(plan: Plan) bool {
-        return plan.ask != .get;
+        return switch (plan.ask) {
+            .get, .consult_get => false,
+            .post_declared, .post_undeclared => true,
+        };
+    }
+
+    /// The HTTP/1.1 script whose statuses this stream may hear: a POST's
+    /// is the sized POST's — `get`'s, and the #236 body cap's 413.
+    fn scriptOf(plan: Plan) scripts.Script {
+        return switch (plan.ask) {
+            .get => .get,
+            .consult_get => .consult_get,
+            .post_declared, .post_undeclared => .post_sized,
+        };
+    }
+
+    /// The path this stream asks for.
+    fn path(plan: Plan) []const u8 {
+        assert(canon.consult_prefix.len >= 1);
+        assert(!std.mem.startsWith(u8, get_path, canon.consult_prefix));
+        return if (plan.ask == .consult_get) canon.consult_prefix else get_path;
     }
 };
 
@@ -418,10 +445,7 @@ pub fn Client(comptime IoType: type) type {
             const plans = client.plans[0..client.streams];
             const goaway_last = try readAnswers(client.receive_buffer[0..client.received_len], plans, &answers);
             for (answers[0..client.streams], plans, 0..) |*answer, plan, index| {
-                // A POST's statuses are the sized POST script's: `get`'s,
-                // and the #236 body cap's 413.
-                const script: scripts.Script = if (plan.carriesBody()) .post_sized else .get;
-                const allowed = scripts.spec(script).allowed_statuses;
+                const allowed = scripts.spec(plan.scriptOf()).allowed_statuses;
                 if (answer.status != 0 and std.mem.indexOfScalar(u16, allowed, answer.status) == null) {
                     return error.StatusUnexpected;
                 }
@@ -808,7 +832,7 @@ pub fn Client(comptime IoType: type) type {
             assert(plan.carriesBody() == (plan.frames >= 1));
             const start = len.*;
             if (!plan.carriesBody()) {
-                writeHead(out, len, id, "GET", flag_end_stream | flag_end_headers);
+                writeHead(out, len, id, "GET", plan.path(), flag_end_stream | flag_end_headers);
                 return;
             }
             assert(plan.frames <= body_frames_max);
@@ -821,7 +845,7 @@ pub fn Client(comptime IoType: type) type {
             const marked = [_][2][]const u8{.{ canon.request_body_header, mark }};
             const declared = [_][2][]const u8{ .{ "content-length", length }, marked[0] };
             const extra: []const [2][]const u8 = if (plan.ask == .post_declared) &declared else &marked;
-            writeHeadTraced(out, len, id, "POST", flag_end_headers, canon.log_request_value, extra);
+            writeHeadTraced(out, len, id, "POST", plan.path(), flag_end_headers, canon.log_request_value, extra);
             assert(len.* - start <= head_bytes_max);
         }
 
@@ -843,17 +867,17 @@ pub fn Client(comptime IoType: type) type {
             len.* += size;
         }
 
-        /// A request head for `get`'s path, with `method`, every field a
+        /// A request head for `path`, with `method`, every field a
         /// literal without indexing on a new name (RFC 7541 §6.2.2): no
         /// table on this side either.
-        fn writeHead(out: *[request_bytes_max]u8, len: *u32, id: u31, method: []const u8, flags: u8) void {
-            writeHeadTraced(out, len, id, method, flags, canon.log_request_value, &.{});
+        fn writeHead(out: *[request_bytes_max]u8, len: *u32, id: u31, method: []const u8, path: []const u8, flags: u8) void {
+            writeHeadTraced(out, len, id, method, path, flags, canon.log_request_value, &.{});
         }
 
         /// A flood's request head: traced as one, so the access log can
         /// tell the exchanges the server ended on purpose.
         fn writeFloodHead(out: *[request_bytes_max]u8, len: *u32, id: u31, method: []const u8, flags: u8) void {
-            writeHeadTraced(out, len, id, method, flags, canon.log_request_flood_value, &.{});
+            writeHeadTraced(out, len, id, method, get_path, flags, canon.log_request_flood_value, &.{});
         }
 
         /// `writeHead`'s frame, carrying `trace` as the access log's
@@ -863,16 +887,19 @@ pub fn Client(comptime IoType: type) type {
             len: *u32,
             id: u31,
             method: []const u8,
+            path: []const u8,
             flags: u8,
             trace: []const u8,
             extra: []const [2][]const u8,
         ) void {
+            assert(path.len >= 1);
+            assert(path[0] == '/');
             const start = len.*;
             len.* += 9;
             const fields = [_][2][]const u8{
                 .{ ":method", method },
                 .{ ":scheme", "http" },
-                .{ ":path", "/sim" },
+                .{ ":path", path },
                 .{ ":authority", "sim" },
                 .{ canon.log_request_header, trace },
             };
