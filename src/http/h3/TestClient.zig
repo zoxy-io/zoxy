@@ -109,6 +109,9 @@ pub fn TestClient(comptime IoType: type) type {
         /// may cut what is in flight, from one that came too early.
         started_ns: u64,
         peer_closed_ns: u64,
+        /// The port this client's socket bound on loopback: what the
+        /// server's access log names it by.
+        local_port: u16,
         on_done: *const fn (*anyopaque) void,
         context: *anyopaque,
 
@@ -129,6 +132,8 @@ pub fn TestClient(comptime IoType: type) type {
             // it could be built on the stack before it is copied in.
             client.io = io;
             client.socket = try io.udpBind(.{ .ip4 = .loopback(0) });
+            client.local_port = io.udpAddress(client.socket).getPort();
+            assert(client.local_port != 0);
             client.server = server;
             client.http3 = .init(.client);
             client.requests = requests;
