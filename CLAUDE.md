@@ -28,22 +28,26 @@ direnv activates the shell). Read before writing code:
 - `zig build h2spec` (h2spec against the shipped build, over h2c and TLS;
   its failures must equal DESIGN.md §12's recorded deviations) runs at
   merge, beside the bench.
+- `zig build h3spec` (h3spec 0.1.15 against the shipped build, over QUIC;
+  its failures must equal §12's recorded deviations — none — and its one
+  pending case the 0-RTT one §12 records) runs at merge too.
 - `zig build bench` (Tier 1: zrk against an nginx origin) runs at merge,
   not per change — compare bands across runs, never single numbers.
 
 ## Policies
 
 - Dependencies are audited forks pinned by content hash in build.zig.zon
-  (libxev, hparse, h2, zssl, and openssl, which builds the libcrypto zssl
-  binds). A pin moves only after re-audit. libxev, hparse and h2 are pure
-  Zig; zssl is the one C surface — a Zig TLS 1.3 protocol layer over
+  (libxev, hparse, h2, h3, zssl, and openssl, which builds the libcrypto
+  zssl binds). A pin moves only after re-audit. libxev, hparse, h2 and h3
+  are pure Zig; zssl is the one C surface — a Zig TLS 1.3 protocol layer over
   libcrypto primitives (DESIGN.md §4's scoped exception), and the C
   binding lives inside it, so `@cImport` stays lint-forbidden here. zrk
   and zio are pinned too: they build the bench and profile harnesses
   (which `ci` compiles), never the zoxy binary.
 - Boundaries (lint-enforced): raw syscalls and the `xev` import live only
   under `src/io/`; `hparse` is imported only by `src/http/parser.zig`;
-  `h2` only under `src/http/h2/`; `zssl` only under `src/tls/`.
+  `h2` only under `src/http/h2/`; `h3` only under `src/http/h3/`; `zssl`
+  only under `src/tls/`.
 - Zero allocation after startup. The memory, fd, and ring budgets are
   closed-form functions of `src/constants.zig` and the loaded config.
   Where a budget is a property of one constant it is comptime-asserted;

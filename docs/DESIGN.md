@@ -50,14 +50,18 @@ Goals, in priority order:
    hooks (§13).
 5. **The serving surface:**
    - an L4 TCP relay (§6);
-   - an HTTP/1.1 reverse proxy that HTTP/2 clients also reach (§7);
+   - an HTTP/1.1 reverse proxy that HTTP/2 and HTTP/3 clients also
+     reach (§7);
    - origins spoken to over HTTP/1.1, HTTPS, h2c and h2, with gRPC
      carried, trailers included;
    - TLS 1.3 terminated and originated (§4).
 
 Non-goals. Each is recorded so that it reads as a decision, not as drift:
 
-- **HTTP/3.**
+- **QUIC past the edge.** HTTP/3 is served to clients (§7), and that is
+  all of QUIC there is: no HTTP/3 to origins, no L4 QUIC pass-through,
+  no 0-RTT (replay is a policy question for later), no server push, no
+  QPACK dynamic table, and no active connection migration.
 - **Caching, compression, body transformation.** Header edits and path
   prefix rewrites are filters (§7). Bodies pass through untouched.
 - **Envoy or nginx parity, or runtime plugins.** That includes
@@ -134,6 +138,14 @@ stickiness still agree across processes because both are stateless
 (§7). A `unix:` listener binds its path once, so it does not spread
 across processes.
 
+**A QUIC binding is one process's.** The kernel hashes each *datagram* to
+a `SO_REUSEPORT` socket, not each connection, so a client whose NAT
+rebinds its port would land on a sibling with no state for it. A QUIC
+binding is therefore bound without `SO_REUSEPORT`, and a second process
+asking for the port is refused at start. Steering by connection ID — an
+eBPF program reading a process index that minted IDs would then carry
+beside the slot index — is a later step (#452).
+
 **Handshake CPU.** Signing occupies the loop until the signature is
 ready. An RSA signature can take milliseconds, so certificate selection
 prefers ECDSA among compatible keys within the same name tier (§4).
@@ -154,7 +166,8 @@ audited commit, and a pin moves only after a re-audit.
 | libxev | proactor event loop: io_uring, with kqueue and epoll for development | `src/io/` |
 | hparse | HTTP/1.1 head syntax: SIMD, zero-copy, no allocation | `src/http/parser.zig` |
 | h2 | HTTP/2 frames, HPACK, RFC 9113 §8 field rules; holds no allocator | `src/http/h2/` |
-| zssl | the TLS 1.3 protocol layer, in Zig, over libcrypto primitives | `src/tls/` |
+| h3 | QUIC (RFC 9000, 9001, 9002), QPACK's static table, HTTP/3 (RFC 9114); sans-I/O, holds no allocator, its packet protection a comptime backend | `src/http/h3/` |
+| zssl | the TLS 1.3 protocol layer, in Zig, over libcrypto primitives, with RFC 9001's QUIC mode | `src/tls/` |
 | openssl 3.5 LTS | libcrypto, compiled by Zig from vendored C | inside zssl |
 
 The lint enforces every import boundary. `@cImport` is forbidden in
@@ -403,7 +416,9 @@ whose feature no config names has count 0 and costs nothing.**
 | tunnels | an upgraded connection's life | `tunnels`: required with upgrades, ≤ conn slots | as a relay buffer |
 | TLS engines | a TLS connection's life | `tls_engines`: min(conn slots, 1024) → 1024, if a listener terminates | ~92 KiB + plaintext |
 | HTTP/2 sessions | an HTTP/2 connection's life | `h2_connections`: min(conn slots, 1024) → conn slots, if a listener speaks HTTP/2 | ~100 KiB |
-| shared streams + heads | one HTTP/2 stream | `h2_streams`: required with HTTP/2 | a stream + a head |
+| shared streams + heads | one HTTP/2 or HTTP/3 stream | `h2_streams`: required with HTTP/2 or a QUIC binding | a stream + a head |
+| HTTP/3 connections | a QUIC connection's life | `quic_connections`: min(64, conn slots, TLS engines), if a listener has a QUIC binding | ~835 KiB: the transport and its streams' buffers |
+| QUIC endpoints | the process's life | one per QUIC binding | 8 receives and 32 sends in flight, their datagram buffers (~80 KiB) |
 | HTTP/2 origin connections | pooled | min(2 × HTTP/2 endpoints, 4096) | a client session + buffers |
 | HTTP/2 origin streams | one leg | = upstream slots | staging for one stream |
 | HTTPS origin sessions | with their upstream slot | min(16 × HTTPS endpoints, upstream slots, heap room) | a TLS client |
@@ -436,6 +451,14 @@ Why pools have these shapes:
   (§13), so the ring and fd reservations already cover it: the stream
   arms nothing else while it waits. A consult that finds no slot free
   takes its type's declared failure.
+- **An HTTP/3 connection is ~835 KiB.** h3 sizes a connection at compile
+  time, every stream's buffers inside it — 15 streams (8 requests, the
+  client's 4 unidirectional, its own 3), 16 KiB in and 32 KiB out apiece
+  (`constants.zig`'s HTTP/3 block) — beside its transport state, so its
+  pool is priced per connection rather than per activity. It also holds
+  a conn slot, an admission stream that carries nothing, and a TLS
+  engine for its life. Borrowing stream buffers from the shared pools is
+  the follow-up that would make idle cheap here too (#451).
 - **TLS engines are capped at 1024.** An engine is about ten times the
   size of a default head buffer, so one per conn slot at the ceiling
   would be gigabytes. A deployment past the cap sheds instead.
@@ -684,7 +707,7 @@ flowchart LR
     there is no request to send elsewhere.
   - An HTTPS or HTTP/2 cluster cannot sit behind an `l4` listener.
 
-## 7. L7 data path — HTTP/1.1 and HTTP/2
+## 7. L7 data path — HTTP/1.1, HTTP/2 and HTTP/3
 
 ```mermaid
 flowchart LR
@@ -1089,6 +1112,85 @@ gates startup.
   idling, and at `keepalive_requests`. A budget overrun gets
   `GOAWAY(ENHANCE_YOUR_CALM)` (§8).
 
+### HTTP/3 to clients
+
+- **How a client arrives.** An `http` listener with `tls` may name a
+  QUIC binding (`http.quic`), a UDP address, usually its own port. It
+  shares the listener's routes, filters, policies and certificates; ALPN
+  is `h3` alone. Every answer the listener relays from an origin — over
+  TCP and over HTTP/3 alike — carries `Alt-Svc: h3=":<port>"; ma=<age>`
+  (RFC 7838), set over the origin's own, so clients learn the binding. It
+  takes one of the listener's response header edits. The proxy's own
+  answers (a shed `503`, a static page) carry none, and the port it names
+  is the one bound: behind a port mapping, a config sets
+  `alt_svc_max_age_s` to 0 and writes the field as its own response
+  filter.
+- **The split:**
+  - the `h3` package owns QUIC and HTTP/3: packets and frames, loss
+    recovery (NewReno), flow control, QPACK's static table, and the
+    session's control and QPACK streams. Its packet protection is a
+    comptime backend, and zoxy's is libcrypto (`QuicCrypto.zig`, §4):
+    nine contexts made once for the process, rekeyed per call;
+  - zssl runs the handshake in QUIC mode (RFC 9001 §4): CRYPTO octets in
+    per level, the flight, traffic secrets and transport parameters out;
+  - `Connection.zig` is one connection's slot, sans-I/O: the transport,
+    the session, and the pump between the transport and the engine. A
+    refusal closes with the code RFC 9000 and 9001 name:
+    TRANSPORT_PARAMETER_ERROR for parameters a client may not send, the
+    alert's CRYPTO_ERROR or PROTOCOL_VIOLATION for what the engine refuses,
+    and INTERNAL_ERROR for this side's own failure;
+  - `Endpoint.zig` is the binding's UDP socket, and every op on it: 8
+    receives and 32 sends in flight, and a queue of the connections with
+    a datagram to send, served in turn;
+  - `driver.zig` is a connection's place in the server: a pass per
+    datagram and per timer — the handshake carried, transport events
+    handed to their exchanges, cut-short answers offered again (h3
+    raises no writable event), bodies with room read into — then its
+    datagrams queued and its timer aimed.
+- **A connection is a `Conn`** in state `.h3`, with no socket of its own:
+  its admission stream carries nothing, its exchanges run on shared
+  stream slots as HTTP/2's do, and teardown, drain and deadlines are the
+  rest of the server's. A teardown decided inside a pass waits for the
+  pass to end.
+- **Connection IDs.** Every ID the server mints is eight octets: the slot
+  index, then four random ones. A short header's destination names its
+  slot, so routing is an index and a compare. A client's Initials carry
+  the ID it chose — or after a Retry, the one the Retry named — until it
+  hears the server's, and those are matched against the handshaking
+  connections, a scan paid only on Initials.
+- **Admission.** An Initial nothing holds may start a connection, after
+  the listener's connection policies (#425). Once the pool is half full
+  it is Retried first: its token a MAC over the client's original ID, its
+  address and the time, good for ten seconds. An unknown version gets
+  Version Negotiation; a short header no connection holds, a stateless
+  reset, always shorter than its trigger. A connection that never opens
+  a packet is given one idle window from birth.
+- **Downgrade, the same boundary.** A request's QPACK section decodes to
+  the fields HPACK yields, and `downgrade` writes the HTTP/1.1 head it
+  stands for and parses it back. A section that does not decode is
+  QPACK's connection error; a malformed message is `H3_MESSAGE_ERROR`
+  on its stream. The answer is mapped as HTTP/2's is.
+- **Streams.** Each request stream runs on a shared stream slot; a
+  connection opens at most 8 at once. One the pool cannot hold is
+  `H3_REQUEST_REJECTED`, which the client may retry. A failure scoped to
+  a stream cancels it both ways with `H3_INTERNAL_ERROR`. A stream whose
+  exchange ends before its request is read is told to stop
+  (`STOP_SENDING(H3_NO_ERROR)`) and drained at the transport, so its
+  octets are never read as a new request.
+- **Flow control is the transport's.** A body is read only as far as its
+  relay buffer has room; the rest stays in the transport, and QUIC's
+  stream window holds the client to it. Each body frame the origin takes
+  makes room, and the stream is read again.
+- **One timer.** A connection's deadline is the first of the transport's
+  own timers (loss detection, the acknowledgement delay, the idle
+  timeout), its exchanges' deadlines and its age cap.
+- **Draining.** GOAWAY naming the next request stream, the requests below
+  it finished, and the connection closed with `H3_NO_ERROR` once the
+  last is. The endpoint outlives its listener's drain until its last
+  connection is gone.
+- **Paths.** The server advertises `disable_active_migration` and drops a
+  connection's datagrams from any other address (§12).
+
 ### HTTP/2 to origins
 
 - **A leg, not a second exchange.** An `h2c` or `h2` cluster's
@@ -1137,6 +1239,9 @@ choke point, and has a counter.
 | HTTP/2 sessions | h2c preface; TLS admission | h2c: close. TLS: offer `http/1.1` only, or close if `h2` is all the listener offers | connection |
 | head ring | a client's first byte | `503`, **always close**: the refused bytes are unread | connection (h2c preface only) |
 | shared streams / stream heads | an HTTP/2 request | `REFUSED_STREAM` | stream |
+| QUIC pool half full | a client's first Initial | a Retry: its address proven before a slot is spent (RFC 9000 §8.1.2) | — |
+| QUIC connections, conn slots, TLS engines | a client's first Initial, or its Retried one | unanswered: the client's Initial timer retries | connection |
+| shared streams / stream heads (HTTP/3) | an HTTP/3 request | `H3_REQUEST_REJECTED` | stream |
 | L7 relay buffer | after routing | `503` | stream |
 | tunnels (or draining) | the upgrade request, before forwarding | `503` | — |
 | cluster total in-flight | pick, first try | `503` / L4 close | stream |
@@ -1346,8 +1451,8 @@ flowchart TB
 ## 9. Testing — the gates
 
 A feature without its gate is not done. `zig build ci` runs every gate
-that makes no claim about speed, except h2spec, which needs an external
-binary. h2spec and the speed gates run at merge.
+that makes no claim about speed, except h2spec and h3spec, which need
+external binaries. They and the speed gates run at merge.
 
 | gate | command | when | what it proves |
 |---|---|---|---|
@@ -1358,6 +1463,7 @@ binary. h2spec and the speed gates run at merge.
 | live gate | `zig build smoke`, `smoke-release` | every change | the shipped binary, on a real kernel, judged by equalities |
 | a dependent's build | `zig build`, `test`, `smoke` in `examples/edge` | every change (CI's consumer job) | a build on the fetched package runs, its own extensions held to `zoxy.testing`'s gate (§13) |
 | HTTP/2 conformance | `zig build h2spec` | at merge | an independent RFC 9113 implementation agrees, except §12's deviations |
+| HTTP/3 conformance | `zig build h3spec` | at merge | an independent QUIC and HTTP/3 implementation agrees, except §12's deviations |
 | benchmark | `zig build bench` | at merge | bands compared across runs, plus hard RSS and drain gates |
 
 - **Simulation** (`sim/`). `SimIo` runs the real `Server` against
@@ -1440,6 +1546,19 @@ binary. h2spec and the speed gates run at merge.
   The failing cases must equal `smoke/h2spec.zig`'s list exactly. That
   list is the one §12 deviation h2spec can observe. A deviation that gets
   fixed fails the gate as loudly as a regression.
+- **h3spec** (0.1.15, 86 cases) runs over QUIC against the ReleaseSafe
+  build, on a listener whose pool holds every case's connection. Its
+  failures must equal `smoke/h3spec.zig`'s list — empty — and its one
+  pending case the one §12 records; the case lines are held to h3spec's
+  own summary.
+- **The simulator's HTTP/3 population.** A seed whose TLS listener speaks
+  http draws a QUIC binding half the time, and one or two HTTP/3 clients
+  over zoxy's own test client, asking what the HTTP/2 population asks and
+  judged by its oracle. Adversarial seeds meet the datagram adversary:
+  drops, duplicates, delays past a successor, corruption the AEAD must
+  refuse, and NAT rebinding. `h3_protocol_errors` is an alarm that must
+  stay at zero: a conforming client that causes one is the server
+  misreading a stream.
 - **The bench** (`bench/`):
   - **zrk** is open-loop and corrects for coordinated omission. It drives
     direct and proxied paths: L4, L7 with and without keep-alive, and
@@ -1526,9 +1645,18 @@ src/
       origin_pool.zig   HTTP/2 origin connections and their legs
       origin.zig        h1 ↔ h2 at the origin: fields, answer, trailers
       TestOrigin.zig    test support: an h2c origin
+    h3/
+      Connection.zig    one QUIC connection: transport, session, the handshake carried, sans-I/O
+      driver.zig        its place in the server: a pass per datagram and per timer
+      Endpoint.zig      a QUIC binding's UDP socket: routing, admission, Retry, resets
+      exchange.zig      a request stream's half of the shared exchange
+      crypto.zig        libcrypto as h3's packet-protection backend
+      TestClient.zig    test support: an HTTP/3 client over the Io seam
   tls/
     Engine.zig          the terminating engine over zssl, sans-I/O, pooled
     OriginClient.zig    TLS client to h2 and HTTPS origins, sans-I/O
+    QuicCrypto.zig      packet protection from libcrypto, nine contexts for the process
+    QuicClient.zig      test support: zssl's QUIC client
     trust.zig           chain verification; certificate DNS names
     Credentials.zig     a PEM chain and key, parsed once
     certificate_set.zig choosing a certificate by SNI and signature scheme
@@ -1541,7 +1669,7 @@ src/
                         and the embedder's bed and zero-allocation gate (zoxy.testing, §13)
   *_test.zig            directed suites, mostly over SimIo (13 files)
 sim/                    the simulator: Harness, L4 and L7 populations, oracles
-smoke/                  the live gate and the h2spec harness
+smoke/                  the live gate and the h2spec and h3spec harnesses
 bench/                  zrk loopback harness, profile, micro benches
 scripts/lint.zig        the build-time lint
 tools/schema.zig        the schema emitter's entry point
@@ -1563,7 +1691,8 @@ tools/schema.zig        the schema emitter's entry point
   and [A Database Without Dynamic Memory](https://tigerbeetle.com/blog/a-database-without-dynamic-memory):
   static allocation and deterministic simulation.
 - [zrk](https://github.com/zoxy-io/zrk), [poop](https://github.com/andrewrk/poop),
-  [h2spec](https://github.com/summerwind/h2spec): the benchmark and
+  [h2spec](https://github.com/summerwind/h2spec),
+  [h3spec](https://github.com/kazu-yamamoto/h3spec): the benchmark and
   conformance tools.
 
 The specifications are §12's.
@@ -1582,6 +1711,9 @@ accident when it is not.
 | **9112** HTTP/1.1 | §3.2 target forms; §6.3 body length; §7 transfer codings and trailers; §9 connection management | §7, §8 |
 | **9113** HTTP/2 | §3.4 preface; §4.2 frame size; §5.1 stream states; §6 frames, SETTINGS, GOAWAY, flow control; §8.2–§8.3 fields, in both roles | §7 |
 | **7541** HPACK | the codec; §4.1 list-size accounting | the `h2` package |
+| **9000**, **9001**, **9002** QUIC | the transport, its TLS and its recovery; §8.1 address validation, §10.3 stateless reset, §6 version negotiation at the endpoint | the `h3` package; §7 |
+| **9114** HTTP/3, **9204** QPACK | the session, §4.1.1 rejection, §5.2 GOAWAY; QPACK's static table, capacity zero | the `h3` package; §7 |
+| **7838** `Alt-Svc` | the field, on the answers a listener with a QUIC binding relays | §7 |
 | **6585**, **8297** | `429` and `431`; `103` | §8's static set; §7's interim relay |
 | **9209** `Proxy-Status` | the field and its cause tokens | §8 |
 | **3986** URI | §2.3 unreserved characters; §5.2.4 dot-segments | §7's canonical path |
@@ -1621,6 +1753,19 @@ chosen.
   field values inside the advertised size (`--max-header-length 3000`),
   so this bound is never what it tests.
 
+- **0-RTT is not offered** (RFC 9001 §4.6). No session ticket is issued
+  over QUIC — a ticket a TCP connection issued still resumes a QUIC
+  handshake, without early data — and the engine is configured for no
+  early data at all, so no client has an early-data key, and h3spec's one
+  0-RTT case is pending rather than run. Replay protection is a policy
+  question this release does not answer. `smoke/h3spec.zig` records it
+  as its one pending case.
+- **A QUIC connection is not migrated** (RFC 9000 §9). The server
+  advertises `disable_active_migration` and drops a connection's
+  datagrams from any other address (`h3_migration_dropped`), which §9
+  allows. A NAT rebinding therefore ends the connection; path validation
+  is a later step.
+
 **There is no conformance suite.** §9's gates are internal: the fuzzer
 proves *this* parser never panics, which is a different claim from
 agreeing with everyone else. Two external checks exist:
@@ -1629,7 +1774,9 @@ agreeing with everyone else. Two external checks exist:
   differential fuzzer across servers and proxies, tests exactly the
   strictness §7 claims. Its one finding against zoxy produced the trailer
   rule.
-- h2spec answers the same question for HTTP/2 (§9).
+- h2spec answers the same question for HTTP/2, and h3spec for QUIC and
+  HTTP/3 (§9). curl over ngtcp2 and nghttp3 was run against the binary
+  by hand: downloads, uploads, multiplexed and parallel connections.
 
 ## 13. Embedding — the library seam
 

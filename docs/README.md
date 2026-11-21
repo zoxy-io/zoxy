@@ -541,6 +541,50 @@ trailing HEADERS, whether they came as a chunked body's trailer section or
 as an HTTP/2 origin's trailing HEADERS. A client's request trailers go no
 further.
 
+#### HTTP/3
+
+An `http` listener with `tls` also serves HTTP/3 (RFC 9114) when it names a
+QUIC binding: a UDP address, usually the listener's own port. The binding
+shares the listener's routes, filters, policies and certificates, and
+offers `h3` alone in ALPN. Each request then takes the HTTP/2 path:
+routing, filters, redirects, the access log, and the same origins.
+
+```json
+"listeners": [
+    { "bind": "0.0.0.0:443", "http": { "cluster": "web", "quic": { "bind": "0.0.0.0:443" } },
+      "tls": { "cert": "/etc/zoxy/site.crt", "key": "/etc/zoxy/site.key",
+               "alpn": ["h2", "http/1.1"] } }
+],
+"limits": { "h2_streams": 4096, "quic_connections": 256 }
+```
+
+Every answer the listener relays from an origin carries
+`Alt-Svc: h3=":443"; ma=86400` (RFC 7838), so a client that arrived over
+TCP learns it may come back over QUIC. `quic.alt_svc_max_age_s` sets the
+`ma` (a day by default); 0 advertises nothing. The field takes one of the
+listener's response header edits, and names the port bound, so behind a
+port mapping set 0 and write the field as a response filter of your own.
+
+`limits.quic_connections` bounds the QUIC connections at once, each about
+835 KiB: h3 holds every stream's buffers inside the connection. It defaults
+to 64, at most `conn_slots` and `tls_engines`, since each holds a TLS
+engine for its life. Their requests share `limits.h2_streams` with HTTP/2's,
+which a QUIC binding requires. One connection opens at most 8 requests at
+once; one the stream pool cannot hold is refused with `H3_REQUEST_REJECTED`,
+which a client retries.
+
+Once the pool is half full, a new connection is first sent a Retry, so the
+client proves its address before a slot is spent on it. A first Initial
+that finds no slot is left unanswered (`zoxy_h3_shed_connections`), and the
+client's own timer retries it.
+
+A QUIC binding belongs to one process: it is bound without `SO_REUSEPORT`,
+because the kernel hashes each datagram, not each connection, and a second
+process asking for the port is refused at start. A connection is not
+migrated: a datagram from an address other than the one a connection began
+from is dropped (`zoxy_h3_migration_dropped`). 0-RTT, server push and
+QPACK's dynamic table are not offered.
+
 #### Tunnelled upgrades (WebSocket)
 
 By default any request carrying `Upgrade` is answered `501`, the same as
