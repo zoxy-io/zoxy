@@ -569,6 +569,25 @@ const uncovered_ops = [_]struct { kind: SimIo.OpKind, reason: []const u8 }{
             "sweep configures no admin listener; src/admin_test.zig covers it, " ++
             "and the Tier-0.5 live gate delivers real ones through its scrapes",
     },
+    // #449's datagram seam, until the sweep runs a QUIC listener: no seed
+    // binds a UDP socket yet. src/io/contract_test.zig drives all three on
+    // both backends, the SimIo adversary's drop, duplicate, corrupt and
+    // rebind fates included.
+    .{
+        .kind = .recv_from,
+        .reason = "no seed binds a QUIC listener yet (#449); src/io/contract_test.zig " ++
+            "echoes datagrams on both backends",
+    },
+    .{
+        .kind = .send_to,
+        .reason = "no seed binds a QUIC listener yet (#449); src/io/contract_test.zig " ++
+            "echoes datagrams on both backends",
+    },
+    .{
+        .kind = .datagram_cancel,
+        .reason = "no seed binds a QUIC listener yet (#449); src/io/contract_test.zig " ++
+            "cancels an armed receive on both backends",
+    },
 };
 
 comptime {

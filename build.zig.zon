@@ -40,11 +40,12 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        // Audited fork: zoxy-io/libxev branch zoxy-zig-0.17 = upstream
-        // 451a2bc03644c2b70fb28a808313d12989bfa8e3 (upstream's Zig 0.17
-        // port of the audited snapshot 9ce8e8e) plus six commits, each its
-        // own stacked PR, replayed onto it unchanged — audited as the left
-        // SHA, pinned as the right:
+        // Audited fork: zoxy-io/libxev branch zoxy-udp-error-address =
+        // zoxy-zig-0.17 plus one commit (6f2700b, below); zoxy-zig-0.17 =
+        // upstream 451a2bc03644c2b70fb28a808313d12989bfa8e3 (upstream's Zig
+        // 0.17 port of the audited snapshot 9ce8e8e) plus six commits, each
+        // its own stacked PR, replayed onto it unchanged — audited as the
+        // left SHA, pinned as the right:
         //   c369817 66867ab expose io_uring setup flags through Options
         //   6bd950d e0ec7a0 expose the CQ depth (IORING_SETUP_CQSIZE) —
         //                   the c10k lever
@@ -55,8 +56,29 @@
         //   fe5a07b 813b4b0 leave readiness to the wait in submit (kqueue)
         //   010be2a b0268b1 let connect address an AF_UNIX pathname socket
         //                   (zoxy-io/libxev#5, #303)
+        //           6f2700b decode a UDP receive's sender only when the
+        //                   receive succeeded (#449)
         // Diff against that upstream commit to audit; the pin moves only
         // after re-audit.
+        //
+        // Re-audit for 6f2700b (#449, QUIC's datagram seam), 2026-11-21.
+        // One file, src/watcher/udp.zig, and one behaviour: the three UDP
+        // read callbacks — recvmsg on io_uring/epoll, recvfrom on kqueue
+        // and IOCP — decoded the sender's address storage whatever the
+        // result, and a receive that failed (zoxy's `datagramCancel`, a
+        // drain's way to close a QUIC socket) never had it written, so
+        // `toIpAddress` hit `unreachable` on the stale family. `peerAddress`
+        // now decodes only a successful receive's storage, and only for
+        // AF_INET/AF_INET6, reporting 0.0.0.0:0 otherwise. No op, error
+        // mapping, `Completion` field or TCP path is touched; zoxy used no
+        // UDP watcher before this pin. zoxy binds its UDP sockets itself
+        // rather than through the watcher's `bind`, which sets
+        // SO_REUSEPORT and SO_REUSEADDR — the one thing `udpBind` must not
+        // do, since a second process sharing the port would take a live
+        // connection's datagrams (§3). A test arms a read, cancels it and
+        // requires `error.Canceled` with port 0, and reached the
+        // `unreachable` without the change. libxev's suite: 148 pass, 6
+        // skip in Debug.
         //
         // Re-audit for b0268b1 (Zig 0.17), 2026-11-13. Two halves, and
         // neither changes what a zoxy build runs.
@@ -171,8 +193,8 @@
         // arms discard which errno failed, which is what left a c10k run
         // reporting 227,628 indistinguishable failures.
         .libxev = .{
-            .url = "git+https://github.com/zoxy-io/libxev#b0268b106fe4a1d274d759581d821f8490a40978",
-            .hash = "libxev-0.0.0-86vtc2l2FACqC0P-gGqU0h_zG2B2WYWGtILfBGq5lUGt",
+            .url = "git+https://github.com/zoxy-io/libxev#6f2700b0910b27dabcd286c5e9b93e9c7ba36587",
+            .hash = "libxev-0.0.0-86vtcxuDFAB_NXH5YretjkCVWx8-MGlWxZ4fp_GZ1C_7",
         },
         // Load generator, §9 Tier 0/1 only — never linked into the proxy
         // (no `src/` file imports it), so a bump moves what the benchmark

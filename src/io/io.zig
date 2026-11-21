@@ -67,6 +67,28 @@
 //!       continue is not the one path no gate can enter, §8/#206)
 //!   wantsOperatorDump(io) bool                          (whether a
 //!       give-up should also spend the whole counter set on stderr)
+//!
+//! Datagrams (#449, QUIC), on a socket type of their own so a stream op
+//! cannot be handed one, and a completion type of their own because a
+//! datagram op carries its message header beside the loop's completion:
+//!
+//!   UdpSocket, DatagramCompletion                       (types)
+//!   udpBind(io, address) ListenError!UdpSocket          (sync; no
+//!       SO_REUSEPORT: the kernel would hash each datagram to a process,
+//!       and a connection's next datagram to a sibling with no state for
+//!       it — so a second process asking for the port is refused, loudly)
+//!   udpAddress(io, socket) IpAddress                    (the bound
+//!       address, its port resolved when the bind asked for zero)
+//!   recvFrom(io, socket, buffer, dc, U, u, cb(u, RecvFromError!Datagram))
+//!       (one datagram, or its first `buffer.len` octets: a delivery that
+//!       fills the buffer may have been cut, so a caller sizes the buffer
+//!       past the largest datagram it accepts and drops one that fills it)
+//!   sendTo(io, socket, bytes, peer, dc, U, u, cb(u, SendToError!u32))
+//!   datagramCancel(io, target_dc, cancel_c, U, u, cb(u)) (forces an armed
+//!       recvFrom to deliver Canceled: a drain's way to close a socket
+//!       whose receives would otherwise wait forever)
+//!   udpClose(io, socket) void                           (sync; nothing
+//!       may be armed on it)
 
 const std = @import("std");
 
@@ -238,6 +260,31 @@ pub const RecvError = error{
     Unexpected,
 };
 
+/// One datagram a `recvFrom` delivered (#449): its length — zero is a
+/// legal datagram — and who sent it. `len == buffer.len` means it may have
+/// been cut; see `recvFrom`.
+pub const Datagram = struct {
+    len: u32,
+    peer: std.Io.net.IpAddress,
+};
+
+/// A datagram receive's failures (#449). No end of stream and no reset: a
+/// datagram socket has neither. An ICMP error reaching an unconnected
+/// socket is not reported by the kernel either.
+pub const RecvFromError = error{
+    /// `datagramCancel` forced it: the socket is being closed.
+    Canceled,
+    Unexpected,
+};
+
+/// A datagram send's failures (#449). `Unexpected` covers ENOBUFS and
+/// friends, which `lastPressure` classifies; a datagram is not retried,
+/// since QUIC's own loss recovery already resends what was lost.
+pub const SendToError = error{
+    Canceled,
+    Unexpected,
+};
+
 /// What a `recvGroup` delivers on success: the byte count and which of the
 /// backend's provided buffers the bytes landed in. The id is the caller's
 /// claim ticket — `bufferGroupSlice` to read, `bufferGroupReturn` to give
@@ -393,6 +440,14 @@ pub fn assertIoInterface(comptime IoType: type) void {
             "stop",
             "abort",
             "wantsOperatorDump",
+            "UdpSocket",
+            "DatagramCompletion",
+            "udpBind",
+            "udpAddress",
+            "recvFrom",
+            "sendTo",
+            "datagramCancel",
+            "udpClose",
         };
         for (required_decls) |decl_name| {
             if (!@hasDecl(IoType, decl_name)) {

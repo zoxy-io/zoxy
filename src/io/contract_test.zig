@@ -1530,3 +1530,248 @@ test "contract: a read-half shutdown forces an armed recv on XevIo" {
     defer xev_io.deinit();
     try runReadShutdownContract(XevIo, &xev_io);
 }
+
+/// The datagram contract (#449), one story over any backend: a client
+/// sends `datagram_count` distinct datagrams, the server echoes each to
+/// whoever sent it, and the client counts what came back. The server's
+/// last armed receive is then cancelled, which is how a drain closes a
+/// datagram socket, and both sockets close. Without an adversary every
+/// datagram must make the round trip whole.
+fn DatagramScenario(comptime IoType: type) type {
+    Io.assertIoInterface(IoType);
+    return struct {
+        io: *IoType,
+        server: IoType.UdpSocket = undefined,
+        client: IoType.UdpSocket = undefined,
+        server_address: std.Io.net.IpAddress = undefined,
+        server_recv: IoType.DatagramCompletion = .{},
+        server_send: IoType.DatagramCompletion = .{},
+        client_recv: IoType.DatagramCompletion = .{},
+        client_send: IoType.DatagramCompletion = .{},
+        cancel_completion: IoType.Completion = .{},
+        server_buffer: [256]u8 = undefined,
+        client_buffer: [256]u8 = undefined,
+        echo: [256]u8 = undefined,
+        echo_len: u32 = 0,
+        echo_peer: std.Io.net.IpAddress = undefined,
+        sent: u8 = 0,
+        echoed: u8 = 0,
+        received: u8 = 0,
+        mismatched: u8 = 0,
+        server_canceled: bool = false,
+        cancel_done: bool = false,
+        closed: bool = false,
+
+        const Self = @This();
+        const datagram_count: u8 = 8;
+
+        fn payload(index: u8, out: *[16]u8) []const u8 {
+            return std.fmt.bufPrint(out, "datagram-{d:0>2}", .{index}) catch unreachable;
+        }
+
+        fn start(scenario: *Self, address: std.Io.net.IpAddress) !void {
+            scenario.server = try scenario.io.udpBind(address);
+            scenario.server_address = scenario.io.udpAddress(scenario.server);
+            assert(scenario.server_address.getPort() != 0);
+            scenario.client = try scenario.io.udpBind(address);
+            scenario.io.recvFrom(scenario.server, &scenario.server_buffer, &scenario.server_recv, Self, scenario, onServerRecv);
+            scenario.io.recvFrom(scenario.client, &scenario.client_buffer, &scenario.client_recv, Self, scenario, onClientRecv);
+            scenario.sendNext();
+        }
+
+        fn sendNext(scenario: *Self) void {
+            assert(scenario.sent < datagram_count);
+            var bytes: [16]u8 = undefined;
+            const token = payload(scenario.sent, &bytes);
+            @memcpy(scenario.echo[0..token.len], token);
+            scenario.io.sendTo(scenario.client, scenario.echo[0..token.len], &scenario.server_address, &scenario.client_send, Self, scenario, onClientSent);
+        }
+
+        fn onClientSent(scenario: *Self, result: Io.SendToError!u32) void {
+            const sent = result catch unreachable;
+            assert(sent == "datagram-00".len);
+            scenario.sent += 1;
+        }
+
+        fn onServerRecv(scenario: *Self, result: Io.RecvFromError!Io.Datagram) void {
+            const datagram = result catch |err| {
+                assert(err == error.Canceled);
+                scenario.server_canceled = true;
+                return scenario.maybeClose();
+            };
+            assert(datagram.len < scenario.server_buffer.len);
+            scenario.echo_len = datagram.len;
+            scenario.echo_peer = datagram.peer;
+            scenario.io.sendTo(scenario.server, scenario.server_buffer[0..datagram.len], &scenario.echo_peer, &scenario.server_send, Self, scenario, onEchoed);
+        }
+
+        fn onEchoed(scenario: *Self, result: Io.SendToError!u32) void {
+            const sent = result catch unreachable;
+            assert(sent == scenario.echo_len);
+            scenario.echoed += 1;
+            scenario.io.recvFrom(scenario.server, &scenario.server_buffer, &scenario.server_recv, Self, scenario, onServerRecv);
+        }
+
+        fn onClientRecv(scenario: *Self, result: Io.RecvFromError!Io.Datagram) void {
+            const datagram = result catch unreachable;
+            var bytes: [16]u8 = undefined;
+            const expected = payload(scenario.received, &bytes);
+            if (!std.mem.eql(u8, scenario.client_buffer[0..datagram.len], expected)) scenario.mismatched += 1;
+            scenario.received += 1;
+            if (scenario.received < datagram_count) {
+                scenario.sendNext();
+                scenario.io.recvFrom(scenario.client, &scenario.client_buffer, &scenario.client_recv, Self, scenario, onClientRecv);
+                return;
+            }
+            // Every echo is back: the server's armed receive is the one
+            // op left, and a cancel is what ends it.
+            scenario.io.datagramCancel(&scenario.server_recv, &scenario.cancel_completion, Self, scenario, onCancelDone);
+        }
+
+        fn onCancelDone(scenario: *Self) void {
+            scenario.cancel_done = true;
+            scenario.maybeClose();
+        }
+
+        /// Once both the forced receive and its cancel have delivered:
+        /// only then is nothing armed on either socket.
+        fn maybeClose(scenario: *Self) void {
+            if (!scenario.server_canceled or !scenario.cancel_done) return;
+            assert(!scenario.closed);
+            scenario.closed = true;
+            scenario.io.udpClose(scenario.server);
+            scenario.io.udpClose(scenario.client);
+        }
+
+        fn verify(scenario: *const Self) !void {
+            try std.testing.expectEqual(datagram_count, scenario.sent);
+            try std.testing.expectEqual(datagram_count, scenario.echoed);
+            try std.testing.expectEqual(datagram_count, scenario.received);
+            try std.testing.expectEqual(@as(u8, 0), scenario.mismatched);
+            try std.testing.expect(scenario.server_canceled);
+            try std.testing.expect(scenario.closed);
+        }
+    };
+}
+
+test "contract: datagram echo on SimIo" {
+    var seed: u64 = 1;
+    while (seed <= 20) : (seed += 1) {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        var sim_io: SimIo = undefined;
+        try sim_io.init(arena_state.allocator(), .{ .seed = seed });
+        var scenario: DatagramScenario(SimIo) = .{ .io = &sim_io };
+        try scenario.start(try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0"));
+        try sim_io.run();
+        try scenario.verify();
+        try std.testing.expect(sim_io.udpFullyReleased());
+    }
+}
+
+test "contract: datagram echo on XevIo over real loopback" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var xev_io: XevIo = undefined;
+    try initTestIo(&xev_io, arena_state.allocator(), 0);
+    defer xev_io.deinit();
+    var scenario: DatagramScenario(XevIo) = .{ .io = &xev_io };
+    try scenario.start(try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0"));
+    try xev_io.run();
+    try scenario.verify();
+}
+
+test "xevio: a datagram port already bound is AddressInUse, with no SO_REUSEPORT to share it" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var xev_io: XevIo = undefined;
+    try initTestIo(&xev_io, arena_state.allocator(), 0);
+    defer xev_io.deinit();
+    const first = try xev_io.udpBind(try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0"));
+    defer xev_io.udpClose(first);
+    const bound = xev_io.udpAddress(first);
+    try std.testing.expectError(error.AddressInUse, xev_io.udpBind(bound));
+}
+
+/// One datagram sent through the simulated network under a given
+/// adversary, and what reached the receiver: how many copies, and whether
+/// each arrived intact and from where.
+const DatagramFate = struct {
+    io: *SimIo,
+    receiver: SimIo.UdpSocket = undefined,
+    recv_completion: SimIo.DatagramCompletion = .{},
+    send_completion: SimIo.DatagramCompletion = .{},
+    timer_completion: SimIo.Completion = .{},
+    cancel_completion: SimIo.Completion = .{},
+    buffer: [64]u8 = undefined,
+    copies: u8 = 0,
+    intact: u8 = 0,
+    last_peer_port: u16 = 0,
+    done: bool = false,
+
+    const token = "fate-of-one-datagram";
+
+    fn onRecv(fate: *DatagramFate, result: Io.RecvFromError!Io.Datagram) void {
+        const datagram = result catch return;
+        fate.copies += 1;
+        if (std.mem.eql(u8, fate.buffer[0..datagram.len], token)) fate.intact += 1;
+        fate.last_peer_port = datagram.peer.getPort();
+        fate.io.recvFrom(fate.receiver, &fate.buffer, &fate.recv_completion, DatagramFate, fate, onRecv);
+    }
+
+    fn onSent(fate: *DatagramFate, result: Io.SendToError!u32) void {
+        assert(!fate.done);
+        _ = result catch unreachable;
+    }
+
+    fn onTimer(fate: *DatagramFate, result: Io.TimerError!void) void {
+        result catch unreachable;
+        fate.io.datagramCancel(&fate.recv_completion, &fate.cancel_completion, DatagramFate, fate, onCancel);
+    }
+
+    fn onCancel(fate: *DatagramFate) void {
+        fate.done = true;
+    }
+};
+
+fn sendOneDatagram(adversary: SimIo.Adversary, seed: u64) !DatagramFate {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var sim_io: SimIo = undefined;
+    try sim_io.init(arena_state.allocator(), .{ .seed = seed, .adversary = adversary });
+    var fate: DatagramFate = .{ .io = &sim_io };
+    const any = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    fate.receiver = try sim_io.udpBind(any);
+    const sender = try sim_io.udpBind(any);
+    const to = sim_io.udpAddress(fate.receiver);
+    sim_io.recvFrom(fate.receiver, &fate.buffer, &fate.recv_completion, DatagramFate, &fate, DatagramFate.onRecv);
+    sim_io.sendTo(sender, DatagramFate.token, &to, &fate.send_completion, DatagramFate, &fate, DatagramFate.onSent);
+    // Long past any delay the adversary may add: whatever was coming has
+    // landed by then, and the cancel ends the receive left armed.
+    sim_io.timerStart(&fate.timer_completion, 50 * std.time.ns_per_ms, DatagramFate, &fate, DatagramFate.onTimer);
+    try sim_io.run();
+    try std.testing.expect(fate.done);
+    sim_io.udpClose(sender);
+    sim_io.udpClose(fate.receiver);
+    try std.testing.expect(sim_io.udpFullyReleased());
+    var result = fate;
+    result.io = undefined;
+    return result;
+}
+
+test "simio: the datagram adversary drops, doubles, corrupts and rebinds" {
+    const clean = try sendOneDatagram(.{}, 7);
+    try std.testing.expectEqual(@as(u8, 1), clean.copies);
+    try std.testing.expectEqual(@as(u8, 1), clean.intact);
+    const dropped = try sendOneDatagram(.{ .udp_drop_percent = 100 }, 7);
+    try std.testing.expectEqual(@as(u8, 0), dropped.copies);
+    const doubled = try sendOneDatagram(.{ .udp_duplicate_percent = 100 }, 7);
+    try std.testing.expectEqual(@as(u8, 2), doubled.copies);
+    try std.testing.expectEqual(@as(u8, 2), doubled.intact);
+    const corrupted = try sendOneDatagram(.{ .udp_corrupt_percent = 100 }, 7);
+    try std.testing.expectEqual(@as(u8, 1), corrupted.copies);
+    try std.testing.expectEqual(@as(u8, 0), corrupted.intact);
+    const rebound = try sendOneDatagram(.{ .udp_rebind_percent = 100 }, 7);
+    try std.testing.expectEqual(@as(u8, 1), rebound.copies);
+    try std.testing.expect(rebound.last_peer_port != clean.last_peer_port);
+}

@@ -60,7 +60,7 @@ const pending_ops_max: u32 = constants.inFlightOps(
     listeners_max,
     constants.health_probe_concurrency_max,
     h2_origin_connections_max,
-);
+) + udp_pending_ops_max;
 const pending_signals_max: u8 = 8;
 
 /// The most shared HTTP/2 streams a scenario run under the simulator may
@@ -107,6 +107,41 @@ const client_ip_bytes: [4]u8 = .{ 198, 51, 100, 1 };
 /// distinguishable in the access log by address alone.
 const client_port_base: u16 = 50_000;
 
+/// Datagram sockets one scenario may bind (#449).
+pub const udp_sockets_max: u16 = 64;
+/// Datagrams one socket's receive queue holds: the simulated socket
+/// receive buffer. One arriving at a full queue is dropped, as the
+/// kernel drops it.
+pub const udp_queue_max: u16 = 64;
+/// Datagrams the simulated network holds at once, in flight or queued at
+/// a socket. A send that finds none free is dropped: congestion, which
+/// QUIC recovers from as it does any loss.
+pub const udp_datagrams_max: u16 = 1024;
+/// The widest datagram the simulator carries: a 1500-octet MTU's payload
+/// with headroom, so a receive buffer past QUIC's ceiling still fits.
+pub const datagram_bytes_max: u32 = 2048;
+/// One hop's base latency: datagrams are never instantaneous, so a
+/// handshake's round trips take virtual time a deadline can race.
+const datagram_latency_ns: u64 = 100_000;
+/// Datagram ops one scenario may have armed at once, on top of the stream
+/// ops `pending_ops_max` counts: a few receives and a send per socket.
+const udp_pending_ops_max: u32 = @as(u32, udp_sockets_max) * 4;
+/// Separates `datagram_prng` from `prng`, as `key_seed_salt` does.
+const datagram_seed_salt: u64 = 0x75_64_70_6e_65_74_00_01;
+/// Where datagram ports start: a range of their own, below the stream
+/// table's ephemeral and client ports, so no simulated address is two
+/// sockets'.
+const udp_port_base: u16 = 20_000;
+/// The last port the range hands out.
+const udp_port_last: u16 = 39_999;
+
+comptime {
+    assert(udp_queue_max <= udp_datagrams_max);
+    assert(datagram_bytes_max >= 1500);
+    assert(udp_port_last < ephemeral_port_base);
+    assert(udp_port_last < client_port_base);
+}
+
 sockets: Pool(SocketEntry),
 listeners: []ListenerEntry,
 listeners_count: u16,
@@ -126,6 +161,28 @@ prng: std.Random.DefaultPrng,
 /// the delivery schedule of every *non*-TLS connection under every seed —
 /// re-rolling the sweep's coverage while the sweep still reports green.
 key_prng: std.Random.DefaultPrng,
+/// The datagram adversary's own stream (#449), for the reason `key_prng`
+/// has one: a seed's datagram fates must not shift every later stream
+/// decision, or adding a QUIC client re-rolls the sweep's whole coverage.
+datagram_prng: std.Random.DefaultPrng,
+/// Datagram sockets (#449), by index; a handle carries its generation.
+udp_sockets: []UdpEntry,
+/// The simulated network's slots: every datagram in flight or queued at a
+/// socket holds one. Only `datagram_free` and `in_flight` are read to find
+/// them, so a seed that binds no UDP socket never touches a slot.
+datagrams: []DatagramSlot,
+/// The free slots, as a stack.
+datagram_free: []u16,
+datagram_free_len: u16,
+/// The slots in flight, unordered: `landDatagrams` picks the earliest due.
+in_flight: []u16,
+in_flight_len: u16,
+/// Every datagram launched so far, the tie-break that keeps two arriving
+/// at one instant in the order they were sent.
+datagram_sequence: u64,
+/// The next port a port-zero datagram bind, or an adversary rebinding,
+/// takes: from its own range, apart from the stream table's.
+next_udp_port: u16,
 adversary: Adversary,
 /// Pending one-shot `setNodelay`/`setLingerRst` failures (§9). A virtual
 /// socket table has no reason to refuse a socket option, so without this
@@ -259,6 +316,19 @@ pub const Adversary = struct {
     /// which is the property being tested.
     log_write_stall_ns: u64 = 0,
     batch_max: u32 = constants.loop_completions_per_tick_max,
+    /// The datagram network's faults (#449), each per datagram sent:
+    /// drop it, deliver it twice, flip one of its octets (an AEAD's to
+    /// refuse; the TCP adversary never corrupts, a network does), or
+    /// delay it by up to `udp_delay_ns_max` past the base latency, which
+    /// is what reorders datagrams.
+    udp_drop_percent: u8 = 0,
+    udp_duplicate_percent: u8 = 0,
+    udp_corrupt_percent: u8 = 0,
+    udp_delay_ns_max: u64 = 0,
+    /// Per datagram sent from a socket not yet rebound: from then on its
+    /// datagrams arrive from a new port, as a NAT rebinding makes them,
+    /// and replies to that port still reach it.
+    udp_rebind_percent: u8 = 0,
 };
 
 pub const Options = struct {
@@ -287,6 +357,15 @@ pub const Socket = packed struct(u32) {
 pub const Listener = struct {
     index: u16,
 };
+
+/// A datagram socket (#449), carrying a generation as `Socket` does.
+pub const UdpSocket = packed struct(u32) {
+    index: u16,
+    generation: u16,
+};
+
+/// A datagram op's completion: the simulator's own needs no more.
+pub const DatagramCompletion = Completion;
 
 pub const Completion = struct {
     op: Op = .none,
@@ -318,6 +397,9 @@ pub const OpKind = enum(u8) {
     timer,
     timer_cancel,
     connect_cancel,
+    recv_from,
+    send_to,
+    datagram_cancel,
 };
 
 const Op = union(OpKind) {
@@ -332,6 +414,9 @@ const Op = union(OpKind) {
     timer: struct { fire_at_ns: u64, canceled: bool },
     timer_cancel: struct { target: *Completion },
     connect_cancel: struct { target: *Completion },
+    recv_from: struct { socket: UdpSocket, buffer: []u8, canceled: bool },
+    send_to: struct { socket: UdpSocket, bytes: []const u8, peer: std.Io.net.IpAddress, canceled: bool },
+    datagram_cancel: struct { target: *Completion },
 };
 
 const ConnectFate = enum(u8) { succeed, refuse, blackhole, pressure };
@@ -347,6 +432,9 @@ const Result = union(enum) {
     timer: Io.TimerError!void,
     timer_cancel: void,
     connect_cancel: void,
+    recv_from: Io.RecvFromError!Io.Datagram,
+    send_to: Io.SendToError!u32,
+    datagram_cancel: void,
 };
 
 const ErasedCallback = *const fn (?*anyopaque, *const Result) void;
@@ -426,6 +514,33 @@ const SocketEntry = struct {
     /// caller to it.
     unix: bool,
     inbox: Ring,
+};
+
+/// One datagram socket (#449).
+const UdpEntry = struct {
+    generation: u16,
+    active: bool,
+    address: std.Io.net.IpAddress,
+    /// The port its datagrams appear to come from once the adversary has
+    /// rebound it, and which replies to still reach it; null before.
+    rebound_port: ?u16,
+    /// Datagram ops armed on it, which `udpClose` holds to zero.
+    armed: u16,
+    /// Its receive queue: indices into `datagrams`, oldest first.
+    queue: [udp_queue_max]u16,
+    queue_head: u16,
+    queue_len: u16,
+};
+
+/// One datagram in the simulated network (#449).
+const DatagramSlot = struct {
+    state: enum(u8) { free, in_flight, queued },
+    sequence: u64,
+    len: u32,
+    from: std.Io.net.IpAddress,
+    to: std.Io.net.IpAddress,
+    arrive_at_ns: u64,
+    bytes: [datagram_bytes_max]u8,
 };
 
 const ListenerEntry = struct {
@@ -512,6 +627,10 @@ pub fn init(io: *SimIo, arena: std.mem.Allocator, options: Options) error{OutOfM
     // below cannot overflow before it widens.
     assert(options.buffer_group_bytes >= 1);
     assert(options.buffer_group_count <= constants.buffer_group_entries_max);
+    assert(options.adversary.udp_drop_percent <= 100);
+    assert(options.adversary.udp_duplicate_percent <= 100);
+    assert(options.adversary.udp_corrupt_percent <= 100);
+    assert(options.adversary.udp_rebind_percent <= 100);
 
     io.listeners = try arena.alloc(ListenerEntry, listeners_max);
     io.pending = try arena.alloc(*Completion, pending_ops_max);
@@ -564,7 +683,36 @@ pub fn init(io: *SimIo, arena: std.mem.Allocator, options: Options) error{OutOfM
     io.alarm_exit_code = 0;
     io.alarm_reason = .drain_stalled;
     io.alarm_fired = false;
+    try io.initDatagrams(arena, options.seed);
     assert(io.sockets.isFullyReleased());
+}
+
+/// The datagram network, empty (#449): no socket bound, nothing in flight.
+/// The slots are not written here — only the free stack is — so a seed
+/// that binds no UDP socket pays a 2 KiB stack, not the slots' pages.
+fn initDatagrams(io: *SimIo, arena: std.mem.Allocator, seed: u64) error{OutOfMemory}!void {
+    io.udp_sockets = try arena.alloc(UdpEntry, udp_sockets_max);
+    for (io.udp_sockets) |*entry| entry.* = .{
+        .generation = 0,
+        .active = false,
+        .address = undefined,
+        .rebound_port = null,
+        .armed = 0,
+        .queue = undefined,
+        .queue_head = 0,
+        .queue_len = 0,
+    };
+    io.datagrams = try arena.alloc(DatagramSlot, udp_datagrams_max);
+    io.datagram_free = try arena.alloc(u16, udp_datagrams_max);
+    for (io.datagram_free, 0..) |*entry, index| entry.* = @intCast(udp_datagrams_max - 1 - index);
+    io.datagram_free_len = udp_datagrams_max;
+    io.in_flight = try arena.alloc(u16, udp_datagrams_max);
+    io.in_flight_len = 0;
+    io.datagram_sequence = 0;
+    io.datagram_prng = std.Random.DefaultPrng.init(seed ^ datagram_seed_salt);
+    io.next_udp_port = udp_port_base;
+    assert(io.udp_sockets.len == udp_sockets_max);
+    assert(io.datagram_free_len == io.datagrams.len);
 }
 
 /// Targeted scenario control: every connect to this address black-holes
@@ -1347,6 +1495,11 @@ pub fn pendingOpsReferenceLiveSockets(io: *const SimIo) bool {
             .timer,
             .timer_cancel,
             .connect_cancel,
+            // Datagram sockets live in their own table (#449), which
+            // `udpClose` holds to nothing armed.
+            .recv_from,
+            .send_to,
+            .datagram_cancel,
             => continue,
         };
         assert(socket.index < sockets_max);
@@ -1474,6 +1627,7 @@ pub fn run(io: *SimIo) Io.RunError!void {
         // batch that may never come.
         if (io.fireAlarmIfDue()) break;
         io.deliverDueSignals();
+        io.landDatagrams();
         const ready = io.collectReady(&ready_buffer);
         if (ready.len == 0) {
             if (io.pending_count == 0 and io.pending_signals_count == 0) {
@@ -1560,6 +1714,362 @@ fn dumpPendingOps(io: *const SimIo) void {
             else => std.debug.print("  {s}\n", .{@tagName(completion.op)}),
         }
     }
+}
+
+/// Bind a datagram socket (#449). Port zero takes the next port of the
+/// datagram range. A port already bound — or rebound to — on an
+/// overlapping address is `AddressInUse`, as it is for the kernel twin,
+/// which binds without SO_REUSEPORT. A full table is
+/// `AddressUnavailable`: the seam's error set has no exhaustion member,
+/// and no scenario binds sixty-four sockets.
+pub fn udpBind(io: *SimIo, address: std.Io.net.IpAddress) Io.ListenError!UdpSocket {
+    var effective = address;
+    if (effective.getPort() == 0) effective.setPort(io.takeUdpPort());
+    assert(effective.getPort() != 0);
+    if (io.udpPortTaken(&effective)) return error.AddressInUse;
+    for (io.udp_sockets, 0..) |*entry, index| {
+        if (entry.active) continue;
+        assert(entry.armed == 0);
+        assert(entry.queue_len == 0);
+        entry.active = true;
+        entry.address = effective;
+        entry.rebound_port = null;
+        entry.queue_head = 0;
+        return .{ .index = @intCast(index), .generation = entry.generation };
+    }
+    return error.AddressUnavailable;
+}
+
+/// Whether an active socket answers `address`'s port on an overlapping
+/// address: bound there, or rebound to it, which is a port held whatever
+/// the address.
+fn udpPortTaken(io: *const SimIo, address: *const std.Io.net.IpAddress) bool {
+    const port = address.getPort();
+    assert(port != 0);
+    for (io.udp_sockets) |*entry| {
+        if (!entry.active) continue;
+        if (entry.rebound_port == port) return true;
+        if (entry.address.getPort() != port) continue;
+        if (addressesOverlap(&entry.address, address)) return true;
+    }
+    return false;
+}
+
+/// The next datagram-range port no active socket holds. Bounded by the
+/// range: a scenario holds at most `udp_sockets_max` ports at once, far
+/// fewer than the range has.
+fn takeUdpPort(io: *SimIo) u16 {
+    const range: u32 = @as(u32, udp_port_last) - udp_port_base + 1;
+    assert(range > @as(u32, udp_sockets_max) * 2);
+    var tries: u32 = 0;
+    while (tries < range) : (tries += 1) {
+        const port = io.next_udp_port;
+        io.next_udp_port = if (port == udp_port_last) udp_port_base else port + 1;
+        const probe: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = port } };
+        if (!io.udpPortTaken(&probe)) return port;
+    }
+    unreachable; // The range is wider than every port a scenario can hold.
+}
+
+/// Whether a datagram for `to` reaches a socket bound at `bound`: the
+/// same address, or a wildcard of the same family on either side. Each
+/// family is its own world — no dual-stack bind — and a wildcard-bound
+/// socket's datagrams carry its wildcard as their source, where the kernel
+/// would name a concrete address; replies to it still route here.
+fn addressesOverlap(bound: *const std.Io.net.IpAddress, to: *const std.Io.net.IpAddress) bool {
+    assert(bound.getPort() != 0);
+    assert(to.getPort() != 0);
+    return switch (bound.*) {
+        .ip4 => |b| switch (to.*) {
+            .ip4 => |t| std.mem.allEqual(u8, &b.bytes, 0) or std.mem.allEqual(u8, &t.bytes, 0) or
+                std.mem.eql(u8, &b.bytes, &t.bytes),
+            .ip6 => false,
+        },
+        .ip6 => |b| switch (to.*) {
+            .ip6 => |t| std.mem.allEqual(u8, &b.bytes, 0) or std.mem.allEqual(u8, &t.bytes, 0) or
+                std.mem.eql(u8, &b.bytes, &t.bytes),
+            .ip4 => false,
+        },
+    };
+}
+
+/// The address a datagram socket is bound to, its port resolved.
+pub fn udpAddress(io: *SimIo, socket: UdpSocket) std.Io.net.IpAddress {
+    const entry = io.udpEntry(socket);
+    assert(entry.address.getPort() != 0);
+    return entry.address;
+}
+
+/// Arm a receive: it delivers the oldest datagram queued at the socket,
+/// once one is, or `Canceled` when `datagramCancel` forces it.
+pub fn recvFrom(
+    io: *SimIo,
+    socket: UdpSocket,
+    buffer: []u8,
+    completion: *DatagramCompletion,
+    comptime Userdata: type,
+    userdata: *Userdata,
+    comptime callback: fn (*Userdata, Io.RecvFromError!Io.Datagram) void,
+) void {
+    assert(completion.state == .dead);
+    assert(buffer.len >= 1);
+    const entry = io.udpEntry(socket);
+    assert(entry.armed < udp_pending_ops_max);
+    entry.armed += 1;
+    completion.* = .{
+        .op = .{ .recv_from = .{ .socket = socket, .buffer = buffer, .canceled = false } },
+        .userdata = userdata,
+        .callback = erasedResult(Userdata, .recv_from, callback),
+    };
+    io.enqueue(completion);
+}
+
+/// Arm a send: it completes at the next delivery — the kernel takes a
+/// datagram whole or not at all — and its datagram travels apart from it,
+/// under the adversary. `peer` is copied.
+pub fn sendTo(
+    io: *SimIo,
+    socket: UdpSocket,
+    bytes: []const u8,
+    peer: *const std.Io.net.IpAddress,
+    completion: *DatagramCompletion,
+    comptime Userdata: type,
+    userdata: *Userdata,
+    comptime callback: fn (*Userdata, Io.SendToError!u32) void,
+) void {
+    assert(completion.state == .dead);
+    assert(bytes.len >= 1);
+    assert(bytes.len <= datagram_bytes_max);
+    assert(peer.getPort() != 0);
+    const entry = io.udpEntry(socket);
+    assert(entry.armed < udp_pending_ops_max);
+    entry.armed += 1;
+    completion.* = .{
+        .op = .{ .send_to = .{ .socket = socket, .bytes = bytes, .peer = peer.*, .canceled = false } },
+        .userdata = userdata,
+        .callback = erasedResult(Userdata, .send_to, callback),
+    };
+    io.enqueue(completion);
+}
+
+/// Force an armed datagram op to deliver `Canceled`. A target that has
+/// already delivered is left alone, as the timer and connect cancels
+/// leave theirs.
+pub fn datagramCancel(
+    io: *SimIo,
+    target: *DatagramCompletion,
+    cancel_completion: *Completion,
+    comptime Userdata: type,
+    userdata: *Userdata,
+    comptime callback: fn (*Userdata) void,
+) void {
+    assert(cancel_completion.state == .dead);
+    if (target.state != .dead) assert(target.op == .recv_from or target.op == .send_to);
+    cancel_completion.* = .{
+        .op = .{ .datagram_cancel = .{ .target = target } },
+        .userdata = userdata,
+        .callback = erasedVoid(Userdata, .datagram_cancel, callback),
+    };
+    io.enqueue(cancel_completion);
+}
+
+/// Close a datagram socket with nothing armed on it (#449). What waits in
+/// its queue is dropped, as the kernel drops a closed socket's buffer.
+pub fn udpClose(io: *SimIo, socket: UdpSocket) void {
+    const entry = io.udpEntry(socket);
+    assert(entry.armed == 0);
+    while (entry.queue_len > 0) {
+        io.freeDatagram(entry.queue[entry.queue_head]);
+        entry.queue_head = (entry.queue_head + 1) % udp_queue_max;
+        entry.queue_len -= 1;
+    }
+    entry.active = false;
+    entry.generation +%= 1;
+    assert(!entry.active);
+}
+
+fn udpEntry(io: *SimIo, socket: UdpSocket) *UdpEntry {
+    assert(socket.index < udp_sockets_max);
+    const entry = &io.udp_sockets[socket.index];
+    // A stale handle is the §5 release rule broken, as for streams.
+    assert(entry.active);
+    assert(entry.generation == socket.generation);
+    return entry;
+}
+
+fn freeDatagram(io: *SimIo, index: u16) void {
+    assert(index < udp_datagrams_max);
+    assert(io.datagram_free_len < udp_datagrams_max);
+    io.datagrams[index].state = .free;
+    io.datagram_free[io.datagram_free_len] = index;
+    io.datagram_free_len += 1;
+}
+
+/// The datagram at the head of the socket's queue, into `buffer` — cut
+/// to it, as the kernel cuts one — or the cancel.
+fn finishRecvFrom(io: *SimIo, socket: UdpSocket, buffer: []u8, canceled: bool) Io.RecvFromError!Io.Datagram {
+    const entry = io.udpEntry(socket);
+    assert(entry.armed >= 1);
+    entry.armed -= 1;
+    if (canceled) return error.Canceled;
+    assert(entry.queue_len >= 1);
+    assert(entry.queue_len <= udp_queue_max);
+    const index = entry.queue[entry.queue_head];
+    const slot = &io.datagrams[index];
+    assert(slot.state == .queued);
+    entry.queue_head = (entry.queue_head + 1) % udp_queue_max;
+    entry.queue_len -= 1;
+    const len: u32 = @min(slot.len, @as(u32, @intCast(buffer.len)));
+    @memcpy(buffer[0..len], slot.bytes[0..len]);
+    const peer = slot.from;
+    io.freeDatagram(index);
+    return .{ .len = len, .peer = peer };
+}
+
+/// The send's datagram onto the network, under the adversary: dropped,
+/// doubled, corrupted, delayed — or, from a socket the adversary rebinds,
+/// from a new port from here on. Every fate is mixed into the trace.
+fn finishSendTo(
+    io: *SimIo,
+    socket: UdpSocket,
+    bytes: []const u8,
+    peer: *const std.Io.net.IpAddress,
+    canceled: bool,
+) Io.SendToError!u32 {
+    const entry = io.udpEntry(socket);
+    assert(entry.armed >= 1);
+    entry.armed -= 1;
+    if (canceled) return error.Canceled;
+    assert(bytes.len >= 1);
+    const random = io.datagram_prng.random();
+    if (entry.rebound_port == null) {
+        if (random.uintLessThan(u8, 100) < io.adversary.udp_rebind_percent) {
+            entry.rebound_port = io.takeUdpPort();
+        }
+    }
+    var from = entry.address;
+    if (entry.rebound_port) |port| from.setPort(port);
+    io.mix(from.getPort());
+    const dropped = random.uintLessThan(u8, 100) < io.adversary.udp_drop_percent;
+    io.mix(@intFromBool(dropped));
+    if (dropped) return @intCast(bytes.len);
+    const copies: u8 = if (random.uintLessThan(u8, 100) < io.adversary.udp_duplicate_percent) 2 else 1;
+    io.mix(copies);
+    for (0..copies) |_| io.launchDatagram(bytes, &from, peer, random);
+    return @intCast(bytes.len);
+}
+
+fn launchDatagram(
+    io: *SimIo,
+    bytes: []const u8,
+    from: *const std.Io.net.IpAddress,
+    to: *const std.Io.net.IpAddress,
+    random: std.Random,
+) void {
+    assert(bytes.len >= 1);
+    assert(bytes.len <= datagram_bytes_max);
+    // Every slot holds a datagram: the network is congested, and this one
+    // is lost, which QUIC recovers from as it does any loss.
+    if (io.datagram_free_len == 0) return io.mix(0xd409);
+    io.datagram_free_len -= 1;
+    const index = io.datagram_free[io.datagram_free_len];
+    const slot = &io.datagrams[index];
+    const delay = if (io.adversary.udp_delay_ns_max == 0) 0 else random.uintAtMost(u64, io.adversary.udp_delay_ns_max);
+    slot.* = .{
+        .state = .in_flight,
+        .sequence = io.datagram_sequence,
+        .len = @intCast(bytes.len),
+        .from = from.*,
+        .to = to.*,
+        .arrive_at_ns = io.now_ns_value + datagram_latency_ns + delay,
+        .bytes = undefined,
+    };
+    io.datagram_sequence += 1;
+    @memcpy(slot.bytes[0..bytes.len], bytes);
+    const corrupted = random.uintLessThan(u8, 100) < io.adversary.udp_corrupt_percent;
+    if (corrupted) {
+        const at = random.uintLessThan(usize, bytes.len);
+        const mask = 1 + random.uintLessThan(u8, 255);
+        slot.bytes[at] ^= mask;
+        io.mix((@as(u64, at) << 8) | mask);
+    }
+    assert(io.in_flight_len < udp_datagrams_max);
+    io.in_flight[io.in_flight_len] = index;
+    io.in_flight_len += 1;
+    io.mix(slot.arrive_at_ns ^ (@as(u64, slot.len) << 48));
+}
+
+/// Every datagram whose arrival is due lands in its socket's queue — the
+/// earliest first, ties in the order they were sent, so with the adversary
+/// off they land in order — or is dropped where no socket answers its
+/// address or the queue is full, as the kernel drops it (#449).
+fn landDatagrams(io: *SimIo) void {
+    var landed: u32 = 0;
+    while (io.earliestDueDatagram()) |position| : (landed += 1) {
+        assert(landed < udp_datagrams_max);
+        const index = io.in_flight[position];
+        io.in_flight_len -= 1;
+        io.in_flight[position] = io.in_flight[io.in_flight_len];
+        const slot = &io.datagrams[index];
+        assert(slot.state == .in_flight);
+        const entry = io.udpDestination(&slot.to) orelse {
+            io.mix(0xd40a);
+            io.freeDatagram(index);
+            continue;
+        };
+        assert(entry.queue_len <= udp_queue_max);
+        if (entry.queue_len == udp_queue_max) {
+            io.mix(0xd40b);
+            io.freeDatagram(index);
+            continue;
+        }
+        const tail = (entry.queue_head + entry.queue_len) % udp_queue_max;
+        entry.queue[tail] = index;
+        entry.queue_len += 1;
+        slot.state = .queued;
+    }
+}
+
+/// The position in `in_flight` of the earliest datagram due by now, ties
+/// broken by send order, or null when none is due.
+fn earliestDueDatagram(io: *const SimIo) ?u16 {
+    assert(io.in_flight_len <= udp_datagrams_max);
+    var best: ?u16 = null;
+    for (io.in_flight[0..io.in_flight_len], 0..) |index, position| {
+        const slot = &io.datagrams[index];
+        if (slot.arrive_at_ns > io.now_ns_value) continue;
+        if (best) |held| {
+            const kept = &io.datagrams[io.in_flight[held]];
+            if (slot.arrive_at_ns > kept.arrive_at_ns) continue;
+            if (slot.arrive_at_ns == kept.arrive_at_ns and slot.sequence > kept.sequence) continue;
+        }
+        best = @intCast(position);
+    }
+    return best;
+}
+
+/// The socket a datagram for `to` reaches: one rebound to its port —
+/// whatever its address, as a NAT maps the port alone — or one bound at
+/// its port on an overlapping address.
+fn udpDestination(io: *SimIo, to: *const std.Io.net.IpAddress) ?*UdpEntry {
+    assert(to.getPort() != 0);
+    for (io.udp_sockets) |*entry| {
+        if (!entry.active) continue;
+        if (entry.rebound_port == to.getPort()) return entry;
+        if (entry.address.getPort() != to.getPort()) continue;
+        if (addressesOverlap(&entry.address, to)) return entry;
+    }
+    return null;
+}
+
+/// Whether every datagram socket has been closed (#449): the release rule
+/// a run's end asserts, as `sockets.isFullyReleased` is for streams.
+pub fn udpFullyReleased(io: *const SimIo) bool {
+    assert(io.datagram_free_len <= udp_datagrams_max);
+    for (io.udp_sockets) |*entry| {
+        if (entry.active) return false;
+    }
+    return true;
 }
 
 fn enqueue(io: *SimIo, completion: *Completion) void {
@@ -1652,6 +2162,11 @@ fn opReady(io: *SimIo, completion: *Completion) bool {
             break :ready io.peerEntry(entry).inbox.freeSpace() > 0;
         },
         .close, .timer_cancel, .connect_cancel => true,
+        // A receive waits for a datagram to land at its socket (#449); a
+        // send completes at once — the kernel takes a datagram whole or
+        // not at all — and its datagram travels apart from it.
+        .recv_from => |op| op.canceled or io.udpEntry(op.socket).queue_len > 0,
+        .send_to, .datagram_cancel => true,
         // A sink that takes its time is the whole point of the staging
         // buffers (§8): while this write is out, lines pile up in the
         // other one, and the drop rung fires when they overflow it. With
@@ -1708,6 +2223,18 @@ fn deliverOne(io: *SimIo, completion: *Completion) void {
                 op.target.op.connect.canceled = true;
             }
             break :cancel .{ .connect_cancel = {} };
+        },
+        .recv_from => |op| .{ .recv_from = io.finishRecvFrom(op.socket, op.buffer, op.canceled) },
+        .send_to => |op| .{ .send_to = io.finishSendTo(op.socket, op.bytes, &op.peer, op.canceled) },
+        .datagram_cancel => |op| cancel: {
+            if (op.target.state == .pending) {
+                switch (op.target.op) {
+                    .recv_from => op.target.op.recv_from.canceled = true,
+                    .send_to => op.target.op.send_to.canceled = true,
+                    else => unreachable,
+                }
+            }
+            break :cancel .{ .datagram_cancel = {} };
         },
     };
     io.traceMix(completion, &result);
@@ -1969,6 +2496,11 @@ fn earliestWakeNs(io: *const SimIo) u64 {
     // op is stranded must still advance to it, or the deadlock this
     // exists to report would be declared before it could fire (#226).
     earliest = @min(earliest, io.alarm_at_ns);
+    // A datagram in flight wakes the clock at its arrival, where a receive
+    // armed for it becomes ready (#449).
+    for (io.in_flight[0..io.in_flight_len]) |index| {
+        earliest = @min(earliest, io.datagrams[index].arrive_at_ns);
+    }
     return earliest;
 }
 
@@ -2154,6 +2686,12 @@ fn traceMix(io: *SimIo, completion: *const Completion, result: *const Result) vo
         .close => 6000,
         .timer_cancel => 7000,
         .connect_cancel => 8000,
+        .recv_from => |r| if (r) |d|
+            (@as(u64, d.peer.getPort()) << 32) | d.len
+        else |err|
+            12000 + @intFromError(err),
+        .send_to => |r| if (r) |n| 13000 + @as(u64, n) else |err| 14000 + @intFromError(err),
+        .datagram_cancel => 15000,
         .log_write => |r| if (r) |n| 9000 + @as(u64, n) else |err| 10000 + @intFromError(err),
     };
     io.mix(detail);
