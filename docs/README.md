@@ -56,6 +56,7 @@ budgets (DESIGN.md §5/§8; closed-form except where marked):
           + labeled metrics 26450 B (tables, labels and render buffers)
           + policy answers 0 B (a build's own pages, four variants each)
           + policy edits 0 B (a build's request edits, every stream slot)
+          + consult slots 0 B (a build's consult requests and replies)
           + tunnels 0 x 0 B (their own relay buffers, never HTTP's)
           + tls engines 0 x 0 B (+ plaintext 0 B each, libcrypto heap 0 KiB)
           + config arena 2 KiB (measured, not closed-form)

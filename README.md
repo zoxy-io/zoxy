@@ -27,8 +27,8 @@ processes behind `SO_REUSEPORT`, never threads sharing memory.
   memory, file descriptors and ring depth are closed-form functions of them,
   printed at startup
 - **A library first** — build your own proxy on the `zoxy` package,
-  configured in code, with your own pickers and request policies held to
-  the same zero-allocation gate ([`examples/edge`](examples/edge),
+  configured in code, with your own pickers, policies, handlers and
+  health checks held to the same zero-allocation gate ([`examples/edge`](examples/edge),
   [DESIGN.md §13](docs/DESIGN.md#13-embedding--the-library-seam))
 
 ## Quick start

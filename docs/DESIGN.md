@@ -1654,7 +1654,8 @@ extensions they list.
   - `App.check` runs step zero, the banner and the same resource
     gauntlet a start runs, gives everything back, and binds no port. It
     returns `--check`'s verdict (§8);
-  - `App.picker(&instance)` and `App.policy(&instance)` make
+  - `App.picker(&instance)`, `App.policy`, `App.responsePolicy`,
+    `App.connectionPolicy`, `App.handler` and `App.probe` make
     selections. A type the build does not list is a compile error;
   - `config.resolve(arena, *const Options)` is step zero on its own, for
     a build that wants the verdict alone;
@@ -1692,7 +1693,7 @@ every extension call compiles out, as in the stock binary. An instance
 carries its parameters and its state. A selection is the type's index
 and a type-erased pointer to the instance, so `Options` stays
 non-generic. Selecting one instance from several sites shares its
-state. `App.picker` and `App.policy` are the supported constructors:
+state. The `App` selection helpers are the supported constructors:
 the instance's type cannot be checked at runtime, so they check it at
 compile time, and a selection made by hand whose index the build's
 lists do not reach is refused at step zero (`ExtensionUnserved`).
@@ -2024,11 +2025,16 @@ zoxy's own simulator runs scripted extensions (`ScriptedPicker`,
 `ScriptedPolicy`), so every dispatch arm, the fallback and both policy
 phases are in the census, and every counter the scripted types declare
 must fire across the sweep. An embedder's own functions are theirs to
-cover with the bed. `examples/edge` is a working build:
-- two picker types, one instance selected by two clusters;
-- both policy phases;
-- series of its own: a counter and a gauge for a picker, and a counter
-  for a policy;
+cover with the bed. `examples/edge` is a working build, and its
+README maps every hook to where it is shown:
+- two picker types, one instance selected by two clusters, one hearing
+  its picks' completions;
+- both policy phases: a listener policy that answers with its own `401`,
+  tags, edits and completes, and route policies, one of which consults;
+- a response policy, a connection policy, a handler serving a control
+  plane that replaces two clusters' endpoints live, and a check kind;
+- series of its own: counters and gauges for a picker and for listener,
+  route and connection policies, scraped from its metrics listener;
 - its own bed tests and a live smoke.
 
 CI builds, tests and smokes it against a fetched package.
