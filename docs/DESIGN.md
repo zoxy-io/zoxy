@@ -1673,8 +1673,13 @@ extensions they list.
   not surface.
 - **The startup sequence**, written once in `app.zig`:
   0. resolve the options, and refuse a selection the build does not
-     list (`ExtensionUnserved`) or a head buffer smaller than the widest
-     answer the build's policies declare (`AnswerHeadOverBuffer`);
+     list (`ExtensionUnserved`), a head buffer smaller than the widest
+     answer the build's policies declare (`AnswerHeadOverBuffer`) or
+     its handlers' (`HandlerResponseOverBuffer`), policy lists that
+     could overrun the render's edits (`PolicyEditsOverLimit`), or a
+     consulting policy selected with no consult slot
+     (`ConsultSlotsRequired`). `App.check` runs this step too, so
+     `--check` refuses what a start would;
   1. price the config and print the banner (§5);
   2. take the fd budget, open the log sink, load every certificate;
   3. build the loop and the server, bind the extensions, hand over the
