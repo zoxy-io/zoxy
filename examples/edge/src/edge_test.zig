@@ -16,7 +16,9 @@ const Bed = zoxy.testing.Bed(edge.extensions);
 /// carries from the first run into the second. Only counts that return
 /// to zero once a run drains — `TenantGuard.in_flight`,
 /// `ConnectionCap.open` — steer a choice, which `exercise` asserts as it
-/// begins and ends. A build whose picker keeps other steering state
+/// begins and ends. Counts that keep growing, `ReadOnly.refused` and
+/// `EndpointsControl.updates`, are read as a run's delta. A build whose
+/// picker keeps other steering state
 /// (round-robin's cursor, say) resets it at the start of its scenario, or
 /// the replay would diverge for a reason that is not a bug.
 var instances: edge.Instances = .{};
@@ -30,6 +32,7 @@ const static_endpoints = [_]std.Io.net.IpAddress{ loopback(29101), loopback(2910
 
 const plan: edge.Plan = .{
     .listen = loopback(28080),
+    .control = loopback(28081),
     .app = &app_endpoints,
     .static = &static_endpoints,
 };
@@ -73,6 +76,15 @@ fn exercise(bed: *Bed) !void {
     const asset_again = bed.request(0, "GET /static/app.js HTTP/1.1\r\n" ++ tenant);
     const upload = bed.request(0, "POST /static/app.js HTTP/1.1\r\nContent-Length: 0\r\n" ++ tenant);
     const anonymous = bed.request(0, "GET /orders HTTP/1.1\r\nHost: edge\r\nConnection: close\r\n\r\n");
+    // The control plane, on its own listener (#434): the application down
+    // to its second endpoint (#428), a list that is not one, and a method
+    // it does not take.
+    const update = bed.request(1, "PUT /endpoints HTTP/1.1\r\nHost: edge\r\nContent-Length: 15\r\n" ++
+        "Connection: close\r\n\r\n127.0.0.1:29002");
+    const garbled = bed.request(1, "PUT /endpoints HTTP/1.1\r\nHost: edge\r\nContent-Length: 7\r\n" ++
+        "Connection: close\r\n\r\nnowhere");
+    const listing = bed.request(1, "GET /endpoints HTTP/1.1\r\nHost: edge\r\nConnection: close\r\n\r\n");
+    const updates_before = instances.endpoints_control.updates;
     const two_tenants = bed.request(0, "GET /orders HTTP/1.1\r\nx-tenant: other\r\n" ++ tenant);
     try bed.run();
 
@@ -113,6 +125,15 @@ fn exercise(bed: *Bed) !void {
     // route refused after it included — and none is still counted.
     try std.testing.expectEqual(@as(u64, 5), bed.counter(edge.TenantGuard, .completed));
     try std.testing.expectEqual(@as(u32, 0), instances.tenant_guard.in_flight);
+    // The update took both clusters; the others changed nothing. Whether
+    // `/orders` and `/search` ran before it or after, either application
+    // endpoint answers them, so their checks above hold either way.
+    try std.testing.expectEqual(@as(?u16, 200), update.status());
+    try std.testing.expectEqualStrings("1 endpoint(s) now serve api search\n", update.body());
+    try std.testing.expectEqual(updates_before + 1, instances.endpoints_control.updates);
+    try std.testing.expectEqual(@as(?u16, 400), garbled.status());
+    try std.testing.expectEqual(@as(?u16, 405), listing.status());
+    try expectLine(listing, "Allow: PUT\r\n");
     // One response policy call per origin response: the four answered,
     // and none of the edge's own pages.
     try std.testing.expectEqual(edited_before + 4, instances.security_headers.edited);

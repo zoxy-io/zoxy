@@ -5,7 +5,7 @@
 //! the "discovery" a build does before its options exist.
 //!
 //! The build lists two picker types, two request policies, a response
-//! policy and a connection policy:
+//! policy, a connection policy and a handler:
 //!
 //! - `LeastInFlight` picks the endpoint with the fewest requests in
 //!   flight. One instance serves both the `api` and `search` clusters, so
@@ -29,6 +29,12 @@
 //!   connections open at once to a cap. One past it is closed before a
 //!   byte of it is read, which no request policy could do: they meet a
 //!   connection only once a head arrives.
+//! - `EndpointsControl`, the edge's control plane (#434), answers on a
+//!   listener of its own, which the operator binds where only operators
+//!   reach. A `PUT` of a new application endpoint list replaces the
+//!   `api` and `search` clusters' sets while the edge serves (#428): an
+//!   endpoint that stays keeps its connections and health, one that
+//!   leaves drains, one that arrives takes a free slot.
 //!
 //! Each obeys the contract every extension does: run to completion, no
 //! allocation, no clock, no syscall, nothing kept from a view past the
@@ -46,6 +52,7 @@ const zoxy = @import("zoxy");
 const assert = std.debug.assert;
 
 pub const extensions: zoxy.Extensions = .{
+    .handlers = &.{EndpointsControl},
     .pickers = &.{ LeastInFlight, PathAffinity },
     .request_policies = &.{ TenantGuard, ReadOnly },
     .response_policies = &.{SecurityHeaders},
@@ -61,6 +68,12 @@ pub const tenant_header = "x-tenant";
 pub const tenant_forward_header = "x-edge-tenant";
 /// The longest tenant name `TenantGuard` lets on.
 pub const tenant_bytes_max = 64;
+/// The most endpoints one list names: on the command line, and in a
+/// control-plane update. The application clusters keep this many slots.
+pub const endpoints_max = 16;
+/// The clusters that draw on the application's endpoints, which the
+/// control plane updates together.
+pub const app_clusters = [_][]const u8{ "api", "search" };
 
 /// The endpoint with the fewest requests in flight; among equals, the one
 /// offered first, so the choice is a function of what zoxy offered.
@@ -330,6 +343,103 @@ pub const ConnectionCap = struct {
     }
 };
 
+/// The edge's control plane (#434, #428): `PUT /endpoints` with a body of
+/// comma- or newline-separated `IP:port` literals makes them the
+/// application's endpoints, in both `app_clusters`, without a reload.
+/// Anything but a `PUT` is `405`.
+///
+/// Each cluster applies the list all at once or not at all, but the two
+/// are asked in turn and nothing rolls back: the second can refuse for
+/// room (`SlotsExhausted`, `409`) while slots of its own still drain,
+/// leaving `api` on the new list and `search` on the old. The answer
+/// names which, and the `PUT` is idempotent — an endpoint already in a
+/// set keeps its slot — so the operator retries once the drain is done.
+///
+/// No authentication: where its listener is bound is this example's only
+/// guard, and whoever reaches it moves all of the application's traffic.
+/// A real build guards the route with a request policy — a token, or on
+/// a mutual-TLS listener the client certificate's names (#432) — or
+/// serves it on a `unix:` socket.
+pub const EndpointsControl = struct {
+    /// The application clusters' sets, taken at `bind`: what the handler
+    /// changes while it serves.
+    sets: [app_clusters.len]?zoxy.extension.EndpointSet = @splat(null),
+    /// Lists both clusters took: what an operator's tooling would expose.
+    /// A list only the first took is not counted.
+    updates: u64 = 0,
+    /// The list being parsed, per request: the handler runs to
+    /// completion, so one serves every call.
+    parsed: [endpoints_max]zoxy.extension.EndpointSet.Endpoint = undefined,
+
+    pub const response_bytes_max = 2048;
+
+    pub fn bind(
+        control: *EndpointsControl,
+        site: *const zoxy.extension.PolicySite,
+        startup: *const zoxy.extension.Startup,
+    ) !void {
+        // A handler route sends to no cluster.
+        assert(site.route_index != null);
+        assert(site.cluster_index == null);
+        for (app_clusters, &control.sets) |name, *set| {
+            set.* = startup.endpointSet(name) orelse return error.EndpointSlotsMissing;
+        }
+    }
+
+    pub fn handle(
+        control: *EndpointsControl,
+        request: *const zoxy.extension.Request,
+        body: []const u8,
+        response: *zoxy.extension.HandlerResponse,
+    ) void {
+        assert(request.cluster_index == null);
+        for (control.sets) |set| assert(set != null);
+        response.header("Content-Type", "text/plain; charset=utf-8");
+        if (request.method != .put) {
+            response.status = 405;
+            response.header("Allow", "PUT");
+            response.write("PUT a comma-separated list of IP:port endpoints\n");
+            return;
+        }
+        const list = control.parse(body) orelse {
+            response.status = 400;
+            response.print("not a list of 1 to {d} IP:port endpoints\n", .{endpoints_max});
+            return;
+        };
+        for (app_clusters, control.sets, 0..) |name, set, index| {
+            set.?.replace(list) catch |err| {
+                response.status = if (err == error.SlotsExhausted) 409 else 400;
+                response.print("{s} refused the list: {s}", .{ name, @errorName(err) });
+                if (index > 0) response.print(", after {s} took it", .{app_clusters[0]});
+                response.write("\n");
+                return;
+            };
+        }
+        control.updates += 1;
+        response.print("{d} endpoint(s) now serve", .{list.len});
+        for (app_clusters) |name| response.print(" {s}", .{name});
+        response.write("\n");
+    }
+
+    /// `body` as endpoints, weight 1 each, or null when it is not a list
+    /// of 1 to `endpoints_max` IP literals with ports. Validation beyond
+    /// the syntax — a zero port, a duplicate — is the set's.
+    fn parse(control: *EndpointsControl, body: []const u8) ?[]const zoxy.extension.EndpointSet.Endpoint {
+        assert(control.parsed.len == endpoints_max);
+        var count: u16 = 0;
+        var literals = std.mem.tokenizeAny(u8, body, ", \t\r\n");
+        while (literals.next()) |literal| {
+            if (count == endpoints_max) return null;
+            const address = std.Io.net.IpAddress.parseLiteral(literal) catch return null;
+            control.parsed[count] = .{ .address = address };
+            count += 1;
+        }
+        assert(count <= endpoints_max);
+        if (count == 0) return null;
+        return control.parsed[0..count];
+    }
+};
+
 /// The build's extension instances: options select these by address, so
 /// they live as long as the server does.
 pub const Instances = struct {
@@ -339,11 +449,15 @@ pub const Instances = struct {
     read_only: ReadOnly = .{},
     security_headers: SecurityHeaders = .{},
     connection_cap: ConnectionCap = .{},
+    endpoints_control: EndpointsControl = .{},
 };
 
 /// What the command line discovered.
 pub const Plan = struct {
     listen: std.Io.net.IpAddress,
+    /// The control plane's own listener: bind it where only operators
+    /// reach, loopback say, since what it answers changes the edge.
+    control: std.Io.net.IpAddress,
     /// The application's endpoints: the `api` and `search` clusters both
     /// draw on them.
     app: []const std.Io.net.IpAddress,
@@ -358,14 +472,16 @@ pub const Plan = struct {
 /// `ConnectionCap`, its requests guarded by `TenantGuard` and its
 /// responses edited by `SecurityHeaders`, with `/static` read-only and
 /// path-affine, `/search` and everything else to the application through
-/// one shared `LeastInFlight`. Allocated in `arena`, which the caller
-/// keeps for as long as the options run.
+/// one shared `LeastInFlight`; and the control plane's listener, whose
+/// one route `EndpointsControl` answers. Allocated in `arena`, which the
+/// caller keeps for as long as the options run.
 pub fn options(
     arena: std.mem.Allocator,
     instances: *Instances,
     plan: *const Plan,
 ) error{OutOfMemory}!zoxy.Options {
     assert(plan.app.len >= 1);
+    assert(plan.app.len <= endpoints_max);
     assert(plan.static.len >= 1);
     const routes = try arena.dupe(zoxy.Options.Listener.Route, &.{
         .{
@@ -376,7 +492,10 @@ pub fn options(
         .{ .prefix = "/search", .cluster = "search" },
         .{ .prefix = "/", .cluster = "api" },
     });
-    const listeners = try arena.dupe(zoxy.Options.Listener, &.{.{
+    const control_routes = try arena.dupe(zoxy.Options.Listener.Route, &.{
+        .{ .prefix = "/endpoints", .handler = App.handler(&instances.endpoints_control) },
+    });
+    const listeners = try arena.dupe(zoxy.Options.Listener, &.{ .{
         .bind = .{ .ip = plan.listen },
         .protocol = .{ .http = .{
             .target = .{ .routes = routes },
@@ -392,11 +511,29 @@ pub fn options(
             zoxy.extension.Selection,
             &.{App.connectionPolicy(&instances.connection_cap)},
         ),
-    }});
+    }, .{
+        .bind = .{ .ip = plan.control },
+        .protocol = .{ .http = .{
+            .target = .{ .routes = control_routes },
+            .max_body_bytes = zoxy.defaults.max_body_bytes,
+            .keepalive_requests = zoxy.defaults.keepalive_requests,
+        } },
+    } });
     const app = try endpoints(arena, plan.app);
     const clusters = try arena.dupe(zoxy.Options.Cluster, &.{
-        .{ .name = "api", .endpoints = app, .pick = App.picker(&instances.least_in_flight) },
-        .{ .name = "search", .endpoints = app, .pick = App.picker(&instances.least_in_flight) },
+        // Slots for the endpoints the control plane may add (#428).
+        .{
+            .name = app_clusters[0],
+            .endpoints = app,
+            .endpoint_slots = endpoints_max,
+            .pick = App.picker(&instances.least_in_flight),
+        },
+        .{
+            .name = app_clusters[1],
+            .endpoints = app,
+            .endpoint_slots = endpoints_max,
+            .pick = App.picker(&instances.least_in_flight),
+        },
         .{
             .name = "static",
             .endpoints = try endpoints(arena, plan.static),

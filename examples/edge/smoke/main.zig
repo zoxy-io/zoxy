@@ -54,21 +54,27 @@ pub fn main(init: std.process.Init) !u8 {
     try watchdog.concurrent(io, watch, .{io});
     defer watchdog.cancel(io);
     var app: Origin = undefined;
+    // The application's next endpoint: in no list the edge starts with,
+    // joined by the control plane while it serves.
+    var app_next: Origin = undefined;
     var static_a: Origin = undefined;
     var static_b: Origin = undefined;
     try app.start(io);
     defer app.stop();
+    try app_next.start(io);
+    defer app_next.stop();
     try static_a.start(io);
     defer static_a.stop();
     try static_b.start(io);
     defer static_b.stop();
 
-    const listen_port = try freePort(io);
+    const listen_port, const control_port = try freePorts(io);
     const listen = try std.fmt.allocPrint(arena, "127.0.0.1:{d}", .{listen_port});
+    const control = try std.fmt.allocPrint(arena, "127.0.0.1:{d}", .{control_port});
     const static_list = try std.fmt.allocPrint(arena, "{s},{s}", .{ static_a.label(), static_b.label() });
     // The pre-flight first: it resolves the options and asks the box for
     // what a start would, and binds nothing.
-    try expectCheckPasses(io, args[1], listen, app.label(), static_list);
+    try expectCheckPasses(io, &.{ args[1], "--check", listen, control, app.label(), static_list });
     // The pre-flight's own process was waited for; it never gets a pid
     // the watchdog would have to know.
 
@@ -77,7 +83,7 @@ pub fn main(init: std.process.Init) !u8 {
     const log_file = try Io.Dir.cwd().createFile(io, log_path, .{ .read = true });
     defer log_file.close(io);
     var child = try std.process.spawn(io, .{
-        .argv = &.{ args[1], listen, app.label(), static_list },
+        .argv = &.{ args[1], listen, control, app.label(), static_list },
         .stdout = .{ .file = log_file },
         .stderr = .{ .file = log_file },
     });
@@ -90,6 +96,8 @@ pub fn main(init: std.process.Init) !u8 {
     };
 
     var passed = exercise(io, listen_port, &app, &static_a, &static_b);
+    // Last, since it moves the application to `app_next` for good.
+    passed = exerciseControl(io, listen_port, control_port, &app_next) and passed;
     try std.posix.kill(child.id.?, .TERM);
     const term = try child.wait(io);
     running = false;
@@ -100,7 +108,8 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
     std.debug.print("zoxy-edge smoke: routes, pickers, both policy phases, the tenant's challenge, " ++
-        "header and tag, and the response headers, under a connection cap, over XevIo, clean drain\n", .{});
+        "header and tag, the response headers under a connection cap, and a live endpoint update over XevIo, " ++
+        "clean drain\n", .{});
     return 0;
 }
 
@@ -147,6 +156,27 @@ fn exercise(io: Io, port: u16, app: *const Origin, static_a: *const Origin, stat
     passed = expectStatus(io, port, anonymous, &buffer, "401") and passed;
     const unnamed = "GET /orders HTTP/1.1\r\nHost: edge\r\nx-tenant: a b\r\nConnection: close\r\n\r\n";
     passed = expectStatus(io, port, unnamed, &buffer, "401") and passed;
+    return passed;
+}
+
+/// The control plane (#434), on its own listener: the application moved
+/// to `next` while the edge serves (#428), the next request answered
+/// there, and a list that is not one refused without a change.
+fn exerciseControl(io: Io, port: u16, control_port: u16, next: *const Origin) bool {
+    var request_buffer: [256]u8 = undefined;
+    const update = std.fmt.bufPrint(
+        &request_buffer,
+        "PUT /endpoints HTTP/1.1\r\nHost: edge\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ next.label().len, next.label() },
+    ) catch unreachable; // A label is at most 21 octets: `255.255.255.255:65535`.
+    var buffer: [response_bytes_max]u8 = undefined;
+    var passed = expectStatus(io, control_port, update, &buffer, "200");
+    const tenant = "Host: edge\r\nx-tenant: acme\r\nConnection: close\r\n\r\n";
+    passed = expectBody(io, port, "GET /orders HTTP/1.1\r\n" ++ tenant, &buffer, next.label()) and passed;
+    passed = expectBody(io, port, "GET /search?q=zig HTTP/1.1\r\n" ++ tenant, &buffer, next.label()) and passed;
+    const garbled = "PUT /endpoints HTTP/1.1\r\nHost: edge\r\nContent-Length: 7\r\nConnection: close\r\n\r\nnowhere";
+    passed = expectStatus(io, control_port, garbled, &buffer, "400") and passed;
+    passed = expectBody(io, port, "GET /orders HTTP/1.1\r\n" ++ tenant, &buffer, next.label()) and passed;
     return passed;
 }
 
@@ -242,9 +272,10 @@ fn watch(io: Io) void {
     std.process.exit(1);
 }
 
-fn expectCheckPasses(io: Io, edge: []const u8, listen: []const u8, app: []const u8, static: []const u8) !void {
+fn expectCheckPasses(io: Io, argv: []const []const u8) !void {
+    assert(argv.len >= 2);
     var child = try std.process.spawn(io, .{
-        .argv = &.{ edge, "--check", listen, app, static },
+        .argv = argv,
         .stdout = .ignore,
     });
     const term = try child.wait(io);
@@ -254,14 +285,19 @@ fn expectCheckPasses(io: Io, edge: []const u8, listen: []const u8, app: []const 
     }
 }
 
-/// A loopback port nothing listens on, as the kernel picks one.
-fn freePort(io: Io) !u16 {
+/// Two loopback ports nothing listens on, as the kernel picks them —
+/// held open together, so it cannot pick one twice.
+fn freePorts(io: Io) !struct { u16, u16 } {
     var address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-    var server = try address.listen(io, .{ .mode = .stream });
-    defer server.deinit(io);
-    const port = server.socket.address.getPort();
-    assert(port != 0);
-    return port;
+    var first = try address.listen(io, .{ .mode = .stream });
+    defer first.deinit(io);
+    var second = try address.listen(io, .{ .mode = .stream });
+    defer second.deinit(io);
+    const ports = .{ first.socket.address.getPort(), second.socket.address.getPort() };
+    assert(ports[0] != 0);
+    assert(ports[1] != 0);
+    assert(ports[0] != ports[1]);
+    return ports;
 }
 
 fn awaitListening(io: Io, port: u16) !void {
