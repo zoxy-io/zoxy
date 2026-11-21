@@ -140,9 +140,14 @@ pub fn TestClient(comptime IoType: type) type {
             client.done = false;
             client.on_done = on_done;
             client.context = context;
+            // The first Destination Connection ID's length, drawn from the
+            // seed across RFC 9000's whole range (§7.2: at least eight
+            // octets): a server's Initial handling meets every one.
+            const destination_len: usize = 8 + @as(usize, seed[63] % 13);
+            assert(destination_len <= quic.ConnectionId.octets_max);
             client.quic.initInPlace(.{
                 .side = .client,
-                .original_destination = try .init(seed[0..8]),
+                .original_destination = try .init(seed[24..][0..destination_len]),
                 .source = try .init(seed[8..16]),
                 // The server's three streams in; the requests and this side's
                 // control stream out.

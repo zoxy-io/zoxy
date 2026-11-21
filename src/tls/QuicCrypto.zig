@@ -234,6 +234,20 @@ pub fn hkdfSha256Expand(out: []u8, prk: *const [32]u8, info: []const u8) void {
     HkdfSha256.expand(out, info, prk.*);
 }
 
+/// The longest message `hmacSha256` takes: a Retry token's body and the
+/// address it is minted for, at the widest.
+pub const hmac_message_bytes_max: u32 = 64;
+
+/// HMAC-SHA-256 over a short message, for zoxy's own QUIC tokens (#449) —
+/// a Retry token's integrity and a stateless reset's token — rather than
+/// one of h3's primitives, whose extract only ever takes a connection ID.
+/// std.crypto's, as the key schedule's HMAC is.
+pub fn hmacSha256(out: *[32]u8, key: *const [32]u8, message: []const u8) void {
+    assert(message.len >= 1);
+    assert(message.len <= hmac_message_bytes_max);
+    std.crypto.auth.hmac.sha2.HmacSha256.create(out, message, key);
+}
+
 /// RFC 5869 expand over SHA-384, for AES-256-GCM's schedule.
 pub fn hkdfSha384Expand(out: []u8, prk: *const [48]u8, info: []const u8) void {
     assert(out.len >= 1);

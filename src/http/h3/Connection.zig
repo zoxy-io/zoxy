@@ -77,9 +77,11 @@ pub const Slot = struct {
     generation: u32,
     quic: Quic,
     session: Session,
-    /// The Destination Connection ID of the client's first Initial: what
-    /// its Initials carry until it hears this side's, so a retransmitted
-    /// one finds this connection rather than starting another.
+    /// The Destination Connection ID of the Initial that started this
+    /// connection — the client's own choice, or after a Retry the ID the
+    /// Retry named — which is what its Initials carry until it hears this
+    /// side's, so a retransmitted one finds this connection rather than
+    /// starting another.
     original: ConnectionId,
     /// This side's transport parameters, encoded once the transport
     /// exists: what the engine's EncryptedExtensions carries.
@@ -149,7 +151,9 @@ pub const Slot = struct {
             },
         });
         slot.session = .init();
-        slot.original = if (start.retry) |retried| retried.original_destination else start.initial_destination;
+        // Not a Retry's vouched-for original: the client has moved off that
+        // one, to the ID the Retry named, and its next Initials carry that.
+        slot.original = start.initial_destination;
         slot.refusal = null;
         slot.endpoint_index = start.endpoint_index;
         slot.peer = start.peer;

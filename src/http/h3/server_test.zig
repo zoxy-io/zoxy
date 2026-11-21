@@ -152,8 +152,17 @@ const Bed = struct {
     credentials: [1]?Credentials,
     origin: Origin,
     client: Client,
+    /// A second client, started when the first is done — while its
+    /// connection still holds its slot through the closing period.
+    second: Client,
+    second_requests: []const TestClient.Request,
 
     fn create(seed: u64) !*Bed {
+        return createUnder(seed, .{});
+    }
+
+    /// Under the datagram adversary `adversary` states.
+    fn createUnder(seed: u64, adversary: SimIo.Adversary) !*Bed {
         const bed = try std.testing.allocator.create(Bed);
         errdefer std.testing.allocator.destroy(bed);
         bed.arena_state = .init(std.testing.allocator);
@@ -163,6 +172,7 @@ const Bed = struct {
         const limits = bed.config.limits;
         try bed.sim_io.init(arena, .{
             .seed = seed,
+            .adversary = adversary,
             .buffer_group_count = limits.head_buffers,
             .buffer_group_bytes = limits.head_buffer_bytes,
         });
@@ -186,6 +196,25 @@ const Bed = struct {
         const bed: *Bed = @ptrCast(@alignCast(context));
         bed.origin.stop();
         bed.server.beginDrain();
+    }
+
+    fn onFirstDone(context: *anyopaque) void {
+        const bed: *Bed = @ptrCast(@alignCast(context));
+        var seed: [64]u8 = undefined;
+        for (&seed, 0..) |*octet, index| octet.* = @intCast(index + 101);
+        bed.second.start(&bed.sim_io, loopback(listen_port), bed.second_requests, seed, onClientDone, bed) catch unreachable;
+    }
+
+    /// Two clients, the second after the first.
+    fn runPair(bed: *Bed, first: []const TestClient.Request, second: []const TestClient.Request) !void {
+        bed.second_requests = second;
+        var seed: [64]u8 = undefined;
+        for (&seed, 0..) |*octet, index| octet.* = @intCast(index + 1);
+        try bed.client.start(&bed.sim_io, loopback(listen_port), first, seed, onFirstDone, bed);
+        try bed.sim_io.run();
+        try std.testing.expect(bed.second.done);
+        try std.testing.expect(bed.server.isIdle());
+        try std.testing.expect(bed.server.reconcile());
     }
 
     fn run(bed: *Bed, requests: []const TestClient.Request) !void {
@@ -311,4 +340,37 @@ test "h3 server: a datagram in a version it does not speak is answered with Vers
     try std.testing.expect(probe.answer_len >= 7);
     try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, probe.answer[1..5], .big));
     try std.testing.expect(bed.server.isIdle());
+}
+
+test "h3 server: a client the pool's pressure Retries proves its address and is served" {
+    // The first connection holds one of the two slots through its closing
+    // period, so the second meets the watermark: a Retry, its token
+    // returned in the next Initial, and the connection then admitted under
+    // the ID the Retry named (RFC 9000 §8.1.2, §7.3).
+    const bed = try Bed.create(6);
+    defer bed.destroy();
+    try bed.runPair(&.{.{ .path = "/one" }}, &.{.{ .path = "/two" }});
+    try std.testing.expectEqual(@as(u16, 200), bed.client.answers[0].status);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("h3_retries"));
+    try std.testing.expectEqual(@as(u16, 200), bed.second.answers[0].status);
+    try std.testing.expectEqualStrings("hello", bed.second.answers[0].bodyBytes());
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("h3_handshakes"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("h3_tokens_refused"));
+}
+
+test "h3 server: a Retried client's Initial, delivered twice, starts one connection" {
+    // After a Retry the client's Initials carry the ID the Retry named until
+    // it hears this side's; a copy of one must find the connection the
+    // first copy started, not admit a second the client will never finish.
+    const bed = try Bed.createUnder(7, .{ .partial_io = false, .udp_duplicate_percent = 100 });
+    defer bed.destroy();
+    try bed.runPair(&.{.{ .path = "/one" }}, &.{.{ .path = "/two" }});
+    try std.testing.expectEqual(@as(u16, 200), bed.second.answers[0].status);
+    // Each copy of its first Initial is Retried on its own — a Retry is
+    // stateless — and the client takes the first (RFC 9000 §17.2.5.2).
+    try std.testing.expect(bed.server.counters.get("h3_retries") >= 1);
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("h3_admitted"));
+    // The pool is full while the copy arrives, so a copy taken for a new
+    // client is shed rather than admitted — which says the same thing.
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("h3_shed_connections"));
 }
