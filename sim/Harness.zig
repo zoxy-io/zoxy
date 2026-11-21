@@ -2101,19 +2101,31 @@ fn terminatingListener(harness: *Harness) zoxy.Options.Listener {
 }
 
 /// The staging size this seed runs with (§8, §9). Adversarial seeds sit
-/// at the floor — one worst-case line each — so the buffer swap runs
-/// constantly and every line meets a nearly-full buffer, against the
-/// default's hundred-line headroom where the swap fires once a
-/// scenario. The *drop* rung itself stays out of reach here: a scenario
-/// emits a handful of lines and filling even the floor takes dozens, so
-/// it is pinned by a directed test (`access_log_test.zig`) rather than
-/// left to a seed that cannot generate the volume.
+/// at the floor — one worst-case line, which holds about eighteen of the
+/// sweep's real ones — so the buffer swap runs constantly and lines meet
+/// a nearly-full buffer, against the default's headroom (about eighty
+/// real lines) where the swap fires once a scenario. The *drop* rung
+/// itself is meant to stay out of reach: it needs a scenario's lines to
+/// outrun the floor inside one slow sink write, so it is pinned by a
+/// directed test (`access_log_test.zig`) rather than left to the sweep.
 ///
 /// The one scenario that does generate it is Rapid Reset (#276): a
 /// hundred lines, as fast as PONGs return, outrun any smaller staging
 /// behind the adversary's slow sink. A seed that may draw it stages at
 /// the ceiling, which holds them all, so the drop rung stays the
 /// directed test's.
+///
+/// A seed with HTTP/3 clients (#449) stages at the default too, on
+/// evidence rather than arithmetic. Its clients add at most
+/// `h3_clients_max * H3Client.streams_max` (eight) lines, and soak #144
+/// found two seeds (558591242, 559342788) whose lines — HTTP/2 sheds,
+/// HTTP/3 answers, aborts — all landed inside one slow sink write and
+/// outran the floor. Those seeds give up the floor's swap pressure; the
+/// rest keep it. A population without HTTP/3 can in principle outrun the
+/// floor as well — six HTTP/2 clients at four streams each — but no soak
+/// has seen it in hundreds of millions of seeds, and the census entry is
+/// the alarm if one does. Bounding the staging by the drawn population
+/// would be exact, but the population is drawn after the server starts.
 ///
 /// The floor is one line of *this* config, not the static minimum:
 /// #140's named headers widen a line, so the floor is computed from this
@@ -2124,7 +2136,7 @@ fn deriveAccessLogBuffer(harness: *const Harness) u32 {
         return 0;
     }
     if (harness.h2_rapid_reset) return zoxy.constants.access_log_buffer_bytes_max;
-    if (harness.clean) {
+    if (harness.clean or harness.h3_count != 0) {
         return zoxy.constants.access_log_buffer_bytes_default;
     }
     const floor = @max(
