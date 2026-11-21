@@ -2,6 +2,9 @@
 //! policies through zoxy's serving path, on `zoxy.testing.Bed` — the bed
 //! zoxy runs its own extensions through — held to the zero-allocation
 //! gate, which also replays the seed and compares the traces.
+//!
+//! The health-check kind is the smoke's to show: a bed scenario drains
+//! within milliseconds of virtual time, before a sweep comes due.
 
 const std = @import("std");
 
@@ -29,12 +32,14 @@ fn loopback(port: u16) std.Io.net.IpAddress {
 
 const app_endpoints = [_]std.Io.net.IpAddress{ loopback(29001), loopback(29002) };
 const static_endpoints = [_]std.Io.net.IpAddress{ loopback(29101), loopback(29102), loopback(29103) };
+const auth_endpoints = [_]std.Io.net.IpAddress{loopback(29201)};
 
 const plan: edge.Plan = .{
     .listen = loopback(28080),
     .control = loopback(28081),
     .app = &app_endpoints,
     .static = &static_endpoints,
+    .auth = &auth_endpoints,
 };
 
 const tenant = "Host: edge\r\nx-tenant: acme\r\nConnection: close\r\n\r\n";
@@ -72,6 +77,7 @@ fn exercise(bed: *Bed) !void {
 
     const orders = bed.request(0, "GET /orders HTTP/1.1\r\n" ++ tenant);
     const search = bed.request(0, "GET /search?q=zig HTTP/1.1\r\n" ++ tenant);
+    const account = bed.request(0, "GET /account HTTP/1.1\r\n" ++ tenant);
     const asset = bed.request(0, "GET /static/app.js HTTP/1.1\r\n" ++ tenant);
     const asset_again = bed.request(0, "GET /static/app.js HTTP/1.1\r\n" ++ tenant);
     const upload = bed.request(0, "POST /static/app.js HTTP/1.1\r\nContent-Length: 0\r\n" ++ tenant);
@@ -99,10 +105,11 @@ fn exercise(bed: *Bed) !void {
     try std.testing.expectEqual(@as(?u16, 200), search.status());
     try std.testing.expect(isOneOf(search.body(), &app_endpoints));
     // Counted by the build's own series (#435), which start at zero with
-    // each run: one pick in each cluster, summed — and each pick heard
-    // its outcome once (#423), neither one failing.
-    try std.testing.expectEqual(@as(u64, 2), bed.counter(edge.LeastInFlight, .picks));
-    try std.testing.expectEqual(@as(u64, 2), bed.counter(edge.LeastInFlight, .completed));
+    // each run: `/orders` and `/account` in `api`, `/search` in `search`,
+    // summed — and each pick heard its outcome once (#423), none failing.
+    // The consult's own pick is `auth`'s, whose picker is the stock p2c.
+    try std.testing.expectEqual(@as(u64, 3), bed.counter(edge.LeastInFlight, .picks));
+    try std.testing.expectEqual(@as(u64, 3), bed.counter(edge.LeastInFlight, .completed));
     try std.testing.expectEqual(@as(u64, 0), bed.counter(edge.LeastInFlight, .failed));
 
     // One path, one endpoint, on the cluster `PathAffinity` serves.
@@ -123,8 +130,14 @@ fn exercise(bed: *Bed) !void {
     try std.testing.expectEqual(@as(u64, 2), bed.counter(edge.TenantGuard, .refused));
     // Every request it let on completed once (#429) — the upload the
     // route refused after it included — and none is still counted.
-    try std.testing.expectEqual(@as(u64, 5), bed.counter(edge.TenantGuard, .completed));
+    try std.testing.expectEqual(@as(u64, 6), bed.counter(edge.TenantGuard, .completed));
     try std.testing.expectEqual(@as(u32, 0), instances.tenant_guard.in_flight);
+    // The account's request waited on its consult (#437): the bed's auth
+    // origin answers `200`, so the guard let it on to the application.
+    try std.testing.expectEqual(@as(?u16, 200), account.status());
+    try std.testing.expect(isOneOf(account.body(), &app_endpoints));
+    try std.testing.expectEqual(@as(u64, 1), bed.counter(edge.AccountGuard, .allowed));
+    try std.testing.expectEqual(@as(u32, 1), answeredBy(bed, &auth_endpoints));
     // The update took both clusters; the others changed nothing. Whether
     // `/orders` and `/search` ran before it or after, either application
     // endpoint answers them, so their checks above hold either way.
@@ -134,13 +147,13 @@ fn exercise(bed: *Bed) !void {
     try std.testing.expectEqual(@as(?u16, 400), garbled.status());
     try std.testing.expectEqual(@as(?u16, 405), listing.status());
     try expectLine(listing, "Allow: PUT\r\n");
-    // One response policy call per origin response: the four answered,
-    // and none of the edge's own pages.
-    try std.testing.expectEqual(edited_before + 4, instances.security_headers.edited);
+    // One response policy call per origin response: the five answered,
+    // and none of the edge's own pages, nor the consult's reply.
+    try std.testing.expectEqual(edited_before + 5, instances.security_headers.edited);
     // Every connection let on was released, and none met the cap.
     try std.testing.expectEqual(@as(u32, 0), instances.connection_cap.open);
     try std.testing.expectEqual(@as(u64, 0), bed.counter(edge.ConnectionCap, .refused));
-    try std.testing.expectEqual(@as(u32, 2), answeredBy(bed, &app_endpoints));
+    try std.testing.expectEqual(@as(u32, 3), answeredBy(bed, &app_endpoints));
     try std.testing.expectEqual(@as(u32, 2), answeredBy(bed, &static_endpoints));
 }
 

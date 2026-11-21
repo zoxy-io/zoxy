@@ -2,23 +2,27 @@
 //! configured entirely in code — its extensions and its options are
 //! `edge.zig`; this file is only its command line.
 //!
-//!     zoxy-edge [--check] LISTEN CONTROL APP STATIC
+//!     zoxy-edge [--check] LISTEN CONTROL APP STATIC AUTH
 //!
 //! LISTEN is the `IP:port` to accept on, and CONTROL the control plane's,
 //! which belongs where only operators reach — loopback, say — since it
-//! asks no credentials and moves the application's traffic. APP and
-//! STATIC are comma-separated `IP:port` lists, at most
-//! `edge.endpoints_max` each: the application's endpoints, and the
-//! static-content ones. Discovery here is the command line; a build that
-//! asks a registry or DNS does so at this same point — before its options
-//! exist, with the whole startup sequence still ahead of it.
+//! asks no credentials and moves the application's traffic. APP, STATIC
+//! and AUTH are comma-separated `IP:port` lists, at most
+//! `edge.endpoints_max` each: the application's endpoints, the
+//! static-content ones, and the auth service `/account` consults.
+//! Discovery here is the command line; a build that asks a registry or
+//! DNS does so at this same point — before its options exist, with the
+//! whole startup sequence still ahead of it — and one that keeps asking
+//! while it serves updates the sets it took at `bind`, as the control
+//! plane does.
 //!
 //! The supported entry points, in the order a build calls them
 //! (DESIGN.md §13):
 //!
 //! 1. discover what the options need — here, parse the command line;
 //! 2. build `zoxy.Options` (`edge.options`), selecting extension instances
-//!    with `App.picker` and `App.policy`;
+//!    with `App.picker`, `App.policy`, `App.responsePolicy`,
+//!    `App.connectionPolicy`, `App.handler` and `App.probe`;
 //! 3. `App.serve`, which resolves the options, prices them and prints the
 //!    banner, takes the fd budget and the log sink, builds the server,
 //!    binds the extensions and runs to the drain — or `App.check`, which
@@ -45,10 +49,10 @@ pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
     assert(args.len >= 1);
-    const check = args.len == 6 and std.mem.eql(u8, args[1], "--check");
+    const check = args.len == 7 and std.mem.eql(u8, args[1], "--check");
     const positional = if (check) args[2..] else args[1..];
-    if (positional.len != 4) {
-        std.debug.print("usage: zoxy-edge [--check] LISTEN CONTROL APP STATIC\n", .{});
+    if (positional.len != 5) {
+        std.debug.print("usage: zoxy-edge [--check] LISTEN CONTROL APP STATIC AUTH\n", .{});
         return 2;
     }
     const arena_before = init.arena.queryCapacity();
@@ -57,6 +61,7 @@ pub fn main(init: std.process.Init) !u8 {
         .control = try address(positional[1]),
         .app = try addresses(arena, positional[2]),
         .static = try addresses(arena, positional[3]),
+        .auth = try addresses(arena, positional[4]),
         .log_requests = true,
     };
     const options = try edge.options(arena, &instances, &plan);

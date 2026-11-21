@@ -4,8 +4,8 @@
 //! it needs none: the endpoints arrive from its command line, which is
 //! the "discovery" a build does before its options exist.
 //!
-//! The build lists two picker types, two request policies, a response
-//! policy, a connection policy and a handler:
+//! The build lists two picker types, three request policies, a response
+//! policy, a connection policy, a handler and a health-check kind:
 //!
 //! - `LeastInFlight` picks the endpoint with the fewest requests in
 //!   flight. One instance serves both the `api` and `search` clusters, so
@@ -22,6 +22,10 @@
 //!   it; and it counts the request in flight until it completes (#429).
 //! - `ReadOnly`, on the `/static` route, refuses anything but a read once
 //!   the route is chosen and before any connection is taken for it.
+//! - `AccountGuard`, on the `/account` route, asks the `auth` service
+//!   whether the request's tenant may (#437) before it decides. The
+//!   request waits, parked, while zoxy runs the consult on the loop; no
+//!   thread blocks, and a service that cannot answer fails closed.
 //! - `SecurityHeaders`, on the listener's way out (#424), sets the
 //!   headers a browser-facing edge owes every response an origin sends,
 //!   and drops the one that names the origin's software.
@@ -35,6 +39,9 @@
 //!   `api` and `search` clusters' sets while the edge serves (#428): an
 //!   endpoint that stays keeps its connections and health, one that
 //!   leaves drains, one that arrives takes a free slot.
+//! - `HealthzProbe` is the `static` cluster's health-check kind (#436):
+//!   zoxy dials and holds the deadline, the type says what to send and
+//!   what a healthy answer is.
 //!
 //! Each obeys the contract every extension does: run to completion, no
 //! allocation, no clock, no syscall, nothing kept from a view past the
@@ -53,8 +60,9 @@ const assert = std.debug.assert;
 
 pub const extensions: zoxy.Extensions = .{
     .handlers = &.{EndpointsControl},
+    .probes = &.{HealthzProbe},
     .pickers = &.{ LeastInFlight, PathAffinity },
-    .request_policies = &.{ TenantGuard, ReadOnly },
+    .request_policies = &.{ TenantGuard, ReadOnly, AccountGuard },
     .response_policies = &.{SecurityHeaders},
     .connection_policies = &.{ConnectionCap},
 };
@@ -71,6 +79,10 @@ pub const tenant_bytes_max = 64;
 /// The most endpoints one list names: on the command line, and in a
 /// control-plane update. The application clusters keep this many slots.
 pub const endpoints_max = 16;
+/// Consults `AccountGuard` may have in flight at once: each holds one
+/// buffer, priced in the banner as `consult slots`, and a request past
+/// them takes the guard's declared failure.
+pub const consult_slots = 64;
 /// The clusters that draw on the application's endpoints, which the
 /// control plane updates together.
 pub const app_clusters = [_][]const u8{ "api", "search" };
@@ -272,6 +284,118 @@ pub const ReadOnly = struct {
     }
 };
 
+/// The `/account` route's guard (#437): before a request reaches the
+/// application, the edge asks the `auth` cluster
+/// `GET /allow?tenant=<tenant>`, and lets the request on at a `200` and
+/// answers `403` at anything else. The question is rendered into the
+/// instance, which zoxy copies before it reads another verdict. Every
+/// request consults here; a real guard would remember the tenants it was
+/// told about, in its own memory and for a time it chooses, and consult
+/// only on a miss.
+pub const AccountGuard = struct {
+    /// The `auth` cluster's index, resolved once at `bind`.
+    auth: ?u16 = null,
+    /// The question this request asks, rendered here because the consult
+    /// borrows it: zoxy copies it out before it reads another verdict.
+    question: [consult_request_bytes_max]u8 = undefined,
+
+    /// What a consult that cannot be made or answered decides: an
+    /// account is not served on a guess, so `503`.
+    pub const consult_failure: zoxy.extension.ConsultFailure = .closed;
+    /// The longest question, which the comptime block below holds the
+    /// longest tenant's to.
+    pub const consult_request_bytes_max = 256;
+    /// The reply is read for its status; its body may be cut here.
+    pub const consult_reply_bytes_max = 64;
+    /// How long a consult may take, under the request's own deadline:
+    /// past it the consult fails, and the guard's failure answers.
+    pub const consult_timeout_ms = 500;
+
+    pub const metrics_prefix = "account_guard";
+    pub const counters = .{
+        .allowed = "Requests the auth service let on.",
+        .denied = "Requests the auth service refused.",
+    };
+
+    const question_format = "GET /allow?tenant={s} HTTP/1.1\r\nHost: auth\r\nConnection: close\r\n\r\n";
+
+    comptime {
+        // The longest tenant's question fits the declared bound.
+        const longest: [tenant_bytes_max]u8 = @splat('a');
+        assert(std.fmt.count(question_format, .{&longest}) <= consult_request_bytes_max);
+    }
+
+    pub fn bind(
+        guard: *AccountGuard,
+        site: *const zoxy.extension.PolicySite,
+        startup: *const zoxy.extension.Startup,
+    ) !void {
+        _ = startup;
+        assert(site.route_index != null);
+        // Null for a cluster a consult cannot ask: HTTP/2, or TLS.
+        guard.auth = site.clusterNamed("auth") orelse return error.AuthClusterMissing;
+    }
+
+    pub fn evaluate(guard: *AccountGuard, request: *const zoxy.extension.Request) zoxy.extension.Verdict {
+        assert(request.cluster_index != null); // The route phase.
+        assert(guard.auth != null);
+        // `TenantGuard` let only a request with one tenant this far.
+        const tenant = tenantOf(request, tenant_header) orelse return .{ .reject = .forbidden };
+        // Fits: the comptime block renders the longest tenant's question.
+        const question = std.fmt.bufPrint(&guard.question, question_format, .{tenant}) catch unreachable;
+        return .{ .consult = .{ .cluster_index = guard.auth.?, .request = question } };
+    }
+
+    /// The service's answer, once it came: what decides.
+    pub fn consulted(
+        guard: *AccountGuard,
+        request: *const zoxy.extension.Request,
+        reply: *const zoxy.extension.ConsultReply,
+    ) zoxy.extension.Verdict {
+        assert(request.cluster_index != null);
+        assert(reply.body.len <= consult_reply_bytes_max);
+        _ = guard;
+        if (reply.status == 200) {
+            request.metrics.add(AccountGuard, .allowed, 1);
+            return .proceed;
+        }
+        request.metrics.add(AccountGuard, .denied, 1);
+        return .{ .reject = .forbidden };
+    }
+};
+
+/// The `static` cluster's health-check kind (#436): `GET /healthz`,
+/// passing on a `200` status line. The stock `http` check states this
+/// one too; a build's own kind earns its place on a protocol zoxy does
+/// not speak — a database's greeting, a cache's `PING` — and the
+/// contract is the same: zoxy dials, sends `request(round)`, and asks
+/// `judge` of the reply so far each time more of it arrives.
+///
+/// One instance serves every probe of the cluster, and they run
+/// concurrently, so a probe's own progress is the round zoxy keeps; an
+/// instance holds only configuration and what its probes share — here,
+/// nothing.
+pub const HealthzProbe = struct {
+    pub const reply_bytes_max = 512;
+
+    const status_line_ok = "HTTP/1.1 200 ";
+
+    pub fn request(probe: *HealthzProbe, round: u8) []const u8 {
+        assert(round == 0); // One round: `judge` never asks for a next.
+        _ = probe;
+        return "GET /healthz HTTP/1.1\r\nHost: edge\r\nConnection: close\r\n\r\n";
+    }
+
+    pub fn judge(probe: *HealthzProbe, round: u8, reply: []const u8) zoxy.extension.ProbeJudgement {
+        assert(round == 0);
+        assert(reply.len <= reply_bytes_max);
+        if (reply.len < status_line_ok.len) return .read_more;
+        _ = probe;
+        if (!std.mem.startsWith(u8, reply, status_line_ok)) return .fail;
+        return .pass;
+    }
+};
+
 /// What every response leaving the edge carries, whatever its origin
 /// sent (#424): edits the response filters could state too, here in code
 /// beside the build's other policies. They see the origin's final head
@@ -450,6 +574,8 @@ pub const Instances = struct {
     security_headers: SecurityHeaders = .{},
     connection_cap: ConnectionCap = .{},
     endpoints_control: EndpointsControl = .{},
+    account_guard: AccountGuard = .{},
+    healthz: HealthzProbe = .{},
 };
 
 /// What the command line discovered.
@@ -463,6 +589,8 @@ pub const Plan = struct {
     app: []const std.Io.net.IpAddress,
     /// The static-content endpoints.
     static: []const std.Io.net.IpAddress,
+    /// The auth service's endpoints, which `AccountGuard` consults.
+    auth: []const std.Io.net.IpAddress,
     /// Log every request to standard output, its tenant's tag in it: the
     /// binary does, and the simulator tests, which read no log, do not.
     log_requests: bool = false,
@@ -471,10 +599,12 @@ pub const Plan = struct {
 /// zoxy-edge's options: one HTTP listener, its connections capped by
 /// `ConnectionCap`, its requests guarded by `TenantGuard` and its
 /// responses edited by `SecurityHeaders`, with `/static` read-only and
-/// path-affine, `/search` and everything else to the application through
-/// one shared `LeastInFlight`; and the control plane's listener, whose
-/// one route `EndpointsControl` answers. Allocated in `arena`, which the
-/// caller keeps for as long as the options run.
+/// path-affine and health-checked by `HealthzProbe`, `/account` guarded
+/// by `AccountGuard`'s consult, `/search` and everything else to the
+/// application through one shared `LeastInFlight`; and the control
+/// plane's listener, whose one route `EndpointsControl` answers.
+/// Allocated in `arena`, which the caller keeps for as long as the
+/// options run.
 pub fn options(
     arena: std.mem.Allocator,
     instances: *Instances,
@@ -483,11 +613,17 @@ pub fn options(
     assert(plan.app.len >= 1);
     assert(plan.app.len <= endpoints_max);
     assert(plan.static.len >= 1);
+    assert(plan.auth.len >= 1);
     const routes = try arena.dupe(zoxy.Options.Listener.Route, &.{
         .{
             .prefix = "/static",
             .cluster = "static",
             .request_policies = try arena.dupe(zoxy.extension.Selection, &.{App.policy(&instances.read_only)}),
+        },
+        .{
+            .prefix = "/account",
+            .cluster = app_clusters[0],
+            .request_policies = try arena.dupe(zoxy.extension.Selection, &.{App.policy(&instances.account_guard)}),
         },
         .{ .prefix = "/search", .cluster = "search" },
         .{ .prefix = "/", .cluster = "api" },
@@ -538,14 +674,22 @@ pub fn options(
             .name = "static",
             .endpoints = try endpoints(arena, plan.static),
             .pick = App.picker(&instances.path_affinity),
+            .check = .{ .kind = App.probe(&instances.healthz), .fall = 2, .rise = 1, .timeout_ms = 1000 },
         },
+        .{ .name = "auth", .endpoints = try endpoints(arena, plan.auth), .pick = .p2c },
     });
     return .{
         .listeners = listeners,
         .clusters = clusters,
         .access_log = if (plan.log_requests) .{ .sink = .stdout } else null,
         .timeouts = zoxy.defaults.timeouts,
-        .limits = zoxy.defaults.limits,
+        .limits = limits: {
+            var limits = zoxy.defaults.limits;
+            // Consults in flight at once (#437): a build that selects a
+            // consulting policy sizes them, or startup refuses it.
+            limits.consult_slots = consult_slots;
+            break :limits limits;
+        },
     };
 }
 
