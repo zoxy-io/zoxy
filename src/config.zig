@@ -1900,6 +1900,7 @@ fn resolveLimits(
         listeners_count,
         health_probes,
         origin_pools.connections,
+        features.quic,
     );
     // Zero exactly when the log is off, so the one number says both how
     // big the staging buffers are and whether there are any (§8). A
@@ -2144,6 +2145,7 @@ fn resolveCqFill(
     listeners_count: u32,
     health_probes: u32,
     origin_connections: u32,
+    quic_endpoints: u32,
 ) ValidationError!u32 {
     assert(conn_slots >= 1);
     assert(listeners_count >= 1);
@@ -2160,6 +2162,7 @@ fn resolveCqFill(
         listeners_count,
         health_probes,
         origin_connections,
+        quic_endpoints,
         cq_fill_eighths,
     )) {
         return error.LimitConnSlotsOverCqFill;

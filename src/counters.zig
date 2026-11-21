@@ -423,6 +423,64 @@ pub const Counters = struct {
     /// frame of a body without a declared length, which overruns the
     /// default buffer by the octets its chunk framing takes.
     h2_frames_held: Value = Value.init(0),
+    /// QUIC connections admitted from a client's first Initial (#449).
+    /// Inside the flow identity beside `admitted` — each holds a conn slot
+    /// and counts `completed` when it goes — and outside the accept gate's,
+    /// since no socket was accepted for one.
+    h3_admitted: Value = Value.init(0),
+    /// QUIC handshakes confirmed: the client's Finished verified (RFC 9001
+    /// §4.1.2).
+    h3_handshakes: Value = Value.init(0),
+    /// First Initials left unanswered because a conn slot or an HTTP/3
+    /// slot was free for neither: the client's Initial timer brings it
+    /// back. Outside the accept gate's shed sum, as no socket was accepted.
+    h3_shed_connections: Value = Value.init(0),
+    /// First Initials left unanswered for want of a TLS engine, every one
+    /// in use (#449's share of `limits.tls_engines`).
+    h3_shed_tls_engines: Value = Value.init(0),
+    /// First Initials left unanswered because libcrypto could not serve
+    /// the engine's key derivation: the fixed heap out (§4).
+    h3_shed_tls_crypto: Value = Value.init(0),
+    /// HTTP/3 requests rejected with H3_REQUEST_REJECTED because the shared
+    /// stream pool, or its stream heads, were empty: unprocessed, which the
+    /// client may retry (RFC 9114 §4.1.1).
+    h3_shed_streams: Value = Value.init(0),
+    /// QUIC and HTTP/3 connection errors an authenticated client caused,
+    /// each closing its connection with the code its RFC names.
+    h3_protocol_errors: Value = Value.init(0),
+    /// Request field sections that did not decode: QPACK's connection
+    /// error (RFC 9204 §2.2).
+    h3_qpack_failures: Value = Value.init(0),
+    /// Requests whose decoded fields were not a valid message, each
+    /// cancelled with H3_MESSAGE_ERROR (RFC 9114 §4.1.2).
+    h3_malformed_requests: Value = Value.init(0),
+    /// Packets the transport's loss detection declared lost (RFC 9002).
+    h3_packets_lost: Value = Value.init(0),
+    /// Connections the idle timer closed silently (RFC 9000 §10.1).
+    h3_idle_closed: Value = Value.init(0),
+    /// Transport events dropped because they came faster than a pass
+    /// polled them: each pass then reads every request stream again.
+    h3_events_overflowed: Value = Value.init(0),
+    /// Datagrams no connection holds and nothing answers: too short, an
+    /// Initial that may not start one, one arriving during a drain, or one
+    /// with no send buffer free to answer.
+    h3_datagrams_dropped: Value = Value.init(0),
+    /// Version Negotiation packets sent for a version this side does not
+    /// speak (RFC 9000 §6).
+    h3_version_negotiations: Value = Value.init(0),
+    /// Retries sent: a new connection while the QUIC pool was under
+    /// pressure, asked to prove its address first (RFC 9000 §8.1.2).
+    h3_retries: Value = Value.init(0),
+    /// Stateless resets sent for a short header no connection holds (RFC
+    /// 9000 §10.3).
+    h3_stateless_resets: Value = Value.init(0),
+    /// Initials whose token vouched for nothing — forged, another
+    /// address's, or past its life — dropped.
+    h3_tokens_refused: Value = Value.init(0),
+    /// A connection's datagrams from an address other than the one it began
+    /// from, dropped: this side advertises `disable_active_migration`, and
+    /// a rebound path is not validated (RFC 9000 §9).
+    h3_migration_dropped: Value = Value.init(0),
     /// HTTP/2 connections ended GOAWAY(ENHANCE_YOUR_CALM) for overrunning
     /// a per-connection budget (#276), one counter per budget: each is a
     /// client inside the protocol's rules and expensive anyway, and what
@@ -994,6 +1052,13 @@ pub const Counters = struct {
         assert(previous < std.math.maxInt(u64));
     }
 
+    /// `increment`, by more than one: a batch the transport reports as a
+    /// count (#449's lost packets).
+    pub fn incrementBy(counters: *Counters, comptime name: []const u8, delta: u64) void {
+        const previous = @field(counters, name).add(delta);
+        assert(previous <= std.math.maxInt(u64) - delta);
+    }
+
     pub fn get(counters: *const Counters, comptime name: []const u8) u64 {
         return @field(counters, name).get();
     }
@@ -1172,7 +1237,7 @@ pub const Counters = struct {
         const completed = counters.get("completed");
         const accepted = counters.get("accepted");
         const shed = counters.shedTotal();
-        assert(completed <= admitted);
+        assert(completed <= admitted + counters.get("h3_admitted"));
         assert(admitted <= accepted);
         // #425: a policy refuses an admitted connection, by RST or not.
         assert(counters.get("conn_policy_reset") <= counters.get("conn_policy_rejected"));
@@ -1239,7 +1304,9 @@ pub const Counters = struct {
         // where the pressure is, which is the only thing it exists to say.
         assert(counters.kernelPressureTotal() == counters.get("kernel_pressure_errors"));
         assert(counters.kernelPressureCauseTotal() == counters.get("kernel_pressure_errors"));
-        const flow_holds = admitted == completed + active_count;
+        // A QUIC connection is admitted from a datagram, not accepted from
+        // a socket (#449): in the flow, and never in the gate.
+        const flow_holds = admitted + counters.get("h3_admitted") == completed + active_count;
         const gate_holds = accepted == admitted + shed;
         return flow_holds and gate_holds;
     }

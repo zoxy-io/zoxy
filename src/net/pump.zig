@@ -209,7 +209,7 @@ pub fn Pump(
         fn source(stream: *const StreamType) IoType.Socket {
             const conn = stream.conn;
             return switch (direction) {
-                .client_to_upstream => conn.client_socket,
+                .client_to_upstream => conn.clientSocket(),
                 .upstream_to_client => stream.upstream_socket.?,
             };
         }
@@ -218,7 +218,7 @@ pub fn Pump(
             const conn = stream.conn;
             return switch (direction) {
                 .client_to_upstream => stream.upstream_socket.?,
-                .upstream_to_client => conn.client_socket,
+                .upstream_to_client => conn.clientSocket(),
             };
         }
 

@@ -45,6 +45,10 @@ const H2Session = @import("http/h2/Session.zig");
 const H2Connection = @import("http/h2/Connection.zig");
 const H2Slot = H2Connection.Slot;
 const H2Exchange = @import("http/h2/exchange.zig");
+const H3Connection = @import("http/h3/Connection.zig");
+const H3Slot = H3Connection.Slot;
+const H3Exchange = @import("http/h3/exchange.zig");
+const QuicCrypto = @import("tls/QuicCrypto.zig");
 const H2Origin = @import("http/h2/origin_pool.zig");
 const OriginClient = @import("tls/OriginClient.zig");
 const h2_origin_fields = @import("http/h2/origin.zig");
@@ -108,6 +112,20 @@ pub fn Server(comptime runtime: Runtime) type {
         /// The pool that hands the slab's units out, one per connection that
         /// speaks HTTP/2, each already carved (`initH2Sessions`).
         h2_sessions: Pool(H2Slot),
+        /// The §5 HTTP/3 pool (#449, `limits.quic_connections`): a QUIC
+        /// connection's transport and session per slot, the better part of
+        /// a megabyte each, laid out once and initialized in place.
+        h3_slots: Pool(H3Slot),
+        /// The connection each HTTP/3 slot serves, by slot index — what a
+        /// connection ID this server minted names (`QuicEndpoint.find`) —
+        /// or null for a free slot.
+        h3_owners: []?*ConnType,
+        /// One per listener with a QUIC binding, in config order: its UDP
+        /// socket and the datagrams in flight on it.
+        quic_endpoints: []QuicEndpoint,
+        /// Where a request's field section is decoded and an answer's
+        /// encoded, one per process (`H3Exchange.Scratch`).
+        h3_scratch: H3Exchange.Scratch,
         /// The layout every slot was carved to, or null with no sessions.
         h2_layout: ?H2Session.Layout,
         /// SETTINGS_INITIAL_WINDOW_SIZE as every session advertises it
@@ -480,6 +498,8 @@ pub fn Server(comptime runtime: Runtime) type {
         pub const AccessLogType = access_log_module.AccessLog(runtime);
         pub const Proxy = proxy.Proxy(runtime);
         const H2Driver = H2Connection.Driver(runtime);
+        const H3Driver = @import("http/h3/driver.zig").Driver(runtime);
+        pub const QuicEndpoint = @import("http/h3/Endpoint.zig").Endpoint(runtime);
         const H2ExchangeType = H2Exchange.Exchange(runtime);
         pub const OriginMux = H2Origin.Mux(runtime);
         pub const UpstreamTls = upstream_tls_module.Driver(runtime);
@@ -758,6 +778,7 @@ pub fn Server(comptime runtime: Runtime) type {
             try server.initHeadBuffers(arena, &options);
             try server.initTlsEngines(arena, &options);
             try server.initH2Pools(arena, &options);
+            try server.initH3Pools(arena, &options, config);
             try server.initOriginPools(arena, &options);
             try server.initUpstreamTls(arena, &options);
             server.l4_inflight = try arena.alloc(u16, keys.count);
@@ -838,7 +859,9 @@ pub fn Server(comptime runtime: Runtime) type {
             if (@hasDecl(IoType, "stream_slots_max")) {
                 assert(options.stream_slots <= IoType.stream_slots_max);
             }
-            if (options.h2_connections == 0) assert(options.stream_slots == 0);
+            // Shared streams exist exactly where something multiplexes them:
+            // HTTP/2's sessions, HTTP/3's connections, or both (#449).
+            if (options.h2_connections == 0 and options.quic_connections == 0) assert(options.stream_slots == 0);
             try server.initH2Sessions(arena, options);
             try server.shared_streams.init(arena, options.stream_slots);
             assert(server.streams.capacity() + server.shared_streams.capacity() ==
@@ -886,22 +909,66 @@ pub fn Server(comptime runtime: Runtime) type {
             assert(server.h2_sessions.slots.len == options.h2_connections);
         }
 
-        /// A shared stream and a stream head for HTTP/2 stream `id` on
-        /// `conn` (#275), bound to it and linked into the connection's list —
-        /// or null when either pool is empty, the caller's to refuse. The
-        /// pair is all-or-nothing: an exchange cannot begin without the
-        /// buffer its request is written into.
-        pub fn acquireSharedStream(server: *Self, conn: *ConnType, id: u31) ?*StreamType {
-            assert(conn.state == .h2);
-            assert(id != 0);
+        /// The HTTP/3 pools (#449): the slots, the table naming each slot's
+        /// connection, an endpoint per QUIC binding, and the field-section
+        /// scratch — all of it nothing on a deployment that serves no QUIC.
+        fn initH3Pools(
+            server: *Self,
+            arena: std.mem.Allocator,
+            options: *const InitOptions,
+            config: *const config_module.Config,
+        ) error{OutOfMemory}!void {
+            assert(options.quic_connections <= options.conn_slots);
+            try server.h3_slots.init(arena, options.quic_connections);
+            server.h3_owners = try arena.alloc(?*ConnType, options.quic_connections);
+            @memset(server.h3_owners, null);
+            const endpoints = quicListenerCount(config);
+            assert((endpoints == 0) == (options.quic_connections == 0));
+            server.quic_endpoints = try arena.alloc(QuicEndpoint, endpoints);
+            server.h3_scratch = if (endpoints == 0) .empty else try H3Exchange.Scratch.init(arena);
+            assert(server.h3_owners.len == server.h3_slots.capacity());
+        }
+
+        /// The listeners with a QUIC binding (#449): one endpoint each.
+        pub fn quicListenerCount(config: *const config_module.Config) u16 {
+            var count: u16 = 0;
+            for (config.listeners) |*listener| {
+                if (listener.quic != null) count += 1;
+            }
+            assert(count <= config.listeners.len);
+            return count;
+        }
+
+        /// A shared stream and a stream head for multiplexed stream `id` on
+        /// `conn` (#275, #449) — an HTTP/2 stream or an HTTP/3 request
+        /// stream — bound to it and linked into the connection's list, or
+        /// null when either pool is empty, the caller's to refuse. The pair
+        /// is all-or-nothing: an exchange cannot begin without the buffer
+        /// its request is written into.
+        pub fn acquireSharedStream(server: *Self, conn: *ConnType, id: StreamType.MuxId) ?*StreamType {
+            switch (id) {
+                .h2 => |h2_id| {
+                    assert(conn.state == .h2);
+                    assert(h2_id != 0);
+                },
+                .h3 => assert(conn.state == .h3),
+            }
             const stream = server.shared_streams.acquire() orelse return null;
             const head = server.stream_head_buffers.acquire() orelse {
                 server.shared_streams.release(stream);
                 return null;
             };
             stream.prepare(conn);
-            stream.mux = .h2;
-            stream.h2_id = id;
+            switch (id) {
+                .h2 => |h2_id| {
+                    stream.mux = .h2;
+                    stream.h2_id = h2_id;
+                },
+                .h3 => |h3_id| {
+                    stream.mux = .h3;
+                    stream.h3_id = h3_id;
+                },
+            }
             stream.h2_head = head;
             stream.h2_next = conn.h2_streams;
             conn.h2_streams = stream;
@@ -920,11 +987,12 @@ pub fn Server(comptime runtime: Runtime) type {
         /// its client half is the session's, and no upstream runs on one.
         pub fn releaseSharedStream(server: *Self, stream: *StreamType) void {
             const conn = stream.conn;
-            const streams_max = conn.h2.?.session.config.concurrent_streams_max;
+            const streams_max = conn.multiplexedMax();
             assert(stream.muxed());
             assert(stream.armedCount() == 0);
-            // No tunnel is ever claimed for one: HTTP/2 refuses `upgrade` as
-            // connection-specific (RFC 9113 §8.2.2) before §7 could read it.
+            // No tunnel is ever claimed for one: HTTP/2 and HTTP/3 refuse
+            // `upgrade` as connection-specific (RFC 9113 §8.2.2, RFC 9114
+            // §4.2) before §7 could read it.
             assert(conn.tunnel_buffer == null);
             // An exchange ended mid-flight still holds its upstream half:
             // nothing is armed on it any more, so it closes synchronously.
@@ -955,6 +1023,7 @@ pub fn Server(comptime runtime: Runtime) type {
                 link.* = stream.h2_next;
                 stream.h2_next = null;
                 stream.h2_id = 0;
+                stream.h3_id = 0;
                 stream.mux = .none;
                 server.shared_streams.release(stream);
                 return;
@@ -962,12 +1031,12 @@ pub fn Server(comptime runtime: Runtime) type {
             unreachable; // A shared stream is on its connection's list.
         }
 
-        /// The teardown's first pass over the exchanges an HTTP/2 connection
-        /// multiplexes: each forced, none released — the release is the last
-        /// op's, or the teardown's once nothing is armed at all.
+        /// The teardown's first pass over the exchanges a multiplexed
+        /// connection carries: each forced, none released — the release is
+        /// the last op's, or the teardown's once nothing is armed at all.
         fn quiesceSharedStreams(server: *Self, conn: *ConnType) void {
-            const slot = conn.h2 orelse return;
-            const streams_max = slot.session.config.concurrent_streams_max;
+            const streams_max = conn.multiplexedMax();
+            if (streams_max == 0) return;
             var cursor = conn.h2_streams;
             var visited: u32 = 0;
             while (cursor) |stream| : (cursor = stream.h2_next) {
@@ -977,15 +1046,13 @@ pub fn Server(comptime runtime: Runtime) type {
             }
         }
 
-        /// Every exchange an HTTP/2 connection is multiplexing, ended with
+        /// Every exchange a multiplexed connection is carrying, ended with
         /// it: the connection is torn down, so none of them can answer.
         fn releaseSharedStreams(server: *Self, conn: *ConnType) void {
-            // Only a connection that spoke HTTP/2 multiplexed anything.
-            const slot = conn.h2 orelse {
-                assert(conn.h2_streams == null);
-                return;
-            };
-            const streams_max = slot.session.config.concurrent_streams_max;
+            // Only a connection that spoke HTTP/2 or HTTP/3 multiplexed
+            // anything; `multiplexedMax` asserts the list empty otherwise.
+            const streams_max = conn.multiplexedMax();
+            if (streams_max == 0) return;
             var released: u32 = 0;
             while (conn.h2_streams) |stream| : (released += 1) {
                 assert(released < streams_max);
@@ -1248,7 +1315,9 @@ pub fn Server(comptime runtime: Runtime) type {
             const health_probes = server.config.healthProbes();
             const probe_scratch_bytes: u64 =
                 @as(u64, health_probes) * probeBufferBytes(options.*);
-            server.h2_scratch = if (options.h2_connections >= 1)
+            // Every multiplexed answer is mapped through it, HTTP/3's as
+            // HTTP/2's (#449): reserved wherever a shared stream can run.
+            server.h2_scratch = if (options.stream_slots >= 1)
                 try H2Exchange.Scratch.init(arena, options.head_buffer_bytes)
             else
                 .empty;
@@ -1602,7 +1671,7 @@ pub fn Server(comptime runtime: Runtime) type {
 
         /// The §8 wall clock in seconds, which is what a ticket's issue
         /// time and its key's sealing clock are both measured on.
-        fn nowUnix(server: *const Self) u64 {
+        pub fn nowUnix(server: *const Self) u64 {
             return @divFloor(server.io.nowWallNs(), std.time.ns_per_s);
         }
 
@@ -1800,6 +1869,7 @@ pub fn Server(comptime runtime: Runtime) type {
                 if (state.certificates.len > 0) assert(state.certificates[0].credentials == state.credentials.?);
                 server.armAccept(state);
             }
+            try server.openQuicEndpoints();
             try server.admin.start();
             server.health.start();
             server.io.signalWait(Self, server, onSignal);
@@ -1925,7 +1995,7 @@ pub fn Server(comptime runtime: Runtime) type {
             // Parked upstreams are idle capacity; the drain sheds them
             // first (§8). Synchronous closes: no armed op to wait for.
             server.reapParked(true);
-            server.drainH2Connections();
+            server.drainMultiplexedConnections();
             OriginMux.beginDrain(server);
             // A zero deadline is "no cap" (§5): the drain waits for the
             // last connection however long that takes, which is what
@@ -1989,12 +2059,30 @@ pub fn Server(comptime runtime: Runtime) type {
         /// (#275): an idle one has nothing that would make it notice, and
         /// its client is owed a GOAWAY saying which streams were taken — so
         /// it can retry the rest elsewhere instead of finding them cut.
-        fn drainH2Connections(server: *Self) void {
+        /// Every connection that multiplexes is told to go away (§8):
+        /// HTTP/2's and HTTP/3's GOAWAY, the streams already taken finished.
+        /// Whether every QUIC endpoint has closed, closing each that has not
+        /// begun to: only ever asked once no connection is left.
+        fn quicEndpointsClosed(server: *Self) bool {
+            assert(server.draining);
+            assert(server.h3_slots.isFullyReleased());
+            var closed = true;
+            for (server.quic_endpoints) |*endpoint| {
+                endpoint.close();
+                if (!endpoint.closed) closed = false;
+            }
+            return closed;
+        }
+
+        fn drainMultiplexedConnections(server: *Self) void {
             assert(server.draining);
             for (server.conns.slots) |*conn| {
                 if (!server.conns.isAcquired(conn)) continue;
-                if (conn.state != .h2) continue;
-                H2Driver.beginDrain(server, conn);
+                switch (conn.state) {
+                    .h2 => H2Driver.beginDrain(server, conn),
+                    .h3 => H3Driver.beginDrain(server, conn),
+                    else => {},
+                }
             }
         }
 
@@ -2296,6 +2384,11 @@ pub fn Server(comptime runtime: Runtime) type {
         pub fn maybeStopAfterDrain(server: *Self) void {
             if (!server.draining) return;
             if (!server.conns.isFullyReleased()) return;
+            // The QUIC endpoints outlive their listeners' sockets, since the
+            // connections on them need them to finish (#449): each closes
+            // once the last of those is gone, and the loop stops once its
+            // last op is in.
+            if (!server.quicEndpointsClosed()) return;
             // An in-flight scrape holds no pool slot but does hold an armed
             // op and the admin fd; the loop must not stop until it drains.
             if (!server.admin.isQuiescent()) return;
@@ -2739,6 +2832,132 @@ pub fn Server(comptime runtime: Runtime) type {
 
         /// The shared conn-slot rung (§8): both protocols shed the same
         /// way when slots run out, so the rung lives in one place.
+        /// Bind every QUIC binding's UDP socket and begin receiving (#449),
+        /// once the packet-protection contexts exist: libcrypto's, made once
+        /// for the process (`QuicCrypto`) on the heap the engines use.
+        fn openQuicEndpoints(server: *Self) Io.ListenError!void {
+            if (server.quic_endpoints.len == 0) return;
+            if (!QuicCrypto.initialized()) QuicCrypto.init() catch return error.Unexpected;
+            var next: u16 = 0;
+            for (server.config.listeners, 0..) |*listener, index| {
+                const quic = listener.quic orelse continue;
+                try server.quic_endpoints[next].open(server, next, @intCast(index), quic.bind_address);
+                next += 1;
+            }
+            assert(next == server.quic_endpoints.len);
+            assert(QuicCrypto.initialized());
+        }
+
+        /// Whether the QUIC pool is full enough that a new connection is
+        /// Retried before it is admitted (RFC 9000 §8.1.2).
+        pub fn quicUnderPressure(server: *const Self) bool {
+            const capacity: u64 = server.h3_slots.capacity();
+            const held: u64 = server.h3_slots.acquired_count;
+            assert(held <= capacity);
+            return held * 8 >= capacity * constants.quic_retry_watermark_eighths;
+        }
+
+        /// What a QUIC connection is admitted from: its first Initial's
+        /// Destination Connection ID, a Retry's vouched-for original if
+        /// there was one, and where it came from.
+        pub const QuicInitial = struct {
+            destination: H3Connection.ConnectionId,
+            retry: ?H3Connection.Quic.Retried,
+            peer: std.Io.net.IpAddress,
+        };
+
+        /// A QUIC connection admitted from its first Initial (#449): a conn
+        /// slot and its stream, an HTTP/3 slot begun in place with an ID
+        /// minted for it, an engine from its listener's credentials carrying
+        /// the slot's transport parameters, and its listener's tables. Null
+        /// is a rung shed, and counted, with everything taken given back:
+        /// the Initial goes unanswered and the client tries again. Outside
+        /// the accept gate's identity — no socket was accepted — and inside
+        /// the flow's: admitted, and completed when it goes.
+        pub fn admitQuic(server: *Self, endpoint: *const QuicEndpoint, initial: *const QuicInitial) ?*ConnType {
+            assert(!server.draining);
+            const conn = server.conns.acquire() orelse {
+                server.counters.increment("h3_shed_connections");
+                return null;
+            };
+            conn.stream = server.admitStream(conn);
+            server.updateConnPressure();
+            const slot = server.h3_slots.acquire() orelse {
+                server.releaseConn(conn);
+                server.counters.increment("h3_shed_connections");
+                return null;
+            };
+            const engine = server.beginQuicSlot(endpoint, slot, initial) orelse {
+                server.h3_slots.release(slot);
+                server.releaseConn(conn);
+                return null;
+            };
+            const state = &server.listeners[endpoint.listener_index];
+            conn.prepare(server, null, engine, .l7, .http, initial.peer);
+            server.installListenerState(conn, null, state);
+            conn.h3 = slot;
+            server.h3_owners[server.h3_slots.indexOf(slot)] = conn;
+            server.counters.increment("h3_admitted");
+            server.storeDeadline(conn, server.idleTimeoutMs());
+            server.armDeadline(conn);
+            assert(conn.armed.deadline);
+            return conn;
+        }
+
+        /// The slot begun from the Initial under an ID minted for it — its
+        /// pool index, then four random octets, so the ID names the slot —
+        /// and the engine that will run its handshake; null is a counted
+        /// rung, nothing of either left held.
+        fn beginQuicSlot(
+            server: *Self,
+            endpoint: *const QuicEndpoint,
+            slot: *H3Slot,
+            initial: *const QuicInitial,
+        ) ?*TlsEngine {
+            var octets: [constants.h3_connection_id_bytes]u8 = undefined;
+            std.mem.writeInt(u32, octets[0..4], server.h3_slots.indexOf(slot), .big);
+            server.io.fillRandom(octets[4..]);
+            const source = H3Connection.ConnectionId.init(&octets) catch unreachable; // Eight octets.
+            slot.begin(&.{
+                .initial_destination = initial.destination,
+                .source = source,
+                .retry = initial.retry,
+                .idle_timeout_ms = server.idleTimeoutMs(),
+                .stateless_reset_token = endpoint.resetToken(&source),
+                .endpoint_index = endpoint.index,
+                .peer = initial.peer,
+            }) catch {
+                // A Retry token naming the ID the client uses now, which no
+                // token this side minted does.
+                server.counters.increment("h3_tokens_refused");
+                return null;
+            };
+            const state = &server.listeners[endpoint.listener_index];
+            assert(state.credentials != null); // A QUIC binding requires `tls`.
+            const engine = server.acquireQuicEngine(state, slot.transportParameters()) catch |err| {
+                switch (err) {
+                    error.EnginesExhausted => server.counters.increment("h3_shed_tls_engines"),
+                    error.CryptoUnavailable => server.counters.increment("h3_shed_tls_crypto"),
+                }
+                return null;
+            };
+            assert(engine.isQuic());
+            return engine;
+        }
+
+        /// The connection's HTTP/3 slot back (#449), its place in its
+        /// endpoint's send queue given up.
+        fn releaseH3(server: *Self, conn: *ConnType) void {
+            const slot = conn.h3 orelse return;
+            assert(conn.h2_streams == null);
+            QuicEndpoint.forget(server, conn);
+            const index = server.h3_slots.indexOf(slot);
+            assert(server.h3_owners[index] == conn);
+            server.h3_owners[index] = null;
+            server.h3_slots.release(slot);
+            conn.h3 = null;
+        }
+
         fn admitConn(server: *Self, client_socket: IoType.Socket) ?*ConnType {
             assert(!server.draining);
             const conn = server.conns.acquire() orelse {
@@ -3002,6 +3221,36 @@ pub fn Server(comptime runtime: Runtime) type {
             alpn_protocols: []const []const u8,
             client_ca: ?*const config_module.Config.Listener.ClientCa,
         ) AcquireEngineError!*TlsEngine {
+            return server.acquireEngine(credentials, certificates, alpn_protocols, client_ca, null);
+        }
+
+        /// A QUIC connection's engine (#449): its listener's credentials,
+        /// certificates and client CA, in QUIC mode — the handshake at the
+        /// message level, `h3` its one protocol, and the connection's
+        /// transport parameters carried in its EncryptedExtensions.
+        pub fn acquireQuicEngine(
+            server: *Self,
+            listener: *const ListenerState,
+            transport_parameters: []const u8,
+        ) AcquireEngineError!*TlsEngine {
+            assert(transport_parameters.len >= 1);
+            return server.acquireEngine(
+                listener.credentials.?,
+                listener.certificates,
+                &.{},
+                listener.client_ca,
+                .{ .transport_parameters = transport_parameters },
+            );
+        }
+
+        fn acquireEngine(
+            server: *Self,
+            credentials: *const Credentials,
+            certificates: []const CertificateChoice,
+            alpn_protocols: []const []const u8,
+            client_ca: ?*const config_module.Config.Listener.ClientCa,
+            quic: ?TlsEngine.Quic,
+        ) AcquireEngineError!*TlsEngine {
             assert(credentials.chain.len >= 1);
             if (certificates.len > 0) assert(certificates[0].credentials == credentials);
             const engine = server.tls_engines.acquire() orelse
@@ -3023,6 +3272,7 @@ pub fn Server(comptime runtime: Runtime) type {
                     .anchors = ca.anchors,
                     .require = ca.verify == .required,
                 } else null,
+                .quic = quic,
             }) catch {
                 // Deriving the ephemeral keypair is the one fallible step,
                 // and under the OpenSSL backend it *allocates*
@@ -3126,10 +3376,10 @@ pub fn Server(comptime runtime: Runtime) type {
             return @max(options.head_buffer_bytes, declared);
         }
 
-        /// The HTTP/2 mapping scratch's share of the head-sized side
-        /// buffers (#275): nothing where no HTTP/2 is spoken.
+        /// The multiplexed mapping scratch's share of the head-sized side
+        /// buffers (#275, #449): nothing where no shared stream can run.
         fn h2ScratchBytes(options: *const InitOptions) u64 {
-            if (options.h2_connections == 0) return 0;
+            if (options.stream_slots == 0) return 0;
             const bytes = H2Exchange.Scratch.bytesFor(options.head_buffer_bytes);
             assert(bytes > options.head_buffer_bytes);
             return bytes;
@@ -3424,7 +3674,7 @@ pub fn Server(comptime runtime: Runtime) type {
                 .client_to_upstream[0..constants.proxy_header_bytes_max];
             conn.stream.arm(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.recv(
-                conn.client_socket,
+                conn.clientSocket(),
                 staging[conn.stream.head_len..],
                 &conn.stream.op_data_client_to_upstream.completion,
                 ConnType,
@@ -3610,7 +3860,7 @@ pub fn Server(comptime runtime: Runtime) type {
                 .client_to_upstream[0..constants.sni_peek_bytes_max];
             conn.stream.arm(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.recv(
-                conn.client_socket,
+                conn.clientSocket(),
                 staging[conn.stream.head_len..],
                 &conn.stream.op_data_client_to_upstream.completion,
                 ConnType,
@@ -3763,7 +4013,7 @@ pub fn Server(comptime runtime: Runtime) type {
             assert(destination.len >= 1);
             conn.stream.arm(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.recv(
-                conn.client_socket,
+                conn.clientSocket(),
                 destination,
                 &conn.stream.op_data_client_to_upstream.completion,
                 ConnType,
@@ -3899,7 +4149,7 @@ pub fn Server(comptime runtime: Runtime) type {
             if (staged.len >= 1) {
                 conn.stream.arm(&conn.stream.op_data_upstream_to_client, "data_upstream_to_client");
                 server.io.send(
-                    conn.client_socket,
+                    conn.clientSocket(),
                     staged,
                     &conn.stream.op_data_upstream_to_client.completion,
                     ConnType,
@@ -4130,7 +4380,7 @@ pub fn Server(comptime runtime: Runtime) type {
             // routing one to a cluster that announces a header is
             // refused as a pair (`ListenerUnixBindClusterSend`, #303).
             const client_address = &conn.client_address.?;
-            const local_address = server.io.localAddress(conn.client_socket);
+            const local_address = server.io.localAddress(conn.clientSocket());
             const header = switch (version) {
                 .v1 => proxy_protocol.writeV1(&header_buffer, client_address, &local_address),
                 .v2 => proxy_protocol.writeV2(&header_buffer, client_address, &local_address),
@@ -4314,9 +4564,9 @@ pub fn Server(comptime runtime: Runtime) type {
                 // Benign, as `shed.closeWithRst`'s: the refusal must close
                 // either way, and a failed option leaves the client a FIN.
                 // `conn_policy_reset` counts the decision, not the wire.
-                server.io.setLingerRst(conn.client_socket) catch {};
-            } else {
-                server.io.shutdown(conn.client_socket, .both);
+                server.io.setLingerRst(conn.clientSocket()) catch {};
+            } else if (conn.client_socket) |socket| {
+                server.io.shutdown(socket, .both);
             }
             // A socket, or an HTTP/2 origin leg (§7): either way, what is
             // armed on it is forced.
@@ -4418,8 +4668,10 @@ pub fn Server(comptime runtime: Runtime) type {
                 server.releaseH2Session(slot);
                 conn.h2 = null;
             }
+            server.releaseH3(conn);
             assert(conn.tls == null);
             assert(conn.h2 == null);
+            assert(conn.h3 == null);
             assert(conn.stream.relay_buffer == null);
             assert(conn.tunnel_buffer == null);
             assert(conn.stream.upstream == null);
@@ -4449,12 +4701,21 @@ pub fn Server(comptime runtime: Runtime) type {
             // timeout when it is got wrong.
             if (conn.armedCount() != 0 or conn.stream.armedCount() != 0) return;
             if (sharedStreamsArmed(conn)) return;
+            // An HTTP/3 connection holds no op of its own while its timer
+            // is being delivered, so a teardown decided inside its driver's
+            // pass could release the slot the pass is still reading. The
+            // pass's end comes back here (#449).
+            if (conn.h3) |slot| {
+                if (slot.driving) return;
+            }
             // Nothing armed on either slot: no op references either fd,
             // which is what makes the synchronous closes and the two
             // releases safe.
             assert(conn.armedCount() == 0);
             assert(conn.stream.armedCount() == 0);
-            server.io.closeNow(conn.client_socket);
+            // A QUIC connection has no socket of its own: its datagrams were
+            // its endpoint's (#449).
+            if (conn.client_socket) |socket| server.io.closeNow(socket);
             server.upstreamClose(conn.stream);
             // A request torn down while it consulted (#437).
             server.releaseConsultSlot(conn.stream);
@@ -6280,7 +6541,9 @@ pub fn Server(comptime runtime: Runtime) type {
         /// one is found when the timer next fires (`H2Driver.expire`).
         fn storeSharedDeadline(server: *Self, stream: *StreamType, timeout_ms: u32) void {
             const conn = stream.conn;
-            assert(conn.state == .h2);
+            assert(stream.muxed());
+            const expected: ConnType.State = if (stream.mux == .h2) .h2 else .h3;
+            assert(conn.state == expected);
             var deadline_ns = server.io.nowNs() + @as(u64, timeout_ms) * std.time.ns_per_ms;
             if (stream.l7.request_deadline_ns != 0) {
                 deadline_ns = @min(deadline_ns, stream.l7.request_deadline_ns);
@@ -6416,8 +6679,8 @@ pub fn Server(comptime runtime: Runtime) type {
         /// Whether any exchange this connection multiplexes still has an op
         /// in flight: a teardown waits for every one (§5's release rule).
         fn sharedStreamsArmed(conn: *const ConnType) bool {
-            const slot = conn.h2 orelse return false;
-            const streams_max = slot.session.config.concurrent_streams_max;
+            const streams_max = conn.multiplexedMax();
+            if (streams_max == 0) return false;
             var cursor = conn.h2_streams;
             var visited: u32 = 0;
             while (cursor) |stream| : (cursor = stream.h2_next) {
@@ -6563,7 +6826,7 @@ pub fn Server(comptime runtime: Runtime) type {
         /// for a multiplexed exchange's earlier deadline (#275): cancel the
         /// armed timer so it re-arms at the stored target, or arm one if
         /// none is out.
-        fn rebaseTimer(server: *Self, conn: *ConnType) void {
+        pub fn rebaseTimer(server: *Self, conn: *ConnType) void {
             assert(!conn.isTearingDown());
             assert(conn.deadline_ns != 0);
             // A prior dial's rebase cancel can still be draining if the
@@ -6666,9 +6929,10 @@ pub fn Server(comptime runtime: Runtime) type {
             // Both verdict branches re-arm: the caller must have drained the
             // rebase cancel first, or it could match the fresh timer (§8).
             assert(!conn.armed.deadline_cancel);
-            // An HTTP/2 connection's timer serves many deadlines, and its
-            // driver looks for which are due (#275).
+            // A multiplexed connection's timer serves many deadlines, and its
+            // driver looks for which are due (#275, #449).
             if (conn.state == .h2) return H2Driver.expire(server, conn);
+            if (conn.state == .h3) return H3Driver.expire(server, conn);
             server.counters.increment("deadline_expired");
             // A consult's timeout, or the request's under it (#437): the
             // consult takes it, its request deadline still in place.

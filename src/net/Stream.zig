@@ -527,6 +527,21 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
         /// client half is that session: its request arrives as a field
         /// section and leaves as frames, and nothing of it touches a socket.
         h2_id: u31,
+        /// The HTTP/3 request stream this exchange answers (#449): its QUIC
+        /// stream identifier on `conn.h3`'s connection. Zero is a real one —
+        /// QUIC's first client-initiated bidirectional stream — so it is
+        /// `mux` that says whether this is set, not its value.
+        h3_id: u62,
+        /// Its answer was cut short on the transport — a stream's send
+        /// buffer or flow control full — and waits for room. h3 raises no
+        /// event when room opens, so the driver offers it again after each
+        /// datagram (#449).
+        h3_blocked: bool,
+        /// Its request body's buffer has room again while the transport
+        /// holds more of the body: the stream is read once the pass that
+        /// made the room is done, never inside a read that borrows its
+        /// octets (#449).
+        h3_reread: bool,
         /// The head buffer its request was written out into, from the §5
         /// stream-head pool — what `headBytes` reads where an admission
         /// stream reads the ring or its engine's plaintext.
@@ -954,6 +969,9 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
             // `acquireSharedStream`).
             stream.mux = .none;
             stream.h2_id = 0;
+            stream.h3_id = 0;
+            stream.h3_blocked = false;
+            stream.h3_reread = false;
             stream.h2_head = null;
             stream.h2_next = null;
             stream.h2_head_staged = false;
@@ -975,8 +993,9 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
             assert(stream.log.started_wall_ns == 0);
         }
 
-        /// Move the exchange within `.l7` — or within `.h2`, for one of the
-        /// exchanges an HTTP/2 connection multiplexes (#275). Only the
+        /// Move the exchange within `.l7` — or within `.h2` or `.h3`, for one
+        /// of the exchanges a multiplexed connection carries (#275, #449).
+        /// Only the
         /// connection's own `enter` moves an exchange into or out of the
         /// protocol, so a move here on a connection that has left it — torn
         /// down, or tunneling after `101` — is the bug the phase split could
@@ -984,12 +1003,12 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
         /// that is not.
         pub fn moveTo(stream: *Self, phase: Phase) void {
             assert(phase != .none);
-            // An HTTP/2 connection's exchanges each have a phase of their
-            // own, while the connection's state stays `.h2` (#275).
-            if (!stream.muxed()) {
-                assert(stream.conn.state == .l7);
-            } else {
-                assert(stream.conn.state == .h2);
+            // A multiplexed connection's exchanges each have a phase of their
+            // own, while the connection's state stays its protocol's.
+            switch (stream.mux) {
+                .none => assert(stream.conn.state == .l7),
+                .h2 => assert(stream.conn.state == .h2),
+                .h3 => assert(stream.conn.state == .h3),
             }
             stream.phase = phase;
         }
@@ -999,14 +1018,21 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
         /// than the connection's own admission stream.
         pub fn muxed(stream: *const Self) bool {
             // HTTP/2's identifier is never zero on its streams, and is on
-            // every other. HTTP/3's first request stream is QUIC's stream 0,
-            // so this tie is HTTP/2's alone, and the `.h3` arm reshapes it.
+            // every other. HTTP/3's may be zero, so only the tag can say.
             assert((stream.mux == .h2) == (stream.h2_id != 0));
+            if (stream.mux != .h3) assert(stream.h3_id == 0);
             return stream.mux != .none;
         }
 
         /// The protocols that multiplex exchanges on one connection.
-        pub const Mux = enum(u2) { none, h2 };
+        pub const Mux = enum(u2) { none, h2, h3 };
+
+        /// A multiplexed exchange's stream identifier, tagged by its
+        /// protocol: what `Server.acquireSharedStream` binds a slot to.
+        pub const MuxId = union(enum) {
+            h2: u31,
+            h3: u62,
+        };
 
         /// Records the arm in the op and the armed set; call immediately
         /// before submitting through the seam. The mirror of `Conn.arm`,

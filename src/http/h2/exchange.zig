@@ -153,6 +153,7 @@ pub fn Exchange(comptime runtime: Runtime) type {
         // a type whose definition needs itself.
         const Proxy = @import("../proxy.zig").Proxy(runtime);
         const Driver = @import("Connection.zig").Driver(runtime);
+        const H3Half = @import("../h3/exchange.zig").Half(runtime);
 
         /// A stream opened with a well-formed request: a shared slot and a
         /// head buffer for it, its request written out as the HTTP/1.1
@@ -161,7 +162,7 @@ pub fn Exchange(comptime runtime: Runtime) type {
         pub fn open(server: *ServerType, conn: *ConnType, request: *const Session.Step.Request) void {
             assert(conn.state == .h2);
             const session = conn.h2.?.session;
-            const stream = server.acquireSharedStream(conn, request.stream) orelse {
+            const stream = server.acquireSharedStream(conn, .{ .h2 = request.stream }) orelse {
                 server.counters.increment("h2_shed_streams");
                 session.resetStream(request.stream, .refused_stream);
                 return;
@@ -172,7 +173,12 @@ pub fn Exchange(comptime runtime: Runtime) type {
             // as it does for a head read off a socket.
             const storage = server.borrowHeaderScratch();
             defer server.returnHeaderScratch();
-            const head = downgrade.requestHead(request, stream.h2_head.?.data, storage) catch |err| {
+            const neutral: downgrade.Request = .{
+                .fields = request.fields,
+                .content_length = request.content_length,
+                .end_stream = request.end_stream,
+            };
+            const head = downgrade.requestHead(&neutral, stream.h2_head.?.data, storage) catch |err| {
                 return Proxy.refuseH2Request(server, stream, err);
             };
             Proxy.serveH2Request(server, stream, &head);
@@ -232,30 +238,31 @@ pub fn Exchange(comptime runtime: Runtime) type {
         /// it.
         pub fn answer(server: *ServerType, stream: *StreamType) void {
             const conn = stream.conn;
-            assert(stream.h2_id != 0);
-            if (conn.h2.?.session.state == .closed) return server.endSharedStream(stream);
+            const mux = stream.mux;
+            assert(stream.muxed());
+            if (sessionOver(stream)) return server.endSharedStream(stream);
             assert(!stream.ending);
             // The answer can finish the stream and give its slot back, so
             // only the connection is read after it.
             stage(server, stream);
-            Driver.kick(server, conn);
+            kick(server, conn, mux);
         }
 
         /// `answer`'s staging, without the send: the caller kicks.
         fn stage(server: *ServerType, stream: *StreamType) void {
-            const session = stream.conn.h2.?.session;
-            assert(stream.h2_id != 0);
+            assert(stream.muxed());
             assert(stream.phase == .responding or stream.phase == .exchanging);
             assert(!stream.h2_ended);
             if (!stream.h2_head_staged) {
-                if (!stageHead(server, stream, session)) return;
+                if (!stageHead(server, stream)) return;
             }
             const write = &stream.client_write;
             const ends = answerEnds(stream);
             // A trailer section ends the stream in DATA's place (§8.1).
             const trailers_owed = ends and trailersOwed(stream);
             if (write.pending.len >= 1 or (ends and !trailers_owed and !stream.h2_ended)) {
-                const sent = session.sendData(stream.h2_id, write.pending, ends and !trailers_owed);
+                const sent = sendData(stream, write.pending, ends and !trailers_owed) orelse
+                    return fail(server, stream);
                 assert(sent.taken <= write.pending.len);
                 write.pending = write.pending[sent.taken..];
                 stream.log.bytes_out += sent.taken;
@@ -268,7 +275,7 @@ pub fn Exchange(comptime runtime: Runtime) type {
                 if (ends and !trailers_owed and !sent.ended) return;
             }
             if (trailers_owed and !stream.h2_ended) {
-                if (!stageTrailers(server, stream, session)) return;
+                if (!stageTrailers(server, stream)) return;
             }
             Proxy.h2WriteDelivered(server, stream);
         }
@@ -278,7 +285,7 @@ pub fn Exchange(comptime runtime: Runtime) type {
         /// once the answer ends — its framing done, the section whole — and
         /// it asserts as much: a section still arriving is not owed yet.
         fn trailersOwed(stream: *const StreamType) bool {
-            assert(stream.h2_id != 0);
+            assert(stream.muxed());
             const section = stream.h2_trailers;
             if (section.len == 0) return false;
             assert(section.len >= 2);
@@ -291,7 +298,7 @@ pub fn Exchange(comptime runtime: Runtime) type {
         /// END_STREAM (RFC 9113 §8.1). False when the answer cannot go on
         /// now: the session has no room for it yet, or the section is one
         /// HTTP/2 cannot carry, which ends the exchange as a head would.
-        fn stageTrailers(server: *ServerType, stream: *StreamType, session: *Session) bool {
+        fn stageTrailers(server: *ServerType, stream: *StreamType) bool {
             assert(stream.h2_head_staged);
             assert(stream.client_write.pending.len == 0);
             const out = server.h2_scratch.lend();
@@ -301,7 +308,7 @@ pub fn Exchange(comptime runtime: Runtime) type {
                 return false;
             };
             assert(fields.len >= 1);
-            switch (session.sendTrailers(stream.h2_id, fields)) {
+            switch (sendTrailers(server, stream, fields)) {
                 .staged => {},
                 .blocked => return false,
                 .refused => {
@@ -320,7 +327,7 @@ pub fn Exchange(comptime runtime: Runtime) type {
         /// into the relay buffer behind the part already moved to its
         /// front (`pumpBody`) makes contiguous with it.
         pub fn keepTrailers(stream: *StreamType, bytes: []u8, fed: *const Proxy.PayloadFeed) void {
-            assert(stream.h2_id != 0);
+            assert(stream.muxed());
             assert(fed.trailer_len <= fed.feed.consumed);
             if (fed.trailer_len == 0) return;
             const tail = bytes[fed.feed.consumed - fed.trailer_len .. fed.feed.consumed];
@@ -338,7 +345,7 @@ pub fn Exchange(comptime runtime: Runtime) type {
         /// always; a proxied one once nothing of its body is left to come —
         /// no excess still to hand over, and the origin's framing done.
         fn answerEnds(stream: *const StreamType) bool {
-            assert(stream.h2_id != 0);
+            assert(stream.muxed());
             assert(stream.phase == .responding or stream.phase == .exchanging);
             return switch (stream.client_write.then) {
                 .lingering_close, .next_request => true,
@@ -354,7 +361,7 @@ pub fn Exchange(comptime runtime: Runtime) type {
         /// with END_STREAM when nothing follows it. False when the answer
         /// cannot go on now: the session has no room for it yet, or the
         /// head is one HTTP/2 cannot carry, which ends the exchange.
-        fn stageHead(server: *ServerType, stream: *StreamType, session: *Session) bool {
+        fn stageHead(server: *ServerType, stream: *StreamType) bool {
             const write = &stream.client_write;
             assert(write.pending.len >= 1);
             const method = stream.l7.request_method;
@@ -369,7 +376,7 @@ pub fn Exchange(comptime runtime: Runtime) type {
             // whatever the head declares (RFC 9110 §9.3.2).
             const body = if (method == .head) write.pending[0..0] else write.pending[mapped.head_len..];
             const ends = body.len == 0 and answerEnds(stream) and !trailersOwed(stream);
-            switch (session.sendHead(stream.h2_id, mapped.fields, ends)) {
+            switch (sendHead(server, stream, mapped.fields, ends)) {
                 .staged => {},
                 .blocked => return false,
                 .refused => {
@@ -454,13 +461,10 @@ pub fn Exchange(comptime runtime: Runtime) type {
         /// sending its request is told to stop — RST_STREAM(NO_ERROR),
         /// RFC 9113 §8.1 — and the slot goes back.
         pub fn finish(server: *ServerType, stream: *StreamType) void {
-            const session = stream.conn.h2.?.session;
             assert(stream.client_write.pending.len == 0);
             assert(stream.log.emitted or server.access_log.sink == null);
             assert(stream.h2_ended);
-            if (session.awaitingClient(stream.h2_id)) {
-                session.resetStream(stream.h2_id, .no_error);
-            }
+            stopClient(stream);
             if (stream.armedCount() == 0) return server.releaseSharedStream(stream);
             // An op the answer did not wait for is still out — a timed-out
             // dial's cancel, when the 504 came from the connect's own
@@ -473,22 +477,115 @@ pub fn Exchange(comptime runtime: Runtime) type {
         /// the slot back once whatever it has in flight delivers. Its line
         /// says it was aborted.
         pub fn abandon(server: *ServerType, stream: *StreamType, code: h2.frame.ErrorCode) void {
-            const session = stream.conn.h2.?.session;
             assert(code != .no_error);
-            assert(stream.h2_id != 0);
+            assert(stream.muxed());
             const conn = stream.conn;
-            if (session.resettable(stream.h2_id)) session.resetStream(stream.h2_id, code);
+            const mux = stream.mux;
+            resetClient(stream, code);
             server.endSharedStream(stream);
-            Driver.kick(server, conn);
+            kick(server, conn, mux);
         }
 
         /// The exchange failed after it began (an origin that broke off, a
         /// body that would not frame): INTERNAL_ERROR (RFC 9113 §7), which
         /// says nothing about whether the request was processed.
         pub fn fail(server: *ServerType, stream: *StreamType) void {
-            assert(stream.h2_id != 0);
+            assert(stream.muxed());
             assert(!stream.ending);
             abandon(server, stream, .internal_error);
+        }
+
+        // -- the client half, by protocol (#449) --
+        //
+        // Everything above and below is the exchange; these are the few
+        // calls that ask the session it answers through, HTTP/2's or
+        // HTTP/3's. HTTP/2's arms are its session's calls as they were.
+
+        /// The session can say nothing more: the connection is ending under
+        /// the exchange.
+        fn sessionOver(stream: *const StreamType) bool {
+            return switch (stream.mux) {
+                .none => unreachable,
+                .h2 => stream.conn.h2.?.session.state == .closed,
+                .h3 => H3Half.over(stream.conn),
+            };
+        }
+
+        fn sendHead(server: *ServerType, stream: *StreamType, fields: []const hpack.Field, ends: bool) Session.Sent {
+            return switch (stream.mux) {
+                .none => unreachable,
+                .h2 => stream.conn.h2.?.session.sendHead(stream.h2_id, fields, ends),
+                .h3 => H3Half.sendHead(server, stream, fields, ends),
+            };
+        }
+
+        /// Null when the stream cannot take body octets at all, which ends
+        /// the exchange; HTTP/2's session always answers.
+        fn sendData(stream: *StreamType, bytes: []const u8, ends: bool) ?Session.DataSent {
+            return switch (stream.mux) {
+                .none => unreachable,
+                .h2 => stream.conn.h2.?.session.sendData(stream.h2_id, bytes, ends),
+                .h3 => H3Half.sendData(stream, bytes, ends),
+            };
+        }
+
+        fn sendTrailers(server: *ServerType, stream: *StreamType, fields: []const hpack.Field) Session.Sent {
+            return switch (stream.mux) {
+                .none => unreachable,
+                .h2 => stream.conn.h2.?.session.sendTrailers(stream.h2_id, fields),
+                .h3 => H3Half.sendTrailers(server, stream, fields),
+            };
+        }
+
+        /// The answer is whole: a client still sending its request is told
+        /// to stop (RFC 9113 §8.1's RST_STREAM(NO_ERROR), RFC 9114 §4.1's
+        /// STOP_SENDING(H3_NO_ERROR)).
+        fn stopClient(stream: *StreamType) void {
+            switch (stream.mux) {
+                .none => unreachable,
+                .h2 => {
+                    const session = stream.conn.h2.?.session;
+                    if (session.awaitingClient(stream.h2_id)) session.resetStream(stream.h2_id, .no_error);
+                },
+                .h3 => H3Half.stopClient(stream),
+            }
+        }
+
+        /// The exchange is abandoned: the stream reset, if the session still
+        /// holds it.
+        fn resetClient(stream: *StreamType, code: h2.frame.ErrorCode) void {
+            switch (stream.mux) {
+                .none => unreachable,
+                .h2 => {
+                    const session = stream.conn.h2.?.session;
+                    if (session.resettable(stream.h2_id)) session.resetStream(stream.h2_id, code);
+                },
+                // HTTP/3 maps the one code the exchange resets with.
+                .h3 => {
+                    assert(code == .internal_error);
+                    H3Half.reset(stream);
+                },
+            }
+        }
+
+        /// `octets` of the request body reached the origin: HTTP/2 credits
+        /// them back to the client's window; HTTP/3's stream is read for
+        /// the room they left, its flow control having held the rest.
+        fn creditClient(stream: *StreamType, octets: u32) void {
+            switch (stream.mux) {
+                .none => unreachable,
+                .h2 => if (octets >= 1) stream.conn.h2.?.session.consume(stream.h2_id, octets),
+                .h3 => H3Half.bodyRoomOpened(stream),
+            }
+        }
+
+        /// What the exchange staged goes out.
+        fn kick(server: *ServerType, conn: *ConnType, mux: StreamType.Mux) void {
+            switch (mux) {
+                .none => unreachable,
+                .h2 => Driver.kick(server, conn),
+                .h3 => H3Half.kick(server, conn),
+            }
         }
 
         // -- the request body --
@@ -512,6 +609,37 @@ pub fn Exchange(comptime runtime: Runtime) type {
                 return length;
             }
             if (!forwarding(stream)) return drop(conn, data);
+            return takeData(server, stream, data.bytes, data.end_stream);
+        }
+
+        /// What the request body's buffer can take now on an exchange that
+        /// forwards one — how much DATA an HTTP/3 stream is read for (#449),
+        /// its flow control holding the rest at the client — or zero on one
+        /// that does not.
+        pub fn dataRoom(stream: *const StreamType) u32 {
+            assert(stream.muxed());
+            // A handler route takes its whole body beside its head, and past
+            // the head buffer's room answers 413 itself (#434).
+            if (Proxy.readsHandlerBody(stream)) return std.math.maxInt(u32);
+            if (!forwarding(stream)) return 0;
+            const body = &stream.h2_body;
+            if (body.payload_start != 0) return bodyRoom(stream);
+            // Before the first payload its headroom is not yet reserved,
+            // which `bodyRoom` asserts it is.
+            const capacity: u32 = @intCast(stream.relay_buffer.?.client_to_upstream.len);
+            const tail: u32 = if (stream.l7.request_framing == .chunked) chunk_tail_bytes else 0;
+            assert(capacity > headroom(stream) + tail);
+            return capacity - headroom(stream) - tail;
+        }
+
+        /// Request body octets into a forwarding exchange's buffer, as far as
+        /// there is room: HTTP/2's DATA and HTTP/3's alike (#449). Answers
+        /// how many were taken.
+        pub fn takeData(server: *ServerType, stream: *StreamType, bytes: []const u8, end_stream: bool) u32 {
+            assert(stream.muxed());
+            assert(forwarding(stream));
+            const conn = stream.conn;
+            const length: u32 = @intCast(bytes.len);
             const body = &stream.h2_body;
             // The first payload sits where a frame's starts: past room for
             // its chunk size line, which goes in front of it when it is sent.
@@ -521,7 +649,7 @@ pub fn Exchange(comptime runtime: Runtime) type {
             const take = @min(bodyRoom(stream), length);
             assert(take <= length);
             const buffer = stream.relay_buffer.?.client_to_upstream;
-            @memcpy(buffer[body.payload_start + body.payload_len ..][0..take], data.bytes[0..take]);
+            @memcpy(buffer[body.payload_start + body.payload_len ..][0..take], bytes[0..take]);
             body.payload_len += take;
             assert(body.payload_start + body.payload_len <= buffer.len);
             body.total += take;
@@ -533,9 +661,20 @@ pub fn Exchange(comptime runtime: Runtime) type {
                 fail(server, stream);
                 return length;
             }
-            if (take == length and data.end_stream) body.client_ended = true;
+            if (take == length and end_stream) body.client_ended = true;
             if (stream.l7.request_leg == .pumping_body) frameAndSend(server, stream);
             return take;
+        }
+
+        /// The request's end with no more of its body: HTTP/2's trailers or
+        /// END_STREAM on empty DATA, HTTP/3's trailers or FIN (#449).
+        pub fn endBody(server: *ServerType, stream: *StreamType) void {
+            assert(stream.muxed());
+            // A trailer section ends a handler route's body too (#434).
+            if (Proxy.readsHandlerBody(stream)) return Proxy.takeHandlerData(server, stream, &.{}, true);
+            if (!forwarding(stream)) return;
+            stream.h2_body.client_ended = true;
+            if (stream.l7.request_leg == .pumping_body) frameAndSend(server, stream);
         }
 
         /// The request's trailer section ends the client's half. It is not
@@ -544,11 +683,7 @@ pub fn Exchange(comptime runtime: Runtime) type {
         pub fn onTrailers(server: *ServerType, conn: *ConnType, trailers: *const Session.Step.Trailers) void {
             assert(conn.state == .h2);
             const stream = find(conn, trailers.stream) orelse return;
-            // A trailer section ends a handler route's body too (#434).
-            if (Proxy.readsHandlerBody(stream)) return Proxy.takeHandlerData(server, stream, &.{}, true);
-            if (!forwarding(stream)) return;
-            stream.h2_body.client_ended = true;
-            if (stream.l7.request_leg == .pumping_body) frameAndSend(server, stream);
+            endBody(server, stream);
         }
 
         /// Octets for an exchange that will not forward them, consumed.
@@ -570,7 +705,7 @@ pub fn Exchange(comptime runtime: Runtime) type {
         /// (456163385). A pending replay is not condemned: its try is
         /// rebuilt, so what gathers still goes.
         fn forwarding(stream: *const StreamType) bool {
-            assert(stream.h2_id != 0);
+            assert(stream.muxed());
             if (stream.ending) return false;
             if (stream.l7.pending_verdict == .gateway_timeout) return false;
             if (stream.phase != .dialing and stream.phase != .exchanging) return false;
@@ -693,7 +828,8 @@ pub fn Exchange(comptime runtime: Runtime) type {
             assert(body.frame_start + body.frame_sent <= body.frame_end);
             if (body.frame_start + body.frame_sent < body.frame_end) return armBodySend(server, stream);
             // The frame is out: its payload is the client's to send again.
-            if (body.frame_payload >= 1) conn.h2.?.session.consume(stream.h2_id, body.frame_payload);
+            const mux = stream.mux;
+            const credited = body.frame_payload;
             const last = body.frame_last;
             compactBody(stream);
             if (last) {
@@ -701,9 +837,10 @@ pub fn Exchange(comptime runtime: Runtime) type {
             } else {
                 frameAndSend(server, stream);
             }
-            // The window update goes out, and a frame held for room is
-            // offered again.
-            Driver.kick(server, conn);
+            // HTTP/2: the window update goes out, and a frame held for room
+            // is offered again. HTTP/3: the room is read into.
+            creditClient(stream, credited);
+            kick(server, conn, mux);
         }
 
         /// The frame in flight is gone: what gathered behind it moves to
@@ -737,12 +874,12 @@ pub fn Exchange(comptime runtime: Runtime) type {
         /// upstream not one to park.
         pub fn finishAhead(server: *ServerType, stream: *StreamType) void {
             const conn = stream.conn;
-            const session = conn.h2.?.session;
+            const mux = stream.mux;
             assert(stream.h2_ended);
             assert(stream.l7.request_leg != .done);
-            if (session.awaitingClient(stream.h2_id)) session.resetStream(stream.h2_id, .no_error);
+            stopClient(stream);
             server.endSharedStream(stream);
-            Driver.kick(server, conn);
+            kick(server, conn, mux);
         }
 
         /// The client reset a stream, or the session did for a stream error:
@@ -773,13 +910,30 @@ pub fn Exchange(comptime runtime: Runtime) type {
         /// A scan of at most the advertised concurrency, once per event.
         pub fn find(conn: *ConnType, id: u31) ?*StreamType {
             assert(id != 0);
-            const streams_max = conn.h2.?.session.config.concurrent_streams_max;
+            assert(conn.h2 != null);
+            const streams_max = conn.multiplexedMax();
             var cursor = conn.h2_streams;
             var visited: u32 = 0;
             while (cursor) |stream| : (cursor = stream.h2_next) {
                 assert(visited < streams_max);
                 visited += 1;
                 if (stream.h2_id == id) return stream;
+            }
+            return null;
+        }
+
+        /// The exchange on HTTP/3 request stream `id` (#449), if this
+        /// connection is running one: the same scan, by QUIC's identifier.
+        pub fn findH3(conn: *ConnType, id: u62) ?*StreamType {
+            assert(conn.h3 != null);
+            const streams_max = conn.multiplexedMax();
+            var cursor = conn.h2_streams;
+            var visited: u32 = 0;
+            while (cursor) |stream| : (cursor = stream.h2_next) {
+                assert(visited < streams_max);
+                visited += 1;
+                assert(stream.mux == .h3);
+                if (stream.h3_id == id) return stream;
             }
             return null;
         }
