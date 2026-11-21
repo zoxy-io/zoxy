@@ -350,9 +350,9 @@ pub fn Endpoint(comptime runtime: Runtime) type {
         /// RFC 9000 §10.3.2: a token a server can derive again from the ID
         /// alone, so it holds no table of them.
         pub fn resetToken(endpoint: *const Self, id: *const ConnectionId) [16]u8 {
-            var prk: [32]u8 = undefined;
-            crypto.Backend.hkdfSha256Extract(&prk, &endpoint.reset_key, id.bytes());
-            return prk[0..16].*;
+            var mac: [32]u8 = undefined;
+            crypto.Backend.hmacSha256(&mac, &endpoint.reset_key, id.bytes());
+            return mac[0..16].*;
         }
 
         fn mintToken(endpoint: *const Self, target: *[token_bytes_max]u8, original: *const ConnectionId, peer: *const IpAddress) []const u8 {
@@ -383,12 +383,12 @@ pub fn Endpoint(comptime runtime: Runtime) type {
             return ConnectionId.init(token[5..][0..length]) catch null;
         }
 
-        /// HMAC-SHA-256 under the token key, through the packet-protection
-        /// backend's extract — which is that HMAC — over the token's body
-        /// and the address it is for, family included so an IPv4 address
-        /// and the IPv6 one embedding it never share a token.
+        /// HMAC-SHA-256 under the token key over the token's body and the
+        /// address it is for, family included so an IPv4 address and the
+        /// IPv6 one embedding it never share a token.
         fn tokenMac(endpoint: *const Self, body: []const u8, peer: *const IpAddress) [token_mac_bytes]u8 {
             var message: [token_bytes_max + 1 + 16 + 2]u8 = undefined;
+            comptime assert(message.len <= crypto.Backend.hmac_message_bytes_max);
             @memcpy(message[0..body.len], body);
             var length = body.len;
             switch (peer.*) {
@@ -405,9 +405,9 @@ pub fn Endpoint(comptime runtime: Runtime) type {
                     length += 19;
                 },
             }
-            var prk: [32]u8 = undefined;
-            crypto.Backend.hkdfSha256Extract(&prk, &endpoint.token_key, message[0..length]);
-            return prk[0..token_mac_bytes].*;
+            var mac: [32]u8 = undefined;
+            crypto.Backend.hmacSha256(&mac, &endpoint.token_key, message[0..length]);
+            return mac[0..token_mac_bytes].*;
         }
 
         // -- sending --
