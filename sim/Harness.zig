@@ -823,11 +823,12 @@ fn onHttpOriginStop(harness: *Harness, result: Io.TimerError!void) void {
 
 /// The #428 churn's two updates, when this seed churns: only a cluster
 /// that carries the refusing endpoint, so the swap is one refusing
-/// address for another, and only one that retries, so any pick that
-/// lands on either falls back to the origin — which is what keeps every
-/// golden outcome what it was, a reweight's moved hash placements
-/// included. A change to `deriveRetries` that let a two-endpoint cluster
-/// go without retries would break that.
+/// address for another, and only one whose retry budget outlasts both
+/// refusing addresses, so any pick that lands on either falls back to the
+/// origin — which is what keeps every golden outcome what it was, a
+/// reweight's moved hash placements included. The invariant is
+/// `churns`': a budget of at least two retries, and it says why one is
+/// not enough.
 fn armChurn(harness: *Harness) void {
     harness.churn_completions = .{ .{}, .{} };
     harness.churn_steps_count = 0;
@@ -839,9 +840,20 @@ fn armChurn(harness: *Harness) void {
 }
 
 /// Whether this seed churns its http cluster's endpoints.
+///
+/// Only with two retries or more. A request whose tries straddle a churn
+/// step can meet both refusing addresses: refused by the one the step
+/// sends away, then by its stand-in, which it never tried and so does not
+/// skip. One retry then answers `502`, and a clean seed's golden outcome
+/// forbids that. Soak #146's seed 567398787 is exactly that: an HTTP/3
+/// request (#449), its handshake putting it at 10 ms, where the first
+/// step fell. Two retries leave the origin a try, and one request's tries
+/// — refusals land at once, since a clean seed dials with no delay —
+/// cannot straddle both steps, which fall at least 10 ms apart
+/// (`churn_at_ns`).
 fn churns(harness: *const Harness) bool {
     if (harness.endpoints_http_count == 2) assert(harness.retries_http >= 1);
-    return harness.churn_http and harness.endpoints_http_count == 2;
+    return harness.churn_http and harness.endpoints_http_count == 2 and harness.retries_http >= 2;
 }
 
 /// One churn step. The first sends the refusing endpoint away for a
