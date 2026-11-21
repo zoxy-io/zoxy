@@ -17,9 +17,20 @@ const Counters = zoxy.counters.Counters;
 const SimIo = zoxy.Io.SimIo;
 
 /// The seed `checkSeed` is currently running, for the panic handler
-/// below. A plain global because that is what a panic handler can read:
-/// by the time one runs, every frame that knew the seed is gone.
-var running_seed: u64 = 0;
+/// below and the hang watchdog. A global because that is what a panic
+/// handler can read: by the time one runs, every frame that knew the seed
+/// is gone. Atomic because the watchdog reads it from its own task.
+var running_seed = std.atomic.Value(u64).init(0);
+
+/// Seeds `checkSeed` has finished, passing or failing: the watchdog's
+/// evidence that the sweep is moving.
+var seeds_finished = std.atomic.Value(u64).init(0);
+
+/// The sweep's failing seeds, kept where the watchdog can read them too,
+/// so a sweep that hangs after failures still names every one. Each
+/// entry is stored before the count that publishes it.
+var failed_seeds: [failures_max]std.atomic.Value(u64) = @splat(.init(0));
+var failed_count = std.atomic.Value(u8).init(0);
 
 /// Name the seed on the way down (#253).
 ///
@@ -38,10 +49,8 @@ fn panicWithSeed(message: []const u8, first_trace_address: ?usize) noreturn {
     // trace itself is truncated. A zero here is not a seed but an answer:
     // the panic happened outside any run — during setup, the census, or
     // the failure report — and no schedule replays it.
-    std.debug.print("sim: PANIC seed={d} — replay with: zig build sim -- {d} 1\n", .{
-        running_seed,
-        running_seed,
-    });
+    const seed = running_seed.load(.acquire);
+    std.debug.print("sim: PANIC seed={d} — replay with: zig build sim -- {d} 1\n", .{ seed, seed });
     std.debug.defaultPanic(message, first_trace_address);
 }
 
@@ -56,6 +65,19 @@ const default_seed: u64 = 1;
 /// determinism check).
 const default_iterations: u64 = 4096;
 const progress_interval: u64 = 500;
+/// How often a sweep says how far it got: a soak shard is hundreds of
+/// thousands of seeds, and a sweep that printed only its verdict could
+/// not be told apart from a hung one until the runner cancelled it
+/// (run #140). Above `default_iterations`, so `ci` prints none.
+const sweep_progress_interval: u64 = 50_000;
+/// The wall-clock time one seed may take before the watchdog calls the
+/// sweep hung. A seed takes ~4 ms in Debug; what this catches is a seed
+/// that never ends — a spin inside one callback, or ops forever ready at
+/// a frozen virtual clock — which neither the deadlock check nor the
+/// virtual-time alarm can see.
+const seed_wall_ns_max: u64 = 60 * std.time.ns_per_s;
+/// How often the watchdog looks.
+const watchdog_poll_ns: u64 = std.time.ns_per_s;
 /// The most failing seeds one `keep-going` sweep names before it stops.
 /// Bounded so a systematically broken build prints a census rather than a
 /// line per seed; the sweep reports the range it actually reached, so a
@@ -912,11 +934,76 @@ pub fn main(init: std.process.Init) !u8 {
     var arena_state = std.heap.ArenaAllocator.init(init.gpa);
     defer arena_state.deinit();
 
-    if (arguments.len == 2 and std.mem.eql(u8, arguments[1], "fuzz")) {
-        return fuzzForever(&arena_state, init.io);
+    const fuzz = arguments.len == 2 and std.mem.eql(u8, arguments[1], "fuzz");
+    const options: ?Sweep = if (fuzz) null else try parseSweep(arguments);
+    // Cancelled by the defer on every exit; it only ever reads.
+    var watchdog: std.Io.Group = .init;
+    try watchdog.concurrent(init.io, watchdogTask, .{ init.io, if (options) |*range| range else null });
+    defer watchdog.cancel(init.io);
+    if (options) |*range| return sweep(&arena_state, range, init.io);
+    return fuzzForever(&arena_state, init.io);
+}
+
+/// A sweep that stops moving is named, not left to a runner's timeout: no
+/// seed finished for `seed_wall_ns_max` means the running one never will.
+/// The verdict is printed in the lines a sweep's own report uses — the
+/// failing seeds with the hung one last, and the range verified before it
+/// — so the soak's record names the seed, and the process exits. A null
+/// range is `fuzz`, whose random seeds have no range to report.
+fn watchdogTask(io: std.Io, range: ?*const Sweep) void {
+    if (range) |options| assert(options.iterations >= 1);
+    // A stall is judged at the poll's granularity, so it must be finer.
+    assert(watchdog_poll_ns < seed_wall_ns_max);
+    var finished_seen = seeds_finished.load(.acquire);
+    var moved_at = std.Io.Timestamp.now(io, .awake);
+    while (true) {
+        io.sleep(std.Io.Duration.fromNanoseconds(watchdog_poll_ns), .awake) catch |err| {
+            // The sweep ended and cancelled this task: every ordinary exit.
+            assert(err == error.Canceled);
+            return;
+        };
+        const finished = seeds_finished.load(.acquire);
+        if (finished != finished_seen) {
+            finished_seen = finished;
+            moved_at = std.Io.Timestamp.now(io, .awake);
+            continue;
+        }
+        const stalled_ns = moved_at.untilNow(io, .awake).toNanoseconds();
+        if (stalled_ns < seed_wall_ns_max) continue;
+        const seed = running_seed.load(.acquire);
+        // Between seeds is not a hang: the census or the report is running.
+        if (seed == 0) continue;
+        // A seed that ended between the two loads was not hung after all;
+        // unmoved, the count is exactly the seeds before this one.
+        if (seeds_finished.load(.acquire) != finished) continue;
+        reportHang(range, seed, finished);
+        std.process.exit(1);
     }
-    const options = try parseSweep(arguments);
-    return sweep(&arena_state, &options);
+}
+
+fn reportHang(range: ?*const Sweep, seed: u64, finished: u64) void {
+    assert(seed != 0);
+    std.debug.print(
+        "sim: HUNG seed={d}: no seed finished in {d} s — replay with: zig build sim -- {d} 1\n",
+        .{ seed, seed_wall_ns_max / std.time.ns_per_s, seed },
+    );
+    const options = range orelse return;
+    assert(seed >= options.first_seed);
+    const count = failed_count.load(.acquire);
+    assert(count < failures_max);
+    std.debug.print("sim: {d} seed(s) failed:", .{count + 1});
+    for (failed_seeds[0..count]) |*failed| std.debug.print(" {d}", .{failed.load(.monotonic)});
+    std.debug.print(" {d}\n", .{seed});
+    // Seeds run in order, so every one below the hung seed finished; a
+    // hang on the first leaves nothing verified, and says no range.
+    assert(finished == seed - options.first_seed);
+    if (seed == options.first_seed) return;
+    std.debug.print("sim: swept {d}..{d} of {d}..{d}, then hung\n", .{
+        options.first_seed,
+        seed - 1,
+        options.first_seed,
+        options.first_seed + options.iterations - 1,
+    });
 }
 
 /// Random seeds until something breaks: the unbounded companion to the
@@ -927,6 +1014,8 @@ fn fuzzForever(arena_state: *std.heap.ArenaAllocator, io: std.Io) !u8 {
         var seed_bytes: [8]u8 = undefined;
         io.random(&seed_bytes);
         const seed = std.mem.readInt(u64, &seed_bytes, .little);
+        // Zero is "between seeds" to the watchdog and the panic handler.
+        if (seed == 0) continue;
         // No census: a random walk has no range to make a claim about.
         checkSeed(arena_state, seed, null) catch return 1;
         if (count % progress_interval == 0) {
@@ -957,6 +1046,10 @@ fn parseSweep(arguments: []const []const u8) !Sweep {
         }
     }
     if (parsed.iterations == 0) return error.NoIterations;
+    // Zero is "between seeds" to the watchdog and the panic handler, and
+    // a range must not run past the last seed a u64 names.
+    if (parsed.first_seed == 0) return error.SeedZero;
+    if (parsed.iterations > std.math.maxInt(u64) - parsed.first_seed) return error.RangeOverflows;
     assert(parsed.iterations >= 1);
     assert(positional <= 2);
     return parsed;
@@ -969,27 +1062,29 @@ fn parseSweep(arguments: []const []const u8) !Sweep {
 /// This only rescues the *returned* failures: a broken invariant inside
 /// the serving path is a `std.debug.assert`, which panics the process
 /// whatever this flag says.
-fn sweep(arena_state: *std.heap.ArenaAllocator, options: *const Sweep) !u8 {
+fn sweep(arena_state: *std.heap.ArenaAllocator, options: *const Sweep, io: std.Io) !u8 {
     assert(options.iterations >= 1);
+    assert(failed_count.load(.monotonic) == 0);
     const end = options.first_seed + options.iterations;
-    var failed: [failures_max]u64 = @splat(0);
-    var failed_count: u8 = 0;
     var seed = options.first_seed;
     var census: Census = .{};
+    const began = std.Io.Timestamp.now(io, .awake);
     while (seed < end) : (seed += 1) {
         checkSeed(arena_state, seed, &census) catch {
-            assert(failed_count < failures_max);
-            failed[failed_count] = seed;
-            failed_count += 1;
-            if (options.keep_going) {
-                if (failed_count == failures_max) break;
-            } else {
-                break;
-            }
+            const count = failed_count.load(.monotonic);
+            assert(count < failures_max);
+            failed_seeds[count].store(seed, .monotonic);
+            failed_count.store(count + 1, .release);
+            if (!options.keep_going or count + 1 == failures_max) break;
         };
+        const done = seed - options.first_seed + 1;
+        if (done % sweep_progress_interval == 0) reportProgress(options, seed, began, io);
     }
-    if (failed_count != 0) {
-        reportFailures(options, failed[0..failed_count], @min(seed, end - 1));
+    const count = failed_count.load(.monotonic);
+    if (count != 0) {
+        var failed: [failures_max]u64 = undefined;
+        for (failed_seeds[0..count], failed[0..count]) |*stored, *copy| copy.* = stored.load(.monotonic);
+        reportFailures(options, failed[0..count], @min(seed, end - 1));
         return 1;
     }
     assert(seed == end);
@@ -1007,6 +1102,22 @@ fn sweep(arena_state: *std.heap.ArenaAllocator, options: *const Sweep) !u8 {
         end - 1,
     });
     return 0;
+}
+
+/// One line of how far a long sweep got, and how fast: the rate is what
+/// tells a slow shard from a hung one before its runner's cap does.
+fn reportProgress(options: *const Sweep, seed: u64, began: std.Io.Timestamp, io: std.Io) void {
+    assert(seed >= options.first_seed);
+    const done = seed - options.first_seed + 1;
+    assert(done <= options.iterations);
+    const elapsed_ms: u64 = @intCast(@max(1, @divFloor(began.untilNow(io, .awake).toNanoseconds(), std.time.ns_per_ms)));
+    std.debug.print("sim: progress {d}/{d} seed(s), at {d}, {d} s, {d} seed(s)/s\n", .{
+        done,
+        options.iterations,
+        seed,
+        elapsed_ms / std.time.ms_per_s,
+        done * std.time.ms_per_s / elapsed_ms,
+    });
 }
 
 /// The coverage census over a completed range, and its verdict on stdout.
@@ -1062,13 +1173,18 @@ fn reportFailures(options: *const Sweep, failed: []const u64, swept_last: u64) v
 /// feeds the census — the replay would double every total, and a census
 /// is a claim about what one pass over the range reached.
 fn checkSeed(arena_state: *std.heap.ArenaAllocator, seed: u64, census: ?*Census) !void {
-    running_seed = seed;
+    // Zero is the watchdog's and the panic handler's "between seeds".
+    assert(seed != 0);
+    running_seed.store(seed, .release);
     // Cleared on the way out, so the seed the handler prints is only ever
     // one a run was *inside*. A panic does not run this — which is the
     // point — but the census and the failure report that follow the sweep
     // do, and a panic in either would otherwise name the last seed swept
     // as though its schedule were the cause.
-    defer running_seed = 0;
+    defer {
+        running_seed.store(0, .release);
+        _ = seeds_finished.fetchAdd(1, .release);
+    }
     const first = runSeed(arena_state, seed, census) catch |err| {
         std.debug.print("sim: FAILURE seed={d} error={t}\n", .{ seed, err });
         return err;
