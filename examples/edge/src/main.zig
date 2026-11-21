@@ -2,10 +2,13 @@
 //! configured entirely in code — its extensions and its options are
 //! `edge.zig`; this file is only its command line.
 //!
-//!     zoxy-edge [--check] LISTEN APP STATIC
+//!     zoxy-edge [--check] LISTEN CONTROL APP STATIC
 //!
-//! LISTEN is the `IP:port` to accept on; APP and STATIC are
-//! comma-separated `IP:port` lists: the application's endpoints, and the
+//! LISTEN is the `IP:port` to accept on, and CONTROL the control plane's,
+//! which belongs where only operators reach — loopback, say — since it
+//! asks no credentials and moves the application's traffic. APP and
+//! STATIC are comma-separated `IP:port` lists, at most
+//! `edge.endpoints_max` each: the application's endpoints, and the
 //! static-content ones. Discovery here is the command line; a build that
 //! asks a registry or DNS does so at this same point — before its options
 //! exist, with the whole startup sequence still ahead of it.
@@ -34,9 +37,6 @@ const edge = @import("edge.zig");
 
 const assert = std.debug.assert;
 
-/// Endpoints one list may name.
-const endpoints_max = 32;
-
 /// The build's extension instances. Static, because the options select
 /// them by address and the server reads them for the process's life.
 var instances: edge.Instances = .{};
@@ -45,17 +45,18 @@ pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
     assert(args.len >= 1);
-    const check = args.len == 5 and std.mem.eql(u8, args[1], "--check");
+    const check = args.len == 6 and std.mem.eql(u8, args[1], "--check");
     const positional = if (check) args[2..] else args[1..];
-    if (positional.len != 3) {
-        std.debug.print("usage: zoxy-edge [--check] LISTEN APP STATIC\n", .{});
+    if (positional.len != 4) {
+        std.debug.print("usage: zoxy-edge [--check] LISTEN CONTROL APP STATIC\n", .{});
         return 2;
     }
     const arena_before = init.arena.queryCapacity();
     const plan: edge.Plan = .{
         .listen = try address(positional[0]),
-        .app = try addresses(arena, positional[1]),
-        .static = try addresses(arena, positional[2]),
+        .control = try address(positional[1]),
+        .app = try addresses(arena, positional[2]),
+        .static = try addresses(arena, positional[3]),
         .log_requests = true,
     };
     const options = try edge.options(arena, &instances, &plan);
@@ -80,8 +81,8 @@ fn addresses(arena: std.mem.Allocator, list: []const u8) ![]const std.Io.net.IpA
     var parsed: std.ArrayList(std.Io.net.IpAddress) = .empty;
     var literals = std.mem.splitScalar(u8, list, ',');
     while (literals.next()) |literal| {
-        if (parsed.items.len == endpoints_max) {
-            std.debug.print("zoxy-edge: more than {d} endpoints in '{s}'\n", .{ endpoints_max, list });
+        if (parsed.items.len == edge.endpoints_max) {
+            std.debug.print("zoxy-edge: more than {d} endpoints in '{s}'\n", .{ edge.endpoints_max, list });
             return error.TooManyEndpoints;
         }
         try parsed.append(arena, try address(literal));
@@ -89,6 +90,6 @@ fn addresses(arena: std.mem.Allocator, list: []const u8) ![]const std.Io.net.IpA
     // `splitScalar` yields at least one literal, and `address` refuses an
     // empty one, so a list that got here names an endpoint.
     assert(parsed.items.len >= 1);
-    assert(parsed.items.len <= endpoints_max);
+    assert(parsed.items.len <= edge.endpoints_max);
     return parsed.items;
 }
