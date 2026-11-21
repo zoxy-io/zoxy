@@ -7,7 +7,8 @@
 //! Its own origins, in this process: three, each answering every request
 //! with `200` and its own address, which is how a response says which
 //! endpoint a pick chose, and with the `x-edge-tenant` lines it was sent,
-//! which is how a response says what the edge forwarded. Usage:
+//! which is how a response says what the edge forwarded. Each also names
+//! its software in `X-Powered-By`, which the edge must drop. Usage:
 //! `zoxy-edge-smoke <zoxy-edge> <log>`.
 //!
 //! Bounded in wall-clock time by a watchdog: a proxy that stops answering
@@ -99,7 +100,7 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
     std.debug.print("zoxy-edge smoke: routes, pickers, both policy phases, the tenant's challenge, " ++
-        "header and tag over XevIo, clean drain\n", .{});
+        "header and tag, and the response headers, under a connection cap, over XevIo, clean drain\n", .{});
     return 0;
 }
 
@@ -111,6 +112,10 @@ fn exercise(io: Io, port: u16, app: *const Origin, static_a: *const Origin, stat
     // `api` and `search` pick through the one shared `LeastInFlight`, over
     // the one application endpoint.
     passed = expectBody(io, port, "GET /orders HTTP/1.1\r\n" ++ tenant, &buffer, app.label()) and passed;
+    // Every origin response leaves with the edge's headers (#424), and
+    // without the one naming the origin's software.
+    passed = expectHeader(io, port, "GET /orders HTTP/1.1\r\n" ++ tenant, &buffer, "x-frame-options: DENY\r\n") and passed;
+    passed = expectNoHeader(io, port, "GET /orders HTTP/1.1\r\n" ++ tenant, &buffer, "X-Powered-By") and passed;
     // The tenant reaches the origin in the header the edge sets (#424),
     // and a copy the client forged does not.
     passed = expectHeader(
@@ -151,6 +156,17 @@ fn expectHeader(io: Io, port: u16, request: []const u8, buffer: []u8, line: []co
     const head_end = std.mem.indexOf(u8, response, "\r\n\r\n") orelse response.len;
     if (std.mem.indexOf(u8, response[0..@min(head_end + 2, response.len)], line) != null) return true;
     std.debug.print("FAIL: {s}expected the line '{s}', got:\n{s}\n", .{ request, line, response });
+    return false;
+}
+
+/// No `name:` line in the response's head. `line` is that line's start,
+/// CRLF first, so a value that merely mentions the name does not match.
+fn expectNoHeader(io: Io, port: u16, request: []const u8, buffer: []u8, comptime name: []const u8) bool {
+    const response = exchange(io, port, request, buffer);
+    const head_end = std.mem.indexOf(u8, response, "\r\n\r\n") orelse 0;
+    const line = "\r\n" ++ name ++ ":";
+    if (head_end != 0 and std.ascii.findIgnoreCase(response[0 .. head_end + 2], line) == null) return true;
+    std.debug.print("FAIL: {s}expected no '{s}' line, got:\n{s}\n", .{ request, name, response });
     return false;
 }
 
@@ -340,7 +356,7 @@ const Origin = struct {
         var write_buffer: [512]u8 = undefined;
         var writer = stream.writer(origin.io, &write_buffer);
         writer.interface.print(
-            "HTTP/1.1 200 OK\r\nX-Saw-Tenant: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+            "HTTP/1.1 200 OK\r\nX-Powered-By: zoxy-edge-smoke\r\nX-Saw-Tenant: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
             .{ tenants[0..tenants_len], origin.label_len, origin.label() },
         ) catch return;
         writer.interface.flush() catch return;
