@@ -23,6 +23,11 @@ pub const log_request_value = "sim-trace-1";
 /// streams the server ends on purpose — so a clean seed's aborted lines
 /// can be told apart, every one of them a flood's or a bug.
 pub const log_request_flood_value = "sim-flood-1";
+/// And an HTTP/3 client's (#449): the age cap (§6) may cut its requests
+/// on a clean seed, so its aborted lines are told apart the same way —
+/// each one excused only when the cap ended that line's own client's
+/// connection.
+pub const log_request_h3_value = "sim-h3-1";
 pub const log_response_header = "x-sim-origin";
 pub const log_response_value = "sized";
 

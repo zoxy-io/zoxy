@@ -102,14 +102,15 @@ pub fn Client(comptime IoType: type) type {
             }
         }
 
-        /// The HTTP/3 request stream `index` makes of its plan: traced as
-        /// the HTTP/2 population's are, and a POST's body marked with its
-        /// length and this client's salt, which the origin checks octet by
-        /// octet.
+        /// The HTTP/3 request stream `index` makes of its plan: traced
+        /// with HTTP/3's own value (`canon.log_request_h3_value`), so the
+        /// access log's clean-seed rule can tell its aborts apart, and a
+        /// POST's body marked with its length and this client's salt, which
+        /// the origin checks octet by octet.
         fn requestFor(client: *Self, index: u8) TestClient.Request {
             const plan = client.plans[index];
             const headers = &client.headers[index];
-            headers[0] = .{ .name = canon.log_request_header, .value = canon.log_request_value };
+            headers[0] = .{ .name = canon.log_request_header, .value = canon.log_request_h3_value };
             if (!plan.carriesBody()) {
                 return .{ .method = "GET", .path = plan.path(), .headers = headers[0..1] };
             }

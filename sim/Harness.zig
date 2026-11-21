@@ -3609,8 +3609,18 @@ fn verifyAccessLog(harness: *Harness) !void {
     // server ends that client's connection on purpose, and the streams it
     // had open with it. Each is traced as a flood's, so the rule stays
     // exact — every abort a flood's, and any other still a bug.
+    //
+    // The other is the age cap's (§6) on HTTP/3 (#449). The pacing
+    // argument above does not hold for a QUIC handshake: soak #145's seed
+    // 563537103 drew a 10 ms cap, and its two connections were ended at
+    // it with requests open. Those lines are traced as HTTP/3's, and each
+    // is excused only when the cap ended its own client's connection.
     if (harness.clean) {
-        if (tally.http_aborted != tally.http_aborted_flood) return error.AccessLogAbortedOnCleanSeed;
+        const h3_excused = harness.h3AbortsExcused(sink);
+        assert(h3_excused <= tally.http_aborted);
+        if (tally.http_aborted != tally.http_aborted_flood + h3_excused) {
+            return error.AccessLogAbortedOnCleanSeed;
+        }
         // And each L4 connection is one line: the clients connect once
         // apiece, clean-seed pools are sized well past the population so
         // none is shed at admission, and an L4 connection stamps its
@@ -3669,6 +3679,34 @@ const LineTally = struct {
     /// Those of them an HTTP/2 flood's request asked for.
     http_aborted_flood: u64 = 0,
 };
+
+/// The aborted HTTP/3 lines the age cap (§6) accounts for, client by
+/// client: each from a client whose connection the server closed
+/// gracefully, seen no sooner than the cap past that client's start
+/// (`H3Client.verify` reads the same), and named by its line's own
+/// client address — the loopback port its socket bound.
+fn h3AbortsExcused(harness: *const Harness, sink: []const u8) u64 {
+    assert(harness.h3_count <= h3_clients_max);
+    const max_lifetime_ns = @as(u64, harness.server.config.max_lifetime_ms) * std.time.ns_per_ms;
+    if (max_lifetime_ns == 0) return 0;
+    var excused: u64 = 0;
+    for (harness.h3_clients[0..harness.h3_count]) |*client| {
+        if (!client.began) continue;
+        if (!client.transport.peerClosedGracefully(max_lifetime_ns)) continue;
+        var needle_buffer: [40]u8 = undefined;
+        const needle = std.fmt.bufPrint(&needle_buffer, "\"client\":\"127.0.0.1:{d}\"", .{
+            client.transport.local_port,
+        }) catch unreachable;
+        var lines = std.mem.splitScalar(u8, sink, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.indexOf(u8, line, "\"outcome\":\"aborted\"") == null) continue;
+            if (std.mem.indexOf(u8, line, l7.canon.log_request_h3_value) == null) continue;
+            if (std.mem.indexOf(u8, line, needle) != null) excused += 1;
+        }
+    }
+    assert(excused <= sink.len);
+    return excused;
+}
 
 fn tallyAccessLog(sink: []const u8) !LineTally {
     var tally: LineTally = .{};
@@ -3836,10 +3874,12 @@ fn verifyLoggedHeaders(line: []const u8, is_http: bool) !void {
     if (has_request != is_http) return error.AccessLogHeadersWrongShape;
     if (has_response != is_http) return error.AccessLogHeadersWrongShape;
     if (!is_http) return;
-    // A flood's requests carry their own trace (#276); any other value is
-    // a capture gone wrong.
+    // A flood's requests carry their own trace (#276), and so do HTTP/3's
+    // (#449); any other value is a capture gone wrong.
     verifyLoggedValue(line, l7.canon.log_request_header, l7.canon.log_request_value) catch {
-        try verifyLoggedValue(line, l7.canon.log_request_header, l7.canon.log_request_flood_value);
+        verifyLoggedValue(line, l7.canon.log_request_header, l7.canon.log_request_flood_value) catch {
+            try verifyLoggedValue(line, l7.canon.log_request_header, l7.canon.log_request_h3_value);
+        };
     };
     try verifyLoggedValue(line, l7.canon.log_response_header, l7.canon.log_response_value);
 }
