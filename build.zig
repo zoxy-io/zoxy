@@ -123,6 +123,15 @@ pub fn build(b: *std.Build) void {
     });
     const h2_module = h2_dependency.module("h2");
 
+    // h3 — QUIC, QPACK and HTTP/3 (#449) — on h2's terms: pinned, confined
+    // to `src/http/h3/` by the lint, assertions on.
+    const h3_dependency = b.dependency("h3", .{
+        .target = target,
+        .optimize = optimize,
+        .assertions = true,
+    });
+    const h3_module = h3_dependency.module("h3");
+
     // zssl — the TLS 1.3 engine (DESIGN.md §4) — is pinned by content
     // hash; see build.zig.zon for why it replaced the ztls fork. Only
     // src/tls/ may import it (lint-enforced). It is a Zig protocol layer
@@ -195,6 +204,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "xev", .module = xev_module },
             .{ .name = "hparse", .module = hparse_module },
             .{ .name = "h2", .module = h2_module },
+            .{ .name = "h3", .module = h3_module },
             .{ .name = "zssl", .module = zssl_module },
         },
     });
@@ -405,6 +415,11 @@ pub fn build(b: *std.Build) void {
         .optimize = std.lang.Optimize.safe,
         .assertions = true,
     });
+    const h3_fast_dependency = b.dependency("h3", .{
+        .target = target,
+        .optimize = std.lang.Optimize.safe,
+        .assertions = true,
+    });
     const zssl_fast_dependency = b.dependency("zssl", .{
         .target = target,
         .optimize = std.lang.Optimize.safe,
@@ -418,6 +433,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "xev", .module = xev_module },
             .{ .name = "hparse", .module = hparse_fast_dependency.module("hparse") },
             .{ .name = "h2", .module = h2_fast_dependency.module("h2") },
+            .{ .name = "h3", .module = h3_fast_dependency.module("h3") },
             .{ .name = "zssl", .module = zssl_fast_dependency.module("zssl") },
         },
     });
