@@ -513,6 +513,36 @@ pub fn build(b: *std.Build) void {
     );
     h2spec_step.dependOn(&h2spec_run.step);
 
+    // The HTTP/3 conformance gate (#449, DESIGN.md §9, §12): h3spec 0.1.15
+    // against the shipped build, over QUIC, its failures held equal to the
+    // deviations §12 records and its pending case to the one it records.
+    // Merge tier, as h2spec is: a Haskell binary, run from PATH or from
+    // where `--h3spec` points. Same fixture, smoke's own origin.
+    const h3spec_exe = b.addExecutable(.{
+        .name = "zoxy-h3spec",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("smoke/h3spec.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    h3spec_exe.root_module.addAnonymousImport("tls_cert_pem", .{
+        .root_source_file = b.path("src/tls/testdata/cert.pem"),
+    });
+    h3spec_exe.root_module.addAnonymousImport("tls_key_pem", .{
+        .root_source_file = b.path("src/tls/testdata/key.pem"),
+    });
+    const h3spec_run = b.addRunArtifact(h3spec_exe);
+    h3spec_run.addArg("--zoxy");
+    h3spec_run.addArtifactArg(release_zoxy);
+    h3spec_run.addPassthruArgs();
+    h3spec_run.has_side_effects = true;
+    const h3spec_step = b.step(
+        "h3spec",
+        "HTTP/3 conformance at merge: h3spec 0.1.15 against the ReleaseSafe twin, failures equal to §12's deviations",
+    );
+    h3spec_step.dependOn(&h3spec_run.step);
+
     // §9 Tier 1 and the Tier-0 profile: the two harnesses that drive zrk.
     // Registered whatever `-Dbench` says, so `zig build -l` lists them
     // either way; see `addLoadGenerator` for what the option gates.
@@ -595,8 +625,10 @@ pub fn build(b: *std.Build) void {
     ci_step.dependOn(micro_step);
     ci_step.dependOn(load_generator.bench_exe);
     ci_step.dependOn(load_generator.profile_harness);
-    // The h2spec harness, on the same terms: run at merge, compiled here.
+    // The h2spec and h3spec harnesses, on the same terms: run at merge,
+    // compiled here.
     ci_step.dependOn(&h2spec_exe.step);
+    ci_step.dependOn(&h3spec_exe.step);
 
     // Line coverage via kcov (Linux-only, in the dev shell): the unit-test
     // binary plus a simulator sweep, merged — the simulator reaches error

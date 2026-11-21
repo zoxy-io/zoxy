@@ -1819,6 +1819,10 @@ pub fn Server(comptime runtime: Runtime) type {
             // would call a picker that was never told where it serves.
             if (server.selects_extensions) assert(server.extensions_bound);
             server.installTicketKey();
+            // The QUIC bindings first (#449): a TCP listener that answers is
+            // then one whose QUIC binding, if it has one, is bound too —
+            // the order a client probing the port, or a gate, may rely on.
+            try server.openQuicEndpoints();
             for (server.config.listeners, 0..) |listener_config, index| {
                 const state = &server.listeners[index];
                 const offer: []const []const u8 = if (listener_config.tls) |tls| tls.alpn else &.{};
@@ -1869,7 +1873,6 @@ pub fn Server(comptime runtime: Runtime) type {
                 if (state.certificates.len > 0) assert(state.certificates[0].credentials == state.credentials.?);
                 server.armAccept(state);
             }
-            try server.openQuicEndpoints();
             try server.admin.start();
             server.health.start();
             server.io.signalWait(Self, server, onSignal);
