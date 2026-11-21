@@ -1711,8 +1711,10 @@ pub const QuicJson = struct {
         },
         .alt_svc_max_age_s = .{
             .desc = "Seconds a client may remember the Alt-Svc advertisement " ++
-                "of this binding that the listener's TCP responses carry " ++
-                "(RFC 7838 ma). Absent is a day; 0 advertises nothing.",
+                "of this binding, which every answer the listener relays from " ++
+                "an origin carries (RFC 7838 ma); it takes one of the " ++
+                "listener's response header edits. Absent is a day; 0 " ++
+                "advertises nothing.",
             .minimum = 0,
             .maximum = constants.alt_svc_max_age_s_max,
         },
@@ -5373,6 +5375,7 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "ListenerBindUnixPathRelative", .gap = .literal_syntax },
     .{ .name = "ListenerH2cOnTls", .gap = .cross_block },
     .{ .name = "ListenerQuicWithoutTls", .gap = .cross_block },
+    .{ .name = "ListenerQuicAltSvcOverEditLimit", .gap = .budget },
     .{ .name = "ListenerQuicBindInvalid", .gap = .literal_syntax },
     .{ .name = "ListenerQuicBindNotIp", .gap = .literal_syntax },
     .{ .name = "ListenerQuicBindDuplicate", .gap = .duplicate },

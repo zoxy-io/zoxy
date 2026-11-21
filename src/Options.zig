@@ -152,9 +152,10 @@ pub const Listener = struct {
         /// The UDP address HTTP/3 is served on: an IP literal and port
         /// (never `unix:`).
         bind: io.Address,
-        /// RFC 7838 Alt-Svc max-age in seconds, advertised on this
-        /// listener's TCP responses so clients learn of the QUIC binding;
-        /// 0 advertises nothing.
+        /// RFC 7838 Alt-Svc max-age in seconds, advertised on every answer
+        /// this listener relays from an origin, so clients learn of the
+        /// QUIC binding; it takes one of the listener's response header
+        /// edits. 0 advertises nothing.
         alt_svc_max_age_s: u32 = constants.alt_svc_max_age_s_default,
     };
 
