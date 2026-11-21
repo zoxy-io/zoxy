@@ -425,7 +425,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             // A multiplexed exchange's head is the stream head its request
             // was written out into (#275), whatever its connection's socket
             // carries — TLS included: the engine decrypts frames, not heads.
-            if (stream.h2_id != 0) return stream.h2_head.?.data;
+            if (stream.muxed()) return stream.h2_head.?.data;
             // A terminated connection accumulates its head in the engine's
             // own plaintext buffer, not the ring (§4). It has to: a ring
             // buffer binds only on a `recvGroup` delivery, and a request
@@ -732,7 +732,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             // The connection's: a head read in pieces off a socket is an
             // admission stream's alone — a multiplexed exchange's head
             // arrives whole, in the frame that opened it (#275).
-            assert(stream.h2_id == 0);
+            assert(!stream.muxed());
             server.narrowDeadline(conn, budget_ms);
         }
 
@@ -1342,7 +1342,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             // The bytes hold the whole head, so whether they fill their
             // buffer is moot: an HTTP/2 stream's head was written whole
             // and parsed as one, a socket's re-parses as the dial path's do.
-            if (stream.h2_id != 0) {
+            if (stream.muxed()) {
                 const data = stream.h2_head.?.data;
                 return parser.parseRequestHead(data[0..stream.head_len], true, storage, null) catch unreachable;
             }
@@ -1462,7 +1462,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
         ) void {
             assert(stream.phase == .reading_head);
             assert(stream.l7.handler_route != null);
-            if (stream.h2_id != 0) return beginH2Handler(server, stream, request, host, views, render_scratch);
+            if (stream.muxed()) return beginH2Handler(server, stream, request, host, views, render_scratch);
             const body_len: u64 = switch (request.framing) {
                 .none => 0,
                 .content_length => |length| length,
@@ -1492,7 +1492,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             views: *const TargetViews,
             render_scratch: *RenderScratch,
         ) void {
-            assert(stream.h2_id != 0);
+            assert(stream.muxed());
             assert(stream.l7.handler_body_len == 0);
             const room = headBytes(server, stream).len - request.head_len;
             switch (request.framing) {
@@ -1516,7 +1516,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
         /// Whether an HTTP/2 stream is reading a handler route's body
         /// (#434), so its DATA frames are the handler's, not an origin's.
         pub fn readsHandlerBody(stream: *const StreamType) bool {
-            assert(stream.h2_id != 0);
+            assert(stream.muxed());
             if (stream.ending) return false;
             if (stream.phase != .reading_head) return false;
             return stream.l7.handler_route != null;
@@ -1541,7 +1541,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
         /// More of a handler route's body arrived on a socket (#434): the
         /// handler, once the body is whole, or another read.
         fn continueHandlerBody(server: *ServerType, stream: *StreamType) void {
-            assert(stream.h2_id == 0);
+            assert(!stream.muxed());
             assert(stream.l7.handler_route != null);
             assert(stream.l7.request_head_len >= 1);
             const whole = stream.l7.request_head_len + stream.l7.handler_body_len;
@@ -1586,7 +1586,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             // The body is read: on a socket the framing tracker says so,
             // for the turnaround's resync. An HTTP/2 stream's has nothing
             // to resync, and its DATA octets are no chunked framing.
-            if (stream.h2_id == 0) {
+            if (!stream.muxed()) {
                 if (body.len >= 1) _ = feedFraming(&stream.l7.request_framing, body);
                 assert(framingDoneOf(&stream.l7.request_framing));
             }
@@ -2780,7 +2780,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             stream.l7.request_body_pumped = true;
             // A multiplexed exchange's body arrives as DATA (#275), and its
             // exchange forwards it rather than reading a socket.
-            if (stream.h2_id != 0) return H2Exchange.forwardBody(server, stream);
+            if (stream.muxed()) return H2Exchange.forwardBody(server, stream);
             armRequestBodyRecv(server, stream);
         }
 
@@ -3035,7 +3035,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             assert(!server.headerScratchLent());
             const owed = server.h2_interim_owed orelse return;
             server.h2_interim_owed = null;
-            assert(owed.h2_id != 0);
+            assert(owed.muxed());
             // Nothing between the deferral and here could end it: under the
             // borrow its driver stepped nothing (`Driver.kick`).
             assert(!ServerType.exchangeEnding(owed));
@@ -3158,7 +3158,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             // opened (`H2Exchange.capRequests`): the stream that reached
             // it ended the connection with GOAWAY. An answer here ends only
             // its own stream, so it carries no verdict and takes no count.
-            if (stream.h2_id != 0) return true;
+            if (stream.muxed()) return true;
             if (!requestsCapReached(stream)) return true;
             server.counters.increment("l7_keepalive_requests_capped");
             return false;
@@ -3198,7 +3198,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
         ) StaticPersistence {
             // Asked only when it matters, as before the split: an answer
             // that may not keep has nothing to resync, and may have no head.
-            const resyncable = stream.h2_id == 0 and may_keep and staticResponseResyncable(stream);
+            const resyncable = !stream.muxed() and may_keep and staticResponseResyncable(stream);
             return persistenceWith(server, stream, may_keep, resyncable);
         }
 
@@ -3215,7 +3215,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             // the mapping drops the `Connection` line either variant would
             // carry — so this picks only which rendering is mapped, and
             // keeps the rule that a kept answer is one whose head parsed.
-            if (stream.h2_id != 0) {
+            if (stream.muxed()) {
                 return .{ .keep = stream.l7.request_head_len >= 1, .capped = false };
             }
             const would_keep = may_keep and
@@ -3838,14 +3838,14 @@ pub fn Proxy(comptime runtime: Runtime) type {
             // HTTP/1.1 client, which reads the same framing; for an HTTP/2
             // stream, the payload alone — DATA frames the body itself, so a
             // chunked one is dechunked, in place, at the front (#275).
-            const fed = payloadFraming(&stream.l7.response_framing, excess, stream.h2_id != 0);
+            const fed = payloadFraming(&stream.l7.response_framing, excess, stream.muxed());
             if (fed.feed.malformed) {
                 upstreamFailed(server, stream);
                 return;
             }
             // Its trailer section, met here when the body was small, stays
             // in the upstream head behind the payload until it is said.
-            if (stream.h2_id != 0) H2Exchange.keepTrailers(stream, excess, &fed);
+            if (stream.muxed()) H2Exchange.keepTrailers(stream, excess, &fed);
             const head_write_len = coalesceResponseExcess(
                 server,
                 stream,
@@ -3918,7 +3918,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             // taken whole, in which case the stream is finished and back in
             // its pool before this returns. A caller reads nothing of
             // `stream` after arming a write, on either path.
-            if (stream.h2_id != 0) return H2Exchange.answer(server, stream);
+            if (stream.muxed()) return H2Exchange.answer(server, stream);
             resumeClientWrite(server, stream);
         }
 
@@ -3991,8 +3991,8 @@ pub fn Proxy(comptime runtime: Runtime) type {
                 .redirect_next_request, .redirect_lingering_close => {
                     assert(stream.phase == .responding);
                     // A multiplexed exchange's is its stream head (#275).
-                    if (stream.h2_id != 0) assert(stream.h2_head != null);
-                    if (conn.tls == null and stream.h2_id == 0) {
+                    if (stream.muxed()) assert(stream.h2_head != null);
+                    if (conn.tls == null and !stream.muxed()) {
                         assert(stream.head_buffer_id != StreamType.head_buffer_none);
                     }
                 },
@@ -4163,7 +4163,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             if (framingDoneOf(&stream.l7.response_framing)) return finishExchange(server, stream);
             // The session is a multiplexed exchange's client (#275): its
             // body pump offers DATA rather than sending.
-            if (stream.h2_id != 0) return H2Exchange.pumpBody(server, stream);
+            if (stream.muxed()) return H2Exchange.pumpBody(server, stream);
             armResponseBodyRecv(server, stream);
         }
 
@@ -4383,7 +4383,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
             // A multiplexed exchange's end is its stream's (#275): there is
             // no connection of its own to keep or close, so what it holds
             // goes back and the stream is finished.
-            if (stream.h2_id != 0) {
+            if (stream.muxed()) {
                 if (!request_complete) return H2Exchange.finishAhead(server, stream);
                 detachUpstream(server, stream);
                 server.releaseRelayBuffer(stream.relay_buffer.?);
@@ -4585,7 +4585,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
         /// admission stream's connection would be torn down. The timer is
         /// the connection's, re-armed by its driver after the scan.
         pub fn expireExchange(server: *ServerType, stream: *StreamType) void {
-            assert(stream.h2_id != 0);
+            assert(stream.muxed());
             assert(!stream.ending);
             // A consult's timeout, or the request's under it (#437): the
             // consult takes it, its request deadline still in place.
@@ -4918,12 +4918,12 @@ pub fn Proxy(comptime runtime: Runtime) type {
         /// exchange's pending verdict, and a failed send fails its upstream,
         /// as on the HTTP/1.1 path.
         pub fn settleVerdict(server: *ServerType, stream: *StreamType) void {
-            assert(stream.h2_id != 0);
+            assert(stream.muxed());
             settlePendingVerdict(server, stream);
         }
 
         pub fn failUpstream(server: *ServerType, stream: *StreamType) void {
-            assert(stream.h2_id != 0);
+            assert(stream.muxed());
             upstreamFailed(server, stream);
         }
 
@@ -5107,7 +5107,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
         /// The answer may finish the stream before this returns, so
         /// nothing here reads the stream after it is answered.
         pub fn refuseH2Request(server: *ServerType, stream: *StreamType, err: downgrade.Error) void {
-            assert(stream.h2_id != 0);
+            assert(stream.muxed());
             assert(stream.l7.request_head_len == 0); // Nothing parsed.
             beginH2Request(server, stream, 0);
             switch (err) {
@@ -5120,7 +5120,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
         /// What a head's arrival does on a socket, for a head that arrived
         /// in one frame: the request's clock starts, and it is being read.
         fn beginH2Request(server: *ServerType, stream: *StreamType, head_len: u32) void {
-            assert(stream.h2_id != 0);
+            assert(stream.muxed());
             assert(stream.phase == .none);
             stream.moveTo(.reading_head);
             stream.head_len = head_len;
@@ -5133,7 +5133,7 @@ pub fn Proxy(comptime runtime: Runtime) type {
         /// into it, and the stream finished. There is no connection to
         /// keep or close: the next request is the client's next stream.
         pub fn h2WriteDelivered(server: *ServerType, stream: *StreamType) void {
-            assert(stream.h2_id != 0);
+            assert(stream.muxed());
             assert(stream.client_write.pending.len == 0);
             const then = stream.client_write.then;
             switch (then) {

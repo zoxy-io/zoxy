@@ -513,6 +513,14 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
         /// this slot — and on the L4 path the exchange simply lasts as
         /// long as the connection does.
         log: LogState,
+        /// Which protocol multiplexes this exchange on its connection, on
+        /// a shared slot — none on an admission stream, whose client is the
+        /// connection itself. The `h2_head` … `h2_body` fields below serve
+        /// whichever it is: a multiplexed exchange's client half is its
+        /// session, HTTP/2's or HTTP/3's (#449), and the head buffer, the
+        /// connection's list, the staging flags and the request body are
+        /// the same things on either.
+        mux: Mux,
         /// The HTTP/2 stream this exchange answers (#275), on a shared slot:
         /// its identifier on `conn.h2`'s session — zero on an admission
         /// stream, whose client is the connection itself. A shared stream's
@@ -944,6 +952,7 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
             // An admission stream's client is its connection; a shared one
             // is bound to its HTTP/2 stream after this (`Server`'s
             // `acquireSharedStream`).
+            stream.mux = .none;
             stream.h2_id = 0;
             stream.h2_head = null;
             stream.h2_next = null;
@@ -977,13 +986,27 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
             assert(phase != .none);
             // An HTTP/2 connection's exchanges each have a phase of their
             // own, while the connection's state stays `.h2` (#275).
-            if (stream.h2_id == 0) {
+            if (!stream.muxed()) {
                 assert(stream.conn.state == .l7);
             } else {
                 assert(stream.conn.state == .h2);
             }
             stream.phase = phase;
         }
+
+        /// Whether this exchange is one its connection multiplexes (#275,
+        /// #449) — on a shared slot, answered through a session — rather
+        /// than the connection's own admission stream.
+        pub fn muxed(stream: *const Self) bool {
+            // HTTP/2's identifier is never zero on its streams, and is on
+            // every other. HTTP/3's first request stream is QUIC's stream 0,
+            // so this tie is HTTP/2's alone, and the `.h3` arm reshapes it.
+            assert((stream.mux == .h2) == (stream.h2_id != 0));
+            return stream.mux != .none;
+        }
+
+        /// The protocols that multiplex exchanges on one connection.
+        pub const Mux = enum(u2) { none, h2 };
 
         /// Records the arm in the op and the armed set; call immediately
         /// before submitting through the seam. The mirror of `Conn.arm`,
