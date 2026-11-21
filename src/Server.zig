@@ -900,6 +900,7 @@ pub fn Server(comptime runtime: Runtime) type {
                 return null;
             };
             stream.prepare(conn);
+            stream.mux = .h2;
             stream.h2_id = id;
             stream.h2_head = head;
             stream.h2_next = conn.h2_streams;
@@ -920,7 +921,7 @@ pub fn Server(comptime runtime: Runtime) type {
         pub fn releaseSharedStream(server: *Self, stream: *StreamType) void {
             const conn = stream.conn;
             const streams_max = conn.h2.?.session.config.concurrent_streams_max;
-            assert(stream.h2_id != 0);
+            assert(stream.muxed());
             assert(stream.armedCount() == 0);
             // No tunnel is ever claimed for one: HTTP/2 refuses `upgrade` as
             // connection-specific (RFC 9113 §8.2.2) before §7 could read it.
@@ -954,6 +955,7 @@ pub fn Server(comptime runtime: Runtime) type {
                 link.* = stream.h2_next;
                 stream.h2_next = null;
                 stream.h2_id = 0;
+                stream.mux = .none;
                 server.shared_streams.release(stream);
                 return;
             }
@@ -3059,7 +3061,7 @@ pub fn Server(comptime runtime: Runtime) type {
         pub fn returnHeadBuffer(server: *Self, stream: *StreamType) void {
             // A multiplexed exchange's head is a stream head (#275), from a
             // pool of its own: neither the ring nor an engine.
-            if (stream.h2_id != 0) {
+            if (stream.muxed()) {
                 server.stream_head_buffers.release(stream.h2_head.?);
                 stream.h2_head = null;
                 return;
@@ -3084,7 +3086,7 @@ pub fn Server(comptime runtime: Runtime) type {
         /// Whether the exchange holds a head buffer of any kind — the ring's
         /// or, on a multiplexed exchange, a stream head (#275).
         pub fn holdsHeadBuffer(stream: *const StreamType) bool {
-            if (stream.h2_id != 0) return stream.h2_head != null;
+            if (stream.muxed()) return stream.h2_head != null;
             return stream.head_buffer_id != StreamType.head_buffer_none;
         }
 
@@ -6265,9 +6267,9 @@ pub fn Server(comptime runtime: Runtime) type {
         /// now, where it only refreshes the connection's window — the seam
         /// a shared stream's own deadline will be kept behind.
         pub fn storeExchangeDeadline(server: *Self, stream: *StreamType, timeout_ms: u32) void {
-            assert(stream.conn.stream == stream or stream.h2_id != 0);
+            assert(stream.conn.stream == stream or stream.muxed());
             assert(timeout_ms >= 1);
-            if (stream.h2_id != 0) return server.storeSharedDeadline(stream, timeout_ms);
+            if (stream.muxed()) return server.storeSharedDeadline(stream, timeout_ms);
             server.storeDeadline(stream.conn, timeout_ms);
         }
 
@@ -6335,7 +6337,7 @@ pub fn Server(comptime runtime: Runtime) type {
         pub fn rebaseExchangeDeadline(server: *Self, stream: *StreamType) void {
             assert(!stream.conn.isTearingDown());
             // A multiplexed exchange's store re-based already, if it had to.
-            if (stream.h2_id != 0) return;
+            if (stream.muxed()) return;
             assert(stream.conn.stream == stream);
             server.rebaseDeadline(stream.conn);
         }
@@ -6347,8 +6349,8 @@ pub fn Server(comptime runtime: Runtime) type {
         /// an exchange that can end apart from its connection (#275)
         /// changes the answer here rather than at every op.
         pub fn exchangeEnding(stream: *const StreamType) bool {
-            assert(stream.conn.stream == stream or stream.h2_id != 0);
-            if (stream.ending) assert(stream.h2_id != 0);
+            assert(stream.conn.stream == stream or stream.muxed());
+            if (stream.ending) assert(stream.muxed());
             return stream.ending or stream.conn.isTearingDown();
         }
 
@@ -6356,7 +6358,7 @@ pub fn Server(comptime runtime: Runtime) type {
         /// teardown — now that one more of its ops has delivered.
         pub fn continueExchangeEnd(server: *Self, stream: *StreamType) void {
             assert(exchangeEnding(stream));
-            if (stream.h2_id != 0) return server.continueSharedStreamEnd(stream);
+            if (stream.muxed()) return server.continueSharedStreamEnd(stream);
             assert(stream.conn.state == .tearing_down);
             server.continueTeardown(stream.conn);
         }
@@ -6367,7 +6369,7 @@ pub fn Server(comptime runtime: Runtime) type {
         /// its stream, the connection serving on (#275).
         pub fn endExchange(server: *Self, stream: *StreamType) void {
             assert(!exchangeEnding(stream));
-            if (stream.h2_id == 0) return server.beginTeardown(stream.conn);
+            if (!stream.muxed()) return server.beginTeardown(stream.conn);
             H2ExchangeType.fail(server, stream);
         }
 
@@ -6376,7 +6378,7 @@ pub fn Server(comptime runtime: Runtime) type {
         /// its slot back once the last of that delivers. Idempotent: an
         /// exchange already ending is on its way.
         pub fn endSharedStream(server: *Self, stream: *StreamType) void {
-            assert(stream.h2_id != 0);
+            assert(stream.muxed());
             if (stream.ending) return;
             server.quiesceSharedStream(stream);
             server.continueSharedStreamEnd(stream);
@@ -6386,7 +6388,7 @@ pub fn Server(comptime runtime: Runtime) type {
         /// multiplexed exchange before waiting for it: mark it ending, and
         /// force every op it has armed to deliver.
         fn quiesceSharedStream(server: *Self, stream: *StreamType) void {
-            assert(stream.h2_id != 0);
+            assert(stream.muxed());
             assert(!stream.ending);
             stream.ending = true;
             // Its deadline no longer applies: the forced ops end it.
@@ -6402,7 +6404,7 @@ pub fn Server(comptime runtime: Runtime) type {
         /// none is left, the slot goes back — and a connection tearing down
         /// that waited on it goes on.
         fn continueSharedStreamEnd(server: *Self, stream: *StreamType) void {
-            assert(stream.h2_id != 0);
+            assert(stream.muxed());
             assert(stream.ending);
             assert(stream.deadline_ns == 0);
             if (stream.armedCount() != 0) return;

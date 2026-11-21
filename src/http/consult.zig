@@ -456,7 +456,7 @@ pub fn Engine(comptime runtime: extension.Runtime) type {
             // An admission stream's timer was delivered to get here; a
             // multiplexed one's driver re-arms its connection's after the
             // scan.
-            if (stream.h2_id == 0) server.armDeadline(stream.conn);
+            if (!stream.muxed()) server.armDeadline(stream.conn);
         }
 
         /// Once every leg is delivered: the socket closes, the slot goes
