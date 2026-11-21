@@ -109,6 +109,12 @@ jobs:
           set -euo pipefail
           block=$(( SHARDS * SEEDS ))
           if [ -n "$START_OVERRIDE" ]; then
+            # The sim refuses seed 0, its "between seeds" sentinel; say so
+            # here rather than as eight shards that each fail at once.
+            if [ "$START_OVERRIDE" -lt 1 ]; then
+              echo "::error::start_seed must be at least 1"
+              exit 1
+            fi
             start="$START_OVERRIDE"
           elif [ "$RUN_NUMBER" -ge "$EPOCH_RUN" ]; then
             start=$(( EPOCH_SEED + (RUN_NUMBER - EPOCH_RUN) * block ))
@@ -225,6 +231,10 @@ jobs:
           shard_last=$(( shard_start + SEEDS - 1 ))
           began=$(date +%s)
           set +e
+          # `tee` streams the sweep's progress lines (one per 50,000 seeds,
+          # with the rate) into this step's live log, so a slow shard can
+          # be told from a hung one while it runs. The sim's watchdog ends
+          # a sweep whose seed has not finished in 60 s, and names it.
           zig build -Dbench=false sim -- "$shard_start" "$SEEDS" keep-going 2>&1 \
             | tee "sweep-${SHARD}.log"
           status=${PIPESTATUS[0]}
@@ -274,7 +284,12 @@ jobs:
               extent=unknown
             fi
           fi
-          if grep -q 'NONDETERMINISM' "sweep-${SHARD}.log"; then
+          # A hang is the sim's own watchdog naming a seed that never
+          # ended; its lines read like any failure's, so only this tells
+          # the record what kind it was.
+          if grep -q '^sim: HUNG ' "sweep-${SHARD}.log"; then
+            kind=hang
+          elif grep -q 'NONDETERMINISM' "sweep-${SHARD}.log"; then
             kind=nondeterminism
           else
             kind=invariant

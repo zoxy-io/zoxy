@@ -104,7 +104,7 @@ devenv shell                    # zig 0.17, zls, kcov
 zig build                       # build zig-out/bin/zoxy
 zig build ci                    # the per-change gate: tests + lint + simulation + smoke
 zig build test                  # unit tests
-zig build sim -- 0 500          # deterministic simulator: [seed] [iterations]
+zig build sim -- 1 500          # deterministic simulator: [seed ≥ 1] [iterations]
 zig build smoke                 # live gate: the real binary against a real origin
 zig build schema                # emit zig-out/config.schema.json
 zig build run -- config/example.json

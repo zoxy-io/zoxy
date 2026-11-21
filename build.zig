@@ -706,7 +706,7 @@ pub fn build(b: *std.Build) void {
     kcov_sim.addDirectoryArg2(src_root, include_arg);
     const sim_cov = kcov_sim.addOutputDirectoryArg("cov-sim");
     kcov_sim.addArtifactArg(cov_sim);
-    kcov_sim.addArgs(&.{ "0", "150" });
+    kcov_sim.addArgs(&.{ "1", "150" });
 
     const kcov_merge = b.addSystemCommand(&.{ "kcov", "--merge" });
     const merged_cov = kcov_merge.addOutputDirectoryArg("cov-merged");

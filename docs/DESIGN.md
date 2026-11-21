@@ -1483,6 +1483,13 @@ external binaries. They and the speed gates run at merge.
   - **Replay.** Every seed runs twice, and the two trace hashes must
     match. A failure, or a panic, prints its seed, and
     `zig build sim -- <seed>` replays it.
+  - **Hangs.** Neither the deadlock check nor the virtual-time alarm
+    sees a seed that never ends: a spin inside one callback, or ops
+    forever ready while the virtual clock is frozen. A wall-clock
+    watchdog does. If no seed finishes for 60 s, it names the running
+    seed and ends the sweep. A long sweep also prints its progress every
+    50,000 seeds, with the rate, so a soak shard shows whether it is
+    moving.
   - **Per-seed invariants.** Each seed must drain or reach the expected
     backstop after a deliberately withheld completion. After a normal
     drain, the simulator checks the following.
