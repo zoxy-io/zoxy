@@ -700,6 +700,44 @@ comptime {
     assert(@as(u64, conn_slots_max) + stream_slots_max <= std.math.maxInt(u32));
 }
 
+/// HTTP/3's per-connection shape (#449). h3 sizes a connection at compile
+/// time — every stream's buffers are arrays inside it — so these are what
+/// one QUIC connection costs, and `limits.quic_connections` multiplies it.
+/// The request streams one connection runs at once: the bidirectional
+/// streams a client may open (`initial_max_streams_bidi`), each a shared
+/// stream slot while its exchange runs.
+pub const h3_requests_max: u32 = 8;
+/// A client's unidirectional streams: its control stream and QPACK's two
+/// (RFC 9114 §6.2), and one of a reserved type (§6.2.3), read and ignored.
+pub const h3_peer_unidirectional_max: u32 = 4;
+/// One stream's receive buffer and window: what a request body may have in
+/// flight from the client before its exchange takes it, and the bound on
+/// the field section a client may send (`h3_field_section_bytes_max`).
+pub const h3_stream_receive_bytes: u32 = 16 * 1024;
+/// One stream's send buffer: response octets sent and not yet
+/// acknowledged, which bounds a stream to this much per round trip.
+pub const h3_stream_send_bytes: u32 = 32 * 1024;
+/// SETTINGS_MAX_FIELD_SECTION_SIZE (RFC 9114 §4.2.2): a section the client
+/// keeps to encodes to less than it — QPACK's literals and prefixes are
+/// shorter than the 32 octets a field is charged — so its HEADERS frame,
+/// type and length beside it, always fits a stream's receive buffer, and a
+/// section is never one this side could not read whole.
+pub const h3_field_section_bytes_max: u32 = h3_stream_receive_bytes - 16;
+/// The length of every connection ID this server mints (RFC 9000 §5.1),
+/// fixed so a short header's destination reads without a connection.
+pub const h3_connection_id_bytes: u8 = 8;
+
+comptime {
+    assert(h3_requests_max >= 1);
+    // h3's own floor: the four unidirectional types RFC 9114 names.
+    assert(h3_peer_unidirectional_max >= 4);
+    // RFC 9000 §5.1 asks for at least 64 bits of entropy; §17.2 caps it.
+    assert(h3_connection_id_bytes >= 8);
+    assert(h3_connection_id_bytes <= 20);
+    assert(h3_field_section_bytes_max < h3_stream_receive_bytes);
+    assert(h3_field_section_bytes_max >= head_buffer_bytes_min);
+}
+
 /// Completions drained per loop tick before control returns to the kernel;
 /// bounds both callback batches and `Io.now_ns` staleness (§4).
 pub const loop_completions_per_tick_max: u32 = 256;
