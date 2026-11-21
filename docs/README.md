@@ -1790,9 +1790,10 @@ platform does.
 The block is optional. The compiled constants are hard ceilings; this block
 sizes the actual pools anywhere from 1 up to them, so a small deployment
 neither reserves nor demands the ceiling's resources. The conditional keys
-(`tls_engines`, `tunnels`, `h2_connections` and `h2_streams`) are left
-out of the example below, because each is refused unless the feature it
-sizes is configured. They are described further down.
+(`tls_engines`, `tunnels`, `h2_connections`, `h2_streams` and
+`quic_connections`) are left out of the example below, because each is
+refused unless the feature it sizes is configured. They are described
+further down.
 
 ```json
 "limits": {
@@ -1839,6 +1840,12 @@ apart from `relay_buffers`.
 unless a listener speaks it, in which case `h2_streams` is **required**.
 Each HTTP/2 connection holds a session of about 100 KiB and each stream
 slot a head buffer; the banner prints both.
+`quic_connections` sizes HTTP/3, which an `http` listener with `tls`
+serves on the UDP address its `quic` binding names. It is zero unless a
+listener has one, and defaults to 64, at most `conn_slots` and
+`tls_engines`: each QUIC connection holds a TLS engine for its whole life.
+HTTP/3's requests share the `h2_streams` pool with HTTP/2's, so a `quic`
+binding requires `h2_streams` even where no listener speaks HTTP/2.
 `upstream_h2_connections` and `upstream_h2_streams` size
 [HTTP/2 to the origin](#http2-to-the-origin-and-grpc) and are zero unless
 a cluster speaks `h2c` or `h2`. Both have defaults, and the banner prints

@@ -49,6 +49,9 @@ const repeat = zoxy.testing.repeat;
 /// state any of these, so the library's `resolve` never returns one.
 pub const SpellingError = error{
     ListenerBindInvalid,
+    /// A `quic` bind that is neither an `IP:port` literal nor `unix:` and
+    /// a path (#449); the path form parses, and the library refuses it.
+    ListenerQuicBindInvalid,
     ListenerHttpOrL4,
     ClusterPickUnknown,
     ClusterCheckTypeUnknown,
@@ -703,7 +706,18 @@ fn httpOf(
         .keepalive_requests = http_json.keepalive_requests,
         .proxy_status = http_json.proxy_status,
         .h2c = http_json.h2c,
+        .quic = try quicOf(&http_json.quic),
     };
+}
+
+/// An http listener's QUIC binding as JSON spells it (#449): the bind
+/// literal in the grammar every other bind has, so a `unix:` path parses
+/// here and earns the library's own refusal, which code meets too.
+fn quicOf(quic_json: *const ?QuicJson) ParseError!?Options.Listener.Quic {
+    const quic = if (quic_json.*) |*quic| quic else return null;
+    const bind = addressOf(quic.bind) orelse return error.ListenerQuicBindInvalid;
+    assert(quic.bind.len >= 1);
+    return .{ .bind = bind, .alt_svc_max_age_s = quic.alt_svc_max_age_s };
 }
 
 fn routesOf(
@@ -1355,6 +1369,10 @@ pub const LimitsJson = struct {
     /// `upstream_slots` and `upstream_tls_sessions` beside it.
     h2_connections: ?u32 = null,
     h2_streams: ?u32 = null,
+    /// The #449 QUIC connection pool: defaulted where a listener has a
+    /// `quic` binding, and only legal there. Its streams are `h2_streams`',
+    /// the pool HTTP/2 and HTTP/3 share, so the key keeps HTTP/2's name.
+    quic_connections: ?u32 = null,
     /// The §7 HTTP/2 origin pools: connections to `h2c` and `h2` clusters
     /// and the streams on them that can hold an answer. Both defaulted,
     /// and only legal where some cluster speaks HTTP/2.
@@ -1448,13 +1466,22 @@ pub const LimitsJson = struct {
             .maximum = constants.conn_slots_max,
         },
         .h2_streams = .{
-            .desc = "Concurrent HTTP/2 streams across all connections, each " ++
-                "with its own head buffer. Required when some listener speaks " ++
-                "HTTP/2 and rejected otherwise. A stream beyond the pool is " ++
-                "refused with REFUSED_STREAM, which clients retry. One " ++
+            .desc = "Concurrent HTTP/2 and HTTP/3 streams across all " ++
+                "connections, each with its own head buffer. Required when " ++
+                "some listener speaks HTTP/2 or has an http.quic binding, and " ++
+                "rejected otherwise. An HTTP/2 stream beyond the pool is " ++
+                "refused with REFUSED_STREAM, which clients retry. One HTTP/2 " ++
                 "connection advertises at most 100.",
             .minimum = 1,
             .maximum = constants.stream_slots_max,
+        },
+        .quic_connections = .{
+            .desc = "Concurrent HTTP/3 connections, each holding its own " ++
+                "connection state and a TLS engine for its whole life. Allowed " ++
+                "only when some listener has an http.quic binding; defaults to " ++
+                "64, and may exceed neither conn_slots nor tls_engines.",
+            .minimum = 1,
+            .maximum = constants.quic_connections_max,
         },
         .upstream_h2_connections = .{
             .desc = "Connections to the endpoints of HTTP/2 clusters (h2c or h2), " ++
@@ -1554,7 +1581,7 @@ pub const ListenerJson = struct {
         .http = .{
             .desc = "Speak HTTP as a reverse proxy, with routing, filters and " ++
                 "body limits: HTTP/1.1, plus HTTP/2 over TLS (h2 in tls.alpn) " ++
-                "or in the clear (http.h2c).",
+                "or in the clear (http.h2c), and HTTP/3 over QUIC (http.quic).",
         },
         .l4 = .{
             .desc = "Speak L4: relay bytes to a cluster without parsing them as " ++
@@ -1595,6 +1622,10 @@ pub const HttpListenerJson = struct {
     proxy_status: bool = false,
     /// h2c by prior knowledge (#275); plaintext listeners only.
     h2c: bool = false,
+    /// Optional #449 QUIC binding; absent serves no HTTP/3. TLS listeners
+    /// only, since QUIC is TLS 1.3 and presents this listener's
+    /// certificates.
+    quic: ?QuicJson = null,
 
     pub const schema_doc =
         "An HTTP listener's settings. Exactly one of `cluster` or " ++
@@ -1649,6 +1680,41 @@ pub const HttpListenerJson = struct {
                 "preface (h2c with prior knowledge, RFC 9113 §3.3); HTTP/1.1 " ++
                 "clients are still served. Plaintext only: a TLS listener offers " ++
                 "h2 in tls.alpn instead. Requires limits.h2_streams.",
+        },
+        .quic = .{
+            .desc = "Also serve HTTP/3 over QUIC on this UDP address (RFC 9114), " ++
+                "with the listener's routes, policies and certificates. Requires " ++
+                "tls, and limits.h2_streams, the stream pool HTTP/3 shares with " ++
+                "HTTP/2. The listener's TCP responses advertise it in Alt-Svc.",
+        },
+    };
+};
+
+/// An http listener's #449 QUIC binding: where HTTP/3 is served, and how
+/// long the TCP side's advertisement of it lasts. Its own object rather
+/// than a bare bind, because the advertisement is a property of the
+/// binding and not of the listener.
+pub const QuicJson = struct {
+    bind: []const u8,
+    /// RFC 7838's `ma`, in seconds; the stock value where absent.
+    alt_svc_max_age_s: u32 = constants.alt_svc_max_age_s_default,
+
+    pub const schema_doc =
+        "A UDP binding that serves HTTP/3 over QUIC beside the listener's " ++
+        "TCP socket, sharing everything the listener states.";
+    pub const schema_fields = .{
+        .bind = .{
+            .desc = "UDP address to serve HTTP/3 on: an `IP:port` literal " ++
+                "(hostnames and `unix:` paths are rejected). It may be the " ++
+                "listener's own bind, since UDP ports are not TCP ones; two " ++
+                "listeners' quic bindings may not share one.",
+        },
+        .alt_svc_max_age_s = .{
+            .desc = "Seconds a client may remember the Alt-Svc advertisement " ++
+                "of this binding that the listener's TCP responses carry " ++
+                "(RFC 7838 ma). Absent is a day; 0 advertises nothing.",
+            .minimum = 0,
+            .maximum = constants.alt_svc_max_age_s_max,
         },
     };
 };
@@ -5306,6 +5372,13 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "ListenerBindUnixPathInvalid", .gap = .literal_syntax },
     .{ .name = "ListenerBindUnixPathRelative", .gap = .literal_syntax },
     .{ .name = "ListenerH2cOnTls", .gap = .cross_block },
+    .{ .name = "ListenerQuicWithoutTls", .gap = .cross_block },
+    .{ .name = "ListenerQuicBindInvalid", .gap = .literal_syntax },
+    .{ .name = "ListenerQuicBindNotIp", .gap = .literal_syntax },
+    .{ .name = "ListenerQuicBindDuplicate", .gap = .duplicate },
+    .{ .name = "LimitQuicConnectionsWithoutQuic", .gap = .budget },
+    .{ .name = "LimitQuicConnectionsOverConnSlots", .gap = .budget },
+    .{ .name = "LimitQuicConnectionsOverTlsEngines", .gap = .budget },
     .{ .name = "LimitUpstreamH2ConnectionsWithoutHttp2", .gap = .budget },
     .{ .name = "LimitUpstreamH2StreamsWithoutHttp2", .gap = .budget },
     .{ .name = "LimitUpstreamH2StreamsOverUpstreamSlots", .gap = .budget },
@@ -5907,8 +5980,15 @@ fn fuzzParse(context: void, smith: *std.testing.Smith) !void {
         // A config that loaded with either half of that broken would price
         // memory it cannot use, or use memory it did not price.
         var tls_listeners: u32 = 0;
+        // The QUIC pool is zero exactly when no listener binds QUIC, and
+        // each binding is on a terminating listener (#449).
+        var quic_listeners: u32 = 0;
         for (parsed.listeners) |listener| {
             assert(listener.routes.len >= 1);
+            if (listener.quic != null) {
+                quic_listeners += 1;
+                assert(listener.tls != null);
+            }
             for (listener.routes) |route| {
                 assert(route.cluster_index < parsed.clusters.len);
                 assert(route.prefix.len >= 1);
@@ -5923,6 +6003,8 @@ fn fuzzParse(context: void, smith: *std.testing.Smith) !void {
         }
         assert((tls_listeners >= 1) == (parsed.limits.tls_engines >= 1));
         assert(parsed.limits.tls_engines <= parsed.limits.conn_slots);
+        assert((quic_listeners >= 1) == (parsed.limits.quic_connections >= 1));
+        assert(parsed.limits.quic_connections <= parsed.limits.tls_engines);
     } else |_| {}
 }
 
@@ -7843,6 +7925,147 @@ test "config: a listener speaking HTTP/2 sizes its pools, and only one does (#27
         "\"tls\":{\"cert\":\"/c.pem\",\"key\":\"/k.pem\"}" ++ tail_head;
     try expectParseError(error.ListenerH2cOnTls, h2c_on_tls ++ streams);
     try expectParseError(error.ListenerH2cOnTls, h2c_on_tls ++ "}");
+}
+
+test "config: a quic binding serves HTTP/3 beside its listener, sizing its pool and sharing the streams (#449)" {
+    const tail_head = "}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}";
+    const http = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"";
+    const tls = ",\"tls\":{\"cert\":\"/c.pem\",\"key\":\"/k.pem\"}";
+    const quic = ",\"quic\":{\"bind\":\"127.0.0.1:1\"}}";
+    const streams = ",\"limits\":{\"h2_streams\":64}}";
+
+    // On its own listener's TCP address, which a UDP port does not clash
+    // with: a QUIC-only deployment has the shared streams and no HTTP/2
+    // session, and the pool defaults within the engines.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, http ++ quic ++ tls ++ tail_head ++ streams);
+        const binding = parsed.listeners[0].quic.?;
+        const expected = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:1");
+        try std.testing.expect(binding.bind_address.eql(&expected));
+        try std.testing.expectEqual(constants.alt_svc_max_age_s_default, binding.alt_svc_max_age_s);
+        try std.testing.expectEqual(@as(u32, 64), parsed.limits.stream_slots);
+        try std.testing.expectEqual(@as(u32, 0), parsed.limits.h2_connections);
+        try std.testing.expectEqual(
+            @min(constants.quic_connections_default, parsed.limits.conn_slots, parsed.limits.tls_engines),
+            parsed.limits.quic_connections,
+        );
+    }
+    // Absent, nothing is reserved for it.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, http ++ "}" ++ tls ++ tail_head ++ "}");
+        try std.testing.expect(parsed.listeners[0].quic == null);
+        try std.testing.expectEqual(@as(u32, 0), parsed.limits.quic_connections);
+        try std.testing.expectEqual(@as(u32, 0), parsed.limits.stream_slots);
+    }
+    // Beside HTTP/2 on one listener the two share one stream pool; the
+    // default is capped by a smaller engine pool, and a stated count and
+    // a zero max-age are taken as they are.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, http ++
+            ",\"quic\":{\"bind\":\"[::1]:443\",\"alt_svc_max_age_s\":0}}" ++
+            ",\"tls\":{\"cert\":\"/c.pem\",\"key\":\"/k.pem\",\"alpn\":[\"h2\",\"http/1.1\"]}" ++
+            tail_head ++ ",\"limits\":{\"h2_streams\":8,\"tls_engines\":16}}");
+        comptime assert(constants.quic_connections_default > 16);
+        try std.testing.expectEqual(@as(u32, 16), parsed.limits.quic_connections);
+        try std.testing.expect(parsed.limits.h2_connections >= 1);
+        try std.testing.expectEqual(@as(u32, 8), parsed.limits.stream_slots);
+        try std.testing.expectEqual(@as(u32, 0), parsed.listeners[0].quic.?.alt_svc_max_age_s);
+    }
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, http ++ quic ++ tls ++ tail_head ++
+            ",\"limits\":{\"h2_streams\":8,\"quic_connections\":3}}");
+        try std.testing.expectEqual(@as(u32, 3), parsed.limits.quic_connections);
+    }
+
+    // QUIC is TLS 1.3, and is told so first, with the streams sized or not.
+    try expectParseError(error.ListenerQuicWithoutTls, http ++ quic ++ tail_head ++ streams);
+    try expectParseError(error.ListenerQuicWithoutTls, http ++ quic ++ tail_head ++ "}");
+    // HTTP/3's requests are the shared streams', a capacity decision.
+    try expectParseError(error.LimitH2StreamsRequired, http ++ quic ++ tls ++ tail_head ++ "}");
+    // The pool is refused where nothing binds QUIC, and held to the conn
+    // slots and to the engines every connection holds one of.
+    try expectParseError(
+        error.LimitQuicConnectionsWithoutQuic,
+        http ++ "}" ++ tls ++ tail_head ++ ",\"limits\":{\"quic_connections\":4}}",
+    );
+    try expectParseError(
+        error.LimitQuicConnectionsOutOfRange,
+        http ++ quic ++ tls ++ tail_head ++ ",\"limits\":{\"h2_streams\":8,\"quic_connections\":0}}",
+    );
+    try expectParseError(
+        error.LimitQuicConnectionsOverConnSlots,
+        http ++ quic ++ tls ++ tail_head ++
+            ",\"limits\":{\"conn_slots\":4,\"h2_streams\":8,\"quic_connections\":5}}",
+    );
+    try expectParseError(
+        error.LimitQuicConnectionsOverTlsEngines,
+        http ++ quic ++ tls ++ tail_head ++
+            ",\"limits\":{\"tls_engines\":4,\"h2_streams\":8,\"quic_connections\":5}}",
+    );
+    // The bind is an IP literal: a hostname does not parse, and a socket
+    // file parses and carries no datagram.
+    try expectParseError(
+        error.ListenerQuicBindInvalid,
+        http ++ ",\"quic\":{\"bind\":\"localhost:443\"}}" ++ tls ++ tail_head ++ streams,
+    );
+    try expectParseError(
+        error.ListenerQuicBindNotIp,
+        http ++ ",\"quic\":{\"bind\":\"unix:/run/zoxy.sock\"}}" ++ tls ++ tail_head ++ streams,
+    );
+    // Pools are sized on a binding's presence, as on every feature's
+    // (`countListenerFeatures`): a missing stream pool outranks a bind
+    // that is refused once the listener itself resolves.
+    try expectParseError(
+        error.LimitH2StreamsRequired,
+        http ++ ",\"quic\":{\"bind\":\"unix:/run/zoxy.sock\"}}" ++ tls ++ tail_head ++ "}",
+    );
+    try expectParseError(error.ListenerQuicAltSvcMaxAgeOutOfRange, http ++ std.fmt.comptimePrint(
+        ",\"quic\":{{\"bind\":\"127.0.0.1:1\",\"alt_svc_max_age_s\":{d}}}}}",
+        .{constants.alt_svc_max_age_s_max + 1},
+    ) ++ tls ++ tail_head ++ streams);
+    // An http body's key only: a relay has no HTTP/3 to serve.
+    try expectParseError(
+        error.UnknownField,
+        "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"," ++
+            "\"quic\":{\"bind\":\"127.0.0.1:1\"}}" ++ tls ++ tail_head ++ "}",
+    );
+}
+
+test "config: two listeners' quic bindings may not share a UDP address (#449)" {
+    const tail = "}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}," ++
+        "\"limits\":{\"h2_streams\":8}}";
+    const tls = ",\"tls\":{\"cert\":\"/c.pem\",\"key\":\"/k.pem\"}";
+    const first = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\"," ++
+        "\"http\":{\"cluster\":\"a\",\"quic\":{\"bind\":\"127.0.0.1:443\"}}" ++ tls;
+    const second_at = "},{\"bind\":\"127.0.0.1:443\",\"http\":{\"cluster\":\"a\",\"quic\":{\"bind\":";
+
+    // A UDP port is not a TCP one: the second listener's TCP bind is the
+    // first one's UDP bind, and its own UDP bind is free.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, first ++ second_at ++ "\"127.0.0.1:444\"}}" ++ tls ++ tail);
+        try std.testing.expect(parsed.listeners[0].quic != null);
+        try std.testing.expect(parsed.listeners[1].quic != null);
+        try std.testing.expect(parsed.limits.quic_connections >= 1);
+    }
+    try expectParseError(error.ListenerQuicBindDuplicate, first ++ second_at ++ "\"127.0.0.1:443\"}}" ++ tls ++ tail);
+    // Equal as addresses, not as text.
+    try expectParseError(
+        error.ListenerQuicBindDuplicate,
+        "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\",\"quic\":{\"bind\":\"[::1]:443\"}}" ++ tls ++
+            "},{\"bind\":\"127.0.0.1:3\",\"http\":{\"cluster\":\"a\",\"quic\":{\"bind\":\"[0:0::1]:443\"}}" ++ tls ++ tail,
+    );
 }
 
 test "config: tls_engines follows the tls listeners, and refuses a mismatch" {
