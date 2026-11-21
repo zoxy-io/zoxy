@@ -171,6 +171,18 @@ pub const backend = xev.backend;
 
 pub const Completion = xev.Completion;
 
+/// A datagram socket (#449): an fd, like `Socket`, kept a type of its own
+/// so a stream op cannot be handed one.
+pub const UdpSocket = enum(i32) { _ };
+
+/// A datagram op's completion (#449): the loop's, and the state libxev's
+/// UDP watcher builds for it — the message header and address storage
+/// recvmsg and sendmsg point into, which must live as long as the op does.
+pub const DatagramCompletion = struct {
+    completion: xev.Completion = .{},
+    state: xev.UDP.State = undefined,
+};
+
 const ListenerEntry = struct {
     fd: posix.socket_t,
     address: Io.Address,
@@ -1934,6 +1946,166 @@ fn onNotifierWake(
     // The internal signal wait is the one legitimate `.rearm`: an eventfd
     // read has no stale-time hazard, unlike timers.
     return .rearm;
+}
+
+/// Bind a datagram socket (#449). No SO_REUSEPORT, unlike `listenIp`: for
+/// TCP the kernel hands a process whole connections, but for UDP it
+/// hashes each datagram's 4-tuple to a socket, so a client whose address
+/// changed would land on a sibling process holding none of its state. A
+/// second process asking for the same port is therefore refused with
+/// `AddressInUse`, which an operator reads, where sharing it would break
+/// connections at random.
+pub fn udpBind(io: *XevIo, address: std.Io.net.IpAddress) Io.ListenError!UdpSocket {
+    // socket() failing — EMFILE, ENFILE — is unclassified here, as for
+    // `listenIp`: startup binds every listener before serving, and the fd
+    // budget it asserts first is what keeps those out of reach.
+    io.last_pressure = Io.Pressure.none;
+    const udp = xev.UDP.init(address) catch return error.Unexpected;
+    const posix_address = xev.net.Address.fromIpAddress(address);
+    const rc = posix.system.bind(udp.fd, &posix_address.any, posix_address.getOsSockLen());
+    const errno = posix.errno(rc);
+    if (errno != .SUCCESS) {
+        closeFd(udp.fd);
+        return switch (errno) {
+            .ADDRINUSE => error.AddressInUse,
+            .ADDRNOTAVAIL => error.AddressUnavailable,
+            .ACCES => error.AccessDenied,
+            else => error.Unexpected,
+        };
+    }
+    assert(udp.fd >= 0);
+    return @fromBackingInt(@intCast(udp.fd));
+}
+
+/// The address a datagram socket is bound to, its port resolved when the
+/// bind asked for zero.
+pub fn udpAddress(io: *XevIo, socket: UdpSocket) std.Io.net.IpAddress {
+    _ = io;
+    var storage: posix.sockaddr.storage = undefined;
+    var length: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+    const rc = posix.system.getsockname(@backingInt(socket), @ptrCast(&storage), &length);
+    // A bound socket this process owns: getsockname has nothing to refuse.
+    assert(posix.errno(rc) == .SUCCESS);
+    const address = xev.net.Address.initPosix(@ptrCast(&storage)).toIpAddress();
+    assert(address.getPort() != 0);
+    return address;
+}
+
+/// One datagram into `buffer` (#449). An empty datagram is legal, and
+/// libxev reports it as end of stream, which a datagram socket has none
+/// of: it is delivered as a zero-length datagram instead.
+pub fn recvFrom(
+    io: *XevIo,
+    socket: UdpSocket,
+    buffer: []u8,
+    completion: *DatagramCompletion,
+    comptime Userdata: type,
+    userdata: *Userdata,
+    comptime callback: fn (*Userdata, Io.RecvFromError!Io.Datagram) void,
+) void {
+    assert(buffer.len >= 1);
+    assert(buffer.len <= std.math.maxInt(u32));
+    const udp = xev.UDP.initFd(@backingInt(socket));
+    udp.read(&io.loop, &completion.completion, &completion.state, .{ .slice = buffer }, Userdata, userdata, (struct {
+        fn adapter(
+            context: ?*Userdata,
+            loop: *xev.Loop,
+            inner: *xev.Completion,
+            state: *xev.UDP.State,
+            peer: std.Io.net.IpAddress,
+            udp_inner: xev.UDP,
+            read_buffer: xev.ReadBuffer,
+            result: xev.ReadError!usize,
+        ) xev.CallbackAction {
+            const io_inner: *XevIo = @fieldParentPtr("loop", loop);
+            io_inner.recordPressure(inner);
+            _ = state;
+            _ = udp_inner;
+            if (result) |n| assert(n <= read_buffer.slice.len) else |_| {}
+            callback(context.?, if (result) |n|
+                Io.Datagram{ .len = @intCast(n), .peer = peer }
+            else |err| switch (@as(anyerror, err)) {
+                error.EOF => Io.Datagram{ .len = 0, .peer = peer },
+                error.Canceled => error.Canceled,
+                else => error.Unexpected,
+            });
+            return .disarm;
+        }
+    }).adapter);
+}
+
+/// One datagram to `peer` (#449). The address is copied into the op's
+/// state, so the caller's need not outlive the call.
+pub fn sendTo(
+    io: *XevIo,
+    socket: UdpSocket,
+    bytes: []const u8,
+    peer: *const std.Io.net.IpAddress,
+    completion: *DatagramCompletion,
+    comptime Userdata: type,
+    userdata: *Userdata,
+    comptime callback: fn (*Userdata, Io.SendToError!u32) void,
+) void {
+    assert(bytes.len >= 1);
+    assert(peer.getPort() != 0);
+    const udp = xev.UDP.initFd(@backingInt(socket));
+    udp.write(&io.loop, &completion.completion, &completion.state, peer.*, .{ .slice = bytes }, Userdata, userdata, (struct {
+        fn adapter(
+            context: ?*Userdata,
+            loop: *xev.Loop,
+            inner: *xev.Completion,
+            state: *xev.UDP.State,
+            udp_inner: xev.UDP,
+            write_buffer: xev.WriteBuffer,
+            result: xev.WriteError!usize,
+        ) xev.CallbackAction {
+            const io_inner: *XevIo = @fieldParentPtr("loop", loop);
+            io_inner.recordPressure(inner);
+            _ = state;
+            _ = udp_inner;
+            _ = write_buffer;
+            callback(context.?, if (result) |n|
+                @as(u32, @intCast(n))
+            else |err| switch (@as(anyerror, err)) {
+                error.Canceled => error.Canceled,
+                else => error.Unexpected,
+            });
+            return .disarm;
+        }
+    }).adapter);
+}
+
+/// Force an armed `recvFrom` (or `sendTo`) to deliver: a drain's way to
+/// close a socket whose receives would otherwise wait forever (#449).
+pub fn datagramCancel(
+    io: *XevIo,
+    target: *DatagramCompletion,
+    cancel_completion: *Completion,
+    comptime Userdata: type,
+    userdata: *Userdata,
+    comptime callback: fn (*Userdata) void,
+) void {
+    loopCancel(&io.loop, &target.completion, cancel_completion, Userdata, userdata, (struct {
+        fn adapter(
+            context: ?*Userdata,
+            loop: *xev.Loop,
+            inner_completion: *xev.Completion,
+            result: xev.CancelError!void,
+        ) xev.CallbackAction {
+            _ = loop;
+            _ = inner_completion;
+            // NotFound: the op already completed — a legal race.
+            result catch {};
+            callback(context.?);
+            return .disarm;
+        }
+    }).adapter);
+}
+
+/// Close a datagram socket with nothing armed on it (#449).
+pub fn udpClose(io: *XevIo, socket: UdpSocket) void {
+    _ = io;
+    closeFd(@backingInt(socket));
 }
 
 /// Portable stand-in for the io_uring backend's `Loop.cancel` helper.

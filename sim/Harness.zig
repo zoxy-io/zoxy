@@ -2975,6 +2975,9 @@ fn strandCanExplainStuck(harness: *const Harness) bool {
         // every seed that strands it, and a named arm is what makes that
         // obvious to whoever adds the next kind.
         .none => unreachable,
+        // #449's datagram ops: out of `drawStrandKind`'s list, since no
+        // seed binds a QUIC listener yet — unreachable on the same terms.
+        .recv_from, .send_to, .datagram_cancel => unreachable,
     };
 }
 
