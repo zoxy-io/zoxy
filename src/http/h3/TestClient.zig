@@ -103,6 +103,12 @@ pub fn TestClient(comptime IoType: type) type {
         /// armed is let go of, and the socket closes once nothing is.
         closing: bool,
         done: bool,
+        /// When `start` ran, and when the server closed the connection with
+        /// H3_NO_ERROR while this client was not closing it itself — zero
+        /// if it never did. An oracle tells the age cap's close (§6), which
+        /// may cut what is in flight, from one that came too early.
+        started_ns: u64,
+        peer_closed_ns: u64,
         on_done: *const fn (*anyopaque) void,
         context: *anyopaque,
 
@@ -138,6 +144,8 @@ pub fn TestClient(comptime IoType: type) type {
             client.requested = false;
             client.closing = false;
             client.done = false;
+            client.started_ns = io.nowNs();
+            client.peer_closed_ns = 0;
             client.on_done = on_done;
             client.context = context;
             // The first Destination Connection ID's length, drawn from the
@@ -182,7 +190,10 @@ pub fn TestClient(comptime IoType: type) type {
                     .stream_reset => |reset| if (reset.stream < client.requests.len * 4) {
                         client.answers[@intCast(reset.stream / 4)].reset = true;
                     },
-                    .closed => return client.close(),
+                    .closed => |closed| {
+                        client.notePeerClose(closed.code, closed.application, closed.idle);
+                        return client.close();
+                    },
                     else => {},
                 }
             }
@@ -297,6 +308,25 @@ pub fn TestClient(comptime IoType: type) type {
             const index = id / 4;
             if (index >= client.requests.len) return null;
             return &client.answers[@intCast(index)];
+        }
+
+        /// Whether the server ended the connection gracefully, observed no
+        /// sooner than `age_ns_min` past this client's start.
+        pub fn peerClosedGracefully(client: *const Self, age_ns_min: u64) bool {
+            assert(age_ns_min >= 1);
+            if (client.peer_closed_ns == 0) return false;
+            assert(client.peer_closed_ns >= client.started_ns);
+            return client.peer_closed_ns - client.started_ns >= age_ns_min;
+        }
+
+        fn notePeerClose(client: *Self, code: u64, application: bool, idle: bool) void {
+            // Its own close, or an idle timeout, is not the server's word.
+            if (client.closing or idle) return;
+            if (!application) return;
+            if (code != @backingInt(quic.error_code.Application.no_error)) return;
+            assert(client.peer_closed_ns == 0);
+            client.peer_closed_ns = client.io.nowNs();
+            assert(client.peer_closed_ns >= client.started_ns);
         }
 
         /// The run is ending with this client still going: close now, and

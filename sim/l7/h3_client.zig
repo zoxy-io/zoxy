@@ -173,17 +173,27 @@ pub fn Client(comptime IoType: type) type {
             if (client.transport.done) assert(client.ended);
         }
 
-        /// The oracle, over every answer that came back.
-        pub fn verify(client: *const Self) ClientError!void {
+        /// The oracle, over every answer that came back. `max_lifetime_ns`
+        /// is the age cap (§6), zero when none is set: a hard end that cuts
+        /// whatever its connection has in flight, on a clean seed as on any.
+        pub fn verify(client: *const Self, max_lifetime_ns: u64) ClientError!void {
             assert(client.streams >= 1);
             assert(client.streams <= requests_max);
+            // The one cut a clean seed allows: the server's graceful close,
+            // seen no sooner than the cap past this client's start. That is a
+            // lower bound on the cap's own close, not the close itself: the
+            // connection is born a handshake later, and this client cannot see
+            // when. A close inside that handshake's width passes too; one
+            // before it does not.
+            const capped = max_lifetime_ns != 0 and client.began and
+                client.transport.peerClosedGracefully(max_lifetime_ns);
             for (client.plans[0..client.streams], client.transport.answers[0..client.streams]) |plan, *answer| {
                 const allowed = scripts.spec(plan.scriptOf()).allowed_statuses;
                 if (answer.status != 0 and std.mem.indexOfScalar(u16, allowed, answer.status) == null) {
                     return error.StatusUnexpected;
                 }
                 if (answer.status == 200) try checkBody(answer, client.clean);
-                if (!client.clean) continue;
+                if (!client.clean or capped) continue;
                 if (answer.status != 200) return error.GoldenOutcomeMissed;
                 if (!answer.finished) return error.GoldenOutcomeMissed;
             }
