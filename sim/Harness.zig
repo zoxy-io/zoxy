@@ -3278,8 +3278,9 @@ pub fn verify(harness: *Harness) !void {
     for (harness.h2_clients[0..harness.h2_count]) |*client| {
         try client.verify();
     }
+    const max_lifetime_ns = @as(u64, harness.server.config.max_lifetime_ms) * std.time.ns_per_ms;
     for (harness.h3_clients[0..harness.h3_count]) |*client| {
-        try client.verify();
+        try client.verify(max_lifetime_ns);
     }
     try harness.verifyTlsSessions();
 }

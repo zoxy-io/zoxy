@@ -218,9 +218,17 @@ const uncovered = [_]Uncovered{
     },
     .{
         .name = "h3_version_negotiations",
-        .why = .unreached,
-        .reason = "the sweep's clients speak QUIC v1, and a corrupted version reaches it only " ++
-            "with the datagram still 1200 octets; src/http/h3/server_test.zig sends one",
+        .why = .must_stay_zero,
+        // A rate, not zero, and the soak is what proved it: "never" held
+        // at 4096 seeds and failed in run #143, 2 to 7 times per 500,000
+        // seeds a shard. One per 20,000 leaves several times that as
+        // headroom, and still sits orders of magnitude under a regression
+        // that answered the sweep's own v1 Initials, which would fire on
+        // nearly every seed with an HTTP/3 client.
+        .allowance = .{ .at_most_one_per = 20_000 },
+        .reason = "the sweep's clients speak QUIC v1; only the adversary corrupting a " ++
+            "datagram's version field, with the datagram still 1200 octets, reaches it, " ++
+            "and src/http/h3/server_test.zig sends one on purpose",
     },
     // §7 HTTP/2 to the origin. The sweep's origins speak HTTP/1.1 — the
     // byte-exact integrity oracle reads their wire — and no cluster it
