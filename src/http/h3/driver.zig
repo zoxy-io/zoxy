@@ -246,6 +246,18 @@ pub fn Driver(comptime runtime: Runtime) type {
         /// than the armed target re-bases it; later is found lazily (§4).
         fn refreshDeadline(server: *ServerType, conn: *ConnType) void {
             const slot = conn.h3.?;
+            // A transport that turned closing starts its closing period only
+            // once a clock sees that state: its next send, receive or
+            // `onTimeout`. One with nothing it may send — no keys yet, or an
+            // address the amplification limit holds — gets no send, so the
+            // clock is given here. Without it the transport has no timer, the
+            // target falls back to an unheard window already past, and the
+            // timer fires at the same instant forever.
+            if (Half.over(conn) and slot.quic.timeout() == null) {
+                slot.quic.onTimeout(server.io.nowNs());
+            }
+            // Only a transport that has ended is without one once closing.
+            if (Half.over(conn) and !slot.quic.isClosed()) assert(slot.quic.timeout() != null);
             // A transport that has never opened a packet has armed no timer
             // of its own: one idle window from the connection's birth, which
             // nothing it is sent can push later (`expire`).

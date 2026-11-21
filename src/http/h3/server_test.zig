@@ -163,12 +163,18 @@ const Bed = struct {
 
     /// Under the datagram adversary `adversary` states.
     fn createUnder(seed: u64, adversary: SimIo.Adversary) !*Bed {
+        return createWith(seed, adversary, &options);
+    }
+
+    /// Under the options `stated` gives, for a test that needs a timeout
+    /// or a limit other than the bed's own.
+    fn createWith(seed: u64, adversary: SimIo.Adversary, stated: *const Options) !*Bed {
         const bed = try std.testing.allocator.create(Bed);
         errdefer std.testing.allocator.destroy(bed);
         bed.arena_state = .init(std.testing.allocator);
         errdefer bed.arena_state.deinit();
         const arena = bed.arena_state.allocator();
-        bed.config = try config_module.resolve(arena, &options);
+        bed.config = try config_module.resolve(arena, stated);
         const limits = bed.config.limits;
         try bed.sim_io.init(arena, .{
             .seed = seed,
@@ -373,4 +379,111 @@ test "h3 server: a Retried client's Initial, delivered twice, starts one connect
     // The pool is full while the copy arrives, so a copy taken for a new
     // client is shed rather than admitted — which says the same thing.
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("h3_shed_connections"));
+}
+
+/// A client that says one Initial and then nothing, ever: a TestClient's
+/// real first datagram — a ClientHello the server opens and answers — taken
+/// off a socket standing in for the server, the client abandoned, and the
+/// datagram sent on once from a socket that closes as soon as it has. The
+/// server's flight and its retransmission go unheard, so the client's 1200
+/// octets are all its address ever proves (RFC 9000 §8.1), and nothing
+/// afterwards hands the transport a clock.
+const SilentClient = struct {
+    io: *SimIo,
+    bed: *Bed,
+    client: Client,
+    capture: SimIo.UdpSocket,
+    sender: SimIo.UdpSocket,
+    initial: [SimIo.datagram_bytes_max]u8,
+    initial_len: u32,
+    capture_completion: SimIo.DatagramCompletion,
+    send_completion: SimIo.DatagramCompletion,
+    drain_timer: SimIo.Completion,
+    /// The drain left the connection closing with nothing it may send.
+    closing: bool,
+
+    /// Past the first probe timeout's retransmission, which spends what
+    /// the amplification limit allows, and past the unheard window.
+    const drain_after_ns: u64 = 1500 * std.time.ns_per_ms;
+
+    fn start(probe: *SilentClient, bed: *Bed) !void {
+        probe.io = &bed.sim_io;
+        probe.bed = bed;
+        probe.initial_len = 0;
+        probe.closing = false;
+        probe.capture_completion = .{};
+        probe.send_completion = .{};
+        probe.drain_timer = .{};
+        probe.capture = try probe.io.udpBind(.{ .ip4 = .loopback(0) });
+        probe.io.recvFrom(probe.capture, &probe.initial, &probe.capture_completion, SilentClient, probe, onCaptured);
+        var seed: [64]u8 = undefined;
+        for (&seed, 0..) |*octet, index| octet.* = @intCast(index + 1);
+        const requests = [_]TestClient.Request{.{ .path = "/never" }};
+        try probe.client.start(probe.io, probe.io.udpAddress(probe.capture), &requests, seed, onClientDone, probe);
+        probe.io.timerStart(&probe.drain_timer, drain_after_ns, SilentClient, probe, onDrain);
+    }
+
+    fn onCaptured(probe: *SilentClient, result: Io.RecvFromError!Io.Datagram) void {
+        const datagram = result catch unreachable;
+        assert(datagram.len >= 1200);
+        probe.initial_len = datagram.len;
+        probe.io.udpClose(probe.capture);
+        probe.client.abandon();
+        probe.sender = probe.io.udpBind(.{ .ip4 = .loopback(0) }) catch unreachable;
+        const server = loopback(listen_port);
+        const initial = probe.initial[0..probe.initial_len];
+        probe.io.sendTo(probe.sender, initial, &server, &probe.send_completion, SilentClient, probe, onSent);
+    }
+
+    fn onSent(probe: *SilentClient, result: Io.SendToError!u32) void {
+        const sent = result catch 0;
+        assert(sent == probe.initial_len);
+        probe.io.udpClose(probe.sender);
+    }
+
+    fn onClientDone(context: *anyopaque) void {
+        _ = context;
+    }
+
+    fn onDrain(probe: *SilentClient, result: Io.TimerError!void) void {
+        result catch unreachable;
+        probe.bed.origin.stop();
+        probe.bed.server.beginDrain();
+        // The test's premise, held rather than assumed: the drain closed the
+        // one connection, and its close has nowhere it may go.
+        var held: u32 = 0;
+        for (probe.bed.server.h3_owners) |owner| {
+            const conn = owner orelse continue;
+            held += 1;
+            const quic = &conn.h3.?.quic;
+            probe.closing = quic.state == .closing and !quic.wantsSend();
+        }
+        assert(held == 1);
+    }
+};
+
+test "h3 server: a handshake drained once its client fell silent still ends, with nothing it may send" {
+    // Soak #141. The drain closes a connection whose handshake never
+    // confirmed outright, and the CONNECTION_CLOSE cannot go: the flight
+    // and its retransmission spent the three times 1200 octets the client's
+    // address allows. With no send, no clock saw the closing state, so the
+    // transport had no timer; the deadline fell back to the unheard window,
+    // long past, and the timer fired at the same instant forever. A short
+    // idle window puts that fallback in the past, as the soak's seeds had.
+    var stated = options;
+    // The head budget must sit between the dial budget and the idle window.
+    stated.timeouts.connect_ms = 50;
+    stated.timeouts.idle_ms = 200;
+    stated.timeouts.head_ms = defaults.headMs(stated.timeouts.connect_ms, stated.timeouts.idle_ms);
+    const bed = try Bed.createWith(9, .{}, &stated);
+    defer bed.destroy();
+    const probe = try std.testing.allocator.create(SilentClient);
+    defer std.testing.allocator.destroy(probe);
+    try probe.start(bed);
+    try bed.sim_io.run();
+    try std.testing.expect(probe.closing);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("h3_admitted"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("h3_handshakes"));
+    try std.testing.expect(bed.server.isIdle());
+    try std.testing.expect(bed.server.reconcile());
 }
