@@ -17,7 +17,10 @@
 //!
 //! Sends are the endpoint's, not the connections': a fixed set of datagram
 //! buffers, each in flight at most once, and a queue of the connections
-//! with something to send, served in turn one datagram at a time. A
+//! with something to send, served in turn one send at a time. A send is one
+//! datagram, or where the kernel segments (UDP GSO) a run of a
+//! connection's datagrams of one size, the last of them possibly shorter:
+//! one op and one trip through the stack for a whole answer's worth. A
 //! connection never holds an op, so its teardown waits on nothing here.
 //!
 //! One process serves one UDP port (DESIGN.md §3): without SO_REUSEPORT,
@@ -86,6 +89,10 @@ pub fn Endpoint(comptime runtime: Runtime) type {
         closing: bool,
         closed: bool,
         armed: u32,
+        /// The datagrams one send may carry here: the socket's segmenting
+        /// limit, capped by `quic_send_segments_max`, and one after the
+        /// kernel has refused a segmented send.
+        segments_max: u16,
 
         pub const Receive = struct {
             endpoint: *Self,
@@ -98,9 +105,11 @@ pub fn Endpoint(comptime runtime: Runtime) type {
 
         pub const Send = struct {
             endpoint: *Self,
-            buffer: [Connection.Quic.datagram_octets]u8,
+            buffer: [constants.quic_send_segments_max * Connection.Quic.datagram_octets]u8,
             completion: IoType.DatagramCompletion,
             peer: IpAddress,
+            /// The datagram size a segmented send was cut at, or zero.
+            segment: u16,
             armed: bool,
         };
 
@@ -119,12 +128,18 @@ pub fn Endpoint(comptime runtime: Runtime) type {
             endpoint.closing = false;
             endpoint.closed = false;
             endpoint.armed = 0;
+            endpoint.segments_max = @intCast(@min(
+                constants.quic_send_segments_max,
+                server.io.udpSegmentsMax(endpoint.socket),
+            ));
+            assert(endpoint.segments_max >= 1);
             server.io.fillRandom(&endpoint.token_key);
             server.io.fillRandom(&endpoint.reset_key);
             endpoint.sends_free_len = constants.quic_endpoint_sends;
             for (&endpoint.sends, 0..) |*send, position| {
                 send.endpoint = endpoint;
                 send.completion = .{};
+                send.segment = 0;
                 send.armed = false;
                 endpoint.sends_free[position] = @intCast(position);
             }
@@ -300,7 +315,7 @@ pub fn Endpoint(comptime runtime: Runtime) type {
                 return endpoint.giveSend(send);
             };
             endpoint.server.counters.increment("h3_version_negotiations");
-            endpoint.armSend(send, octets, peer);
+            endpoint.armSend(send, octets, 0, peer);
         }
 
         /// RFC 9000 §8.1.2: a Retry with a token the client returns in its
@@ -321,7 +336,7 @@ pub fn Endpoint(comptime runtime: Runtime) type {
                 return endpoint.giveSend(send);
             };
             server.counters.increment("h3_retries");
-            endpoint.armSend(send, octets, peer);
+            endpoint.armSend(send, octets, 0, peer);
         }
 
         /// RFC 9000 §10.3: a short header no connection holds — one this
@@ -342,7 +357,7 @@ pub fn Endpoint(comptime runtime: Runtime) type {
                 return endpoint.giveSend(send);
             };
             server.counters.increment("h3_stateless_resets");
-            endpoint.armSend(send, octets, peer);
+            endpoint.armSend(send, octets, 0, peer);
         }
 
         // -- keys --
@@ -460,19 +475,41 @@ pub fn Endpoint(comptime runtime: Runtime) type {
                 const send = endpoint.takeSend() orelse return; // `onSent` resumes.
                 endpoint.dequeue(conn);
                 const slot = conn.h3.?;
+                const now_ns = server.io.nowNs();
+                const datagram_octets = Connection.Quic.datagram_octets;
                 // A buffer of `datagram_octets` is the one `send` asks for.
-                const octets = slot.quic.send(&send.buffer, server.io.nowNs()) catch unreachable;
+                const first = slot.quic.send(send.buffer[0..datagram_octets], now_ns) catch unreachable;
                 // A send moves the transport's timers: loss detection arms
                 // as a packet leaves, and the closing period starts.
                 defer Driver.sent(server, conn);
                 // Nothing to send after all — congestion or the amplification
                 // limit holds it — is not queued again in this turn: the
                 // connection's next pass queues it once something moves.
-                if (octets == 0) {
+                if (first == 0) {
                     endpoint.giveSend(send);
                     continue;
                 }
-                endpoint.armSend(send, octets, &slot.peer);
+                // Behind a full-size first datagram, the connection's next
+                // ones join it while they are the same size: the kernel cuts
+                // them apart (UDP GSO), and only the last may be shorter, so
+                // a shorter one ends the run. Only behind a full-size one,
+                // because a datagram once built is sealed and numbered, and
+                // one longer than the first could neither join nor be put
+                // back — none is longer than the connection's limit.
+                var octets: usize = first;
+                var count: u32 = 1;
+                if (endpoint.segments_max > 1 and first == slot.quic.datagramLimit()) {
+                    while (count < endpoint.segments_max and slot.quic.wantsSend()) {
+                        const next = slot.quic.send(send.buffer[octets..][0..datagram_octets], now_ns) catch unreachable;
+                        if (next == 0) break;
+                        assert(next <= first);
+                        octets += next;
+                        count += 1;
+                        if (next < first) break;
+                    }
+                }
+                const segment: u16 = if (count > 1) @intCast(first) else 0;
+                endpoint.armSend(send, octets, segment, &slot.peer);
                 if (conn.state != .h3) continue;
                 if (slot.quic.wantsSend()) endpoint.append(conn);
             }
@@ -503,13 +540,15 @@ pub fn Endpoint(comptime runtime: Runtime) type {
             endpoint.sends_free_len += 1;
         }
 
-        fn armSend(endpoint: *Self, send: *Send, octets: usize, peer: *const IpAddress) void {
+        fn armSend(endpoint: *Self, send: *Send, octets: usize, segment: u16, peer: *const IpAddress) void {
             assert(octets >= 1);
             assert(octets <= send.buffer.len);
+            assert(segment == 0 or octets > segment);
             send.peer = peer.*;
+            send.segment = segment;
             send.armed = true;
             endpoint.armed += 1;
-            endpoint.server.io.sendTo(endpoint.socket, send.buffer[0..octets], &send.peer, &send.completion, Send, send, onSent);
+            endpoint.server.io.sendTo(endpoint.socket, send.buffer[0..octets], segment, &send.peer, &send.completion, Send, send, onSent);
         }
 
         fn onSent(send: *Send, result: Io.SendToError!u32) void {
@@ -519,8 +558,16 @@ pub fn Endpoint(comptime runtime: Runtime) type {
             endpoint.armed -= 1;
             endpoint.giveSend(send);
             // A datagram the kernel would not take is a packet lost, which
-            // the transport's loss detection already answers for.
-            _ = result catch |err| endpoint.server.witnessKernelPressure(.send, err);
+            // the transport's loss detection already answers for. A
+            // segmented send refused is the kernel or the device saying it
+            // cannot segment at all: every send after it carries one.
+            _ = result catch |err| switch (err) {
+                error.Unsupported => if (send.segment != 0 and endpoint.segments_max > 1) {
+                    endpoint.segments_max = 1;
+                    endpoint.server.counters.increment("h3_segments_refused");
+                },
+                else => endpoint.server.witnessKernelPressure(.send, err),
+            };
             if (endpoint.closing) return endpoint.finishClose();
             endpoint.pump();
         }

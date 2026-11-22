@@ -1584,7 +1584,7 @@ fn DatagramScenario(comptime IoType: type) type {
             var bytes: [16]u8 = undefined;
             const token = payload(scenario.sent, &bytes);
             @memcpy(scenario.echo[0..token.len], token);
-            scenario.io.sendTo(scenario.client, scenario.echo[0..token.len], &scenario.server_address, &scenario.client_send, Self, scenario, onClientSent);
+            scenario.io.sendTo(scenario.client, scenario.echo[0..token.len], 0, &scenario.server_address, &scenario.client_send, Self, scenario, onClientSent);
         }
 
         fn onClientSent(scenario: *Self, result: Io.SendToError!u32) void {
@@ -1602,7 +1602,7 @@ fn DatagramScenario(comptime IoType: type) type {
             assert(datagram.len < scenario.server_buffer.len);
             scenario.echo_len = datagram.len;
             scenario.echo_peer = datagram.peer;
-            scenario.io.sendTo(scenario.server, scenario.server_buffer[0..datagram.len], &scenario.echo_peer, &scenario.server_send, Self, scenario, onEchoed);
+            scenario.io.sendTo(scenario.server, scenario.server_buffer[0..datagram.len], 0, &scenario.echo_peer, &scenario.server_send, Self, scenario, onEchoed);
         }
 
         fn onEchoed(scenario: *Self, result: Io.SendToError!u32) void {
@@ -1681,6 +1681,112 @@ test "contract: datagram echo on XevIo over real loopback" {
     try scenario.verify();
 }
 
+/// One segmented send (UDP GSO) of three datagrams, two of `segment`
+/// octets and a shorter last one: the receiver must see three datagrams,
+/// in order, each its own slice of what was sent.
+fn SegmentScenario(comptime IoType: type) type {
+    Io.assertIoInterface(IoType);
+    return struct {
+        io: *IoType,
+        server: IoType.UdpSocket = undefined,
+        client: IoType.UdpSocket = undefined,
+        server_address: std.Io.net.IpAddress = undefined,
+        server_recv: IoType.DatagramCompletion = .{},
+        client_send: IoType.DatagramCompletion = .{},
+        server_buffer: [256]u8 = undefined,
+        burst: [2 * segment + tail]u8 = undefined,
+        sent: u32 = 0,
+        send_done: bool = false,
+        received: u8 = 0,
+        mismatched: u8 = 0,
+        closed: bool = false,
+
+        const Self = @This();
+        const segment: u16 = 100;
+        const tail: usize = 37;
+        const datagram_count: u8 = 3;
+
+        /// False when the backend cannot segment on this socket: nothing
+        /// is sent, and the caller skips.
+        fn start(scenario: *Self, address: std.Io.net.IpAddress) !bool {
+            scenario.server = try scenario.io.udpBind(address);
+            scenario.server_address = scenario.io.udpAddress(scenario.server);
+            scenario.client = try scenario.io.udpBind(address);
+            if (scenario.io.udpSegmentsMax(scenario.client) < datagram_count) {
+                scenario.io.udpClose(scenario.server);
+                scenario.io.udpClose(scenario.client);
+                return false;
+            }
+            for (&scenario.burst, 0..) |*octet, index| octet.* = @intCast(index % 251);
+            scenario.io.recvFrom(scenario.server, &scenario.server_buffer, &scenario.server_recv, Self, scenario, onServerRecv);
+            scenario.io.sendTo(scenario.client, &scenario.burst, segment, &scenario.server_address, &scenario.client_send, Self, scenario, onSent);
+            return true;
+        }
+
+        fn onSent(scenario: *Self, result: Io.SendToError!u32) void {
+            scenario.sent = result catch unreachable;
+            scenario.send_done = true;
+            scenario.maybeClose();
+        }
+
+        fn onServerRecv(scenario: *Self, result: Io.RecvFromError!Io.Datagram) void {
+            const datagram = result catch unreachable;
+            const from = @as(usize, scenario.received) * segment;
+            const expected = scenario.burst[from..@min(from + segment, scenario.burst.len)];
+            if (!std.mem.eql(u8, scenario.server_buffer[0..datagram.len], expected)) scenario.mismatched += 1;
+            scenario.received += 1;
+            if (scenario.received < datagram_count) {
+                scenario.io.recvFrom(scenario.server, &scenario.server_buffer, &scenario.server_recv, Self, scenario, onServerRecv);
+                return;
+            }
+            scenario.maybeClose();
+        }
+
+        /// Once the send has delivered and all three datagrams are in:
+        /// nothing is armed on either socket.
+        fn maybeClose(scenario: *Self) void {
+            if (!scenario.send_done or scenario.received < datagram_count) return;
+            assert(!scenario.closed);
+            scenario.closed = true;
+            scenario.io.udpClose(scenario.server);
+            scenario.io.udpClose(scenario.client);
+        }
+
+        fn verify(scenario: *const Self) !void {
+            try std.testing.expectEqual(@as(u32, scenario.burst.len), scenario.sent);
+            try std.testing.expectEqual(datagram_count, scenario.received);
+            try std.testing.expectEqual(@as(u8, 0), scenario.mismatched);
+            try std.testing.expect(scenario.closed);
+        }
+    };
+}
+
+test "contract: a segmented send arrives as its datagrams on SimIo" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var sim_io: SimIo = undefined;
+    try sim_io.init(arena_state.allocator(), .{ .seed = 7 });
+    var scenario: SegmentScenario(SimIo) = .{ .io = &sim_io };
+    try std.testing.expect(try scenario.start(try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0")));
+    try sim_io.run();
+    try scenario.verify();
+    try std.testing.expect(sim_io.udpFullyReleased());
+}
+
+test "contract: a segmented send arrives as its datagrams on XevIo over real loopback" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var xev_io: XevIo = undefined;
+    try initTestIo(&xev_io, arena_state.allocator(), 0);
+    defer xev_io.deinit();
+    var scenario: SegmentScenario(XevIo) = .{ .io = &xev_io };
+    // Off io_uring (the macOS dev box) nothing segments: the contract says
+    // one datagram a send there, which the echo test above already covers.
+    if (!try scenario.start(try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0"))) return error.SkipZigTest;
+    try xev_io.run();
+    try scenario.verify();
+}
+
 test "xevio: a datagram port already bound is AddressInUse, with no SO_REUSEPORT to share it" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -1745,7 +1851,7 @@ fn sendOneDatagram(adversary: SimIo.Adversary, seed: u64) !DatagramFate {
     const sender = try sim_io.udpBind(any);
     const to = sim_io.udpAddress(fate.receiver);
     sim_io.recvFrom(fate.receiver, &fate.buffer, &fate.recv_completion, DatagramFate, &fate, DatagramFate.onRecv);
-    sim_io.sendTo(sender, DatagramFate.token, &to, &fate.send_completion, DatagramFate, &fate, DatagramFate.onSent);
+    sim_io.sendTo(sender, DatagramFate.token, 0, &to, &fate.send_completion, DatagramFate, &fate, DatagramFate.onSent);
     // Long past any delay the adversary may add: whatever was coming has
     // landed by then, and the cancel ends the receive left armed.
     sim_io.timerStart(&fate.timer_completion, 50 * std.time.ns_per_ms, DatagramFate, &fate, DatagramFate.onTimer);

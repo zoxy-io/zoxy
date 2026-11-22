@@ -441,6 +441,10 @@ pub const Counters = struct {
     /// First Initials left unanswered because libcrypto could not serve
     /// the engine's key derivation: the fixed heap out (§4).
     h3_shed_tls_crypto: Value = Value.init(0),
+    /// Segmented sends (UDP GSO) the kernel or device refused. The first
+    /// turns segmenting off for that endpoint, and its datagrams are lost,
+    /// which QUIC recovers; so this is one per endpoint at most.
+    h3_segments_refused: Value = Value.init(0),
     /// HTTP/3 requests rejected with H3_REQUEST_REJECTED because the shared
     /// stream pool, or its stream heads, were empty: unprocessed, which the
     /// client may retry (RFC 9114 §4.1.1).

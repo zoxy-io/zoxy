@@ -773,6 +773,11 @@ pub const quic_endpoint_receives: u32 = 8;
 /// One QUIC endpoint's sends in flight: the datagram buffers its
 /// connections share, served in turn. Each is a ring op (§8).
 pub const quic_endpoint_sends: u32 = 32;
+/// The datagrams one of those sends may carry: a connection's next
+/// datagrams of one size, cut apart by the kernel (UDP GSO), so a burst
+/// crosses the stack as one op instead of one each. Sixteen is a 20 KiB
+/// answer in one send, and UDP_MAX_SEGMENTS is 64.
+pub const quic_send_segments_max: u32 = 16;
 /// A stateless reset's length at most (RFC 9000 §10.3): unpredictable
 /// octets and the token, always shorter than what triggered it.
 pub const h3_stateless_reset_bytes_max: u32 = 64;
@@ -796,6 +801,8 @@ comptime {
     assert(h3_field_section_bytes_max >= head_buffer_bytes_min);
     // An endpoint's send buffers are indexed by a `u8`.
     assert(quic_endpoint_sends <= 255);
+    assert(quic_send_segments_max >= 1);
+    assert(quic_send_segments_max <= 64);
     assert(quic_endpoint_receives >= 1);
     // RFC 9000 §10.3: 21 octets at least, and room for the token.
     assert(h3_stateless_reset_bytes_max > 21);
