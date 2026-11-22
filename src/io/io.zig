@@ -83,7 +83,12 @@
 //!       (one datagram, or its first `buffer.len` octets: a delivery that
 //!       fills the buffer may have been cut, so a caller sizes the buffer
 //!       past the largest datagram it accepts and drops one that fills it)
-//!   sendTo(io, socket, bytes, peer, dc, U, u, cb(u, SendToError!u32))
+//!   sendTo(io, socket, bytes, segment, peer, dc, U, u, cb(u, SendToError!u32))
+//!       (`segment` zero: `bytes` is one datagram. Otherwise `bytes` is
+//!       datagrams of `segment` octets each, the last possibly shorter, sent
+//!       as one op — UDP GSO — and at most `udpSegmentsMax` of them)
+//!   udpSegmentsMax(io, socket) u16                      (how many datagrams
+//!       one `sendTo` may carry: 1 when the backend or kernel cannot segment)
 //!   datagramCancel(io, target_dc, cancel_c, U, u, cb(u)) (forces an armed
 //!       recvFrom to deliver Canceled: a drain's way to close a socket
 //!       whose receives would otherwise wait forever)
@@ -282,6 +287,10 @@ pub const RecvFromError = error{
 /// since QUIC's own loss recovery already resends what was lost.
 pub const SendToError = error{
     Canceled,
+    /// A segmented send the kernel or the device refused (UDP GSO wants
+    /// the device's checksum offload, and a kernel since 4.18). Its
+    /// datagrams are lost; the caller stops segmenting.
+    Unsupported,
     Unexpected,
 };
 
@@ -446,6 +455,7 @@ pub fn assertIoInterface(comptime IoType: type) void {
             "udpAddress",
             "recvFrom",
             "sendTo",
+            "udpSegmentsMax",
             "datagramCancel",
             "udpClose",
         };

@@ -317,7 +317,7 @@ const VersionProbe = struct {
         @memset(probe.datagram[15..23], 0x22);
         const server = loopback(listen_port);
         probe.io.recvFrom(probe.socket, &probe.answer, &probe.receive_completion, VersionProbe, probe, onAnswer);
-        probe.io.sendTo(probe.socket, &probe.datagram, &server, &probe.send_completion, VersionProbe, probe, onSent);
+        probe.io.sendTo(probe.socket, &probe.datagram, 0, &server, &probe.send_completion, VersionProbe, probe, onSent);
     }
 
     fn onSent(probe: *VersionProbe, result: Io.SendToError!u32) void {
@@ -432,7 +432,7 @@ const SilentClient = struct {
         probe.sender = probe.io.udpBind(.{ .ip4 = .loopback(0) }) catch unreachable;
         const server = loopback(listen_port);
         const initial = probe.initial[0..probe.initial_len];
-        probe.io.sendTo(probe.sender, initial, &server, &probe.send_completion, SilentClient, probe, onSent);
+        probe.io.sendTo(probe.sender, initial, 0, &server, &probe.send_completion, SilentClient, probe, onSent);
     }
 
     fn onSent(probe: *SilentClient, result: Io.SendToError!u32) void {

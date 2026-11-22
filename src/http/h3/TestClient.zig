@@ -357,7 +357,7 @@ pub fn TestClient(comptime IoType: type) type {
             const octets = client.quic.send(&client.send_buffer, client.io.nowNs()) catch 0;
             if (octets == 0) return client.finishIfClosed();
             client.sending = true;
-            client.io.sendTo(client.socket, client.send_buffer[0..octets], &client.server, &client.send_completion, Self, client, onSent);
+            client.io.sendTo(client.socket, client.send_buffer[0..octets], 0, &client.server, &client.send_completion, Self, client, onSent);
         }
 
         fn onSent(client: *Self, result: Io.SendToError!u32) void {

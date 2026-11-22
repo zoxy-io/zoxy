@@ -417,7 +417,7 @@ const Op = union(OpKind) {
     timer_cancel: struct { target: *Completion },
     connect_cancel: struct { target: *Completion },
     recv_from: struct { socket: UdpSocket, buffer: []u8, canceled: bool },
-    send_to: struct { socket: UdpSocket, bytes: []const u8, peer: std.Io.net.IpAddress, canceled: bool },
+    send_to: struct { socket: UdpSocket, bytes: []const u8, segment: u16, peer: std.Io.net.IpAddress, canceled: bool },
     datagram_cancel: struct { target: *Completion },
 };
 
@@ -1829,10 +1829,20 @@ pub fn recvFrom(
 /// Arm a send: it completes at the next delivery — the kernel takes a
 /// datagram whole or not at all — and its datagram travels apart from it,
 /// under the adversary. `peer` is copied.
+/// The simulated kernel segments as Linux does (`UDP_MAX_SEGMENTS`), so a
+/// segmenting caller's path is the one every simulation drives.
+pub const udp_segments_max: u16 = 64;
+
+pub fn udpSegmentsMax(io: *SimIo, socket: UdpSocket) u16 {
+    _ = io.udpEntry(socket);
+    return udp_segments_max;
+}
+
 pub fn sendTo(
     io: *SimIo,
     socket: UdpSocket,
     bytes: []const u8,
+    segment: u16,
     peer: *const std.Io.net.IpAddress,
     completion: *DatagramCompletion,
     comptime Userdata: type,
@@ -1841,13 +1851,18 @@ pub fn sendTo(
 ) void {
     assert(completion.state == .dead);
     assert(bytes.len >= 1);
-    assert(bytes.len <= datagram_bytes_max);
+    if (segment == 0) {
+        assert(bytes.len <= datagram_bytes_max);
+    } else {
+        assert(segment <= datagram_bytes_max);
+        assert(bytes.len <= @as(usize, segment) * udp_segments_max);
+    }
     assert(peer.getPort() != 0);
     const entry = io.udpEntry(socket);
     assert(entry.armed < udp_pending_ops_max);
     entry.armed += 1;
     completion.* = .{
-        .op = .{ .send_to = .{ .socket = socket, .bytes = bytes, .peer = peer.*, .canceled = false } },
+        .op = .{ .send_to = .{ .socket = socket, .bytes = bytes, .segment = segment, .peer = peer.*, .canceled = false } },
         .userdata = userdata,
         .callback = erasedResult(Userdata, .send_to, callback),
     };
@@ -1935,6 +1950,7 @@ fn finishSendTo(
     io: *SimIo,
     socket: UdpSocket,
     bytes: []const u8,
+    segment: u16,
     peer: *const std.Io.net.IpAddress,
     canceled: bool,
 ) Io.SendToError!u32 {
@@ -1952,12 +1968,20 @@ fn finishSendTo(
     var from = entry.address;
     if (entry.rebound_port) |port| from.setPort(port);
     io.mix(from.getPort());
-    const dropped = random.uintLessThan(u8, 100) < io.adversary.udp_drop_percent;
-    io.mix(@intFromBool(dropped));
-    if (dropped) return @intCast(bytes.len);
-    const copies: u8 = if (random.uintLessThan(u8, 100) < io.adversary.udp_duplicate_percent) 2 else 1;
-    io.mix(copies);
-    for (0..copies) |_| io.launchDatagram(bytes, &from, peer, random);
+    // A segmented send is its datagrams on the wire, each lost, doubled or
+    // delivered on its own — what the kernel's GSO hands the network.
+    const width: usize = if (segment == 0) bytes.len else segment;
+    var rest = bytes;
+    while (rest.len > 0) {
+        const datagram = rest[0..@min(width, rest.len)];
+        rest = rest[datagram.len..];
+        const dropped = random.uintLessThan(u8, 100) < io.adversary.udp_drop_percent;
+        io.mix(@intFromBool(dropped));
+        if (dropped) continue;
+        const copies: u8 = if (random.uintLessThan(u8, 100) < io.adversary.udp_duplicate_percent) 2 else 1;
+        io.mix(copies);
+        for (0..copies) |_| io.launchDatagram(datagram, &from, peer, random);
+    }
     return @intCast(bytes.len);
 }
 
@@ -2227,7 +2251,7 @@ fn deliverOne(io: *SimIo, completion: *Completion) void {
             break :cancel .{ .connect_cancel = {} };
         },
         .recv_from => |op| .{ .recv_from = io.finishRecvFrom(op.socket, op.buffer, op.canceled) },
-        .send_to => |op| .{ .send_to = io.finishSendTo(op.socket, op.bytes, &op.peer, op.canceled) },
+        .send_to => |op| .{ .send_to = io.finishSendTo(op.socket, op.bytes, op.segment, &op.peer, op.canceled) },
         .datagram_cancel => |op| cancel: {
             if (op.target.state == .pending) {
                 switch (op.target.op) {

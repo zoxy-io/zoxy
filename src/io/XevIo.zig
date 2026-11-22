@@ -181,7 +181,45 @@ pub const UdpSocket = enum(i32) { _ };
 pub const DatagramCompletion = struct {
     completion: xev.Completion = .{},
     state: xev.UDP.State = undefined,
+    /// A segmented send's message (`sendTo` with a segment): libxev's UDP
+    /// watcher writes no control data, so this op is built here, and its
+    /// header, address and `UDP_SEGMENT` control message live as long as it.
+    segmented: Segmented = undefined,
+
+    const Segmented = struct {
+        msghdr: linux.msghdr_const,
+        iov: [1]posix.iovec_const,
+        address: xev.net.Address,
+        control: SegmentControl,
+    };
 };
+
+/// UDP GSO's control message: one `cmsghdr` carrying `UDP_SEGMENT`'s
+/// `u16`, laid out as the kernel reads it on a 64-bit target — the header's
+/// `size_t` length, level and type, then the data, padded to `CMSG_SPACE`.
+const SegmentControl = extern struct {
+    len: usize,
+    level: i32,
+    kind: i32,
+    segment: u16,
+    padding: [6]u8 = @splat(0),
+
+    /// `CMSG_LEN(sizeof(u16))`: the header and the data, not the padding.
+    const length: usize = @offsetOf(SegmentControl, "segment") + @sizeOf(u16);
+};
+
+/// `SOL_UDP` and `UDP_SEGMENT` (linux/udp.h, since 4.18), and the most
+/// datagrams one segmented send may carry (`UDP_MAX_SEGMENTS`).
+const sol_udp: i32 = 17;
+const udp_segment: i32 = 103;
+const udp_segments_max: u16 = 64;
+
+comptime {
+    // `CMSG_SPACE` of a `u16` on the targets zoxy ships (x86_64, aarch64).
+    assert(@sizeOf(usize) == 8);
+    assert(@sizeOf(SegmentControl) == 24);
+    assert(SegmentControl.length == 18);
+}
 
 const ListenerEntry = struct {
     fd: posix.socket_t,
@@ -2034,12 +2072,27 @@ pub fn recvFrom(
     }).adapter);
 }
 
-/// One datagram to `peer` (#449). The address is copied into the op's
-/// state, so the caller's need not outlive the call.
+/// How many datagrams one `sendTo` may carry on `socket`: UDP GSO's limit
+/// where the kernel takes `UDP_SEGMENT` (asked by setting it to zero, which
+/// is no segmenting at all and changes nothing), one where it does not, and
+/// one off io_uring, whose op this backend builds for it.
+pub fn udpSegmentsMax(io: *XevIo, socket: UdpSocket) u16 {
+    _ = io;
+    if (comptime xev.backend != .io_uring) return 1;
+    const zero: i32 = 0;
+    posix.setsockopt(@backingInt(socket), sol_udp, udp_segment, std.mem.asBytes(&zero)) catch return 1;
+    return udp_segments_max;
+}
+
+/// Datagrams to `peer` (#449): one, or with `segment` set, `bytes` cut into
+/// datagrams of that many octets by the kernel (UDP GSO) — one op and one
+/// trip through the stack for all of them. The address is copied into the
+/// op's state, so the caller's need not outlive the call.
 pub fn sendTo(
     io: *XevIo,
     socket: UdpSocket,
     bytes: []const u8,
+    segment: u16,
     peer: *const std.Io.net.IpAddress,
     completion: *DatagramCompletion,
     comptime Userdata: type,
@@ -2048,6 +2101,15 @@ pub fn sendTo(
 ) void {
     assert(bytes.len >= 1);
     assert(peer.getPort() != 0);
+    if (comptime xev.backend == .io_uring) {
+        if (segment != 0 and bytes.len > segment) {
+            return io.sendSegmented(socket, bytes, segment, peer, completion, Userdata, userdata, callback);
+        }
+    } else {
+        // `udpSegmentsMax` answers one off io_uring, so no caller segments
+        // here; the op that carries the segment is io_uring's alone.
+        assert(segment == 0 or bytes.len <= segment);
+    }
     const udp = xev.UDP.initFd(@backingInt(socket));
     udp.write(&io.loop, &completion.completion, &completion.state, peer.*, .{ .slice = bytes }, Userdata, userdata, (struct {
         fn adapter(
@@ -2073,6 +2135,73 @@ pub fn sendTo(
             return .disarm;
         }
     }).adapter);
+}
+
+/// `sendTo`'s segmented half: a sendmsg op built here, because libxev's
+/// UDP watcher writes no control message, carrying `UDP_SEGMENT`.
+fn sendSegmented(
+    io: *XevIo,
+    socket: UdpSocket,
+    bytes: []const u8,
+    segment: u16,
+    peer: *const std.Io.net.IpAddress,
+    completion: *DatagramCompletion,
+    comptime Userdata: type,
+    userdata: *Userdata,
+    comptime callback: fn (*Userdata, Io.SendToError!u32) void,
+) void {
+    comptime assert(xev.backend == .io_uring);
+    assert(segment >= 1);
+    assert(bytes.len > segment);
+    assert(bytes.len <= @as(usize, segment) * udp_segments_max);
+    const message = &completion.segmented;
+    message.address = xev.net.Address.fromIpAddress(peer.*);
+    message.iov = .{.{ .base = bytes.ptr, .len = bytes.len }};
+    message.control = .{
+        .len = SegmentControl.length,
+        .level = sol_udp,
+        .kind = udp_segment,
+        .segment = segment,
+    };
+    message.msghdr = .{
+        .name = &message.address.any,
+        .namelen = message.address.getOsSockLen(),
+        .iov = &message.iov,
+        .iovlen = 1,
+        .control = &message.control,
+        .controllen = @sizeOf(SegmentControl),
+        .flags = 0,
+    };
+    completion.completion = .{
+        .op = .{ .sendmsg = .{ .fd = @backingInt(socket), .msghdr = &message.msghdr } },
+        .userdata = userdata,
+        .callback = (struct {
+            fn adapter(
+                context: ?*anyopaque,
+                loop: *xev.Loop,
+                inner: *xev.Completion,
+                result: xev.Result,
+            ) xev.CallbackAction {
+                const io_inner: *XevIo = @fieldParentPtr("loop", loop);
+                io_inner.recordPressure(inner);
+                const owner: *Userdata = @ptrCast(@alignCast(context.?));
+                callback(owner, if (result.sendmsg) |n|
+                    @as(u32, @intCast(n))
+                else |err| switch (@as(anyerror, err)) {
+                    error.Canceled => error.Canceled,
+                    // What a kernel or device that cannot segment answers
+                    // (udp_send_skb: EIO without checksum offload; EINVAL
+                    // for a segment it will not cut).
+                    else => switch (inner.result_errno) {
+                        .IO, .INVAL, .OPNOTSUPP, .NOPROTOOPT => error.Unsupported,
+                        else => error.Unexpected,
+                    },
+                });
+                return .disarm;
+            }
+        }).adapter,
+    };
+    io.loop.add(&completion.completion);
 }
 
 /// Force an armed `recvFrom` (or `sendTo`) to deliver: a drain's way to

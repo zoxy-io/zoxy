@@ -198,6 +198,12 @@ const uncovered = [_]Uncovered{
             "derivation needs the fixed heap exhausted, which no scenario reaches",
     },
     .{
+        .name = "h3_segments_refused",
+        .why = .unreached,
+        .reason = "the simulated kernel segments as Linux does; a refusal needs a device " ++
+            "without checksum offload, which no scenario models",
+    },
+    .{
         .name = "h3_qpack_failures",
         .why = .unreached,
         .reason = "the sweep's clients encode with h3's own QPACK; src/http/h3/server_test.zig " ++

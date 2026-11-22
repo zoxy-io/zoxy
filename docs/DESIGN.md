@@ -418,7 +418,7 @@ whose feature no config names has count 0 and costs nothing.**
 | HTTP/2 sessions | an HTTP/2 connection's life | `h2_connections`: min(conn slots, 1024) → conn slots, if a listener speaks HTTP/2 | ~100 KiB |
 | shared streams + heads | one HTTP/2 or HTTP/3 stream | `h2_streams`: required with HTTP/2 or a QUIC binding | a stream + a head |
 | HTTP/3 connections | a QUIC connection's life | `quic_connections`: min(64, conn slots, TLS engines), if a listener has a QUIC binding | ~835 KiB: the transport and its streams' buffers |
-| QUIC endpoints | the process's life | one per QUIC binding | 8 receives and 32 sends in flight, their datagram buffers (~80 KiB) |
+| QUIC endpoints | the process's life | one per QUIC binding | 8 receives and 32 sends in flight, each send room for `quic_send_segments_max` (16) datagrams cut apart by the kernel (UDP GSO) (~760 KiB) |
 | HTTP/2 origin connections | pooled | min(2 × HTTP/2 endpoints, 4096) | a client session + buffers |
 | HTTP/2 origin streams | one leg | = upstream slots | staging for one stream |
 | HTTPS origin sessions | with their upstream slot | min(16 × HTTPS endpoints, upstream slots, heap room) | a TLS client |
