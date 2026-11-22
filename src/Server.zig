@@ -6761,6 +6761,7 @@ pub fn Server(comptime runtime: Runtime) type {
 
         pub fn armDeadline(server: *Self, conn: *ConnType) void {
             const delay_ns = conn.deadline_ns -| server.io.nowNs();
+            conn.deadline_armed_ns = conn.deadline_ns;
             conn.arm(&conn.op_deadline, "deadline");
             server.io.timerStart(
                 &conn.op_deadline.completion,

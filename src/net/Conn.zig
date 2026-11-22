@@ -67,6 +67,11 @@ pub fn Conn(comptime runtime: Runtime) type {
         /// Absolute deadline; state transitions only store a new value —
         /// the armed timer op is never touched (§4).
         deadline_ns: u64,
+        /// The target the deadline timer was last armed for (`armDeadline`).
+        /// `deadline_ns` moves later without touching the timer (§4), so it
+        /// is not where the armed timer fires; a caller deciding whether a new
+        /// target needs a re-base compares against this.
+        deadline_armed_ns: u64,
         /// Admission timestamp. The max-lifetime cap is `birth_ns +
         /// max_lifetime_ms`; `storeDeadline` clamps every deadline to it so
         /// an always-active connection is still reaped (§6).
@@ -431,6 +436,7 @@ pub fn Conn(comptime runtime: Runtime) type {
             conn.client_socket = client_socket;
             conn.tunnel_buffer = null;
             conn.deadline_ns = 0;
+            conn.deadline_armed_ns = 0;
             conn.birth_ns = server.io.nowNs();
             conn.armed = .{};
             // A parameter, not a field the caller installs afterwards: a
