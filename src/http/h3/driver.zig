@@ -283,8 +283,28 @@ pub fn Driver(comptime runtime: Runtime) type {
             // A target always exists: the transport's, or the unheard window.
             assert(deadline_ns != 0);
             assert(deadline_ns >= conn.birth_ns);
-            const earlier = deadline_ns < conn.deadline_ns;
-            conn.deadline_ns = @max(deadline_ns, 1);
+            // A re-base is a cancel and a fresh arm on the ring, and QUIC
+            // moves its deadline on nearly every packet: at 2k req/s on 200
+            // connections the old test, against the stored target, re-based
+            // 5.2 times a request, and io_uring's timeout removal was 13% of
+            // the process. Two things keep most of them off the ring.
+            //
+            // The comparison is with where the timer is armed, not with the
+            // stored target: a target that moved later left the timer where
+            // it was (§4), so a new one between the two still fires in time
+            // from it. And a target only slightly earlier is left to the
+            // timer already armed, which then fires late by at most a
+            // sixteenth of what it had left to wait — the loss timer, which
+            // most of these are, is re-derived on every acknowledgement and
+            // drifts earlier by microseconds as the RTT estimate settles.
+            // Together: 1.6 re-bases a request, one of them the move off the
+            // idle timer that has to happen.
+            const target_ns = @max(deadline_ns, 1);
+            const earlier = if (conn.armed.deadline and !conn.armed.deadline_cancel) blk: {
+                const slack_ns = (conn.deadline_armed_ns -| server.io.nowNs()) / 16;
+                break :blk target_ns + slack_ns < conn.deadline_armed_ns;
+            } else target_ns < conn.deadline_ns;
+            conn.deadline_ns = target_ns;
             if (earlier) server.rebaseTimer(conn);
         }
 
