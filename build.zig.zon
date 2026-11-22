@@ -523,6 +523,25 @@
         // libcrypto's (§4). Its one dependency is hpack, the same pin h2
         // carries.
         //
+        // Audit for 3560e8a, 2026-11-22: zoxy-io/h3#10 over main's aef8b75,
+        // six commits past 7165c3d, gated in h3's three build legs, its
+        // fuzz, simulator, interop and requirements checks:
+        //   - a frame's length is read in any encoding, as haproxy pads
+        //     DATA's (h3#9), and the frame type still minimal;
+        //   - buffers shift with @memmove, not an octet at a time: the
+        //     stream send buffer's compaction on every acknowledgement was
+        //     8.9% of zoxy's CPU under HTTP/3;
+        //   - a MAX_STREAMS goes out on its own only at half the window,
+        //     riding every other packet built, so an answered request no
+        //     longer costs a packet holding only it;
+        //   - STREAM frames sized exactly, so a packet of stream data fills
+        //     the datagram limit to the octet, which the endpoint's UDP GSO
+        //     needs; `datagramLimit` is public for it; and a CONNECTION_CLOSE
+        //     owed behind a full packet stays owed until written;
+        //   - a stream's buffers start undefined, not zeroed: 48 KiB a
+        //     request, 3% of zoxy's CPU.
+        // No allocation, import or I/O was added.
+        //
         // Audit for 7165c3d, 2026-11-21: the merge of zoxy-io/h3#8 into
         // f6bfb94, fourteen commits, each reviewed and gated in h3's three
         // build legs:
@@ -553,8 +572,8 @@
         // docs/VERIFICATION.md §5.5). The interop matrix's loopback cases
         // and h3's simulator pass.
         .h3 = .{
-            .url = "git+https://github.com/zoxy-io/h3#7165c3d057302b43c345dc8d0d20545f63fa01be",
-            .hash = "h3-0.0.0-RBkp8hDZGgCijFdBRQSruhIPhqXT5R72OHTYakMDzrXA",
+            .url = "git+https://github.com/zoxy-io/h3#3560e8aec1428451b6e2c73f351431906ee84886",
+            .hash = "h3-0.0.0-RBkp8n_1GgCrn3yAnFcBkoOE5vuj7kD1dmK_64lZBCpR",
         },
         // libcrypto, built by Zig rather than found on the system.
         //
