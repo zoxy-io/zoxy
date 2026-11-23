@@ -523,6 +523,21 @@
         // libcrypto's (§4). Its one dependency is hpack, the same pin h2
         // carries.
         //
+        // Audit for 7d0e62b, 2026-11-23: zoxy-io/h3#11, one commit over
+        // 3560e8a, gated in h3's three build legs, its fuzz, simulator,
+        // interop and requirements checks:
+        //   - no MAX_STREAM_DATA once a stream's final size is known (RFC
+        //     9000 §13.3). A lost packet that carried credit re-owed every
+        //     window, and the next packet raised one on answered request
+        //     streams a client may have retired — which zrk 3.0.4's h3
+        //     took for a stream it never opened, closing the connection
+        //     with STREAM_STATE_ERROR. Since 3560e8a most answers carry a
+        //     MAX_STREAMS, so most lost answers did it;
+        //   - the client half of the same defect (a frame for a retired
+        //     stream of one's own is discarded, not refused), which this
+        //     server does not reach.
+        // No allocation, import or I/O was added.
+        //
         // Audit for 3560e8a, 2026-11-22: zoxy-io/h3#10 over main's aef8b75,
         // six commits past 7165c3d, gated in h3's three build legs, its
         // fuzz, simulator, interop and requirements checks:
@@ -572,8 +587,8 @@
         // docs/VERIFICATION.md §5.5). The interop matrix's loopback cases
         // and h3's simulator pass.
         .h3 = .{
-            .url = "git+https://github.com/zoxy-io/h3#3560e8aec1428451b6e2c73f351431906ee84886",
-            .hash = "h3-0.0.0-RBkp8n_1GgCrn3yAnFcBkoOE5vuj7kD1dmK_64lZBCpR",
+            .url = "git+https://github.com/zoxy-io/h3#7d0e62b35d7709c0cd9ca54d272ae37dc5647b62",
+            .hash = "h3-0.0.0-RBkp8loMGwB_tsqmAr-QlqWO97x3hikVVuucYBx4ROM9",
         },
         // libcrypto, built by Zig rather than found on the system.
         //
