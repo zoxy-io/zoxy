@@ -785,6 +785,13 @@ pub const h3_stateless_reset_bytes_max: u32 = 64;
 /// one round trip and a lost packet, short enough that a stolen one is
 /// stale before it is useful.
 pub const h3_retry_token_lifetime_s: u32 = 10;
+/// Probe timeouts in a row with nothing acknowledged (RFC 9002 §6.2) after
+/// which a connection waiting for its client to hear the rest of it takes
+/// the client for gone and closes (#475). Each timeout doubles the next, so
+/// three is seven PTOs of silence; a client still there acknowledges a
+/// probe within one. Losing all of a live client's acknowledgements that
+/// long ends its connection the way the idle window would, sooner.
+pub const h3_unanswered_probes_max: u32 = 3;
 /// The QUIC pool's occupancy, in eighths, past which a new connection is
 /// Retried first (RFC 9000 §8.1.2): a round trip spent proving a client's
 /// address, paid only once the pool is under pressure.
@@ -808,6 +815,8 @@ comptime {
     assert(h3_stateless_reset_bytes_max > 21);
     assert(quic_retry_watermark_eighths >= 1);
     assert(quic_retry_watermark_eighths <= 8);
+    // Zero would take every client for gone the moment it went away.
+    assert(h3_unanswered_probes_max >= 1);
 }
 
 /// Completions drained per loop tick before control returns to the kernel;

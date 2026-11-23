@@ -230,8 +230,9 @@ pub fn Driver(comptime runtime: Runtime) type {
 
         /// A connection told to go away closes once its last exchange is
         /// done (RFC 9114 §5.2), with H3_NO_ERROR — and once the client has
-        /// heard everything this side said (`Slot.allHeard`), or an idle
-        /// window after the GOAWAY, whichever is first. A request stream
+        /// heard everything this side said (`Slot.allHeard`), its probes go
+        /// unanswered (`Slot.unanswered`), or an idle window after the
+        /// GOAWAY passes, whichever is first. A request stream
         /// whose HEADERS had not yet arrived whole has no exchange, and is
         /// cut with it, which §5.2 allows: the client retries what it never
         /// heard an answer to.
@@ -245,16 +246,24 @@ pub fn Driver(comptime runtime: Runtime) type {
         /// again — zrk's one read error per capped connection, exactly
         /// 1,000 on the benchmark's c1k-h3. Every acknowledgement settles
         /// the connection, so the close follows the one that empties it.
-        /// The idle window bounds a client that keeps the connection busy
-        /// without ever acknowledging, or without the credit an answer
-        /// needs, as long as a silent one is kept.
+        ///
+        /// A client that has gone is not waited for (#475). It sends its last
+        /// acknowledgement and its close once, and when that datagram is
+        /// lost nothing else ever arrives, so the wait ends once the
+        /// transport's probes have gone unanswered, a few PTOs in. Waiting
+        /// out the idle window held the whole slot a minute: on the
+        /// benchmark's c1k-h3, enough of them to fill the pool at the
+        /// request cap and refuse the clients replacing them. The idle
+        /// window still bounds a client that withholds the credit an answer
+        /// needs, which leaves nothing in flight to probe with.
         fn closeIfDrained(server: *ServerType, conn: *ConnType) void {
             const slot = conn.h3.?;
             if (slot.session.goaway_sent == null) return;
             if (conn.h2_streams != null) return;
             if (Half.over(conn)) return;
             assert(slot.goaway_ns != 0);
-            if (!slot.allHeard() and server.io.nowNs() < lingerDeadline(server, slot)) return;
+            const waiting = !slot.allHeard() and !slot.unanswered();
+            if (waiting and server.io.nowNs() < lingerDeadline(server, slot)) return;
             slot.quic.closeApplication(@backingInt(ApplicationCode.no_error));
             assert(Half.over(conn));
         }
