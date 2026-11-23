@@ -1240,7 +1240,7 @@ choke point, and has a counter.
 | head ring | a client's first byte | `503`, **always close**: the refused bytes are unread | connection (h2c preface only) |
 | shared streams / stream heads | an HTTP/2 request | `REFUSED_STREAM` | stream |
 | QUIC pool half full | a client's first Initial | a Retry: its address proven before a slot is spent (RFC 9000 §8.1.2) | — |
-| QUIC connections, conn slots, TLS engines | a client's first Initial, or its Retried one | unanswered: the client's Initial timer retries | connection |
+| QUIC connections, conn slots, TLS engines | a client's first Initial, or its Retried one | `CONNECTION_REFUSED` in an Initial (RFC 9000 §5.2.2, #454); unanswered only with no send buffer free | connection |
 | shared streams / stream heads (HTTP/3) | an HTTP/3 request | `H3_REQUEST_REJECTED` | stream |
 | L7 relay buffer | after routing | `503` | stream |
 | tunnels (or draining) | the upgrade request, before forwarding | `503` | — |

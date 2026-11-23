@@ -431,16 +431,22 @@ pub const Counters = struct {
     /// QUIC handshakes confirmed: the client's Finished verified (RFC 9001
     /// §4.1.2).
     h3_handshakes: Value = Value.init(0),
-    /// First Initials left unanswered because a conn slot or an HTTP/3
-    /// slot was free for neither: the client's Initial timer brings it
-    /// back. Outside the accept gate's shed sum, as no socket was accepted.
+    /// First Initials shed because a conn slot or an HTTP/3 slot was free
+    /// for neither, each refused (`h3_refused`). Outside the accept gate's
+    /// shed sum, as no socket was accepted.
     h3_shed_connections: Value = Value.init(0),
-    /// First Initials left unanswered for want of a TLS engine, every one
-    /// in use (#449's share of `limits.tls_engines`).
+    /// First Initials shed for want of a TLS engine, every one in use
+    /// (#449's share of `limits.tls_engines`), each refused (`h3_refused`).
     h3_shed_tls_engines: Value = Value.init(0),
-    /// First Initials left unanswered because libcrypto could not serve
-    /// the engine's key derivation: the fixed heap out (§4).
+    /// First Initials shed because libcrypto could not serve the engine's
+    /// key derivation: the fixed heap out (§4). Each refused (`h3_refused`).
     h3_shed_tls_crypto: Value = Value.init(0),
+    /// Shed first Initials answered with CONNECTION_CLOSE and
+    /// CONNECTION_REFUSED (RFC 9000 §5.2.2, #454), so the client fails at
+    /// once rather than at its handshake timeout. One per shed above, but
+    /// for a shed whose refusal could not go out (`h3_datagrams_dropped`):
+    /// no send buffer free, or one too small to write it into.
+    h3_refused: Value = Value.init(0),
     /// Segmented sends (UDP GSO) the kernel or device refused. The first
     /// turns segmenting off for that endpoint, and its datagrams are lost,
     /// which QUIC recovers; so this is one per endpoint at most.

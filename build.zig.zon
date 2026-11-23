@@ -523,6 +523,13 @@
         // libcrypto's (§4). Its one dependency is hpack, the same pin h2
         // carries.
         //
+        // Audit for ba373f8, 2026-11-23: zoxy-io/h3#13, one commit over
+        // 004f04a: `endpoint.writeRefusal`, the stateless Initial carrying
+        // CONNECTION_CLOSE with CONNECTION_REFUSED (RFC 9000 §5.2.2) that
+        // a shed first Initial is now answered with (#454). It writes into
+        // the caller's buffer and seals with the configured backend; no
+        // allocation, import or I/O was added.
+        //
         // Audit for 004f04a, 2026-11-23: zoxy-io/h3#12 over #11, two
         // commits over 3560e8a, gated in h3's three build legs, its fuzz,
         // simulator, interop and requirements checks:
@@ -592,8 +599,8 @@
         // docs/VERIFICATION.md §5.5). The interop matrix's loopback cases
         // and h3's simulator pass.
         .h3 = .{
-            .url = "git+https://github.com/zoxy-io/h3#004f04a18f40bfcf0fd99fc2a020ae182a726039",
-            .hash = "h3-0.0.0-RBkp8s4DGwAzHjIRBnPAkgl09zr1YfMsm04n_PGCK7aZ",
+            .url = "git+https://github.com/zoxy-io/h3#ba373f85d588d7d1696979b5e5d92f98144e67f6",
+            .hash = "h3-0.0.0-RBkp8rgeGwAQpwLNSGP_DsTFjBFpKYaU1GxjeSiDHmh0",
         },
         // libcrypto, built by Zig rather than found on the system.
         //

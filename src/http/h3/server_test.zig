@@ -425,6 +425,26 @@ test "h3 server: a connection the request cap ends closes only once the client h
     }
 }
 
+test "h3 server: a client the pool has no room for is refused, not left to time out" {
+    // One HTTP/3 connection at a time. The second client starts while the
+    // first's connection still holds the slot through its closing period,
+    // so its Initial is shed. Unanswered, it waited out its handshake
+    // timeout (#454); now it hears CONNECTION_REFUSED and ends at once.
+    var stated = options;
+    stated.limits.quic_connections = 1;
+    const bed = try Bed.createWith(5, .{}, &stated);
+    defer bed.destroy();
+    try bed.runPair(&.{.{ .path = "/one" }}, &.{.{ .path = "/two" }});
+    try std.testing.expect(bed.client.answers[0].finished);
+    try std.testing.expect(bed.second.refused);
+    try std.testing.expect(!bed.second.answers[0].finished);
+    const shed = bed.server.counters.get("h3_shed_connections");
+    try std.testing.expect(shed >= 1);
+    // Every shed is answered: a send buffer was free for each.
+    try std.testing.expectEqual(shed, bed.server.counters.get("h3_refused"));
+    try std.testing.expectEqual(@as(u32, 1), bed.origin.answered);
+}
+
 /// A client that says one Initial and then nothing, ever: a TestClient's
 /// real first datagram — a ClientHello the server opens and answers — taken
 /// off a socket standing in for the server, the client abandoned, and the

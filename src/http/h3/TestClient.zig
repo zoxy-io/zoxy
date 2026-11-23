@@ -109,6 +109,9 @@ pub fn TestClient(comptime IoType: type) type {
         /// may cut what is in flight, from one that came too early.
         started_ns: u64,
         peer_closed_ns: u64,
+        /// The server refused the connection (CONNECTION_REFUSED, RFC 9000
+        /// §5.2.2) rather than leaving its Initial unanswered.
+        refused: bool,
         /// The identifier of the server's GOAWAY, if one arrived: what tells
         /// a refused request the client may send again from one it lost.
         goaway: ?u64,
@@ -154,6 +157,7 @@ pub fn TestClient(comptime IoType: type) type {
             client.done = false;
             client.started_ns = io.nowNs();
             client.peer_closed_ns = 0;
+            client.refused = false;
             client.goaway = null;
             client.on_done = on_done;
             client.context = context;
@@ -332,6 +336,10 @@ pub fn TestClient(comptime IoType: type) type {
         fn notePeerClose(client: *Self, code: u64, application: bool, idle: bool) void {
             // Its own close, or an idle timeout, is not the server's word.
             if (client.closing or idle) return;
+            if (!application and code == @backingInt(quic.error_code.Transport.connection_refused)) {
+                client.refused = true;
+                return;
+            }
             if (!application) return;
             if (code != @backingInt(quic.error_code.Application.no_error)) return;
             assert(client.peer_closed_ns == 0);

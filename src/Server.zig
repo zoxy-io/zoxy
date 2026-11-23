@@ -2869,31 +2869,42 @@ pub fn Server(comptime runtime: Runtime) type {
             peer: std.Io.net.IpAddress,
         };
 
+        /// Why a first Initial was not admitted, which decides what it is
+        /// answered with (`QuicEndpoint.admit`).
+        pub const QuicAdmitError = error{
+            /// No room: a conn slot, an HTTP/3 slot, a TLS engine or
+            /// libcrypto's heap. Refused with CONNECTION_REFUSED (#454).
+            Shed,
+            /// Turned away for what it is — a Retry token it cannot hold,
+            /// or a connection policy — and left unanswered.
+            Declined,
+        };
+
         /// A QUIC connection admitted from its first Initial (#449): a conn
         /// slot and its stream, an HTTP/3 slot begun in place with an ID
         /// minted for it, an engine from its listener's credentials carrying
-        /// the slot's transport parameters, and its listener's tables. Null
-        /// is a rung shed, and counted, with everything taken given back:
-        /// the Initial goes unanswered and the client tries again. Outside
-        /// the accept gate's identity — no socket was accepted — and inside
-        /// the flow's: admitted, and completed when it goes.
-        pub fn admitQuic(server: *Self, endpoint: *const QuicEndpoint, initial: *const QuicInitial) ?*ConnType {
+        /// the slot's transport parameters, and its listener's tables. An
+        /// error is a rung shed or a refusal, counted, with everything taken
+        /// given back. Outside the accept gate's identity — no socket was
+        /// accepted — and inside the flow's: admitted, and completed when it
+        /// goes.
+        pub fn admitQuic(server: *Self, endpoint: *const QuicEndpoint, initial: *const QuicInitial) QuicAdmitError!*ConnType {
             assert(!server.draining);
             const conn = server.conns.acquire() orelse {
                 server.counters.increment("h3_shed_connections");
-                return null;
+                return error.Shed;
             };
             conn.stream = server.admitStream(conn);
             server.updateConnPressure();
             const slot = server.h3_slots.acquire() orelse {
                 server.releaseConn(conn);
                 server.counters.increment("h3_shed_connections");
-                return null;
+                return error.Shed;
             };
-            const engine = server.beginQuicSlot(endpoint, slot, initial) orelse {
+            const engine = server.beginQuicSlot(endpoint, slot, initial) catch |err| {
                 server.h3_slots.release(slot);
                 server.releaseConn(conn);
-                return null;
+                return err;
             };
             const state = &server.listeners[endpoint.listener_index];
             conn.prepare(server, null, engine, .l7, .http, initial.peer);
@@ -2907,20 +2918,20 @@ pub fn Server(comptime runtime: Runtime) type {
             // The listener's connection policies, as every connection it
             // admits meets them, before its handshake (#425). A refusal
             // has begun the teardown; its Initial goes unanswered.
-            if (!server.admittedByPolicies(conn)) return null;
+            if (!server.admittedByPolicies(conn)) return error.Declined;
             return conn;
         }
 
         /// The slot begun from the Initial under an ID minted for it — its
         /// pool index, then four random octets, so the ID names the slot —
-        /// and the engine that will run its handshake; null is a counted
-        /// rung, nothing of either left held.
+        /// and the engine that will run its handshake; an error is a
+        /// counted rung, nothing of either left held.
         fn beginQuicSlot(
             server: *Self,
             endpoint: *const QuicEndpoint,
             slot: *H3Slot,
             initial: *const QuicInitial,
-        ) ?*TlsEngine {
+        ) QuicAdmitError!*TlsEngine {
             var octets: [constants.h3_connection_id_bytes]u8 = undefined;
             std.mem.writeInt(u32, octets[0..4], server.h3_slots.indexOf(slot), .big);
             server.io.fillRandom(octets[4..]);
@@ -2937,7 +2948,7 @@ pub fn Server(comptime runtime: Runtime) type {
                 // A Retry token naming the ID the client uses now, which no
                 // token this side minted does.
                 server.counters.increment("h3_tokens_refused");
-                return null;
+                return error.Declined;
             };
             const state = &server.listeners[endpoint.listener_index];
             assert(state.credentials != null); // A QUIC binding requires `tls`.
@@ -2946,7 +2957,7 @@ pub fn Server(comptime runtime: Runtime) type {
                     error.EnginesExhausted => server.counters.increment("h3_shed_tls_engines"),
                     error.CryptoUnavailable => server.counters.increment("h3_shed_tls_crypto"),
                 }
-                return null;
+                return error.Shed;
             };
             assert(engine.isQuic());
             return engine;
