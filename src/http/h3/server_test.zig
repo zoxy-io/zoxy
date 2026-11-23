@@ -174,6 +174,8 @@ const Bed = struct {
     /// connection still holds its slot through the closing period.
     second: Client,
     second_requests: []const TestClient.Request,
+    /// Clients of `runBoth` that are done.
+    both_done: u8,
 
     fn create(seed: u64) !*Bed {
         return createUnder(seed, .{});
@@ -236,6 +238,29 @@ const Bed = struct {
         for (&seed, 0..) |*octet, index| octet.* = @intCast(index + 1);
         try bed.client.start(&bed.sim_io, loopback(listen_port), first, seed, onFirstDone, bed);
         try bed.sim_io.run();
+        try std.testing.expect(bed.second.done);
+        try std.testing.expect(bed.server.isIdle());
+        try std.testing.expect(bed.server.reconcile());
+    }
+
+    fn onEitherDone(context: *anyopaque) void {
+        const bed: *Bed = @ptrCast(@alignCast(context));
+        assert(bed.both_done < 2);
+        bed.both_done += 1;
+        if (bed.both_done == 2) onClientDone(bed);
+    }
+
+    /// Two clients at once: the second's first Initial arrives while the
+    /// first's connection holds its slot.
+    fn runBoth(bed: *Bed, first: []const TestClient.Request, second: []const TestClient.Request) !void {
+        bed.both_done = 0;
+        var seed: [64]u8 = undefined;
+        for (&seed, 0..) |*octet, index| octet.* = @intCast(index + 1);
+        try bed.client.start(&bed.sim_io, loopback(listen_port), first, seed, onEitherDone, bed);
+        for (&seed, 0..) |*octet, index| octet.* = @intCast(index + 101);
+        try bed.second.start(&bed.sim_io, loopback(listen_port), second, seed, onEitherDone, bed);
+        try bed.sim_io.run();
+        try std.testing.expect(bed.client.done);
         try std.testing.expect(bed.second.done);
         try std.testing.expect(bed.server.isIdle());
         try std.testing.expect(bed.server.reconcile());
@@ -367,13 +392,13 @@ test "h3 server: a datagram in a version it does not speak is answered with Vers
 }
 
 test "h3 server: a client the pool's pressure Retries proves its address and is served" {
-    // The first connection holds one of the two slots through its closing
-    // period, so the second meets the watermark: a Retry, its token
+    // Two clients at once: the first connection holds one of the two
+    // slots, so the second meets the watermark: a Retry, its token
     // returned in the next Initial, and the connection then admitted under
     // the ID the Retry named (RFC 9000 §8.1.2, §7.3).
     const bed = try Bed.create(6);
     defer bed.destroy();
-    try bed.runPair(&.{.{ .path = "/one" }}, &.{.{ .path = "/two" }});
+    try bed.runBoth(&.{.{ .path = "/one" }}, &.{.{ .path = "/two" }});
     try std.testing.expectEqual(@as(u16, 200), bed.client.answers[0].status);
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("h3_retries"));
     try std.testing.expectEqual(@as(u16, 200), bed.second.answers[0].status);
@@ -388,7 +413,7 @@ test "h3 server: a Retried client's Initial, delivered twice, starts one connect
     // first copy started, not admit a second the client will never finish.
     const bed = try Bed.createUnder(7, .{ .partial_io = false, .udp_duplicate_percent = 100 });
     defer bed.destroy();
-    try bed.runPair(&.{.{ .path = "/one" }}, &.{.{ .path = "/two" }});
+    try bed.runBoth(&.{.{ .path = "/one" }}, &.{.{ .path = "/two" }});
     try std.testing.expectEqual(@as(u16, 200), bed.second.answers[0].status);
     // Each copy of its first Initial is Retried on its own — a Retry is
     // stateless — and the client takes the first (RFC 9000 §17.2.5.2).
@@ -491,23 +516,65 @@ test "h3 server: a capped connection whose client has gone frees its slot in a f
 }
 
 test "h3 server: a client the pool has no room for is refused, not left to time out" {
-    // One HTTP/3 connection at a time. The second client starts while the
-    // first's connection still holds the slot through its closing period,
-    // so its Initial is shed. Unanswered, it waited out its handshake
-    // timeout (#454); now it hears CONNECTION_REFUSED and ends at once.
+    // One HTTP/3 connection at a time, and two clients at once: the
+    // second's Initial arrives while the first's connection holds the
+    // slot, so it is shed. Unanswered, it waited out its handshake timeout
+    // (#454); now it hears CONNECTION_REFUSED and ends at once.
     var stated = options;
     stated.limits.quic_connections = 1;
     const bed = try Bed.createWith(5, .{}, &stated);
     defer bed.destroy();
-    try bed.runPair(&.{.{ .path = "/one" }}, &.{.{ .path = "/two" }});
-    try std.testing.expect(bed.client.answers[0].finished);
-    try std.testing.expect(bed.second.refused);
-    try std.testing.expect(!bed.second.answers[0].finished);
+    try bed.runBoth(&.{.{ .path = "/one" }}, &.{.{ .path = "/two" }});
+    // Whichever Initial the server took first holds the slot.
+    const served = if (bed.client.refused) &bed.second else &bed.client;
+    const refused = if (bed.client.refused) &bed.client else &bed.second;
+    try std.testing.expect(served.answers[0].finished);
+    try std.testing.expect(!served.refused);
+    try std.testing.expect(refused.refused);
+    try std.testing.expect(!refused.answers[0].finished);
     const shed = bed.server.counters.get("h3_shed_connections");
     try std.testing.expect(shed >= 1);
     // Every shed is answered: a send buffer was free for each.
     try std.testing.expectEqual(shed, bed.server.counters.get("h3_refused"));
     try std.testing.expectEqual(@as(u32, 1), bed.origin.answered);
+}
+
+test "h3 server: a closing connection gives its slot back at once, so the client behind it is served" {
+    // #476. One HTTP/3 connection at a time, and the second client starts
+    // as the first finishes, inside the first connection's draining
+    // period. The period held the whole slot for three PTOs, and the
+    // second client was refused; now a record holds the period and the
+    // slot is free.
+    var stated = options;
+    stated.limits.quic_connections = 1;
+    for (1..9) |seed| {
+        const bed = try Bed.createWith(seed, .{}, &stated);
+        defer bed.destroy();
+        try bed.runPair(&.{.{ .path = "/one" }}, &.{.{ .path = "/two" }});
+        try std.testing.expect(bed.client.answers[0].finished);
+        try std.testing.expect(!bed.second.refused);
+        try std.testing.expect(bed.second.answers[0].finished);
+        try std.testing.expectEqualStrings("hello", bed.second.answers[0].bodyBytes());
+        try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("h3_shed_connections"));
+        try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("h3_handshakes"));
+    }
+}
+
+test "h3 server: a packet in a closed connection's period is answered with its close, from its record" {
+    // #476. A field section that does not decode closes the connection
+    // from this side (RFC 9204 §2.2), so its period is a closing one; every
+    // datagram is delivered twice, so the copy of the client's packet that
+    // carried the section arrives after the close went out and the slot
+    // was given back. Its record answers it with the close, as the
+    // connection would have (RFC 9000 §10.2.1), not a stateless reset.
+    for (1..9) |seed| {
+        const bed = try Bed.createUnder(seed, .{ .partial_io = false, .udp_duplicate_percent = 100 });
+        defer bed.destroy();
+        try bed.run(&.{.{ .raw_section = &.{ 0x00, 0x00, 0x80 } }});
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("h3_qpack_failures"));
+        try std.testing.expect(bed.server.counters.get("h3_closes_repeated") >= 1);
+        try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("h3_stateless_resets"));
+    }
 }
 
 /// A client that says one Initial and then nothing, ever: a TestClient's
@@ -611,6 +678,9 @@ test "h3 server: a handshake drained once its client fell silent still ends, wit
     try probe.start(bed);
     try bed.sim_io.run();
     try std.testing.expect(probe.closing);
+    // A close that never went out is not handed to a record (#476): the
+    // slot held the period, which ended without it.
+    for (bed.server.h3_tombstones) |*record| try std.testing.expectEqual(@as(u64, 0), record.deadline_ns);
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("h3_admitted"));
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("h3_handshakes"));
     try std.testing.expect(bed.server.isIdle());

@@ -417,7 +417,7 @@ whose feature no config names has count 0 and costs nothing.**
 | TLS engines | a TLS connection's life | `tls_engines`: min(conn slots, 1024) → 1024, if a listener terminates | ~92 KiB + plaintext |
 | HTTP/2 sessions | an HTTP/2 connection's life | `h2_connections`: min(conn slots, 1024) → conn slots, if a listener speaks HTTP/2 | ~100 KiB |
 | shared streams + heads | one HTTP/2 or HTTP/3 stream | `h2_streams`: required with HTTP/2 or a QUIC binding | a stream + a head |
-| HTTP/3 connections | a QUIC connection's life | `quic_connections`: min(64, conn slots, TLS engines), if a listener has a QUIC binding | ~835 KiB: the transport and its streams' buffers |
+| HTTP/3 connections | a QUIC connection's life, until its closing or draining period starts; a record of ~300 B holds the period (#476) | `quic_connections`: min(64, conn slots, TLS engines), if a listener has a QUIC binding | ~835 KiB: the transport and its streams' buffers, and the record |
 | QUIC endpoints | the process's life | one per QUIC binding | 8 receives and 32 sends in flight, each send room for `quic_send_segments_max` (16) datagrams cut apart by the kernel (UDP GSO) (~760 KiB) |
 | HTTP/2 origin connections | pooled | min(2 × HTTP/2 endpoints, 4096) | a client session + buffers |
 | HTTP/2 origin streams | one leg | = upstream slots | staging for one stream |
@@ -1192,6 +1192,26 @@ gates startup.
   lasts one idle window from the GOAWAY. The same close ends a
   connection at the request cap. The endpoint outlives its listener's
   drain until its last connection is gone.
+- **Closing.** A connection's closing or draining period (RFC 9000
+  §10.2, three PTOs) is not ended early, but it does not hold the slot
+  (#476). Once a closing connection's CONNECTION_CLOSE is out, or a
+  draining one has nothing to send, the slot, the transport's buffers
+  and the TLS engine are given back. A record at the slot's index holds
+  the rest of the period, as §10.2.1 allows: the connection ID, the
+  client's address, the deadline, and for a closing connection the
+  datagram that carried its close.
+  - A packet for the record is not taken for a new connection or met
+    with a stateless reset.
+  - A closing connection's record answers it with that datagram, sent
+    again as it was, on the 1st, 2nd, 4th, ... packet.
+  - A draining connection's record answers nothing.
+  - Answers never exceed three times what triggered them, §8.1's bound
+    for an address not yet validated.
+  - A new connection in the slot replaces the record only when it in
+    turn closes; its ID differs, so until then the record still answers
+    for the old one.
+  - A close the anti-amplification limit holds back keeps its slot until
+    it goes out or the period ends.
 - **Paths.** The server advertises `disable_active_migration` and drops a
   connection's datagrams from any other address (§12).
 

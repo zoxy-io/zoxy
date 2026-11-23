@@ -484,6 +484,10 @@ pub const Counters = struct {
     /// Stateless resets sent for a short header no connection holds (RFC
     /// 9000 §10.3).
     h3_stateless_resets: Value = Value.init(0),
+    /// CONNECTION_CLOSE datagrams sent again for a packet that arrived in
+    /// its connection's closing period (RFC 9000 §10.2.1), from the
+    /// connection's record once its slot was given back (#476).
+    h3_closes_repeated: Value = Value.init(0),
     /// Initials whose token vouched for nothing — forged, another
     /// address's, or past its life — dropped.
     h3_tokens_refused: Value = Value.init(0),
