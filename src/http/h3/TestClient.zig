@@ -109,6 +109,9 @@ pub fn TestClient(comptime IoType: type) type {
         /// may cut what is in flight, from one that came too early.
         started_ns: u64,
         peer_closed_ns: u64,
+        /// The identifier of the server's GOAWAY, if one arrived: what tells
+        /// a refused request the client may send again from one it lost.
+        goaway: ?u64,
         /// The port this client's socket bound on loopback: what the
         /// server's access log names it by.
         local_port: u16,
@@ -151,6 +154,7 @@ pub fn TestClient(comptime IoType: type) type {
             client.done = false;
             client.started_ns = io.nowNs();
             client.peer_closed_ns = 0;
+            client.goaway = null;
             client.on_done = on_done;
             client.context = context;
             // The first Destination Connection ID's length, drawn from the
@@ -304,7 +308,8 @@ pub fn TestClient(comptime IoType: type) type {
                 .finished => |id| if (client.answerFor(id)) |answer| {
                     answer.finished = true;
                 },
-                .settings, .goaway => {},
+                .settings => {},
+                .goaway => |identifier| client.goaway = identifier,
             }
         }
 

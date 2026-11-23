@@ -214,7 +214,7 @@ pub fn Half(comptime runtime: Runtime) type {
             if (server.draining) return;
             if (over(conn)) return;
             if (slot.session.goaway_sent != null) return;
-            Driver.goAway(conn);
+            Driver.goAway(server, conn);
             server.counters.increment("l7_keepalive_requests_capped");
         }
 
