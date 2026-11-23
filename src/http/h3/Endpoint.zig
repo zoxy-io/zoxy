@@ -231,13 +231,14 @@ pub fn Endpoint(comptime runtime: Runtime) type {
                 .drop => server.counters.increment("h3_datagrams_dropped"),
                 .version_negotiation => endpoint.negotiateVersion(&classified, peer),
                 .route => {
-                    const conn = endpoint.find(&classified.destination) orelse
-                        return endpoint.statelessReset(datagram, &classified, peer);
-                    endpoint.deliver(conn, datagram, peer);
+                    if (endpoint.find(&classified.destination)) |conn| return endpoint.deliver(conn, datagram, peer);
+                    if (endpoint.entombed(&classified.destination, datagram.len, peer)) return;
+                    endpoint.statelessReset(datagram, &classified, peer);
                 },
                 .initial => {
-                    const conn = endpoint.find(&classified.destination) orelse
-                        endpoint.findOriginal(&classified.destination) orelse
+                    if (endpoint.find(&classified.destination)) |conn| return endpoint.deliver(conn, datagram, peer);
+                    if (endpoint.entombed(&classified.destination, datagram.len, peer)) return;
+                    const conn = endpoint.findOriginal(&classified.destination) orelse
                         return endpoint.admit(&classified, datagram, peer);
                     endpoint.deliver(conn, datagram, peer);
                 },
@@ -258,6 +259,42 @@ pub fn Endpoint(comptime runtime: Runtime) type {
             if (slot.endpoint_index != endpoint.index) return null;
             if (!slot.local.eql(destination)) return null;
             return conn;
+        }
+
+        /// A packet for a connection whose slot is given back and whose
+        /// closing or draining period runs on (#476, `Connection.Tombstone`):
+        /// held by its record, not met with a stateless reset or taken for
+        /// a new connection. A closing connection's record answers with the
+        /// datagram that carried its CONNECTION_CLOSE, sent again as it was
+        /// (RFC 9000 §10.2.1 allows the same packet number), at a falling
+        /// rate and never more than three times what triggered it
+        /// (`Tombstone.answers`); a draining one's answers nothing
+        /// (§10.2.2). One from any other address is dropped, as a live
+        /// connection's is.
+        fn entombed(endpoint: *Self, destination: *const ConnectionId, trigger_len: usize, peer: *const IpAddress) bool {
+            const server = endpoint.server;
+            const octets = destination.bytes();
+            if (octets.len != constants.h3_connection_id_bytes) return false;
+            const index = std.mem.readInt(u32, octets[0..4], .big);
+            if (index >= server.h3_tombstones.len) return false;
+            const record = &server.h3_tombstones[index];
+            if (!record.holds(destination, endpoint.index, server.io.nowNs())) return false;
+            if (!record.peer.eql(peer)) {
+                server.counters.increment("h3_migration_dropped");
+                return true;
+            }
+            if (!record.answers(trigger_len)) return true;
+            const len = record.close_datagram_len;
+            assert(len >= 1);
+            assert(len <= 3 * trigger_len);
+            const send = endpoint.takeSend() orelse {
+                server.counters.increment("h3_datagrams_dropped");
+                return true;
+            };
+            @memcpy(send.buffer[0..len], record.close_datagram[0..len]);
+            server.counters.increment("h3_closes_repeated");
+            endpoint.armSend(send, len, 0, &record.peer);
+            return true;
         }
 
         /// A handshaking connection by the ID its client first chose: a
@@ -281,7 +318,13 @@ pub fn Endpoint(comptime runtime: Runtime) type {
             const server = endpoint.server;
             const slot = conn.h3.?;
             if (!slot.peer.eql(peer)) return server.counters.increment("h3_migration_dropped");
-            if (conn.state != .h3) return; // Tearing down: nothing is read.
+            // Tearing down: nothing is read. One whose period went to a
+            // record (`entombed`) has the record answer for it until the
+            // slot is free, as it will after.
+            if (conn.state != .h3) {
+                _ = endpoint.entombed(&slot.local, datagram.len, peer);
+                return;
+            }
             Driver.receive(server, conn, datagram);
         }
 
@@ -519,6 +562,8 @@ pub fn Endpoint(comptime runtime: Runtime) type {
                     endpoint.giveSend(send);
                     continue;
                 }
+                // A closing connection's close, for its record (#476).
+                slot.keepClose(send.buffer[0..first]);
                 // Behind a full-size first datagram, the connection's next
                 // ones join it while they are the same size: the kernel cuts
                 // them apart (UDP GSO), and only the last may be shorter, so

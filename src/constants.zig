@@ -792,6 +792,13 @@ pub const h3_retry_token_lifetime_s: u32 = 10;
 /// probe within one. Losing all of a live client's acknowledgements that
 /// long ends its connection the way the idle window would, sooner.
 pub const h3_unanswered_probes_max: u32 = 3;
+/// The datagram carrying a closing connection's CONNECTION_CLOSE, kept to
+/// send again once the connection's slot is given back (#476). A close
+/// with no reason phrase in each of the three packet number spaces,
+/// coalesced, under the longest connection IDs, is about 170 octets; a
+/// longer one is not kept, and its record answers nothing. A close over
+/// several datagrams is answered with its first.
+pub const h3_close_datagram_bytes_max: u32 = 256;
 /// The QUIC pool's occupancy, in eighths, past which a new connection is
 /// Retried first (RFC 9000 §8.1.2): a round trip spent proving a client's
 /// address, paid only once the pool is under pressure.
@@ -817,6 +824,10 @@ comptime {
     assert(quic_retry_watermark_eighths <= 8);
     // Zero would take every client for gone the moment it went away.
     assert(h3_unanswered_probes_max >= 1);
+    // A close datagram's length is a `u16`, and a short header with a
+    // CONNECTION_CLOSE and its AEAD tag fits.
+    assert(h3_close_datagram_bytes_max <= std.math.maxInt(u16));
+    assert(h3_close_datagram_bytes_max >= 64);
 }
 
 /// Completions drained per loop tick before control returns to the kernel;

@@ -25,6 +25,7 @@ const RelayBuffer = @import("net/relay.zig").RelayBuffer;
 const Server = @import("Server.zig").Server;
 const TlsEngine = @import("tls/Engine.zig");
 const H3Slot = @import("http/h3/Connection.zig").Slot;
+const H3Tombstone = @import("http/h3/Connection.zig").Tombstone;
 const H3Scratch = @import("http/h3/exchange.zig").Scratch;
 const upstream_module = @import("net/upstream.zig");
 
@@ -192,12 +193,13 @@ pub fn Budget(comptime runtime: Runtime) type {
                 .h2_connections = limits.h2_connections,
                 .h2_session_bytes = ServerType.h2SessionBytes(&limits),
                 // Zero unless a listener serves QUIC (#449): the pool, its
-                // owner table, an endpoint per binding, and the scratch.
+                // owner table and its closing records (#476), an endpoint
+                // per binding, and the scratch.
                 .quic_connections = limits.quic_connections,
                 .h3_slot_bytes = if (limits.quic_connections == 0)
                     0
                 else
-                    @sizeOf(H3Slot) + @sizeOf(?*anyopaque),
+                    @sizeOf(H3Slot) + @sizeOf(?*anyopaque) + @sizeOf(H3Tombstone),
                 .quic_endpoints = ServerType.quicListenerCount(config),
                 .quic_endpoint_bytes = if (limits.quic_connections == 0) 0 else ServerType.QuicEndpoint.bytes,
                 .h3_scratch_bytes = if (limits.quic_connections == 0) 0 else H3Scratch.bytes,

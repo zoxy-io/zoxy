@@ -120,6 +120,10 @@ pub fn Server(comptime runtime: Runtime) type {
         /// connection ID this server minted names (`QuicEndpoint.find`) —
         /// or null for a free slot.
         h3_owners: []?*ConnType,
+        /// The closing or draining period of the connection a slot last
+        /// served, by slot index, once the slot is given back (#476,
+        /// `H3Connection.Tombstone`).
+        h3_tombstones: []H3Connection.Tombstone,
         /// One per listener with a QUIC binding, in config order: its UDP
         /// socket and the datagrams in flight on it.
         quic_endpoints: []QuicEndpoint,
@@ -922,11 +926,14 @@ pub fn Server(comptime runtime: Runtime) type {
             try server.h3_slots.init(arena, options.quic_connections);
             server.h3_owners = try arena.alloc(?*ConnType, options.quic_connections);
             @memset(server.h3_owners, null);
+            server.h3_tombstones = try arena.alloc(H3Connection.Tombstone, options.quic_connections);
+            @memset(server.h3_tombstones, .empty);
             const endpoints = quicListenerCount(config);
             assert((endpoints == 0) == (options.quic_connections == 0));
             server.quic_endpoints = try arena.alloc(QuicEndpoint, endpoints);
             server.h3_scratch = if (endpoints == 0) .empty else try H3Exchange.Scratch.init(arena);
             assert(server.h3_owners.len == server.h3_slots.capacity());
+            assert(server.h3_tombstones.len == server.h3_owners.len);
         }
 
         /// The listeners with a QUIC binding (#449): one endpoint each.
