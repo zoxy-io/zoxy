@@ -66,6 +66,8 @@ pub const ApplicationCode = quic.error_code.Application;
 comptime {
     assert(own_unidirectional == 3);
     assert(connection_id_bytes <= ConnectionId.octets_max);
+    // A record keeps a close, never a datagram of any size.
+    assert(constants.h3_close_datagram_bytes_max < Quic.datagram_octets);
 }
 
 /// The connection pool's element (§5): a transport and its session, laid
@@ -113,6 +115,16 @@ pub const Slot = struct {
     /// When this side's GOAWAY was queued, zero before it: what bounds how
     /// long the close waits for the client to hear everything (`allHeard`).
     goaway_ns: u64,
+    /// The first datagram the transport built once closing, the one with
+    /// this side's CONNECTION_CLOSE, as it went out (`keepClose`): what the
+    /// connection's record sends again (`Tombstone`). Empty before then,
+    /// or when it was longer than the record holds.
+    close_datagram: [constants.h3_close_datagram_bytes_max]u8,
+    close_datagram_len: u16,
+    /// That datagram was built: the close is out, kept or not. A close the
+    /// anti-amplification limit holds back (RFC 9000 §8.1) is not, though
+    /// the transport then has nothing it may send.
+    close_sent: bool,
 
     pub const Start = struct {
         /// The packet that starts the connection: its Destination
@@ -164,6 +176,8 @@ pub const Slot = struct {
         slot.driving = false;
         slot.drains_len = 0;
         slot.goaway_ns = 0;
+        slot.close_datagram_len = 0;
+        slot.close_sent = false;
         const encoded = slot.quic.localTransportParameters(&slot.parameters) catch return error.NoSpaceLeft;
         slot.parameters_len = @intCast(encoded.len);
         assert(slot.parameters_len >= 1);
@@ -194,6 +208,54 @@ pub const Slot = struct {
         assert(slot.goaway_ns != 0);
         assert(slot.session.goaway_sent != null);
         return slot.quic.recovery.pto_count >= constants.h3_unanswered_probes_max;
+    }
+
+    /// `datagram` was just built: if it is the first since the transport
+    /// turned closing, the one carrying this side's CONNECTION_CLOSE (RFC
+    /// 9000 §10.2.1), the close is out, and it is kept if the record has
+    /// room. Only that first one: a close over several datagrams is
+    /// answered with its first.
+    pub fn keepClose(slot: *Slot, datagram: []const u8) void {
+        assert(datagram.len >= 1);
+        assert(slot.close_datagram_len <= slot.close_datagram.len);
+        if (slot.quic.state != .closing) return;
+        if (slot.close_sent) return;
+        slot.close_sent = true;
+        if (datagram.len > slot.close_datagram.len) return;
+        @memcpy(slot.close_datagram[0..datagram.len], datagram);
+        slot.close_datagram_len = @intCast(datagram.len);
+    }
+
+    /// Whether all that is left of the connection is its closing or
+    /// draining period (RFC 9000 §10.2), which a record can hold: a
+    /// closing one's CONNECTION_CLOSE is out (`close_sent`), or it is
+    /// draining, which sends nothing (§10.2.2).
+    pub fn periodOnly(slot: *const Slot) bool {
+        return switch (slot.quic.state) {
+            .handshaking, .established => false,
+            .closing => slot.close_sent,
+            .draining => true,
+        };
+    }
+
+    /// The connection's period, as its record holds it once the slot is
+    /// given back (#476): until `deadline_ns`, the end of the period the
+    /// transport set. A draining connection's record keeps no datagram.
+    pub fn tombstone(slot: *const Slot, deadline_ns: u64) Tombstone {
+        assert(slot.periodOnly());
+        assert(deadline_ns != 0);
+        const len: u16 = if (slot.quic.state == .closing) slot.close_datagram_len else 0;
+        var record: Tombstone = .{
+            .deadline_ns = deadline_ns,
+            .local = slot.local,
+            .peer = slot.peer,
+            .endpoint_index = slot.endpoint_index,
+            .received_count = 0,
+            .close_datagram = @splat(0),
+            .close_datagram_len = len,
+        };
+        @memcpy(record.close_datagram[0..len], slot.close_datagram[0..len]);
+        return record;
     }
 
     /// Release request stream `id` from the session, and drop at the
@@ -353,6 +415,73 @@ pub const Slot = struct {
         // A closing transport confirms nothing; `handshake` feeds the engine
         // only an open one, and nothing in a step closes it.
         if (slot.quic.state == .established) assert(slot.quic.handshakeConfirmed());
+    }
+};
+
+/// A connection's closing or draining period (RFC 9000 §10.2), held once
+/// its slot is given back (#476). §10.2 asks a server not to end the period
+/// early, so that a late packet is not taken for a new connection or met
+/// with a stateless reset, and §10.2.1 lets it keep only what that needs:
+/// the ID the packets carry, and for a closing connection the datagram
+/// with its CONNECTION_CLOSE, sent again as it was. The slot, the
+/// transport's buffers and the TLS engine are free for the next client the
+/// moment the period starts, rather than three PTOs later.
+///
+/// One per slot, at the slot's index, which the ID carries. A new
+/// connection in the slot replaces the record only when it in turn closes;
+/// until then the record answers for the old ID, which the new connection
+/// does not carry. Once replaced, the older connection's late packets meet
+/// a stateless reset.
+pub const Tombstone = struct {
+    /// When the period ends; zero for a record that holds nothing.
+    deadline_ns: u64,
+    local: ConnectionId,
+    peer: std.Io.net.IpAddress,
+    endpoint_index: u16,
+    /// Packets that arrived for the connection during its period, the
+    /// count that paces the answers to them (§10.2.1).
+    received_count: u32,
+    /// The datagram that carried the close (`Slot.keepClose`); empty for a
+    /// draining connection, which sends nothing (§10.2.2), or a close
+    /// longer than the record holds.
+    close_datagram: [constants.h3_close_datagram_bytes_max]u8,
+    close_datagram_len: u16,
+
+    pub const empty: Tombstone = .{
+        .deadline_ns = 0,
+        .local = .{},
+        .peer = .{ .ip4 = .unspecified(0) },
+        .endpoint_index = 0,
+        .received_count = 0,
+        .close_datagram = @splat(0),
+        .close_datagram_len = 0,
+    };
+
+    /// Whether `destination` names this record's connection, its period
+    /// not over at `now_ns`.
+    pub fn holds(record: *const Tombstone, destination: *const ConnectionId, endpoint_index: u16, now_ns: u64) bool {
+        if (record.deadline_ns == 0) return false;
+        assert(record.close_datagram_len <= record.close_datagram.len);
+        if (now_ns >= record.deadline_ns) return false;
+        if (record.endpoint_index != endpoint_index) return false;
+        return record.local.eql(destination);
+    }
+
+    /// One more packet for the connection, `trigger_len` octets: whether to
+    /// answer it with the close. §10.2.1 asks the answers to be paced: the
+    /// 1st, 2nd, 4th, 8th, ... packet is answered, so a peer that keeps
+    /// sending hears it ever less often. None is answered with more than
+    /// three times what it carried, the bound §8.1 sets on an address not
+    /// yet validated, which a record no longer knows. A draining
+    /// connection's record answers nothing.
+    pub fn answers(record: *Tombstone, trigger_len: usize) bool {
+        assert(record.deadline_ns != 0);
+        assert(trigger_len >= 1);
+        record.received_count +|= 1;
+        assert(record.received_count >= 1);
+        if (record.close_datagram_len == 0) return false;
+        if (record.close_datagram_len > 3 * trigger_len) return false;
+        return std.math.isPowerOfTwo(record.received_count);
     }
 };
 

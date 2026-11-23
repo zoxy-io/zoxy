@@ -193,6 +193,7 @@ pub fn Driver(comptime runtime: Runtime) type {
             if (conn.state != .h3) return;
             const slot = conn.h3.?;
             if (slot.driving) return; // The pass's own `settle` aims it.
+            if (closeSaid(conn)) return entomb(server, conn);
             refreshDeadline(server, conn);
         }
 
@@ -225,7 +226,44 @@ pub fn Driver(comptime runtime: Runtime) type {
             closeIfDrained(server, conn);
             if (slot.quic.wantsSend()) Endpoint.queue(server, conn);
             if (conn.state != .h3) return;
+            if (closeSaid(conn)) return entomb(server, conn);
             refreshDeadline(server, conn);
+        }
+
+        /// A closing connection whose CONNECTION_CLOSE is out, or one
+        /// draining, which says nothing: all that is left of it is its
+        /// period (RFC 9000 §10.2), which a record holds (`entomb`). A close
+        /// the anti-amplification limit holds back keeps the slot until it
+        /// goes out or the period ends, as before.
+        fn closeSaid(conn: *const ConnType) bool {
+            if (conn.isTearingDown()) return false;
+            assert(conn.state == .h3);
+            return conn.h3.?.periodOnly();
+        }
+
+        /// The slot given back with the period still to run (#476): its
+        /// record (`Connection.Tombstone`) holds the period to its end, and
+        /// the teardown frees the slot, its transport's buffers and its TLS
+        /// engine for the next client now rather than three PTOs later. A
+        /// pool full of closing connections refused the clients replacing
+        /// them: on the benchmark's c1k-h3, every handshake its client gave
+        /// up on and every connection the request cap retired.
+        fn entomb(server: *ServerType, conn: *ConnType) void {
+            const slot = conn.h3.?;
+            assert(closeSaid(conn));
+            assert(!slot.driving);
+            // The clock, which starts the period if nothing has (a draining
+            // connection's, until a clock sees the state) and ends one whose
+            // deadline a late loop has already passed.
+            const now_ns = server.io.nowNs();
+            slot.quic.onTimeout(now_ns);
+            if (!slot.quic.isClosed()) {
+                const deadline_ns = slot.quic.timeout().?;
+                assert(deadline_ns > now_ns);
+                const index = server.h3_slots.indexOf(slot);
+                server.h3_tombstones[index] = slot.tombstone(deadline_ns);
+            }
+            server.beginTeardown(conn);
         }
 
         /// A connection told to go away closes once its last exchange is
