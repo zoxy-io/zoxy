@@ -303,7 +303,10 @@ pub fn Endpoint(comptime runtime: Runtime) type {
                 .destination = classified.destination,
                 .retry = retried,
                 .peer = peer.*,
-            }) orelse return;
+            }) catch |err| switch (err) {
+                error.Shed => return endpoint.refuse(classified, peer),
+                error.Declined => return,
+            };
             Driver.start(server, conn, datagram);
         }
 
@@ -336,6 +339,33 @@ pub fn Endpoint(comptime runtime: Runtime) type {
                 return endpoint.giveSend(send);
             };
             server.counters.increment("h3_retries");
+            endpoint.armSend(send, octets, 0, peer);
+        }
+
+        /// RFC 9000 §5.2.2: an Initial there was no room for, refused with
+        /// CONNECTION_REFUSED (#454). Unanswered, its client waited out its
+        /// handshake timeout before it could try again or elsewhere; this
+        /// tells it at once. A few dozen octets against the client's 1200,
+        /// so it amplifies nothing. With no send buffer free it goes
+        /// unanswered, as before.
+        fn refuse(endpoint: *Self, classified: *const quic.endpoint.Datagram, peer: *const IpAddress) void {
+            const server = endpoint.server;
+            // `admit` refuses only an Initial that may start a connection.
+            assert(classified.mayStart());
+            const send = endpoint.takeSend() orelse return server.counters.increment("h3_datagrams_dropped");
+            // No connection follows, so the identifier it names as this
+            // side's only has to be one the client did not choose.
+            var source_octets: [constants.h3_connection_id_bytes]u8 = undefined;
+            server.io.fillRandom(&source_octets);
+            const source = ConnectionId.init(&source_octets) catch unreachable; // Eight octets.
+            const octets = quic.endpoint.writeRefusal(crypto.Backend, &send.buffer, classified, source) catch {
+                // Only `OutputTooLong` can happen (h3's `RefusalError`), and
+                // a send buffer holds a whole datagram, far more than a
+                // refusal. Counted all the same, so it could not go unseen.
+                endpoint.giveSend(send);
+                return server.counters.increment("h3_datagrams_dropped");
+            };
+            server.counters.increment("h3_refused");
             endpoint.armSend(send, octets, 0, peer);
         }
 

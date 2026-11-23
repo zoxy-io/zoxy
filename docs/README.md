@@ -1370,8 +1370,10 @@ which a client retries.
 
 Once the pool is half full, a new connection is first sent a Retry, so the
 client proves its address before a slot is spent on it. A first Initial
-that finds no slot is left unanswered (`zoxy_h3_shed_connections`), and the
-client's own timer retries it.
+that finds no slot is refused: answered with `CONNECTION_REFUSED` (RFC 9000
+§5.2.2, `zoxy_h3_refused`), so the client fails at once and can try again or
+elsewhere rather than waiting out its handshake timeout
+(`zoxy_h3_shed_connections` counts why).
 
 A QUIC binding belongs to one process: it is bound without `SO_REUSEPORT`,
 because the kernel hashes each datagram, not each connection, and a second
