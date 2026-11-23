@@ -61,6 +61,24 @@ const options: Options = .{
     },
 };
 
+/// The bed's options with a request cap of one: the second request on a
+/// connection is the one that reaches it, so its answer is the last.
+const capped_options: Options = .{
+    .listeners = &.{.{
+        .bind = .{ .ip = loopback(listen_port) },
+        .tls = .{ .cert_pem = cert_pem, .key_pem = key_pem, .label = "the test's fixture" },
+        .protocol = .{ .http = .{
+            .target = .{ .cluster = "origin" },
+            .max_body_bytes = defaults.max_body_bytes,
+            .keepalive_requests = 1,
+            .quic = .{ .bind = .{ .ip = loopback(listen_port) } },
+        } },
+    }},
+    .clusters = options.clusters,
+    .timeouts = options.timeouts,
+    .limits = options.limits,
+};
+
 /// An origin that answers every request head with `origin_answer` and
 /// closes.
 const Origin = struct {
@@ -379,6 +397,32 @@ test "h3 server: a Retried client's Initial, delivered twice, starts one connect
     // The pool is full while the copy arrives, so a copy taken for a new
     // client is shed rather than admitted — which says the same thing.
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("h3_shed_connections"));
+}
+
+test "h3 server: a connection the request cap ends closes only once the client has heard all of it" {
+    // The first request is answered; the second reaches the cap of one, so
+    // the GOAWAY names it and it is refused. With no exchange left, the
+    // connection closed in the same pass — and a closing endpoint sends
+    // CONNECTION_CLOSE and nothing else (RFC 9000 §10.2.1), so the first
+    // answer, handed to the transport and not yet sent, never was. On every
+    // seed. zrk saw a clean close with that request in flight: one read
+    // error per capped connection, exactly 1,000 on the benchmark's c1k-h3.
+    for (1..9) |seed| {
+        const bed = try Bed.createWith(seed, .{ .partial_io = false }, &capped_options);
+        defer bed.destroy();
+        try bed.run(&.{ .{ .path = "/one" }, .{ .path = "/two" } });
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_keepalive_requests_capped"));
+        // The GOAWAY reached the client, naming the second request.
+        try std.testing.expectEqual(@as(?u64, 4), bed.client.goaway);
+        // The first, below it, arrived whole.
+        try std.testing.expect(bed.client.answers[0].finished);
+        try std.testing.expectEqualStrings("hello", bed.client.answers[0].bodyBytes());
+        // The second was refused, which is what lets a client send it
+        // again on another connection (RFC 9114 §5.2).
+        try std.testing.expect(bed.client.answers[1].reset);
+        try std.testing.expect(!bed.client.answers[1].finished);
+        try std.testing.expectEqual(@as(u32, 1), bed.origin.answered);
+    }
 }
 
 /// A client that says one Initial and then nothing, ever: a TestClient's

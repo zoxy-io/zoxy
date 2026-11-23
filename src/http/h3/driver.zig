@@ -144,14 +144,15 @@ pub fn Driver(comptime runtime: Runtime) type {
         /// has no control stream to say it on, and is closed outright.
         pub fn beginDrain(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .h3);
-            goAway(conn);
+            goAway(server, conn);
             kick(server, conn);
         }
 
-        pub fn goAway(conn: *ConnType) void {
+        pub fn goAway(server: *const ServerType, conn: *ConnType) void {
             const slot = conn.h3.?;
             if (Half.over(conn)) return;
             if (slot.session.goaway_sent != null) return;
+            slot.goaway_ns = @max(server.io.nowNs(), 1);
             slot.session.goaway(&slot.quic, null) catch |err| switch (err) {
                 error.HandshakeIncomplete => slot.quic.closeApplication(@backingInt(ApplicationCode.no_error)),
                 // The connection is already closing, or the control stream
@@ -221,24 +222,50 @@ pub fn Driver(comptime runtime: Runtime) type {
             // Outside every read, so a drained stream's octets are dropped
             // here and never inside the read that borrowed them.
             slot.discardDrains();
-            closeIfDrained(conn);
+            closeIfDrained(server, conn);
             if (slot.quic.wantsSend()) Endpoint.queue(server, conn);
             if (conn.state != .h3) return;
             refreshDeadline(server, conn);
         }
 
         /// A connection told to go away closes once its last exchange is
-        /// done (RFC 9114 §5.2), with H3_NO_ERROR. A request stream whose
-        /// HEADERS had not yet arrived whole has no exchange, and is cut
-        /// with it, which §5.2 allows: the client retries what it never
+        /// done (RFC 9114 §5.2), with H3_NO_ERROR — and once the client has
+        /// heard everything this side said (`Slot.allHeard`), or an idle
+        /// window after the GOAWAY, whichever is first. A request stream
+        /// whose HEADERS had not yet arrived whole has no exchange, and is
+        /// cut with it, which §5.2 allows: the client retries what it never
         /// heard an answer to.
-        fn closeIfDrained(conn: *ConnType) void {
+        ///
+        /// A closing endpoint sends CONNECTION_CLOSE and nothing else (RFC
+        /// 9000 §10.2.1). Closing as soon as the last exchange was done
+        /// dropped whatever of the connection's last words the client had
+        /// not yet heard: the tail of an answer that had only been handed
+        /// to the transport, or the GOAWAY itself. The client saw a clean
+        /// close with a request in flight and no word it could send it
+        /// again — zrk's one read error per capped connection, exactly
+        /// 1,000 on the benchmark's c1k-h3. Every acknowledgement settles
+        /// the connection, so the close follows the one that empties it.
+        /// The idle window bounds a client that keeps the connection busy
+        /// without ever acknowledging, or without the credit an answer
+        /// needs, as long as a silent one is kept.
+        fn closeIfDrained(server: *ServerType, conn: *ConnType) void {
             const slot = conn.h3.?;
             if (slot.session.goaway_sent == null) return;
             if (conn.h2_streams != null) return;
             if (Half.over(conn)) return;
+            assert(slot.goaway_ns != 0);
+            if (!slot.allHeard() and server.io.nowNs() < lingerDeadline(server, slot)) return;
             slot.quic.closeApplication(@backingInt(ApplicationCode.no_error));
             assert(Half.over(conn));
+        }
+
+        /// The latest a connection that sent a GOAWAY waits for its client
+        /// to hear everything before it closes anyway.
+        fn lingerDeadline(server: *const ServerType, slot: *const Connection.Slot) u64 {
+            assert(slot.goaway_ns != 0);
+            const idle_ms = server.idleTimeoutMs();
+            assert(idle_ms >= 1);
+            return slot.goaway_ns + @as(u64, idle_ms) * std.time.ns_per_ms;
         }
 
         /// Aim the connection's one timer at the first of the transport's
@@ -279,6 +306,12 @@ pub fn Driver(comptime runtime: Runtime) type {
                     const cap = conn.birth_ns + @as(u64, server.config.max_lifetime_ms) * std.time.ns_per_ms;
                     deadline_ns = @min(deadline_ns, cap);
                 }
+            }
+            // The linger bound of `closeIfDrained`, while it is what the
+            // close waits on: with an exchange left, it waits on that, and a
+            // bound in the past would keep the timer due until it ended.
+            if (slot.goaway_ns != 0 and conn.h2_streams == null and !Half.over(conn)) {
+                deadline_ns = @min(deadline_ns, lingerDeadline(server, slot));
             }
             // A target always exists: the transport's, or the unheard window.
             assert(deadline_ns != 0);

@@ -110,6 +110,9 @@ pub const Slot = struct {
     /// a client may have open.
     drains: [requests_max]u64,
     drains_len: u8,
+    /// When this side's GOAWAY was queued, zero before it: what bounds how
+    /// long the close waits for the client to hear everything (`allHeard`).
+    goaway_ns: u64,
 
     pub const Start = struct {
         /// The packet that starts the connection: its Destination
@@ -160,10 +163,23 @@ pub const Slot = struct {
         slot.local = start.source;
         slot.driving = false;
         slot.drains_len = 0;
+        slot.goaway_ns = 0;
         const encoded = slot.quic.localTransportParameters(&slot.parameters) catch return error.NoSpaceLeft;
         slot.parameters_len = @intCast(encoded.len);
         assert(slot.parameters_len >= 1);
         assert(slot.quic.state == .handshaking);
+    }
+
+    /// Whether the transport holds nothing of this side's the client has
+    /// yet to acknowledge: no ack-eliciting packet in flight, no stream
+    /// octets or FIN waiting to be framed, no RESET_STREAM owed. The one
+    /// place outside h3 that reads its recovery and stream state.
+    pub fn allHeard(slot: *const Slot) bool {
+        assert(slot.quic.streams.count <= streams_max);
+        assert(slot.drains_len <= slot.drains.len);
+        if (slot.quic.recovery.bytes_in_flight > 0) return false;
+        if (slot.quic.streams.wantsSend()) return false;
+        return !slot.quic.streams.owesReset();
     }
 
     /// Release request stream `id` from the session, and drop at the
