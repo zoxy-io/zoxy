@@ -1186,8 +1186,12 @@ gates startup.
   timeout), its exchanges' deadlines and its age cap.
 - **Draining.** GOAWAY naming the next request stream, the requests below
   it finished, and the connection closed with `H3_NO_ERROR` once the
-  last is. The endpoint outlives its listener's drain until its last
-  connection is gone.
+  last is and the client has acknowledged all of it. The wait ends
+  sooner if three probe timeouts in a row go unanswered (#475): a client
+  whose last acknowledgement and close were lost has gone. At most it
+  lasts one idle window from the GOAWAY. The same close ends a
+  connection at the request cap. The endpoint outlives its listener's
+  drain until its last connection is gone.
 - **Paths.** The server advertises `disable_active_migration` and drops a
   connection's datagrams from any other address (§12).
 

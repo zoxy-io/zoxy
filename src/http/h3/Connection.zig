@@ -172,14 +172,28 @@ pub const Slot = struct {
 
     /// Whether the transport holds nothing of this side's the client has
     /// yet to acknowledge: no ack-eliciting packet in flight, no stream
-    /// octets or FIN waiting to be framed, no RESET_STREAM owed. The one
-    /// place outside h3 that reads its recovery and stream state.
+    /// octets or FIN waiting to be framed, no RESET_STREAM owed. With
+    /// `unanswered`, the only places in zoxy that read the transport's
+    /// recovery and stream state, both for the close after a GOAWAY.
     pub fn allHeard(slot: *const Slot) bool {
         assert(slot.quic.streams.count <= streams_max);
         assert(slot.drains_len <= slot.drains.len);
         if (slot.quic.recovery.bytes_in_flight > 0) return false;
         if (slot.quic.streams.wantsSend()) return false;
         return !slot.quic.streams.owesReset();
+    }
+
+    /// Whether the client has let `h3_unanswered_probes_max` probe
+    /// timeouts in a row pass without acknowledging anything: the
+    /// transport's backoff count, which any acknowledgement resets (RFC
+    /// 9002 §6.2.1, a server's peer counting as validated). A client that
+    /// left without its last acknowledgement or close reaching this side
+    /// never resets it.
+    pub fn unanswered(slot: *const Slot) bool {
+        // Asked only of a connection waiting out its GOAWAY.
+        assert(slot.goaway_ns != 0);
+        assert(slot.session.goaway_sent != null);
+        return slot.quic.recovery.pto_count >= constants.h3_unanswered_probes_max;
     }
 
     /// Release request stream `id` from the session, and drop at the

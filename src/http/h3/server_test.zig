@@ -425,6 +425,71 @@ test "h3 server: a connection the request cap ends closes only once the client h
     }
 }
 
+/// A client of the capped bed that goes once its answers are in
+/// (`TestClient.vanishes`), and a look at the server's QUIC pool a while
+/// later: long past a few probe timeouts, far short of the idle window.
+const GoneClient = struct {
+    bed: *Bed,
+    timer: SimIo.Completion,
+    /// QUIC connections the server still held at the look.
+    held: ?u32,
+
+    const requests = [_]TestClient.Request{ .{ .path = "/one" }, .{ .path = "/two" } };
+    const look_after_ns: u64 = 2 * std.time.ns_per_s;
+
+    fn start(gone: *GoneClient, bed: *Bed, seed_base: u8) !void {
+        assert(@as(u64, bed.config.idle_timeout_ms) * std.time.ns_per_ms > 10 * look_after_ns);
+        gone.bed = bed;
+        gone.timer = .{};
+        gone.held = null;
+        var seed: [64]u8 = undefined;
+        for (&seed, 0..) |*octet, index| octet.* = @intCast(index + seed_base);
+        try bed.client.start(&bed.sim_io, loopback(listen_port), &requests, seed, onClientDone, gone);
+        bed.client.vanishes = true;
+        bed.sim_io.timerStart(&gone.timer, look_after_ns, GoneClient, gone, onLook);
+    }
+
+    fn onClientDone(context: *anyopaque) void {
+        _ = context;
+    }
+
+    fn onLook(gone: *GoneClient, result: Io.TimerError!void) void {
+        result catch unreachable;
+        var held: u32 = 0;
+        for (gone.bed.server.h3_owners) |owner| {
+            if (owner != null) held += 1;
+        }
+        gone.held = held;
+        gone.bed.origin.stop();
+        gone.bed.server.beginDrain();
+    }
+};
+
+test "h3 server: a capped connection whose client has gone frees its slot in a few probe timeouts" {
+    // #475. The cap of one answers the first request and refuses the
+    // second at the GOAWAY, and the client goes without acknowledging the
+    // last of it: a client whose final datagram, its acknowledgement and
+    // its close, was lost. The connection waited for that acknowledgement
+    // until an idle window after the GOAWAY, a minute here, and held its
+    // whole slot throughout. Now its probes go unanswered and it closes a
+    // few PTOs in.
+    for (1..9) |seed| {
+        const bed = try Bed.createWith(seed, .{ .partial_io = false }, &capped_options);
+        defer bed.destroy();
+        const gone = try std.testing.allocator.create(GoneClient);
+        defer std.testing.allocator.destroy(gone);
+        try gone.start(bed, @intCast(seed));
+        try bed.sim_io.run();
+        try std.testing.expect(bed.client.done);
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_keepalive_requests_capped"));
+        try std.testing.expect(bed.client.answers[0].finished);
+        try std.testing.expect(bed.client.answers[1].reset);
+        try std.testing.expectEqual(@as(?u32, 0), gone.held);
+        try std.testing.expect(bed.server.isIdle());
+        try std.testing.expect(bed.server.reconcile());
+    }
+}
+
 test "h3 server: a client the pool has no room for is refused, not left to time out" {
     // One HTTP/3 connection at a time. The second client starts while the
     // first's connection still holds the slot through its closing period,

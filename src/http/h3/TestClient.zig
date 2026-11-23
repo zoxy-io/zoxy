@@ -112,6 +112,11 @@ pub fn TestClient(comptime IoType: type) type {
         /// The server refused the connection (CONNECTION_REFUSED, RFC 9000
         /// §5.2.2) rather than leaving its Initial unanswered.
         refused: bool,
+        /// Once its answers are in, stop as a client whose last datagram
+        /// was lost looks to the server: nothing more sent, not even the
+        /// acknowledgement of what completed them, and no close. Set after
+        /// `start`.
+        vanishes: bool,
         /// The identifier of the server's GOAWAY, if one arrived: what tells
         /// a refused request the client may send again from one it lost.
         goaway: ?u64,
@@ -158,6 +163,7 @@ pub fn TestClient(comptime IoType: type) type {
             client.started_ns = io.nowNs();
             client.peer_closed_ns = 0;
             client.refused = false;
+            client.vanishes = false;
             client.goaway = null;
             client.on_done = on_done;
             client.context = context;
@@ -211,7 +217,7 @@ pub fn TestClient(comptime IoType: type) type {
                 }
             }
             if (client.quic.handshakeConfirmed() and !client.requested) client.sendRequests();
-            if (client.answered()) return client.close();
+            if (client.answered()) return if (client.vanishes) client.vanish() else client.close();
             client.flush();
         }
 
@@ -354,6 +360,15 @@ pub fn TestClient(comptime IoType: type) type {
             client.close();
         }
 
+        /// `vanishes`: closing without a close, so nothing is sent again and
+        /// the socket goes once the ops in flight are in.
+        fn vanish(client: *Self) void {
+            assert(client.vanishes);
+            assert(!client.closing);
+            client.closing = true;
+            client.finishIfClosed();
+        }
+
         fn close(client: *Self) void {
             if (!client.closing) {
                 client.closing = true;
@@ -367,6 +382,7 @@ pub fn TestClient(comptime IoType: type) type {
         fn flush(client: *Self) void {
             if (client.sending) return;
             if (client.done) return;
+            if (client.closing and client.vanishes) return client.finishIfClosed();
             const octets = client.quic.send(&client.send_buffer, client.io.nowNs()) catch 0;
             if (octets == 0) return client.finishIfClosed();
             client.sending = true;
@@ -423,7 +439,7 @@ pub fn TestClient(comptime IoType: type) type {
             if (!client.closing) return;
             if (client.done) return;
             if (client.sending) return;
-            if (client.quic.wantsSend()) return client.flush();
+            if (client.quic.wantsSend() and !client.vanishes) return client.flush();
             if (client.receiving) {
                 if (!client.cancel_armed) {
                     client.cancel_armed = true;
