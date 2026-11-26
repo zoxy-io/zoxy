@@ -495,7 +495,10 @@ Fixed reservations beside the pools:
 - listeners;
 - fixed reservations for the admin plane, access log, probes, signal,
   drain, the parked-upstream sweep and the watchdog;
-- per HTTP/2 origin connection, `h2_origin_ops_max` (4).
+- per HTTP/2 origin connection, `h2_origin_ops_max` (4);
+- the resolver's (#481), `resolverOps`: two per socket, one per query,
+  and its timer with the timer's cancel — none without a cluster that
+  follows names.
 
 Upstream slots cost nothing here. A leased one's socket ops are its
 exchange's, charged to the stream, and a parked one holds no op: one
@@ -515,7 +518,8 @@ connection can be mid-exchange at once.
 - upstream slots;
 - health probes;
 - 2 × a log file (held, plus the one opening during a reopen);
-- HTTP/2 origin connections.
+- HTTP/2 origin connections;
+- the resolver's sockets (#481), one per nameserver family.
 
 The defaults fit under the stock `RLIMIT_NOFILE` of 4096. That is why
 the upstream default (1311) sits below the conn default (1386).
@@ -1013,12 +1017,93 @@ shed the request. A retry that has tried every routable endpoint answers
   - **A name that does not resolve** stops the start
     (`EndpointNameUnresolved`), and `--check` exits `2` on it: the box's
     verdict, not the config's.
+  - **Followed** (#481): a cluster with `dns` leaves its names to zoxy's
+    own resolver instead, at startup and while it serves — below.
   - **A `unix:` listener has no client address,** so the loader refuses
     what would need one: `forwarded`, `match.client`, `source_ip`
     hashing, and reaching a cluster that sends a PROXY header.
   - **The socket file at startup:** a missing path is created; a stale
     *socket* is removed; anything else at the path refuses the start.
     `mode` is an octal string.
+
+### Names while serving
+
+A cluster with a `dns` block (#481) follows its names: `Options.Cluster.dns`
+holds the names, each with its port, weight, tier and family, and
+`endpoints` the cluster's own IP addresses, which are in every set it
+takes. `Options.resolver` names the nameservers — one to three, IP and
+port — and one query's timeout; the stock binary reads them from
+`/etc/resolv.conf` when its config names none. A resolver no cluster
+asks, and a cluster that follows names with none to ask, are refused.
+
+- **The first answer comes before step zero.** `App` asks the
+  nameservers for every name that states no addresses
+  (`dns/startup.zig`), blocking, in the wire format the resolver speaks
+  once it serves — so the set a cluster starts with and every later one
+  come from one source, never the system resolver's hosts file and search
+  domains. A name no nameserver gives an address stops the start.
+  `config.resolve` then sees addresses: it starts the cluster from its
+  own and every name's, each address once.
+- **Room.** The cluster's endpoint slots (#428) are sized by zoxy:
+  its own addresses and twice every query's room, `addresses_max` per
+  name and family, so a whole new set fits while the one it replaces
+  drains. `endpoint_slots` beside `dns` is refused, `Startup.endpointSet`
+  answers null for the cluster, and a `unix:` endpoint in it is refused,
+  since every set the resolver writes names IP endpoints alone.
+- **The resolver** (`dns/resolver.zig`) is a loop citizen shaped like
+  the prober:
+  - one UDP socket per nameserver family, bound to the unspecified
+    address on a port the kernel picks, a receive always armed on it;
+  - one query per name and record type, an A query, an AAAA query, or
+    both, each holding the addresses its last answer gave;
+  - one round per cluster: its queries run together, and when the last
+    settles the cluster is offered its own addresses and every query's,
+    each once, through `endpoint_sets.replace` — so an address that
+    leaves drains, one that arrives is probed first on a checked
+    cluster, and one that stays keeps its slot. A round whose answers
+    changed nothing offers nothing;
+  - one timer, armed at the earliest query deadline or due round, and
+    never further out than half the shorter of the query timeout and the
+    refresh floor: an event the timer was not armed for — a round a reply
+    finished, an attempt a SERVFAIL began — waits at most that long, and
+    nothing but the drain cancels the timer.
+- **An attempt** asks one nameserver under a fresh random ID, from
+  `fillRandom`. No reply within `timeout_ms`, or SERVFAIL, REFUSED or
+  another RCODE, asks the next nameserver; past the last, the query fails
+  this round and keeps what it had. NXDOMAIN and a truncated answer fail
+  it at once. A NOERROR answer replaces its addresses, sorted, each
+  once, the first `addresses_max` kept (`dns_answers_truncated`) — an
+  answer with no record empties them.
+- **A reply is believed** only from the nameserver the attempt asked,
+  under the attempt's ID, echoing its one question, and only for
+  addresses owned by the name or by the end of a CNAME chain from it in
+  the answer section (`dns/message.zig`). Everything else is
+  `dns_replies_dropped`: a late reply, a forged one, one cut at
+  `dns_message_bytes_max`. What stands between an off-path forger and a
+  cluster is the ID's 16 bits and a source port the kernel picks once,
+  for the process's life, so there is no DNSSEC and no claim past that:
+  the documented deployment is a local or cluster resolver. A CNAME
+  chain that ends at no record is the server's failure, not an empty
+  name, and asks the next nameserver.
+- **The pace.** The next round waits the least TTL the round saw, held
+  between `refresh_min_ms` and `refresh_max_ms`; after any failure, or a
+  set the cluster refused, the floor. Up to a tenth more is drawn from
+  `fillRandom`, so processes started together do not ask together for
+  ever, and the first round of each is the floor, likewise drawn.
+- **A refused set** — no room while the last one drains, or no endpoint
+  at all because every name answered with none — leaves the cluster
+  serving the set it has (`dns_updates_refused`), and the next round
+  offers again.
+- **The counters.** Every query begun (`dns_queries_sent`) ends in one
+  of `dns_answered`, `dns_nxdomain`, `dns_servfail`, `dns_truncated`,
+  `dns_timed_out` and `dns_canceled`, or is still out: `reconcile` holds
+  the sum. `dns_updates_applied` counts the sets taken.
+- **The drain** stops the resolver with the prober: the attempts out
+  are counted canceled, the timer and each receive are cancelled, the
+  sends complete, and the sockets close once nothing is armed.
+- **What it costs** is in the banner (`dns resolver`): the query table,
+  each query's room, the rounds and one set's scratch, and the slots
+  above in the endpoint tables.
 
 ### Health
 
@@ -1550,8 +1635,10 @@ external binaries. They and the speed gates run at merge.
     asserts *when* something happened, not only *that* it did.
   - **Not swept, covered by directed tests and the live gate instead:**
     HTTP/2 to origins, HTTPS clusters, SNI routing and certificate
-    selection, RSA, mutual TLS, and gRPC deadlines.
-- **Fuzzing.** Eighteen `std.testing.fuzz` targets cover every parser
+    selection, RSA, mutual TLS, gRPC deadlines, and clusters that follow
+    names — whose resolver runs under `SimIo` against scripted
+    nameservers and the datagram adversary in `dns/resolver_test.zig`.
+- **Fuzzing.** Twenty-one `std.testing.fuzz` targets cover every parser
   edge:
   - the HTTP/1.1 head and chunked parsers, and the render;
   - the config;
@@ -1559,6 +1646,8 @@ external binaries. They and the speed gates run at merge.
   - the HTTP/2 session in both roles, the downgrade, and origin and
     response mapping;
   - the ClientHello and PROXY parsers;
+  - DNS replies, an endpoint's DNS name, and the merge of a cluster's
+    addresses (#480, #481);
   - the `Date` stamp;
   - credentials and the trust chain.
 
@@ -1588,9 +1677,13 @@ external binaries. They and the speed gates run at merge.
       backend, run as a process of its own (`smoke/h3_probe.zig`). So the
       leg proves the shipped build serves HTTP/3 on a real kernel; agreeing
       with an independent implementation is h3spec's job;
-    - sticky cookies, bodies, an allowlist, gRPC probes;
-    - `--check`;
-    - the watchdog.
+    - sticky cookies, bodies, an allowlist, gRPC probes, and a sticky
+      cluster whose endpoint is `localhost` (#480);
+    - `--check`, an unresolvable name exiting `2` among its cases;
+    - the watchdog;
+    - a cluster that follows a name the harness's own nameserver answers
+      over real UDP: the start resolves it, a request reaches the origin,
+      the name moves, and the proxy takes one new set and drains (#481).
   - **It runs twice:** against the default build, and against the
     ReleaseSafe build that ships.
 - **h2spec** runs over h2c and over TLS against the ReleaseSafe build.
@@ -1658,6 +1751,9 @@ src/
   dns/
     host.zig            an endpoint's DNS name: what spelling is one, its canonical form, its family
     endpoints.zig       a name's answers as endpoints: their order, an address kept once
+    message.zig         DNS queries and replies, as the resolver reads and test servers write them
+    resolver.zig        the clusters that follow names, re-resolved on the loop
+    startup.zig         the first answer for every followed name, before step zero
     schema.zig          the schema emitter (zig build schema)
     validator.zig       the dialect validator behind the schema/loader differential gate
   balancer.zig          the pick: drain, tried, health, caps, tiers; p2c | rr | hash; cookies
@@ -1721,7 +1817,7 @@ src/
   tls_heap_proof.zig    the libcrypto heap measurements (zig build tls-heap-proof)
   testing/              shared test helpers: fuzz seeds, an origin, the scripted extensions,
                         and the embedder's bed and zero-allocation gate (zoxy.testing, §13)
-  *_test.zig            directed suites, mostly over SimIo (13 files)
+  *_test.zig            directed suites, mostly over SimIo (14 files)
 sim/                    the simulator: Harness, L4 and L7 populations, oracles
 smoke/                  the live gate and the h2spec and h3spec harnesses
 bench/                  zrk loopback harness, profile, micro benches
@@ -1873,14 +1969,15 @@ extensions they list.
   other `pub` declarations are module visibility for zoxy's own files,
   not surface.
 - **The startup sequence**, written once in `app.zig`:
-  0. resolve the options, and refuse a selection the build does not
-     list (`ExtensionUnserved`), a head buffer smaller than the widest
-     answer the build's policies declare (`AnswerHeadOverBuffer`) or
-     its handlers' (`HandlerResponseOverBuffer`), policy lists that
-     could overrun the render's edits (`PolicyEditsOverLimit`), or a
-     consulting policy selected with no consult slot
-     (`ConsultSlotsRequired`). `App.check` runs this step too, so
-     `--check` refuses what a start would;
+  0. ask the nameservers for every name a cluster follows that states no
+     addresses (#481); then resolve the options, and refuse a selection
+     the build does not list (`ExtensionUnserved`), a head buffer
+     smaller than the widest answer the build's policies declare
+     (`AnswerHeadOverBuffer`) or its handlers'
+     (`HandlerResponseOverBuffer`), policy lists that could overrun the
+     render's edits (`PolicyEditsOverLimit`), or a consulting policy
+     selected with no consult slot (`ConsultSlotsRequired`). `App.check`
+     runs this step too, so `--check` refuses what a start would;
   1. price the config and print the banner (§5);
   2. take the fd budget, open the log sink, load every certificate;
   3. build the loop and the server, bind the extensions, hand over the

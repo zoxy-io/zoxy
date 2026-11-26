@@ -230,10 +230,12 @@ Three rules hold for the whole file:
   closing the port.
 - **Unknown fields are rejected.** A misspelt key stops startup with an
   error; it is never ignored.
-- **Names resolve once.** An endpoint is an `IP:port`, a `unix:` path, or
-  a DNS name and port that zoxy resolves at startup
-  ([Endpoints by DNS name](#endpoints-by-dns-name)). Binds are always
-  literal.
+- **Names resolve at startup.** An endpoint is an `IP:port`, a `unix:`
+  path, or a DNS name and port that zoxy resolves at startup
+  ([Endpoints by DNS name](#endpoints-by-dns-name)), and follows while
+  serving only where a cluster asks
+  ([Following a name while serving](#following-a-name-while-serving)).
+  Binds are always literal.
 
 #### Words this manual uses
 
@@ -1581,7 +1583,9 @@ An endpoint may name its origin by DNS name and port:
 
 zoxy resolves each name once, at startup, with the system's resolver: the
 hosts file and `resolv.conf`'s search domains count, as for any other
-program on the machine. Every address the name has becomes an endpoint with
+program on the machine. A cluster with a `dns` block is the exception:
+[it follows its names](#following-a-name-while-serving) with zoxy's own
+resolver instead. Every address the name has becomes an endpoint with
 the entry's `weight` and `priority`, in the entry's place; a name's own
 addresses go IPv4 first and then in address order.
 `family` chooses which addresses: `ipv4` (the default; A records), `ipv6`
@@ -1600,8 +1604,72 @@ zoxy: api.internal:8080 is 10.0.0.1:8080 10.0.0.2:8080
 - **A name that does not resolve** stops the start, and
   [`zoxy --check`](#checking-a-config-without-running-it) exits `2` on it:
   the config may be right on a machine whose resolver knows the name.
-- **The addresses are fixed** once resolved. A name that moves to new
-  addresses needs a restart, which resolves it again.
+- **The addresses are fixed** once resolved, unless the cluster follows
+  its names. Without `dns`, a name that moves to new addresses needs a
+  restart, which resolves it again.
+
+#### Following a name while serving
+
+A cluster with a `dns` block keeps asking its names while it serves, and
+its endpoints follow the answers: a Kubernetes headless service, a cloud
+load balancer whose addresses rotate, a failover record.
+
+```json
+"clusters": {
+    "api": {
+        "endpoints": ["api.internal:8080", "10.0.9.1:8080"],
+        "dns": { "refresh_min_ms": 1000, "refresh_max_ms": 60000, "addresses_max": 16 },
+        "check": { "type": "http", "path": "/healthz" }
+    }
+},
+"resolver": { "nameservers": ["10.96.0.10"], "timeout_ms": 2000 }
+```
+
+- **Who is asked.** zoxy's own resolver asks the `resolver` block's
+  nameservers over UDP, in order: the next when one times out (after
+  `timeout_ms`, 2000 by default) or answers SERVFAIL or REFUSED. A
+  nameserver without a port is on 53. Without a `resolver` block, the
+  nameservers `/etc/resolv.conf` names are asked.
+- **Names are asked as written.** No search domains and no hosts file:
+  write the full name. The startup answer comes from the same
+  nameservers, so the cluster never starts from an answer it would not
+  get again.
+- **At startup** each name is asked once, and the start waits for it. A
+  name with no address stops the start, and `--check` exits `2`, as for
+  a name resolved once. Its addresses are printed on stderr before the
+  banner.
+- **While serving** each name is asked again as its answer's TTL runs
+  out, held between `refresh_min_ms` (1000 by default) and
+  `refresh_max_ms` (60000), plus up to a tenth more, drawn, so processes
+  do not ask together. The cluster's endpoints are its IP addresses and
+  each name's latest, each address once. An address that leaves drains:
+  no new requests, and the ones in flight finish. One that arrives takes
+  traffic at once, or, on a health-checked cluster, once its first probe
+  passes.
+- **When DNS fails** the name keeps the addresses it had: every
+  nameserver timing out, NXDOMAIN, or an answer too large for one
+  datagram (1232 octets). An answer with no address of the name's family
+  does empty it, and if that leaves the cluster with no endpoint at all,
+  the cluster keeps the set it has and asks again at `refresh_min_ms`.
+- **Replies are checked, not signed.** One counts only from the
+  nameserver asked, with the query's ID and question, and only for the
+  name or a CNAME it points to. Point `resolver` at a local or cluster
+  DNS server, as you would any client.
+- **Room.** `addresses_max` (16 by default, at most 64) caps one name's
+  addresses in each family; an answer with more keeps the first in
+  address order. The cluster's endpoint tables hold twice that for each
+  name and family, so a whole new set fits while the old one drains. The
+  banner prices the tables, and the resolver as `dns resolver`.
+- **Not beside** a `unix:` endpoint in the same cluster.
+
+The resolver's counters: `dns_queries_sent`, each query ending in one of
+`dns_answered`, `dns_nxdomain`, `dns_servfail`, `dns_truncated`,
+`dns_timed_out`, or `dns_canceled` at the drain; `dns_replies_dropped`
+for a datagram that answers no query out (late, forged or malformed);
+`dns_answers_truncated` for an answer past `addresses_max`; and
+`dns_updates_applied` and `dns_updates_refused` for the sets offered to
+clusters. A cluster stuck on old addresses shows as `dns_timed_out` or
+`dns_nxdomain` rising while `dns_updates_applied` stays where it was.
 
 #### Weights
 
@@ -2108,6 +2176,7 @@ budgets (DESIGN.md §5/§8; closed-form except where marked):
           + h3 connections 0 x 0 B + quic endpoints 0 x 0 B + h3 scratch 0 B
           + h2 origins 0 x 0 B + origin streams 0 x 0 B
           + https origin sessions 0 x 0 B
+          + dns resolver 0 B (0 queries, for clusters that follow names)
           + config arena 9 KiB (measured, not closed-form)
   fds     4093 required (asserted against RLIMIT_NOFILE)
   ring    4096 entries, completion queue 8192, in-flight ops <= 5559
