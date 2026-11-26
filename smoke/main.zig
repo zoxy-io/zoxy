@@ -31,6 +31,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 
 const client_module = @import("client.zig");
+const dns_module = @import("dns.zig");
 const h2c_module = @import("h2c.zig");
 const h2_origin_module = @import("h2_origin.zig");
 const origin_module = @import("origin.zig");
@@ -51,6 +52,10 @@ const h3_probe_log_path = work_directory ++ "/h3-probe.log";
 /// and it must not be the one every other verdict here is reading.
 const watchdog_config_path = work_directory ++ "/watchdog.json";
 const watchdog_log_path = work_directory ++ "/watchdog.log";
+/// #481's leg runs a proxy of its own too, following a name this harness
+/// answers for, so its config and its output are its own.
+const dns_config_path = work_directory ++ "/dns.json";
+const dns_log_path = work_directory ++ "/dns.log";
 
 /// The #159 bodies this run configures. `robots_body` goes through the
 /// **file** arm — written here, read by the real binary at startup — so
@@ -636,6 +641,7 @@ const Stage = enum {
     https_scrape,
     h3_leg,
     watchdog_leg,
+    dns_leg,
     drain,
     verdicts,
 
@@ -656,6 +662,7 @@ const Stage = enum {
             .https_alpn_refusal => "the ALPN refusal (#271)",
             .https_handshake => "the https handshake",
             .watchdog_leg => "the loop-watchdog leg (#311)",
+            .dns_leg => "the dns leg (#481)",
             .https_request => "an https request",
             .https_close_notify => "the https close_notify",
             .https_scrape => "the https leg's scrape",
@@ -785,6 +792,9 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     // drain that ends it.
     enterStage(.watchdog_leg);
     const watchdog_ok = try loopWatchdogPassed(arena, io, flags.zoxy_path);
+    // Its own proxy too, against the same origin.
+    enterStage(.dns_leg);
+    const dns_ok = try dnsLegPassed(arena, io, flags.zoxy_path);
 
     enterStage(.drain);
     const drained_cleanly = try drain(io, &child, &running);
@@ -797,7 +807,7 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     const drain_ok = drainPassed(drained_cleanly);
     const passed = log_ok and counters.passed and sticky_ok and bodies_ok and
         allowlist_ok and h2c_ok and origin_legs_ok and tls_ok and h3_ok and memory_ok and
-        drain_ok and check_ok and watchdog_ok;
+        drain_ok and check_ok and watchdog_ok and dns_ok;
     return report(io, &lines, &counters, &memory, passed);
 }
 
@@ -2535,6 +2545,152 @@ fn loopWatchdogPassed(arena: std.mem.Allocator, io: Io, zoxy_path: []const u8) !
         );
     }
     return said_so;
+}
+
+/// Where the followed name points (#481): the origin, on the harness's
+/// loopback, until the leg moves it to an address nothing listens at —
+/// which nothing dials, since the leg sends no request after the move.
+const dns_before = [4]u8{ 127, 0, 0, 1 };
+const dns_after = [4]u8{ 127, 0, 0, 2 };
+
+/// How long the leg waits for the proxy to follow the moved name: twenty
+/// refresh floors of its config, scraped every 25 ms.
+const dns_follow_attempts_max: u32 = 80;
+
+/// #481's leg: a proxy whose cluster follows `dns_module.host`, answered
+/// by this harness's own nameserver. Its start asks the nameserver and
+/// names the answer on stderr; a request then reaches the origin through
+/// it; the name moves, and the proxy follows within a few refreshes, the
+/// counters saying so; and it drains cleanly with its resolver running.
+fn dnsLegPassed(arena: std.mem.Allocator, io: Io, zoxy_path: []const u8) !bool {
+    var nameserver: dns_module.Nameserver = undefined;
+    try nameserver.start(io, dns_before, dns_after);
+    defer nameserver.stop();
+    const listen_port = try reserveWatchdogPort(io);
+    const admin_port = try reserveWatchdogPort(io);
+    try writeDnsConfig(arena, io, &.{ listen_port, admin_port, nameserver.port, origin.port });
+    var child = try spawnLegZoxy(io, zoxy_path, dns_config_path, dns_log_path);
+    var running = true;
+    defer if (running) child.kill(io);
+    try awaitListening(io, listen_port);
+
+    var passed = true;
+    if (!try dnsRequestAnswered(io, listen_port)) {
+        std.debug.print("FAIL: a request through the followed name did not reach the origin\n", .{});
+        passed = false;
+    }
+    nameserver.move();
+    const scrape = try awaitDnsFollowed(arena, io, admin_port) orelse {
+        std.debug.print("FAIL: the proxy never followed the moved name ({d} answered)\n", .{nameserver.answered.load(.monotonic)});
+        return false;
+    };
+    // One set taken, the origin's address leaving and the new one
+    // arriving, and no reply the nameserver sent dropped.
+    const expected = [_]struct { []const u8, u64 }{
+        .{ "dns_updates_applied", 1 },
+        .{ "endpoints_departed", 1 },
+        .{ "endpoints_arrived", 1 },
+        .{ "dns_replies_dropped", 0 },
+        .{ "dns_updates_refused", 0 },
+    };
+    for (expected) |entry| {
+        const value = counterOf(&scrape, entry[0]) orelse return false;
+        if (value == entry[1]) continue;
+        std.debug.print("FAIL: dns leg: {s} is {d}, not {d}\n", .{ entry[0], value, entry[1] });
+        passed = false;
+    }
+    if (!try drain(io, &child, &running)) {
+        std.debug.print("FAIL: the dns leg's proxy did not drain cleanly\n", .{});
+        passed = false;
+    }
+    const said = try std.fmt.allocPrint(arena, "zoxy: {s}:{d} is 127.0.0.1:{d}\n", .{ dns_module.host, origin.port, origin.port });
+    if (!try legLogMentions(arena, io, dns_log_path, said)) {
+        std.debug.print("FAIL: the dns leg's proxy did not name its startup answer\n", .{});
+        passed = false;
+    }
+    return passed;
+}
+
+/// One request through the leg's listener, answered 200.
+fn dnsRequestAnswered(io: Io, port: u16) !bool {
+    assert(port != 0);
+    var address: Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+    const stream = try address.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var write_buffer: [256]u8 = undefined;
+    var writer = stream.writer(io, &write_buffer);
+    try writer.interface.writeAll("GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    try writer.interface.flush();
+    var read_buffer: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buffer);
+    var head: [16]u8 = undefined;
+    reader.interface.readSliceAll(&head) catch return false;
+    return std.mem.eql(u8, &head, "HTTP/1.1 200 OK\r");
+}
+
+/// The leg's scrape once the proxy has taken a set from the moved name,
+/// or null when it never did within `dns_follow_attempts_max` scrapes.
+fn awaitDnsFollowed(arena: std.mem.Allocator, io: Io, admin_port: u16) !?scrape_module.Scrape {
+    const retry_delay = Io.Duration.fromNanoseconds(25 * std.time.ns_per_ms);
+    var attempt: u32 = 0;
+    while (attempt < dns_follow_attempts_max) : (attempt += 1) {
+        const scrape = try scrape_module.parse(try scrape_module.fetch(arena, io, admin_port));
+        const applied = scrape.value("dns_updates_applied") orelse return null;
+        if (applied >= 1) return scrape;
+        // Pacing, not correctness: the attempt cap bounds the wait.
+        io.sleep(retry_delay, .awake) catch {};
+    }
+    return null;
+}
+
+/// The leg's config: one http listener to a cluster that follows the
+/// name, refreshed at the floor, the harness's nameserver to ask, and an
+/// admin listener to read the counters off. Ports in the order the
+/// template takes them: listener, admin, nameserver, origin.
+fn writeDnsConfig(arena: std.mem.Allocator, io: Io, ports: *const [4]u16) !void {
+    for (ports) |port| assert(port != 0);
+    const config_json = try std.fmt.allocPrint(arena, dns_config_template, .{
+        ports[0],
+        dns_module.host,
+        ports[3],
+        ports[2],
+        ports[1],
+    });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dns_config_path, .data = config_json });
+}
+
+const dns_config_template =
+    \\{{
+    \\    "listeners": [
+    \\        {{ "bind": "127.0.0.1:{d}", "http": {{
+    \\          "routes": [{{ "prefix": "/", "cluster": "follow" }}] }} }}
+    \\    ],
+    \\    "clusters": {{ "follow": {{
+    \\        "endpoints": ["{s}:{d}"],
+    \\        "dns": {{ "refresh_min_ms": 100, "refresh_max_ms": 200 }} }} }},
+    \\    "resolver": {{ "nameservers": ["127.0.0.1:{d}"], "timeout_ms": 500 }},
+    \\    "admin": {{ "bind": "127.0.0.1:{d}" }}
+    \\}}
+;
+
+/// A leg's own child: its config and its own log, so the main proxy's
+/// output stays the thing `printZoxyLog` shows a failing run.
+fn spawnLegZoxy(io: Io, zoxy_path: []const u8, config: []const u8, log_path: []const u8) !std.process.Child {
+    assert(zoxy_path.len >= 1);
+    const log_file = try Io.Dir.cwd().createFile(io, log_path, .{});
+    defer log_file.close(io);
+    return std.process.spawn(io, .{
+        .argv = &.{ zoxy_path, config },
+        .stdout = .{ .file = log_file },
+        .stderr = .{ .file = log_file },
+    });
+}
+
+/// Whether a leg's proxy's own output carries `needle`.
+fn legLogMentions(arena: std.mem.Allocator, io: Io, log_path: []const u8, needle: []const u8) !bool {
+    const bytes_max: usize = 64 * 1024;
+    const text = Io.Dir.cwd().readFileAlloc(io, log_path, arena, .limited(bytes_max)) catch return false;
+    return std.mem.indexOf(u8, text, needle) != null;
 }
 
 /// Whether the stopped proxy's own output carries `needle`. Read whole:
