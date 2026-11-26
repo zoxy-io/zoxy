@@ -17,7 +17,8 @@ processes behind `SO_REUSEPORT`, never threads sharing memory.
 - **L7** — HTTP/1.1, HTTP/2 and HTTP/3 to clients; routing by host, path
   and header; request and response filters
 - **Origins** — HTTP/1.1, HTTPS, h2c and h2 over pooled connections, gRPC
-  included
+  included; addressed by IP, `unix:` socket or DNS name, which a cluster
+  may follow while it serves
 - **TLS 1.3** — terminated and originated, mutual TLS included
 - **Balancing** — power-of-two-choices, round-robin or rendezvous hashing,
   with weights and standby tiers
