@@ -12,10 +12,12 @@ pub const schema = @import("schema.zig");
 pub const validator = @import("validator.zig");
 
 pub const FileSource = loader.FileSource;
+pub const NameSource = loader.NameSource;
 pub const ParseError = loader.ParseError;
 pub const optionsFromJson = loader.optionsFromJson;
 pub const parse = loader.parse;
 pub const parseWithFiles = loader.parseWithFiles;
+pub const parseWithSources = loader.parseWithSources;
 
 test {
     _ = loader;

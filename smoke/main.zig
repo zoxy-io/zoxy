@@ -126,12 +126,25 @@ const mismatched_config_log = std.fmt.comptimePrint(
     .{ tls_cert_path, tls_sni_key_path },
 );
 
+/// A config whose one endpoint is a name no resolver knows (#480): `.invalid`
+/// is reserved never to resolve (RFC 6761 §6.4). Its first stderr line
+/// names the name and the resolver's reason, which differs from libc to
+/// libc, so the gate pins the line's start and the verdict after it.
+const unresolved_config_path = work_directory ++ "/unresolved.json";
+const unresolved_config_text =
+    \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
+    \\"clusters":{"a":{"endpoints":["zoxy-smoke.invalid:1"]}}}
+;
+const unresolved_config_reason_prefix = "zoxy: cannot resolve 'zoxy-smoke.invalid': ";
+const unresolved_config_verdict = "zoxy: invalid config '" ++ unresolved_config_path ++ "': EndpointNameUnresolved\n";
+
 /// What `--check` must exit with. Spelled here rather than imported from
 /// `main.zig`'s `CheckExit`, on the rule the rest of this file follows:
 /// the gate reads what the binary *did*, so a drift has to fail loudly
 /// rather than agree with itself.
 const check_exit_ok: u8 = 0;
 const check_exit_invalid_config: u8 = 1;
+const check_exit_does_not_fit: u8 = 2;
 
 /// The two lines that must reach stdout for the budget to have been
 /// reported at all — the banner's own header, and the verdict line only a
@@ -2768,7 +2781,7 @@ const config_template =
     \\            "check": {{ "type": "http", "path": "/health", "timeout_ms": {d} }}
     \\        }},
     \\        "sticky": {{
-    \\            "endpoints": ["127.0.0.1:{d}"],
+    \\            "endpoints": ["localhost:{d}"],
     \\            "pick": {{ "policy": "hash", "key": "cookie", "name": "zoxy-smoke-srv" }}
     \\        }},
     \\        {s}
@@ -2840,6 +2853,10 @@ fn prepareWorkDirectory(io: Io) !void {
         .sub_path = mismatched_config_path,
         .data = mismatched_config_text,
     });
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = unresolved_config_path,
+        .data = unresolved_config_text,
+    });
 }
 
 /// One `--check` run's verdict: the code it exited with, whether the
@@ -2871,6 +2888,7 @@ fn checkPassed(arena: std.mem.Allocator, io: Io, zoxy_path: []const u8) !bool {
     const refused = try runZoxyCheck(arena, io, zoxy_path, invalid_config_path);
     const oversized = try runZoxyCheck(arena, io, zoxy_path, oversized_config_path);
     const mismatched = try runZoxyCheck(arena, io, zoxy_path, mismatched_config_path);
+    const unresolved = try runZoxyCheck(arena, io, zoxy_path, unresolved_config_path);
     var passed = true;
     if (accepted.exit_code != check_exit_ok) {
         std.debug.print(
@@ -2898,6 +2916,33 @@ fn checkPassed(arena: std.mem.Allocator, io: Io, zoxy_path: []const u8) !bool {
         .priced = true,
         .what = "a certificate beside another's key",
     })) passed = false;
+    if (!unresolvedAsPinned(&unresolved)) passed = false;
+    return passed;
+}
+
+/// Whether a check run refused a name no resolver knows (#480) as the
+/// box's verdict, not the config's: exit 2, nothing priced, and two lines
+/// — the name with the resolver's reason, then the loader's verdict.
+fn unresolvedAsPinned(unresolved: *const CheckRun) bool {
+    assert(unresolved_config_reason_prefix.len >= 1);
+    assert(unresolved_config_verdict.len >= 1);
+    var passed = true;
+    if (unresolved.exit_code != check_exit_does_not_fit) {
+        std.debug.print("FAIL: --check did not exit 2 for an unresolvable name (exit {d})\n", .{unresolved.exit_code});
+        passed = false;
+    }
+    if (unresolved.budget_on_stdout) {
+        std.debug.print("FAIL: --check printed a budget for an unresolvable name\n", .{});
+        passed = false;
+    }
+    const log = unresolved.log;
+    const shaped = std.mem.startsWith(u8, log, unresolved_config_reason_prefix) and
+        std.mem.endsWith(u8, log, unresolved_config_verdict) and
+        std.mem.countScalar(u8, log, '\n') == 2;
+    if (!shaped) {
+        std.debug.print("FAIL: --check's stderr for an unresolvable name was\n{s}", .{log});
+        passed = false;
+    }
     return passed;
 }
 

@@ -578,6 +578,27 @@ pub const headers_max: u16 = 64;
 /// meets the any-host routes — never malformed, just unroutable by host.
 pub const host_bytes_max: u16 = 256;
 
+/// The longest DNS name an endpoint may give (#480), as text without the
+/// root's trailing dot: 255 octets on the wire (RFC 1035 §2.3.4) less the
+/// root label and the first length octet. Under `host_bytes_max`, so a
+/// name fits every buffer a routing host or a check's `Host` does.
+pub const dns_host_bytes_max: u16 = 253;
+
+/// The longest label of one (RFC 1035 §2.3.4).
+pub const dns_label_bytes_max: u16 = 63;
+
+/// The answers the stock binary's startup lookup (#480) may queue before
+/// it takes them. The lookup runs beside the loop that drains it, so this
+/// bounds what is in flight between the two, not how many addresses a
+/// name has.
+pub const dns_lookup_queue_entries: u16 = 64;
+
+comptime {
+    assert(dns_host_bytes_max <= host_bytes_max);
+    assert(dns_label_bytes_max < dns_host_bytes_max);
+    assert(dns_lookup_queue_entries >= 16); // std's lookup promises not to block at 16.
+}
+
 /// Upper bound on one chunk-size line (hex size, extensions, CRLF) in a
 /// chunked body (§7). Bounded so a hostile peer cannot stream an endless
 /// size line through the relay; kept under one relay buffer so a legal

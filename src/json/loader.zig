@@ -30,6 +30,8 @@ const router = zoxy.http.router;
 const shed = zoxy.shed;
 const trust = zoxy.tls.trust;
 const io_module = zoxy.Io;
+const dns_host = zoxy.dns.host;
+const dns_endpoints = zoxy.dns.endpoints;
 const json_schema = @import("validator.zig");
 /// The ALPN vocabulary (#271). Public so the schema emitter states the
 /// same closed set the loader enforces.
@@ -94,6 +96,13 @@ pub const SpellingError = error{
     ResponseFilterStatusClassUnknown,
     ResponseFilterStatusEmpty,
     EndpointInvalid,
+    /// A name no address answered for, in the family the endpoint asked
+    /// (#480): the name source answered, not the document.
+    EndpointNameUnresolved,
+    /// `family` beside an address that is no name (#480): an address has
+    /// one family already, and the key would sit there inert.
+    EndpointFamilyWithoutName,
+    EndpointFamilyUnknown,
     ClusterTlsCaUnreadable,
     AdminBindInvalid,
     AccessLogSinkUnknown,
@@ -144,6 +153,43 @@ pub const FileSource = struct {
     }
 };
 
+/// How the JSON front-end resolves the names a config's endpoints give
+/// (#480), once, at load: a seam for the reason `FileSource` is one. The
+/// binary passes the system's resolver; `parse` and the fuzzer refuse
+/// every name. What the options carry is addresses, so `resolve` looks up
+/// no name.
+pub const NameSource = struct {
+    context: ?*anyopaque = null,
+    /// The addresses `host` has in `family`, each with `port`, allocated
+    /// in the arena — at least one, or `NameUnresolved`. `host` is in the
+    /// canonical form `dns.host` gives. An address outside `family`, or
+    /// on another port, breaks the contract the loader asserts.
+    lookup: *const fn (
+        context: ?*anyopaque,
+        arena: std.mem.Allocator,
+        host: []const u8,
+        port: u16,
+        family: dns_host.Family,
+    ) error{ NameUnresolved, OutOfMemory }![]const std.Io.net.IpAddress,
+
+    pub const none: NameSource = .{ .lookup = refuse };
+
+    fn refuse(
+        context: ?*anyopaque,
+        arena: std.mem.Allocator,
+        host: []const u8,
+        port: u16,
+        family: dns_host.Family,
+    ) error{ NameUnresolved, OutOfMemory }![]const std.Io.net.IpAddress {
+        _ = context;
+        _ = arena;
+        _ = family;
+        assert(dns_host.isCanonical(host)); // The caller canonicalized it.
+        assert(port != 0);
+        return error.NameUnresolved;
+    }
+};
+
 pub fn parse(arena: std.mem.Allocator, json_bytes: []const u8) ParseError!Config {
     return parseWithFiles(arena, json_bytes, .none);
 }
@@ -153,7 +199,16 @@ pub fn parseWithFiles(
     json_bytes: []const u8,
     files: FileSource,
 ) ParseError!Config {
-    const options = try optionsFromJson(arena, json_bytes, files);
+    return parseWithSources(arena, json_bytes, files, .none);
+}
+
+pub fn parseWithSources(
+    arena: std.mem.Allocator,
+    json_bytes: []const u8,
+    files: FileSource,
+    names: NameSource,
+) ParseError!Config {
+    const options = try optionsFromJson(arena, json_bytes, files, names);
     return resolve(arena, &options);
 }
 
@@ -167,12 +222,13 @@ pub fn optionsFromJson(
     arena: std.mem.Allocator,
     json_bytes: []const u8,
     files: FileSource,
+    names: NameSource,
 ) ParseError!Options {
     const parsed = try std.json.parseFromSliceLeaky(ConfigJson, arena, json_bytes, .{
         .duplicate_field_behavior = .@"error",
         .ignore_unknown_fields = false,
     });
-    return optionsOf(arena, &parsed, files);
+    return optionsOf(arena, &parsed, files, names);
 }
 
 /// The JSON front-end's whole translation (#417): every block's spellings
@@ -183,11 +239,12 @@ fn optionsOf(
     arena: std.mem.Allocator,
     parsed: *const ConfigJson,
     files: FileSource,
+    names: NameSource,
 ) ParseError!Options {
     // A cluster's check budget defaults to the connect timeout, so the
     // timeouts translate first.
     const timeouts = timeoutsOf(&parsed.timeouts);
-    const clusters = try clustersOf(arena, &parsed.clusters, timeouts.connect_ms, files);
+    const clusters = try clustersOf(arena, &parsed.clusters, timeouts.connect_ms, files, names);
     const listeners = try listenersOf(arena, parsed.listeners, files);
     const options: Options = .{
         .listeners = listeners,
@@ -205,19 +262,20 @@ fn optionsOf(
 }
 
 /// The JSON front-end's clusters (#417): each entry's spellings parsed
-/// into options, with the stock values for what the file left out and a
-/// CA bundle read through the file seam. Nothing is judged here that a
-/// cluster written in code could also get wrong — that is
-/// `resolveClusters`'.
+/// into options, with the stock values for what the file left out, a CA
+/// bundle read through the file seam and its endpoints' names resolved
+/// through the name seam (#480). Nothing is judged here that a cluster
+/// written in code could also get wrong — that is `resolveClusters`'.
 fn clustersOf(
     arena: std.mem.Allocator,
     clusters_json: *const ClustersJson,
     connect_ms: u32,
     files: FileSource,
+    names: NameSource,
 ) ParseError![]const Options.Cluster {
     const clusters = try arena.alloc(Options.Cluster, clusters_json.entries.len);
     for (clusters_json.entries, clusters) |*entry, *cluster| {
-        cluster.* = try clusterOf(arena, entry, connect_ms, files);
+        cluster.* = try clusterOf(arena, entry, connect_ms, files, names);
     }
     assert(clusters.len == clusters_json.entries.len);
     return clusters;
@@ -228,11 +286,12 @@ fn clusterOf(
     entry: *const ClustersJson.Entry,
     connect_ms: u32,
     files: FileSource,
+    names: NameSource,
 ) ParseError!Options.Cluster {
     const cluster_json = &entry.cluster;
     const cluster: Options.Cluster = .{
         .name = entry.name,
-        .endpoints = try endpointsOf(arena, cluster_json.endpoints),
+        .endpoints = try endpointsOf(arena, cluster_json.endpoints, names),
         .pick = try pickOf(&cluster_json.pick),
         .protocol = try clusterProtocolOf(cluster_json.protocol),
         .check = try checkOf(cluster_json.check, connect_ms),
@@ -245,7 +304,10 @@ fn clusterOf(
         .proxy_protocol_send = try proxyProtocolSendOf(cluster_json.proxy_protocol),
         .tls = try clusterTlsOf(arena, cluster_json.tls, files),
     };
-    assert(cluster.endpoints.len == cluster_json.endpoints.len);
+    // A name may stand for several addresses, and two entries for one
+    // address, so the counts agree only on a cluster that names none; a
+    // name answers with one address at least, or refuses the load.
+    if (cluster_json.endpoints.len >= 1) assert(cluster.endpoints.len >= 1);
     assert(cluster.name.len == entry.name.len);
     return cluster;
 }
@@ -266,24 +328,105 @@ fn addressOf(literal: []const u8) ?io_module.Address {
     return .{ .ip = ip };
 }
 
-/// A cluster's endpoints in either JSON form (#174): the literal parsed,
-/// and the port, weights and tiers left to `resolveEndpoints`.
+/// An endpoint's address as JSON spells it (#303, #480): an address, or
+/// a DNS name and the port its addresses take.
+const SpelledAddress = union(enum) {
+    address: io_module.Address,
+    name: Name,
+
+    const Name = struct {
+        /// Canonical (`dns.host`), in the arena.
+        host: []const u8,
+        port: u16,
+    };
+};
+
+/// `literal` as an address, or as `host:port` with a DNS name — or null
+/// when it is neither. A name's port is the text after its last colon,
+/// so an unbracketed IPv6 literal, whose host part keeps colons, is no
+/// name and earns the address's refusal.
+fn spelledAddressOf(arena: std.mem.Allocator, literal: []const u8) ParseError!?SpelledAddress {
+    if (addressOf(literal)) |address| return .{ .address = address };
+    const colon = std.mem.lastIndexOfScalar(u8, literal, ':') orelse return null;
+    const port = std.fmt.parseInt(u16, literal[colon + 1 ..], 10) catch return null;
+    var buffer: [constants.dns_host_bytes_max]u8 = undefined;
+    const host = dns_host.canonical(&buffer, literal[0..colon]) orelse return null;
+    assert(host.len >= 1);
+    // The library's rule for an address, held to a name's port too: a
+    // name resolves to addresses, and every one of them carries it.
+    if (port == 0) return error.EndpointPortZero;
+    return .{ .name = .{ .host = try arena.dupe(u8, host), .port = port } };
+}
+
+/// A cluster's endpoints in either JSON form (#174), each name's addresses
+/// in its place (#480): the literal parsed, a name resolved through the
+/// seam, and the port, weights and tiers left to `resolveEndpoints`. A
+/// cluster that names a host keeps each address once
+/// (`dns.endpoints.mergeDuplicates`), as its set is kept once it serves.
 fn endpointsOf(
     arena: std.mem.Allocator,
     endpoints_json: []const EndpointJson,
+    names: NameSource,
 ) ParseError![]const Options.Cluster.Endpoint {
-    const endpoints = try arena.alloc(Options.Cluster.Endpoint, endpoints_json.len);
-    for (endpoints_json, endpoints) |entry, *endpoint| {
-        endpoint.* = .{
-            .address = addressOf(entry.address) orelse return error.EndpointInvalid,
-            // A weight past a `u16` is past the ceiling too, and earns the
-            // ceiling's refusal; the schema's `maximum` refuses it first.
-            .weight = std.math.cast(u16, entry.weight) orelse return error.EndpointWeightOverLimit,
-            .priority = entry.priority,
-        };
+    var endpoints: std.ArrayList(Options.Cluster.Endpoint) = try .initCapacity(arena, endpoints_json.len);
+    var named = false;
+    for (endpoints_json) |*entry| {
+        const spelled = try spelledAddressOf(arena, entry.address) orelse return error.EndpointInvalid;
+        // A weight past a `u16` is past the ceiling too, and earns the
+        // ceiling's refusal; the schema's `maximum` refuses it first.
+        const weight = std.math.cast(u16, entry.weight) orelse return error.EndpointWeightOverLimit;
+        switch (spelled) {
+            .address => |address| {
+                if (entry.family != null) return error.EndpointFamilyWithoutName;
+                try endpoints.append(arena, .{ .address = address, .weight = weight, .priority = entry.priority });
+            },
+            .name => |name| {
+                named = true;
+                try appendNamed(arena, &endpoints, entry, &name, weight, names);
+            },
+        }
     }
-    assert(endpoints.len == endpoints_json.len);
-    return endpoints;
+    // Every entry gave one endpoint at least: an address one, a name its
+    // answers, or the load stopped above.
+    assert(endpoints.items.len >= endpoints_json.len);
+    if (!named) return endpoints.items;
+    const kept = dns_endpoints.mergeDuplicates(Options.Cluster.Endpoint, endpoints.items);
+    assert(kept >= 1);
+    return endpoints.items[0..kept];
+}
+
+/// The addresses `name` resolves to, in `dns.endpoints` order, each an
+/// endpoint with its entry's weight and tier.
+fn appendNamed(
+    arena: std.mem.Allocator,
+    endpoints: *std.ArrayList(Options.Cluster.Endpoint),
+    entry: *const EndpointJson,
+    name: *const SpelledAddress.Name,
+    weight: u16,
+    names: NameSource,
+) ParseError!void {
+    assert(dns_host.isCanonical(name.host));
+    assert(name.port != 0);
+    const family = try familyOf(entry.family);
+    const answered = names.lookup(names.context, arena, name.host, name.port, family) catch |err| switch (err) {
+        error.NameUnresolved => return error.EndpointNameUnresolved,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    assert(answered.len >= 1);
+    // The source's order is not the set's.
+    const addresses = try arena.dupe(std.Io.net.IpAddress, answered);
+    dns_endpoints.sortAddresses(addresses);
+    for (addresses) |*address| {
+        assert(family.admits(address));
+        assert(address.getPort() == name.port);
+        try endpoints.append(arena, .{ .address = .{ .ip = address.* }, .weight = weight, .priority = entry.priority });
+    }
+}
+
+/// An endpoint's `family` (#480): A records alone where it is absent.
+fn familyOf(family_json: ?[]const u8) ValidationError!dns_host.Family {
+    const spelled = family_json orelse return .ipv4;
+    return std.meta.stringToEnum(dns_host.Family, spelled) orelse error.EndpointFamilyUnknown;
 }
 
 /// Either JSON spelling of `pick` (#178). The policy vocabulary is closed
@@ -2372,9 +2515,10 @@ pub const ClusterJson = struct {
     pub const schema_doc = "One upstream cluster: its endpoints, pick policy and health checks.";
     pub const schema_fields = .{
         .endpoints = .{
-            .desc = "Endpoints: IP:port literals (port must be non-zero) or " ++
-                "`unix:` socket paths, each optionally written as an object " ++
-                "that adds a pick weight.",
+            .desc = "Endpoints: IP:port literals (port must be non-zero), " ++
+                "name:port with a DNS name resolved once at startup, or `unix:` " ++
+                "socket paths, each optionally written as an object that adds a " ++
+                "pick weight. A cluster that names a host keeps each address once.",
             .min_items = 1,
         },
         .pick = .{
@@ -2602,15 +2746,20 @@ pub const EndpointJson = struct {
     /// #396's standby tier: 0, the default and what a bare string means,
     /// is the primary.
     priority: u8 = 0,
+    /// #480's family of a name's addresses: absent takes A records alone,
+    /// and an address refuses it.
+    family: ?[]const u8 = null,
 
     pub const schema_doc =
-        "One endpoint: an IP:port literal, a `unix:` socket path, or an " ++
-        "object carrying either with a relative pick weight and a standby tier.";
+        "One endpoint: an IP:port literal, a DNS name and port, a `unix:` " ++
+        "socket path, or an object carrying any of them with a relative pick " ++
+        "weight and a standby tier.";
     pub const schema_fields = .{
         .address = .{
-            .desc = "Endpoint literal: `IP:port` (port must be non-zero), or " ++
-                "`unix:` followed by the absolute path of a stream socket " ++
-                "(printable ASCII, no quote or backslash).",
+            .desc = "Endpoint literal: `IP:port` (port must be non-zero), " ++
+                "`name:port` with a DNS name resolved once at startup into one " ++
+                "endpoint per address, or `unix:` followed by the absolute path " ++
+                "of a stream socket (printable ASCII, no quote or backslash).",
             .min_length = 1,
         },
         .weight = .{
@@ -2629,6 +2778,12 @@ pub const EndpointJson = struct {
             .minimum = 0,
             .maximum = constants.endpoint_priority_max,
         },
+        .family = .{
+            .desc = "Which of a DNS name's addresses become endpoints: ipv4 (the " ++
+                "default; A records), ipv6 (AAAA records) or any (both). Only " ++
+                "beside a name.",
+            .enum_type = dns_host.Family,
+        },
     };
 
     /// The object form as a plain struct, so `innerParse` reads it with
@@ -2638,16 +2793,22 @@ pub const EndpointJson = struct {
         address: []const u8,
         weight: u32 = 1,
         priority: u8 = 0,
+        family: ?[]const u8 = null,
     };
 
     const short_token: std.json.TokenType = .string;
 
     fn fromShort(literal: []const u8) error{}!EndpointJson {
-        return .{ .address = literal, .weight = 1, .priority = 0 };
+        return .{ .address = literal, .weight = 1, .priority = 0, .family = null };
     }
 
     fn fromObject(object: ObjectForm) error{}!EndpointJson {
-        return .{ .address = object.address, .weight = object.weight, .priority = object.priority };
+        return .{
+            .address = object.address,
+            .weight = object.weight,
+            .priority = object.priority,
+            .family = object.family,
+        };
     }
 
     pub fn jsonParse(
@@ -5275,6 +5436,9 @@ const SchemaGap = enum {
     duplicate,
     /// The filesystem answered, not the document.
     filesystem,
+    /// A resolver answered, not the document (#480): a name that does not
+    /// resolve on this box may resolve on the next.
+    name_lookup,
     /// §5 arithmetic: a limit judged against another limit, against the
     /// ring, or against whether any listener asked for the feature it
     /// sizes. Closed-form budget reasoning, and the banner is where it
@@ -5331,7 +5495,9 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "ClusterProxyProtocolOnHttpListener", .gap = .cross_block },
     .{ .name = "ClusterProxyProtocolOnTlsListener", .gap = .cross_block },
     .{ .name = "ClusterUnknown", .gap = .cross_reference },
+    .{ .name = "EndpointFamilyWithoutName", .gap = .literal_syntax },
     .{ .name = "EndpointInvalid", .gap = .literal_syntax },
+    .{ .name = "EndpointNameUnresolved", .gap = .name_lookup },
     .{ .name = "EndpointPortZero", .gap = .literal_syntax },
     .{ .name = "EndpointUnixPathInvalid", .gap = .literal_syntax },
     .{ .name = "EndpointUnixPathRelative", .gap = .literal_syntax },
@@ -5667,8 +5833,9 @@ test "config: references and addresses are validated" {
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
-    // Hostnames are structurally unresolvable: static addresses only (§1).
-    try expectParseError(error.EndpointInvalid,
+    // A name resolves through the name seam (#480), which `parse`'s
+    // refuses: a name it cannot answer stops the load.
+    try expectParseError(error.EndpointNameUnresolved,
         \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["origin.internal:80"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
@@ -5727,6 +5894,147 @@ test "config: unweighted endpoints leave the weights table null" {
     try std.testing.expect(parsed.clusters[0].weights == null);
 }
 
+/// The names the endpoint tests resolve (#480), answering as a resolver
+/// does: every address the name has in the family asked, in an order of
+/// its own — the loader's to put right.
+const TestNames = struct {
+    const Entry = struct { host: []const u8, literals: []const []const u8 };
+
+    const table = [_]Entry{
+        .{ .host = "api.test", .literals = &.{ "10.0.0.2", "10.0.0.1" } },
+        .{ .host = "dual.test", .literals = &.{ "fd00::1", "10.0.0.3" } },
+        .{ .host = "six.test", .literals = &.{"fd00::2"} },
+        .{ .host = "one.test", .literals = &.{"10.0.0.1"} },
+    };
+
+    const source: NameSource = .{ .lookup = lookup };
+
+    fn lookup(
+        context: ?*anyopaque,
+        arena: std.mem.Allocator,
+        host: []const u8,
+        port: u16,
+        family: dns_host.Family,
+    ) error{ NameUnresolved, OutOfMemory }![]const std.Io.net.IpAddress {
+        assert(context == null);
+        assert(port != 0);
+        const entry = for (&table) |*entry| {
+            if (std.mem.eql(u8, entry.host, host)) break entry;
+        } else return error.NameUnresolved;
+        var addresses: std.ArrayList(std.Io.net.IpAddress) = .empty;
+        for (entry.literals) |literal| {
+            const address = std.Io.net.IpAddress.parse(literal, port) catch unreachable;
+            if (family.admits(&address)) try addresses.append(arena, address);
+        }
+        if (addresses.items.len == 0) return error.NameUnresolved;
+        return addresses.items;
+    }
+};
+
+fn expectNamesParseOk(arena_state: *std.heap.ArenaAllocator, json_bytes: []const u8) !Config {
+    arena_state.* = std.heap.ArenaAllocator.init(std.testing.allocator);
+    const parsed = try parseWithSources(arena_state.allocator(), json_bytes, TestCaFiles.source, TestNames.source);
+    try expectSchemaAccepts(json_bytes);
+    return parsed;
+}
+
+fn expectEndpoint(endpoint: io_module.Address, literal: []const u8) !void {
+    const expected: io_module.Address = .{ .ip = try std.Io.net.IpAddress.parseLiteral(literal) };
+    try std.testing.expect(endpoint.eql(&expected));
+}
+
+test "config: a name is resolved at load into one endpoint per address (#480)" {
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+    const parsed = try expectNamesParseOk(&arena_state,
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":[{"address":"API.Test.:8080","weight":3,"priority":1},
+        \\   "dual.test:80", {"address":"dual.test:81","family":"any"},
+        \\   {"address":"six.test:82","family":"ipv6"}]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    const cluster = parsed.clusters[0];
+    // Sorted, whatever the resolver's order; A records alone by default;
+    // both families when asked, IPv4 first.
+    try std.testing.expectEqual(@as(usize, 6), cluster.endpoints.len);
+    try expectEndpoint(cluster.endpoints[0], "10.0.0.1:8080");
+    try expectEndpoint(cluster.endpoints[1], "10.0.0.2:8080");
+    try expectEndpoint(cluster.endpoints[2], "10.0.0.3:80");
+    try expectEndpoint(cluster.endpoints[3], "10.0.0.3:81");
+    try expectEndpoint(cluster.endpoints[4], "[fd00::1]:81");
+    try expectEndpoint(cluster.endpoints[5], "[fd00::2]:82");
+    // Each address takes its entry's weight and tier.
+    try std.testing.expectEqualSlices(u16, &.{ 3, 3, 1, 1, 1, 1 }, cluster.weights.?);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 1, 0, 0, 0, 0 }, cluster.priorities.?);
+}
+
+test "config: a cluster that names a host keeps each address once (#480)" {
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+    // `one.test` is 10.0.0.1, which a literal states too: one endpoint,
+    // holding the stronger claim — the primary tier over a standby, and
+    // at one tier the higher weight.
+    const parsed = try expectNamesParseOk(&arena_state,
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":[{"address":"10.0.0.1:80","priority":1},
+        \\   {"address":"one.test:80","weight":2}, "api.test:80", "10.0.0.9:80"]},
+        \\  "b":{"endpoints":["10.0.0.1:80","10.0.0.1:80"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    const named = parsed.clusters[0];
+    try std.testing.expectEqual(@as(usize, 3), named.endpoints.len);
+    try expectEndpoint(named.endpoints[0], "10.0.0.1:80");
+    try expectEndpoint(named.endpoints[1], "10.0.0.2:80");
+    try expectEndpoint(named.endpoints[2], "10.0.0.9:80");
+    try std.testing.expectEqualSlices(u16, &.{ 2, 1, 1 }, named.weights.?);
+    try std.testing.expect(named.priorities == null);
+    // A cluster of addresses alone is as it was: what it states, it has.
+    try std.testing.expectEqual(@as(usize, 2), parsed.clusters[1].endpoints.len);
+}
+
+test "config: a name's refusals are its own (#480)" {
+    // A name no address answers for: the resolver's verdict, not the
+    // document's — `--check` exits 2 on it.
+    try expectParseError(error.EndpointNameUnresolved,
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":["origin.internal:80"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    // An address has its family already.
+    try expectParseError(error.EndpointFamilyWithoutName,
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":[{"address":"127.0.0.1:2","family":"ipv4"}]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    try expectParseError(error.EndpointFamilyWithoutName,
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":[{"address":"unix:/run/a.sock","family":"any"}]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    try expectParseError(error.EndpointFamilyUnknown,
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":[{"address":"api.test:2","family":"inet"}]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    // A name's port is an address's: nonzero.
+    try expectParseError(error.EndpointPortZero,
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":["api.test:0"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    // No name: a mistyped address, an unbracketed IPv6 literal, an empty
+    // label, a missing port.
+    inline for (.{ "10.0.0.256:80", "::1:80", "api..test:80", "api.test", "api.test:http" }) |literal| {
+        try expectParseError(error.EndpointInvalid,
+            \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
+            \\ "clusters":{"a":{"endpoints":["
+        ++ literal ++
+            \\"]}},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+        );
+    }
+}
+
 test "config: the weight ceiling itself is a legal share" {
     // The bound is inclusive — `endpoint_weight_max` parses, one past it
     // is the error — matching the at-limit convention the name-length
@@ -5758,7 +6066,7 @@ test "config: endpoint weight validation has its own errors" {
     // The object form validates its address exactly like the bare one.
     try expectParseError(error.EndpointInvalid,
         \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
-        \\ "clusters":{"a":{"endpoints":[{"address":"origin.internal:80","weight":2}]}},
+        \\ "clusters":{"a":{"endpoints":[{"address":"origin internal:80","weight":2}]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     try expectParseError(error.EndpointPortZero,
@@ -5899,7 +6207,7 @@ const fuzz_seed_json =
     \\ "pick":{"policy":"hash","key":"cookie","name":"zoxy-srv"},"max_inflight":8,
     \\ "check":{"type":"http","path":"/health","expect_status":200,"timeout_ms":250},
     \\ "panic_threshold_percent":50},
-    \\ "t":{"endpoints":["127.0.0.1:9100"]}},
+    \\ "t":{"endpoints":["127.0.0.1:9100",{"address":"dual.test:9100","family":"any"},"api.test:9100"]}},
     \\ "timeouts":{"connect_ms":5000,"idle_ms":60000,"drain_deadline_ms":10000,
     \\ "max_lifetime_ms":300000,"request_ms":30000,"health_interval_ms":2000},
     \\ "limits":{"conn_slots":64,"relay_buffers":32,"upstream_slots":32,"tls_engines":16},
@@ -5929,8 +6237,11 @@ test "config: the fuzz seed carrying every block parses" {
     // and nothing else would say so.
     var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
-    const parsed = try expectParseOk(&arena_state, fuzz_seed_json);
+    const parsed = try expectNamesParseOk(&arena_state, fuzz_seed_json);
     try std.testing.expectEqual(@as(u32, 10000), parsed.drain_deadline_ms);
+    // The #480 grammar: a name in both spellings, one with its family,
+    // resolved through the test names the fuzz target resolves through.
+    try std.testing.expectEqual(@as(usize, 5), parsed.clusters[1].endpoints.len);
     try std.testing.expectEqual(@as(u32, 30000), parsed.request_timeout_ms);
     try std.testing.expectEqualSlices(u16, &.{ 1, 3 }, parsed.clusters[0].weights.?);
     // The #159 grammar rides the corpus through its `inline` arm — the
@@ -5967,7 +6278,9 @@ fn fuzzParse(context: void, smith: *std.testing.Smith) !void {
     // The in-memory fixtures, not a filesystem: a listener's certificate
     // pair is read at load (#417), and a source refusing every file would
     // stop each TLS mutation there, short of everything resolved after it.
-    if (parseWithFiles(fixed.allocator(), input, TestCaFiles.source)) |parsed| {
+    // And the test names, so a mutated name walks resolution, ordering
+    // and the merge (#480) rather than stopping at the first lookup.
+    if (parseWithSources(fixed.allocator(), input, TestCaFiles.source, TestNames.source)) |parsed| {
         // Success implies the resolved invariants hold — no third outcome.
         assert(parsed.listeners.len >= 1);
         assert(parsed.clusters.len >= 1);
