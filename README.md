@@ -13,26 +13,20 @@ with caller-owned completions — and follows [TigerStyle](docs/TIGER_STYLE.md):
 One thread owns one `io_uring` and every pool. Scale-out is N independent
 processes behind `SO_REUSEPORT`, never threads sharing memory.
 
-- **L4** — blind TCP relay, half-close honored
-- **L7** — HTTP reverse proxy: host and longest-prefix routing, filter
-  rules, keep-alive, pooled HTTP/1.1 upstream connections
-- **HTTP/2** — to clients, over TLS by ALPN or in the clear by prior
-  knowledge; each stream is routed, filtered and balanced like an HTTP/1.1
-  request, to the same pooled upstreams; checked against h2spec at merge
-- **HTTP/3** — to clients, over QUIC on a TLS listener's own port, advertised
-  with `Alt-Svc`; requests take the HTTP/2 path from there, and the whole of
-  it runs under the simulator's datagram adversary; checked against h3spec
-  at merge
-- **Balancing** — power-of-two-choices, round-robin, or rendezvous hashing
-  for client stickiness
-- **Health checks** — active TCP or HTTP probes, per cluster
-- **Observability** — a Prometheus endpoint and a JSON access log
-- **Bounded by construction** — every limit is a compile-time constant, and
-  memory, file descriptors and ring depth are closed-form functions of them,
-  printed at startup
-- **A library first** — build your own proxy on the `zoxy` package,
-  configured in code, with your own pickers, policies, handlers and
-  health checks held to the same zero-allocation gate ([`examples/edge`](examples/edge),
+- **L4** — TCP relay, with PROXY protocol and routing by SNI
+- **L7** — HTTP/1.1, HTTP/2 and HTTP/3 to clients; routing by host, path
+  and header; request and response filters
+- **Origins** — HTTP/1.1, HTTPS, h2c and h2 over pooled connections, gRPC
+  included
+- **TLS 1.3** — terminated and originated, mutual TLS included
+- **Balancing** — power-of-two-choices, round-robin or rendezvous hashing,
+  with weights and standby tiers
+- **Health** — active TCP, HTTP and gRPC checks, and passive ejection
+- **Observability** — Prometheus metrics and a JSON access log
+- **Bounded** — memory, file descriptors and ring depth are reserved at
+  startup and printed in the banner; running out sheds load
+- **A library** — build your own proxy on the `zoxy` package, with your own
+  pickers, policies, handlers and checks ([`examples/edge`](examples/edge),
   [DESIGN.md §13](docs/DESIGN.md#13-embedding--the-library-seam))
 
 ## Quick start
