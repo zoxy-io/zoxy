@@ -103,6 +103,13 @@ pub const SpellingError = error{
     /// one family already, and the key would sit there inert.
     EndpointFamilyWithoutName,
     EndpointFamilyUnknown,
+    /// A `resolver.nameservers` entry that is no IP literal (#481).
+    ResolverNameserverInvalid,
+    /// `/etc/resolv.conf`, read for the nameservers a `resolver` block
+    /// does not name, could not be read (#481).
+    ResolverConfUnreadable,
+    /// It was read, and names no nameserver.
+    ResolverConfNameserversMissing,
     ClusterTlsCaUnreadable,
     AdminBindInvalid,
     AccessLogSinkUnknown,
@@ -255,6 +262,7 @@ fn optionsOf(
         .bodies = try bodiesOf(arena, parsed.bodies, files),
         .admin = try adminOf(parsed.admin),
         .error_pages = try errorPagesOf(arena, parsed.error_pages),
+        .resolver = try resolverOf(arena, parsed.resolver, clusters, files),
     };
     assert(options.listeners.len == parsed.listeners.len);
     assert(options.clusters.len == parsed.clusters.entries.len);
@@ -289,9 +297,12 @@ fn clusterOf(
     names: NameSource,
 ) ParseError!Options.Cluster {
     const cluster_json = &entry.cluster;
+    // A cluster that follows its names (#481) leaves them to the resolver.
+    const followed = try followedOf(arena, cluster_json);
     const cluster: Options.Cluster = .{
         .name = entry.name,
-        .endpoints = try endpointsOf(arena, cluster_json.endpoints, names),
+        .endpoints = if (followed) |split| split.literals else try endpointsOf(arena, cluster_json.endpoints, names),
+        .dns = if (followed) |split| split.dns else null,
         .pick = try pickOf(&cluster_json.pick),
         .protocol = try clusterProtocolOf(cluster_json.protocol),
         .check = try checkOf(cluster_json.check, connect_ms),
@@ -306,8 +317,10 @@ fn clusterOf(
     };
     // A name may stand for several addresses, and two entries for one
     // address, so the counts agree only on a cluster that names none; a
-    // name answers with one address at least, or refuses the load.
-    if (cluster_json.endpoints.len >= 1) assert(cluster.endpoints.len >= 1);
+    // name answers with one address at least, or refuses the load. A
+    // cluster that follows its names (#481) holds its addresses alone.
+    if (cluster_json.endpoints.len >= 1 and followed == null) assert(cluster.endpoints.len >= 1);
+    if (followed) |split| assert(split.literals.len + split.dns.names.len == cluster_json.endpoints.len);
     assert(cluster.name.len == entry.name.len);
     return cluster;
 }
@@ -421,6 +434,110 @@ fn appendNamed(
         assert(address.getPort() == name.port);
         try endpoints.append(arena, .{ .address = .{ .ip = address.* }, .weight = weight, .priority = entry.priority });
     }
+}
+
+/// A cluster that follows its names (#481): its addresses, and the names
+/// the resolver asks — none of them resolved here.
+const Followed = struct {
+    literals: []const Options.Cluster.Endpoint,
+    dns: Options.Cluster.Dns,
+};
+
+fn followedOf(arena: std.mem.Allocator, cluster_json: *const ClusterJson) ParseError!?Followed {
+    const dns_json = cluster_json.dns orelse return null;
+    var literals: std.ArrayList(Options.Cluster.Endpoint) = .empty;
+    var names: std.ArrayList(Options.Cluster.Dns.Name) = .empty;
+    for (cluster_json.endpoints) |*entry| {
+        const spelled = try spelledAddressOf(arena, entry.address) orelse return error.EndpointInvalid;
+        const weight = std.math.cast(u16, entry.weight) orelse return error.EndpointWeightOverLimit;
+        switch (spelled) {
+            .address => |address| {
+                if (entry.family != null) return error.EndpointFamilyWithoutName;
+                try literals.append(arena, .{ .address = address, .weight = weight, .priority = entry.priority });
+            },
+            .name => |name| try names.append(arena, .{
+                .host = name.host,
+                .port = name.port,
+                .weight = weight,
+                .priority = entry.priority,
+                .family = try familyOf(entry.family),
+            }),
+        }
+    }
+    assert(literals.items.len + names.items.len == cluster_json.endpoints.len);
+    return .{ .literals = literals.items, .dns = .{
+        .names = names.items,
+        .refresh_min_ms = dns_json.refresh_min_ms,
+        .refresh_max_ms = dns_json.refresh_max_ms,
+        .addresses_max = dns_json.addresses_max,
+    } };
+}
+
+/// Where the nameservers a `resolver` block leaves out are read (#481).
+const resolv_conf_path = "/etc/resolv.conf";
+/// The most of it read: resolv.conf(5) has no bound, and none is near this.
+const resolv_conf_bytes_max: u32 = 64 * 1024;
+/// The port a nameserver listens on unless its literal says otherwise.
+const nameserver_port_default: u16 = 53;
+
+/// The #481 resolver the clusters that follow names ask: the block's, its
+/// nameservers read from `/etc/resolv.conf` where it names none, or that
+/// file's alone where there is no block and a cluster follows names.
+fn resolverOf(
+    arena: std.mem.Allocator,
+    resolver_json: ?ResolverJson,
+    clusters: []const Options.Cluster,
+    files: FileSource,
+) ParseError!?Options.Resolver {
+    const followed = for (clusters) |*cluster| {
+        if (cluster.dns != null) break true;
+    } else false;
+    const stated = resolver_json orelse {
+        if (!followed) return null;
+        return .{ .nameservers = try systemNameservers(arena, files), .timeout_ms = defaults.resolver_timeout_ms };
+    };
+    const nameservers = if (stated.nameservers) |literals|
+        try nameserversOf(arena, literals)
+    else
+        try systemNameservers(arena, files);
+    assert(nameservers.len >= 1 or stated.nameservers != null);
+    return .{ .nameservers = nameservers, .timeout_ms = stated.timeout_ms };
+}
+
+fn nameserversOf(arena: std.mem.Allocator, literals: []const []const u8) ParseError![]const std.Io.net.IpAddress {
+    const nameservers = try arena.alloc(std.Io.net.IpAddress, literals.len);
+    for (literals, nameservers) |literal, *nameserver| {
+        nameserver.* = std.Io.net.IpAddress.parseLiteral(literal) catch return error.ResolverNameserverInvalid;
+        if (nameserver.getPort() == 0) nameserver.setPort(nameserver_port_default);
+    }
+    assert(nameservers.len == literals.len);
+    return nameservers;
+}
+
+/// The nameservers `/etc/resolv.conf` names, in its order, the first
+/// `dns_nameservers_max` of them as resolv.conf(5) takes them.
+fn systemNameservers(arena: std.mem.Allocator, files: FileSource) ParseError![]const std.Io.net.IpAddress {
+    const text = files.read(files.context, arena, resolv_conf_path, resolv_conf_bytes_max) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.FileUnreadable, error.FileTooLarge => return error.ResolverConfUnreadable,
+    };
+    var nameservers: std.ArrayList(std.Io.net.IpAddress) = .empty;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var count: u32 = 0;
+    while (lines.next()) |line| : (count += 1) {
+        assert(count <= text.len);
+        if (nameservers.items.len == constants.dns_nameservers_max) break;
+        var fields = std.mem.tokenizeAny(u8, line, " \t\r");
+        const keyword = fields.next() orelse continue;
+        if (!std.mem.eql(u8, keyword, "nameserver")) continue;
+        const literal = fields.next() orelse continue;
+        // A scoped IPv6 literal or a malformed line is skipped, as the C
+        // library skips what it cannot use.
+        const address = std.Io.net.IpAddress.parse(literal, nameserver_port_default) catch continue;
+        try nameservers.append(arena, address);
+    }
+    if (nameservers.items.len == 0) return error.ResolverConfNameserversMissing;
+    return nameservers.items;
 }
 
 /// An endpoint's `family` (#480): A records alone where it is absent.
@@ -1377,6 +1494,9 @@ pub const ConfigJson = struct {
     /// absent means every static stays `Content-Length: 0` — including
     /// the sheds, whose bodies this block is the deliberate opt-in for.
     error_pages: ?ErrorPagesJson = null,
+    /// Optional #481 resolver for the clusters that follow names; absent
+    /// asks the nameservers `/etc/resolv.conf` names.
+    resolver: ?ResolverJson = null,
 
     pub const schema_doc =
         "Startup configuration for zoxy, the L4/L7 proxy. This schema checks " ++
@@ -1411,6 +1531,37 @@ pub const ConfigJson = struct {
                 "status code, each naming a body. Only listed statuses get " ++
                 "a body. Without this block, every such response is empty, " ++
                 "including load-shedding responses.",
+        },
+        .resolver = .{
+            .desc = "The nameservers clusters with a `dns` block ask while zoxy " ++
+                "serves. Absent, the nameservers /etc/resolv.conf names are asked.",
+        },
+    };
+};
+
+/// The #481 resolver: whom the clusters that follow names ask, and how
+/// long one query waits.
+pub const ResolverJson = struct {
+    /// Absent reads `/etc/resolv.conf`'s at load.
+    nameservers: ?[]const []const u8 = null,
+    timeout_ms: u32 = defaults.resolver_timeout_ms,
+
+    pub const schema_doc =
+        "How clusters with a `dns` block reach DNS: recursive nameservers " ++
+        "over UDP, asked in order.";
+    pub const schema_fields = .{
+        .nameservers = .{
+            .desc = "Nameserver IP literals, with a port or on 53, asked in order: " ++
+                "the next is asked when one times out or fails. Absent, the ones " ++
+                "/etc/resolv.conf names. Point these at a local or cluster " ++
+                "resolver: replies are checked against the query, not signed.",
+            .min_items = 1,
+            .max_items = constants.dns_nameservers_max,
+        },
+        .timeout_ms = .{
+            .desc = "How long one query waits for one nameserver before the next is asked.",
+            .minimum = constants.dns_timeout_ms_min,
+            .maximum = constants.dns_timeout_ms_max,
         },
     };
 };
@@ -2511,14 +2662,18 @@ pub const ClusterJson = struct {
     /// TLS to the origins: required by `h2`, optional with `http1`
     /// (#296), refused with `h2c`.
     tls: ?ClusterTlsJson = null,
+    /// Optional #481: follow the endpoints' names while serving; absent
+    /// resolves them once, at startup.
+    dns: ?DnsJson = null,
 
     pub const schema_doc = "One upstream cluster: its endpoints, pick policy and health checks.";
     pub const schema_fields = .{
         .endpoints = .{
             .desc = "Endpoints: IP:port literals (port must be non-zero), " ++
-                "name:port with a DNS name resolved once at startup, or `unix:` " ++
-                "socket paths, each optionally written as an object that adds a " ++
-                "pick weight. A cluster that names a host keeps each address once.",
+                "name:port with a DNS name resolved once at startup (or followed " ++
+                "while serving, with `dns`), or `unix:` socket paths, each " ++
+                "optionally written as an object that adds a pick weight. A " ++
+                "cluster that names a host keeps each address once.",
             .min_items = 1,
         },
         .pick = .{
@@ -2592,6 +2747,46 @@ pub const ClusterJson = struct {
             .desc = "TLS to this cluster's origins: the name each must prove and " ++
                 "the CA bundle its chain must reach. Required by protocol h2; " ++
                 "with http1, the origins speak HTTPS. Not allowed with h2c.",
+        },
+        .dns = .{
+            .desc = "Follow the endpoints' DNS names while serving: each is asked " ++
+                "again as its answer's TTL runs out, and the cluster's endpoints " ++
+                "follow the answers. Absent, names are resolved once at startup.",
+        },
+    };
+};
+
+/// #481's pace for a cluster that follows its names.
+pub const DnsJson = struct {
+    refresh_min_ms: u32 = defaults.dns.refresh_min_ms,
+    refresh_max_ms: u32 = defaults.dns.refresh_max_ms,
+    addresses_max: u16 = defaults.dns.addresses_max,
+
+    pub const schema_doc =
+        "Follow the cluster's endpoint names while serving. Every name is asked " ++
+        "of the resolver's nameservers at startup and again as its answer's TTL " ++
+        "runs out; addresses that leave drain, ones that arrive are health-checked " ++
+        "before they take traffic. A name that fails to resolve keeps the " ++
+        "addresses it had.";
+    pub const schema_fields = .{
+        .refresh_min_ms = .{
+            .desc = "The least time between two resolutions, whatever the TTL says, " ++
+                "and the wait before retrying one that failed.",
+            .minimum = constants.dns_refresh_ms_min,
+            .maximum = constants.dns_refresh_ms_max,
+        },
+        .refresh_max_ms = .{
+            .desc = "The most time between two resolutions, whatever the TTL says. " ++
+                "At least refresh_min_ms.",
+            .minimum = constants.dns_refresh_ms_min,
+            .maximum = constants.dns_refresh_ms_max,
+        },
+        .addresses_max = .{
+            .desc = "The most addresses one name gives in each family; an answer " ++
+                "with more keeps the first in address order. The cluster's " ++
+                "endpoint tables are sized from it.",
+            .minimum = 1,
+            .maximum = constants.dns_addresses_max,
         },
     };
 };
@@ -5495,9 +5690,16 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "ClusterProxyProtocolOnHttpListener", .gap = .cross_block },
     .{ .name = "ClusterProxyProtocolOnTlsListener", .gap = .cross_block },
     .{ .name = "ClusterUnknown", .gap = .cross_reference },
+    .{ .name = "ClusterDnsNamesEmpty", .gap = .literal_syntax },
+    .{ .name = "ClusterDnsRefreshOutOfRange", .gap = .budget },
+    .{ .name = "ClusterDnsUnixEndpoint", .gap = .literal_syntax },
     .{ .name = "EndpointFamilyWithoutName", .gap = .literal_syntax },
     .{ .name = "EndpointInvalid", .gap = .literal_syntax },
     .{ .name = "EndpointNameUnresolved", .gap = .name_lookup },
+    .{ .name = "ResolverConfNameserversMissing", .gap = .filesystem },
+    .{ .name = "ResolverConfUnreadable", .gap = .filesystem },
+    .{ .name = "ResolverNameserverInvalid", .gap = .literal_syntax },
+    .{ .name = "ResolverUnused", .gap = .cross_block },
     .{ .name = "EndpointPortZero", .gap = .literal_syntax },
     .{ .name = "EndpointUnixPathInvalid", .gap = .literal_syntax },
     .{ .name = "EndpointUnixPathRelative", .gap = .literal_syntax },
@@ -6033,6 +6235,110 @@ test "config: a name's refusals are its own (#480)" {
             \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
         );
     }
+}
+
+fn expectNamesOptions(arena_state: *std.heap.ArenaAllocator, json_bytes: []const u8) !Options {
+    arena_state.* = std.heap.ArenaAllocator.init(std.testing.allocator);
+    const options = try optionsFromJson(arena_state.allocator(), json_bytes, TestCaFiles.source, TestNames.source);
+    try expectSchemaAccepts(json_bytes);
+    return options;
+}
+
+test "config: a cluster with `dns` leaves its names to the resolver, resolv.conf naming whom to ask (#481)" {
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+    // `api.test` resolves through the test names, and a cluster that
+    // follows it must not have: its names reach the options unresolved.
+    const options = try expectNamesOptions(&arena_state,
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":["10.0.0.9:80",{"address":"API.test:8080","weight":3,"family":"any"}],
+        \\   "dns":{"refresh_max_ms":30000}}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    const cluster = options.clusters[0];
+    try std.testing.expectEqual(@as(usize, 1), cluster.endpoints.len);
+    const dns = cluster.dns.?;
+    try std.testing.expectEqual(@as(usize, 1), dns.names.len);
+    try std.testing.expectEqualStrings("api.test", dns.names[0].host);
+    try std.testing.expectEqual(@as(u16, 8080), dns.names[0].port);
+    try std.testing.expectEqual(@as(u16, 3), dns.names[0].weight);
+    try std.testing.expectEqual(zoxy.dns.host.Family.any, dns.names[0].family);
+    try std.testing.expectEqual(@as(usize, 0), dns.names[0].addresses.len);
+    try std.testing.expectEqual(defaults.dns.refresh_min_ms, dns.refresh_min_ms);
+    try std.testing.expectEqual(@as(u32, 30000), dns.refresh_max_ms);
+    try std.testing.expectEqual(defaults.dns.addresses_max, dns.addresses_max);
+    // No `resolver` block: the nameservers resolv.conf names, on 53.
+    const resolver = options.resolver.?;
+    try std.testing.expectEqual(@as(usize, 2), resolver.nameservers.len);
+    try expectEndpoint(.{ .ip = resolver.nameservers[0] }, "10.0.0.53:53");
+    try expectEndpoint(.{ .ip = resolver.nameservers[1] }, "[fd00::53]:53");
+    try std.testing.expectEqual(defaults.resolver_timeout_ms, resolver.timeout_ms);
+}
+
+test "config: a `resolver` block names its nameservers, a port 53 unless it says otherwise (#481)" {
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+    const options = try expectNamesOptions(&arena_state,
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":["api.test:80"],"dns":{}}},
+        \\ "resolver":{"nameservers":["10.0.0.10","10.0.0.11:5353"],"timeout_ms":500},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    const resolver = options.resolver.?;
+    try expectEndpoint(.{ .ip = resolver.nameservers[0] }, "10.0.0.10:53");
+    try expectEndpoint(.{ .ip = resolver.nameservers[1] }, "10.0.0.11:5353");
+    try std.testing.expectEqual(@as(u32, 500), resolver.timeout_ms);
+    // No cluster follows a name: no resolver, and resolv.conf is not read.
+    var plain_state: std.heap.ArenaAllocator = undefined;
+    defer plain_state.deinit();
+    const plain = try expectNamesOptions(&plain_state,
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":["api.test:80"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    try std.testing.expect(plain.resolver == null);
+}
+
+test "config: a resolver and a cluster's `dns` are refused as their rules say (#481)" {
+    // A cluster that follows names, with literals to start from: the
+    // library's own refusals reach a file.
+    try expectParseError(error.ResolverNameserverInvalid,
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":["10.0.0.9:80","api.test:80"],"dns":{}}},
+        \\ "resolver":{"nameservers":["ns.example"]},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    try expectParseError(error.ResolverUnused,
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":["10.0.0.9:80"]}},
+        \\ "resolver":{"nameservers":["10.0.0.10"]},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    try expectParseError(error.ClusterDnsNamesEmpty,
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":["10.0.0.9:80"],"dns":{}}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    try expectParseError(error.ClusterDnsRefreshOutOfRange,
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":["10.0.0.9:80","api.test:80"],
+        \\   "dns":{"refresh_min_ms":5000,"refresh_max_ms":4000}}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    try expectParseError(error.ClusterDnsUnixEndpoint,
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":["unix:/run/a.sock","api.test:80"],"dns":{}}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    // With nothing to read resolv.conf through, a cluster that follows a
+    // name has no one to ask.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    try std.testing.expectError(error.ResolverConfUnreadable, parse(arena_state.allocator(),
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":["10.0.0.9:80","api.test:80"],"dns":{}}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    ));
 }
 
 test "config: the weight ceiling itself is a legal share" {
@@ -7995,6 +8301,8 @@ const TestCaFiles = struct {
         assert(limit >= 1);
         const bytes: []const u8 = if (std.mem.eql(u8, path, "/ca.pem"))
             zoxy.tls.testdata.origin_ca_pem
+        else if (std.mem.eql(u8, path, resolv_conf_path))
+            "# the tests' resolv.conf\nsearch zoxy.test\nnameserver 10.0.0.53\nnameserver fd00::53\n"
         else if (std.mem.eql(u8, path, "/client-ca.pem"))
             zoxy.tls.testdata.client_ca_pem
         else if (std.mem.eql(u8, path, "/garbage.pem"))
