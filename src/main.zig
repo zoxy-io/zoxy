@@ -173,9 +173,15 @@ fn readConfig(
     // startup-time reader the config file itself used — the one moment
     // this process touches the filesystem for content (parse-once, §1).
     var file_context: BodyFileContext = .{ .io = io };
+    // Endpoint names (#480) are resolved the same once, by the system's
+    // resolver, before the options exist: what they carry is addresses.
+    var name_context: NameContext = .{ .io = io };
     return zoxy_json.optionsFromJson(arena, config_bytes, .{
         .context = &file_context,
         .read = readBodyFile,
+    }, .{
+        .context = &name_context,
+        .lookup = lookupName,
     }) catch |err| {
         std.debug.print("zoxy: invalid config '{s}': {t}\n", .{ config_path, err });
         return err;
@@ -185,6 +191,84 @@ fn readConfig(
 const BodyFileContext = struct {
     io: std.Io,
 };
+
+const NameContext = struct {
+    io: std.Io,
+};
+
+/// The loader's `NameSource.lookup` against the system's resolver (#480):
+/// what `getaddrinfo` answers, or std's own resolver where there is no
+/// glibc — the hosts file and the search domains included, as any other
+/// program on this box finds the name. A name's addresses, or why it has
+/// none, are named on stderr: the banner's figures follow from them.
+fn lookupName(
+    context: ?*anyopaque,
+    arena: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    family: zoxy.dns.host.Family,
+) error{ NameUnresolved, OutOfMemory }![]const std.Io.net.IpAddress {
+    assert(zoxy.dns.host.isCanonical(host));
+    assert(port != 0);
+    const name_context: *NameContext = @ptrCast(@alignCast(context.?));
+    const io = name_context.io;
+    const host_name = std.Io.net.HostName.init(host) catch |err| {
+        std.debug.print("zoxy: cannot resolve '{s}': {t}\n", .{ host, err });
+        return error.NameUnresolved;
+    };
+    var queue_buffer: [zoxy.constants.dns_lookup_queue_entries]std.Io.net.HostName.LookupResult = undefined;
+    var queue: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&queue_buffer);
+    var lookup = io.async(std.Io.net.HostName.lookup, .{ host_name, io, &queue, .{
+        .port = port,
+        .family = switch (family) {
+            .ipv4 => .ip4,
+            .ipv6 => .ip6,
+            .any => null,
+        },
+    } });
+    var addresses: std.ArrayList(std.Io.net.IpAddress) = .empty;
+    // The queue and its buffer are this frame's, and the lookup writes
+    // them until it returns: every path drains the queue to its close and
+    // awaits the lookup before leaving, an arena that ran out included.
+    var out_of_memory = false;
+    // Bounded by the lookup, which closes the queue when it returns.
+    while (queue.getOneUncancelable(io)) |result| {
+        const address = switch (result) {
+            .address => |address| address,
+            .canonical_name => continue,
+        };
+        if (out_of_memory) continue;
+        if (!family.admits(&address)) continue;
+        addresses.append(arena, address) catch {
+            out_of_memory = true;
+        };
+    } else |err| switch (err) {
+        error.Closed => {},
+    }
+    const looked_up = lookup.await(io);
+    if (out_of_memory) return error.OutOfMemory;
+    looked_up catch |err| {
+        std.debug.print("zoxy: cannot resolve '{s}': {t}\n", .{ host, err });
+        return error.NameUnresolved;
+    };
+    if (addresses.items.len == 0) {
+        std.debug.print("zoxy: cannot resolve '{s}': no {t} address\n", .{ host, family });
+        return error.NameUnresolved;
+    }
+    zoxy.dns.endpoints.sortAddresses(addresses.items);
+    printResolved(host, port, addresses.items);
+    return addresses.items;
+}
+
+/// One line per name, `zoxy: api.internal:8080 is 10.0.0.1:8080 …`, in the
+/// order the endpoints take.
+fn printResolved(host: []const u8, port: u16, addresses: []const std.Io.net.IpAddress) void {
+    assert(addresses.len >= 1);
+    assert(port != 0);
+    std.debug.print("zoxy: {s}:{d} is", .{ host, port });
+    for (addresses) |address| std.debug.print(" {f}", .{address});
+    std.debug.print("\n", .{});
+}
 
 /// The loader's `FileSource.read` against the real filesystem: whole
 /// file into the arena, refused past `limit` — the loader turns that
@@ -295,7 +379,8 @@ const help_text =
     \\proxy would — and prints the budget banner to stdout. It exits 0 when
     \\the config would start on this machine, 1 when the config is wrong, and
     \\2 when the config is right and this machine cannot fit it (an fd budget
-    \\above the RLIMIT_NOFILE hard limit).
+    \\above the RLIMIT_NOFILE hard limit, or an endpoint name that does not
+    \\resolve here).
     \\
     \\Signals:
     \\  SIGTERM, SIGINT   Drain in-flight connections, then exit 0. The

@@ -37,6 +37,13 @@ pub const Runtime = extension.Runtime;
 pub const pickers = @import("pickers.zig");
 pub const constants = @import("constants.zig");
 pub const counters = @import("counters.zig");
+/// DNS names in endpoint addresses (#480, #481): what spelling is a name,
+/// which of its addresses an endpoint takes, and how a cluster's answers
+/// become one set of endpoints.
+pub const dns = struct {
+    pub const host = @import("dns/host.zig");
+    pub const endpoints = @import("dns/endpoints.zig");
+};
 /// L7 HTTP/1.1 modules (§7). `parser` wraps the vendored hparse behind
 /// the trust boundary, `render` writes upstream/downstream heads, and
 /// `proxy` is the request-lifecycle state machine over both.
@@ -165,6 +172,8 @@ test {
     _ = pickers;
     _ = constants;
     _ = counters;
+    _ = dns.host;
+    _ = dns.endpoints;
     _ = http.parser;
     _ = http.render;
     _ = http.router;

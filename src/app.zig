@@ -471,8 +471,9 @@ pub const CheckExit = enum(u8) {
     invalid_config = 1,
     /// The config is right and this machine is what refused it: the fd
     /// budget is above `RLIMIT_NOFILE`'s hard limit, the startup arena
-    /// could not be had, or libcrypto would not take the fixed heap
-    /// (§5). The same config would start elsewhere.
+    /// could not be had, libcrypto would not take the fixed heap (§5), or
+    /// an endpoint's name did not resolve here (#480). The same config
+    /// would start elsewhere.
     does_not_fit = 2,
 };
 
@@ -486,6 +487,7 @@ pub fn checkExitFor(err: anyerror) CheckExit {
         error.OutOfMemory,
         error.FdBudgetUnsatisfiable,
         error.LibcryptoHeapUnavailable,
+        error.EndpointNameUnresolved,
         => .does_not_fit,
         else => .invalid_config,
     };
@@ -656,12 +658,15 @@ fn leafNames(
 
 test "checkExitFor: the box's refusals are told from the config's" {
     // What the operator does next is the whole distinction (#301): these
-    // three say "run it elsewhere"…
+    // say "run it elsewhere"…
     try std.testing.expectEqual(CheckExit.does_not_fit, checkExitFor(error.OutOfMemory));
     try std.testing.expectEqual(CheckExit.does_not_fit, checkExitFor(error.LibcryptoHeapUnavailable));
     // The one value `ensureFdBudget` collapses every kernel answer into,
     // and the reason it has a distinct value at all.
     try std.testing.expectEqual(CheckExit.does_not_fit, checkExitFor(error.FdBudgetUnsatisfiable));
+    // A name this box's resolver does not know may be known on the next
+    // one (#480); a misspelled name says so on stderr beside the verdict.
+    try std.testing.expectEqual(CheckExit.does_not_fit, checkExitFor(error.EndpointNameUnresolved));
     // …and everything else says "change the file", including a path in
     // it that would not open, which is the arm most worth pinning: a CI
     // job must not learn to ignore the code a real mistake also earns.
