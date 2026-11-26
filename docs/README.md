@@ -151,7 +151,7 @@ A request passes through four things, in this order:
 | **listener** | an address zoxy accepts connections on, and the protocol it speaks there | [`listeners`](#listeners) |
 | **route** | a rule that picks a cluster for a request, by host, header or path prefix | a listener's [`routes`](#routing) |
 | **cluster** | a named group of servers that can all serve the same requests, and a policy for choosing one | [`clusters`](#clusters-and-load-balancing) |
-| **endpoint** | one server in a cluster: an `IP:port` or a Unix socket path | a cluster's `endpoints` |
+| **endpoint** | one server in a cluster: an `IP:port`, one address of a DNS name, or a Unix socket path | a cluster's `endpoints` |
 
 This config has two routes and two clusters:
 
@@ -230,8 +230,10 @@ Three rules hold for the whole file:
   closing the port.
 - **Unknown fields are rejected.** A misspelt key stops startup with an
   error; it is never ignored.
-- **Addresses are literal.** An endpoint is an `IP:port` or a `unix:` path.
-  zoxy resolves no host names.
+- **Names resolve once.** An endpoint is an `IP:port`, a `unix:` path, or
+  a DNS name and port that zoxy resolves at startup
+  ([Endpoints by DNS name](#endpoints-by-dns-name)). Binds are always
+  literal.
 
 #### Words this manual uses
 
@@ -1534,11 +1536,12 @@ finds the endpoints that are failing, and protects the ones that are busy.
 ### Clusters and load balancing
 
 A cluster is a named set of endpoints plus a policy for choosing one.
-Endpoints are static `IP:port` literals or
-[`unix:` socket paths](#reaching-a-local-app-over-a-unix-socket), parsed
-once at load; zoxy resolves no host names. Only the config bounds cluster
-and endpoint counts (there is no compiled ceiling), and the startup banner
-prints what the endpoint tables cost.
+Endpoints are `IP:port` literals,
+[DNS names with a port](#endpoints-by-dns-name), or
+[`unix:` socket paths](#reaching-a-local-app-over-a-unix-socket), all read
+once at load. Only the config bounds cluster and endpoint counts (there is
+no compiled ceiling), and the startup banner prints what the endpoint
+tables cost.
 
 ```json
 "clusters": {
@@ -1564,6 +1567,41 @@ Upstream connections are pooled process-wide and reusable by any request.
 They speak plain HTTP/1.1 unless the cluster says otherwise: see
 [HTTPS origins](#https-origins) and
 [gRPC and HTTP/2 origins](#grpc-and-http2-origins).
+
+#### Endpoints by DNS name
+
+An endpoint may name its origin by DNS name and port:
+
+```json
+"endpoints": [
+    "api.internal:8080",
+    { "address": "api-v6.internal:8080", "family": "ipv6" }
+]
+```
+
+zoxy resolves each name once, at startup, with the system's resolver: the
+hosts file and `resolv.conf`'s search domains count, as for any other
+program on the machine. Every address the name has becomes an endpoint with
+the entry's `weight` and `priority`, in the entry's place; a name's own
+addresses go IPv4 first and then in address order.
+`family` chooses which addresses: `ipv4` (the default; A records), `ipv6`
+(AAAA records) or `any`. It is refused beside an address, which has a
+family already. Each name's addresses are printed on stderr before the
+banner:
+
+```console
+zoxy: api.internal:8080 is 10.0.0.1:8080 10.0.0.2:8080
+```
+
+- **One address, once.** In a cluster that names a host, two entries that
+  give the same address, two names or a name and a literal, make one
+  endpoint. It takes the stronger claim: the lower `priority`, then the
+  higher `weight`.
+- **A name that does not resolve** stops the start, and
+  [`zoxy --check`](#checking-a-config-without-running-it) exits `2` on it:
+  the config may be right on a machine whose resolver knows the name.
+- **The addresses are fixed** once resolved. A name that moves to new
+  addresses needs a restart, which resolves it again.
 
 #### Weights
 
@@ -2087,7 +2125,7 @@ as at startup.
 |---|---|
 | `0` | the config loads and this machine can start it |
 | `1` | the config is wrong: unreadable, unparseable, semantically refused, or names a file that will not load |
-| `2` | the config is valid but *this machine* cannot fit it: the fd budget exceeds the `RLIMIT_NOFILE` hard limit |
+| `2` | the config is valid but *this machine* cannot fit it: the fd budget exceeds the `RLIMIT_NOFILE` hard limit, or an endpoint's name does not resolve here |
 
 CI can branch on the split: a build agent with a stock `RLIMIT_NOFILE` may
 accept `2` for a config sized for production, but must never accept `1`.
