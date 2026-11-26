@@ -2,12 +2,12 @@
 //! once at startup, never reloaded (§1 non-goal). `resolve` holds a
 //! build's options to every rule zoxy keeps — every limit gets its own
 //! error, every name another block uses resolves, every address is a
-//! static socket address, so the no-DNS non-goal holds structurally — and
-//! compiles them into the runtime shape the server runs. It reads no file
-//! and looks up no name: the stock binary's JSON front-end, a module of
-//! its own under `src/json/`, reads both before the options exist. The
-//! returned `Config` references both the arena and the options' own
-//! memory; the caller keeps both for the process lifetime.
+//! static socket address — and compiles them into the runtime shape the
+//! server runs. It reads no file and looks up no name: the stock binary's
+//! JSON front-end, a module of its own under `src/json/`, reads both
+//! before the options exist. The returned `Config` references both the
+//! arena and the options' own memory; the caller keeps both for the
+//! process lifetime.
 
 const std = @import("std");
 const trust = @import("tls/trust.zig");
