@@ -37,6 +37,7 @@ const filter = @import("http/filter.zig");
 const parser = @import("http/parser.zig");
 const io = @import("io/io.zig");
 const alpn = @import("tls/alpn.zig");
+const dns_host = @import("dns/host.zig");
 
 /// The sockets the proxy accepts on; at least one.
 listeners: []const Listener,
@@ -56,6 +57,9 @@ bodies: []const Body = &.{},
 /// Bodies for statuses zoxy answers itself; a status no page names keeps
 /// its empty one.
 error_pages: []const ErrorPage = &.{},
+/// The nameservers a cluster that follows names asks while serving
+/// (#481), or null. Required exactly when a cluster has `dns`.
+resolver: ?Resolver = null,
 
 /// One listening socket (§4): where it binds, whether it terminates TLS,
 /// and what it speaks.
@@ -354,6 +358,12 @@ pub const Cluster = struct {
     proxy_protocol_send: ?ProxyProtocolSend = null,
     /// TLS to the origins (#296), or null for plaintext.
     tls: ?Tls = null,
+    /// Names the cluster follows while it serves (#481), or null. With
+    /// it, `endpoints` holds the cluster's IP addresses alone, in every
+    /// set it takes — maybe none — and each name's current addresses join
+    /// them; its endpoint slots are zoxy's to size, so `endpoint_slots`
+    /// stays null.
+    dns: ?Dns = null,
 
     pub const Protocol = config.Config.Cluster.Protocol;
     pub const ProxyProtocolSend = config.Config.Cluster.ProxyProtocolSend;
@@ -369,6 +379,41 @@ pub const Cluster = struct {
         weight: u16 = 1,
         /// Its standby tier, 0 the primary (#396).
         priority: u8 = 0,
+    };
+
+    /// The names a cluster follows while it serves (#481): each asked of
+    /// the resolver again as its answer's TTL runs out, held between the
+    /// two bounds below, and the cluster's set made of what they answer.
+    pub const Dns = struct {
+        /// At least one.
+        names: []const Name,
+        /// The least time between two resolutions of the cluster's names,
+        /// whatever the TTL says, and the wait before a retry when one
+        /// failed.
+        refresh_min_ms: u32,
+        /// The most, whatever the TTL says.
+        refresh_max_ms: u32,
+        /// The most addresses one name gives in each family it asks; the
+        /// cluster's endpoint slots are sized from it.
+        addresses_max: u16,
+
+        pub const Name = struct {
+            /// A DNS name in canonical form (`dns.host`).
+            host: []const u8,
+            /// The port every one of its addresses takes.
+            port: u16,
+            /// Each address's share of picks; 0 drains them all.
+            weight: u16 = 1,
+            /// Each address's standby tier.
+            priority: u8 = 0,
+            /// Which records it asks for.
+            family: dns_host.Family = .ipv4,
+            /// What it resolved to at startup, each address with `port` and
+            /// in `family`, at most `addresses_max` per family. Empty, and
+            /// `App` resolves it before step zero; a build that resolved
+            /// the name itself states what it found.
+            addresses: []const std.Io.net.IpAddress = &.{},
+        };
     };
 
     pub const Pick = union(enum) {
@@ -521,6 +566,15 @@ pub const ErrorPage = struct {
     status: u16,
     /// The name of one of the build's bodies.
     body: []const u8,
+};
+
+/// How a cluster's names are asked while it serves (#481): recursive
+/// nameservers over UDP, one at a time.
+pub const Resolver = struct {
+    /// IP addresses and ports, asked in order: 1 to `dns_nameservers_max`.
+    nameservers: []const std.Io.net.IpAddress,
+    /// One query's budget at one nameserver before the next is asked.
+    timeout_ms: u32,
 };
 
 /// The admin listener (§8): the process counters in Prometheus text

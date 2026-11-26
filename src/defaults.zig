@@ -72,6 +72,18 @@ pub const keepalive_requests: u32 = constants.keepalive_requests_default;
 /// The stock pick (§7): the power of two choices.
 pub const pick: Options.Cluster.Pick = .p2c;
 
+/// The stock pace for a cluster that follows names (#481): a refresh at
+/// most once a second and at least once a minute, whatever the TTL says,
+/// and sixteen addresses per name and family.
+pub const dns = struct {
+    pub const refresh_min_ms: u32 = constants.dns_refresh_min_ms_default;
+    pub const refresh_max_ms: u32 = constants.dns_refresh_max_ms_default;
+    pub const addresses_max: u16 = constants.dns_addresses_max_default;
+};
+
+/// One query's stock budget at one nameserver (#481).
+pub const resolver_timeout_ms: u32 = constants.dns_timeout_ms_default;
+
 /// A health check's stock kind, thresholds and verdict (§7) — a TCP
 /// connect, HAProxy's `fall` and `rise`, and a `200` for an http probe. Its stock budget is the connect timeout: one
 /// probe is a dial and an answer, and a check that gave up sooner than a

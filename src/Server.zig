@@ -24,6 +24,7 @@ const extension_metrics = @import("extension_metrics.zig");
 const conn_module = @import("net/Conn.zig");
 const stream_module = @import("net/Stream.zig");
 const health_module = @import("net/health.zig");
+const dns_resolver = @import("dns/resolver.zig");
 const Io = @import("io/io.zig");
 const Pool = @import("mem/Pool.zig").Pool;
 const parser = @import("http/parser.zig");
@@ -486,6 +487,9 @@ pub fn Server(comptime runtime: Runtime) type {
         /// each). Off unless a cluster sets `check`; its `healthy` mask
         /// is what the balancer picks through.
         health: health_module.Checker(runtime),
+        /// #481: the clusters that follow names, asked again as their
+        /// TTLs run out.
+        resolver: dns_resolver.Resolver(runtime),
 
         const Self = @This();
 
@@ -809,6 +813,7 @@ pub fn Server(comptime runtime: Runtime) type {
             server.access_log.init(server, config.access_log_sink, options.access_log_buffer_bytes);
             try server.access_log.reserve(arena);
             try server.health.init(arena, server, keys, probeBufferBytes(options));
+            try server.resolver.init(arena, server);
         }
 
         /// One HTTP/2 session's shape at this config (#275): fields of up
@@ -1351,6 +1356,12 @@ pub fn Server(comptime runtime: Runtime) type {
             return consult_module.bytesFor(runtime.extensions.request_policies, &config.limits);
         }
 
+        /// The resolver's tables under `config` (#481): §5's
+        /// `resolver_bytes` term.
+        pub fn resolverBytes(config: *const config_module.Config) u64 {
+            return dns_resolver.Resolver(runtime).bytesFor(config);
+        }
+
         /// Lend the serving path's header scratch for one parse and the
         /// window that reads it (§7: nothing parsed survives its callback,
         /// so that window ends where the callback does — hence the `defer
@@ -1882,6 +1893,7 @@ pub fn Server(comptime runtime: Runtime) type {
             }
             try server.admin.start();
             server.health.start();
+            try server.resolver.start();
             server.io.signalWait(Self, server, onSignal);
             // Last, and after every op above is armed: the watchdog bounds
             // a loop that has work to deliver, so arming it before there
@@ -2002,6 +2014,9 @@ pub fn Server(comptime runtime: Runtime) type {
             // for its verdicts to inform, and its armed ops must drain
             // before the loop may stop (§8).
             server.health.beginStop();
+            // So does the resolver (#481): a set it found now would only
+            // reach endpoints nothing will be routed to.
+            server.resolver.beginStop();
             // Parked upstreams are idle capacity; the drain sheds them
             // first (§8). Synchronous closes: no armed op to wait for.
             server.reapParked(true);
@@ -2241,7 +2256,9 @@ pub fn Server(comptime runtime: Runtime) type {
             const conns_done = server.conns.isFullyReleased();
             const admin_done = server.admin.isQuiescent();
             const log_done = server.access_log.isQuiescent();
-            const health_done = server.health.isQuiescent();
+            // The resolver (#481) is a background plane as the prober is,
+            // and is reported with it.
+            const health_done = server.health.isQuiescent() and server.resolver.isQuiescent();
             if (conns_done and admin_done and log_done and health_done) return;
             // The forensics are for an operator reading the last thing
             // this process will ever say. A gate that provokes this path
@@ -2407,8 +2424,10 @@ pub fn Server(comptime runtime: Runtime) type {
             // reading, and stopping the loop over an armed sink write
             // would lose exactly those (§8).
             if (!server.access_log.isQuiescent()) return;
-            // Same rule for the prober's armed ops (§8).
+            // Same rule for the prober's armed ops (§8), and the
+            // resolver's (#481).
             if (!server.health.isQuiescent()) return;
+            if (!server.resolver.isQuiescent()) return;
             // And for the HTTP/2 origin connections (§7): each ends once its
             // last exchange has, and its GOAWAY and close take ops of their own.
             if (!server.h2_origins.isFullyReleased()) return;
@@ -2547,7 +2566,8 @@ pub fn Server(comptime runtime: Runtime) type {
                 server.consult_slots.busyCount() == 0 and
                 server.admin.isQuiescent() and
                 server.access_log.isQuiescent() and
-                server.health.isQuiescent();
+                server.health.isQuiescent() and
+                server.resolver.isQuiescent();
         }
 
         pub fn activeCount(server: *const Self) u32 {
@@ -2562,6 +2582,7 @@ pub fn Server(comptime runtime: Runtime) type {
         /// simulator runs this on.
         pub fn reconcile(server: *const Self) bool {
             server.labeled.reconciles(&server.counters);
+            server.resolver.reconciles(&server.counters);
             return server.counters.reconcile(server.activeCount());
         }
 
@@ -5936,6 +5957,9 @@ pub fn Server(comptime runtime: Runtime) type {
             for (server.config.clusters, 0..) |*cluster, index| {
                 if (!std.mem.eql(u8, cluster.name, cluster_name)) continue;
                 if (cluster.slots == null) return null;
+                // The resolver writes a cluster that follows names (#481):
+                // a build's own updates would race it.
+                if (cluster.dns != null) return null;
                 return .{ .context = server, .cluster_index = @intCast(index), .replace_fn = replaceThunk };
             }
             return null;

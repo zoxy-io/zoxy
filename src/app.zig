@@ -37,6 +37,7 @@ const trust = @import("tls/trust.zig");
 
 const Config = config_module.Config;
 const Options = @import("Options.zig");
+const dns_startup = @import("dns/startup.zig");
 
 const assert = std.debug.assert;
 
@@ -76,7 +77,14 @@ pub fn App(comptime extensions: extension.Extensions) type {
         fn load(init: std.process.Init, options: *const Options, startup: *const Startup) !Loaded {
             assert(startup.source.len >= 1);
             const arena_before = init.arena.queryCapacity();
-            const config = resolveServed(init.arena.allocator(), options) catch |err| {
+            // #481: every name a cluster follows has its first answer
+            // before step zero, from the nameservers the resolver will
+            // ask once it serves.
+            const served = dns_startup.resolveNames(init.io, init.arena.allocator(), options) catch |err| {
+                std.debug.print("zoxy: invalid config '{s}': {t}\n", .{ startup.source, err });
+                return err;
+            };
+            const config = resolveServed(init.arena.allocator(), served) catch |err| {
                 std.debug.print("zoxy: invalid config '{s}': {t}\n", .{ startup.source, err });
                 return err;
             };

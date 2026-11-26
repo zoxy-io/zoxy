@@ -659,6 +659,38 @@ pub const Counters = struct {
     /// Parked connections closed because their endpoint left its set —
     /// the ejection path's obligation, for a departure.
     endpoints_parked_closed: Value = Value.init(0),
+    /// #481's resolver: queries begun, each one name's records of one
+    /// type asked of one nameserver. Each ends in exactly one of the six
+    /// outcomes below or is still out, which `Resolver.reconciles` holds.
+    dns_queries_sent: Value = Value.init(0),
+    /// A reply that proved itself the query's and answered NOERROR.
+    dns_answered: Value = Value.init(0),
+    /// NXDOMAIN: the name is gone, and its addresses are kept.
+    dns_nxdomain: Value = Value.init(0),
+    /// SERVFAIL, REFUSED or another RCODE: the next nameserver is asked.
+    dns_servfail: Value = Value.init(0),
+    /// The TC bit: the reply would not fit `dns_message_bytes_max`, and
+    /// the name keeps its addresses.
+    dns_truncated: Value = Value.init(0),
+    /// No reply within `resolver.timeout_ms`: the next nameserver is
+    /// asked.
+    dns_timed_out: Value = Value.init(0),
+    /// Out when the drain stopped the resolver.
+    dns_canceled: Value = Value.init(0),
+    /// Datagrams that answered no query out: cut, malformed, or from
+    /// another peer, under another ID or for another question — what a
+    /// spoofed or late reply is.
+    dns_replies_dropped: Value = Value.init(0),
+    /// Answers carrying more addresses than the cluster's `addresses_max`:
+    /// the first in address order are taken.
+    dns_answers_truncated: Value = Value.init(0),
+    /// Sets the resolver gave its clusters, once their names' answers
+    /// changed.
+    dns_updates_applied: Value = Value.init(0),
+    /// Sets a cluster refused: no room while the set before drains, or no
+    /// endpoint at all. The cluster keeps serving the set it has, and the
+    /// next refresh asks again.
+    dns_updates_refused: Value = Value.init(0),
     /// Probe deadlines that fired *after* the verdict was already known —
     /// the §4 race between a timer and its own cancel, where the delivery
     /// is accounting and nothing else. Counts the race only while

@@ -43,6 +43,8 @@ pub const counters = @import("counters.zig");
 pub const dns = struct {
     pub const host = @import("dns/host.zig");
     pub const endpoints = @import("dns/endpoints.zig");
+    pub const message = @import("dns/message.zig");
+    pub const startup = @import("dns/startup.zig");
 };
 /// L7 HTTP/1.1 modules (§7). `parser` wraps the vendored hparse behind
 /// the trust boundary, `render` writes upstream/downstream heads, and
@@ -174,6 +176,9 @@ test {
     _ = counters;
     _ = dns.host;
     _ = dns.endpoints;
+    _ = dns.message;
+    _ = dns.startup;
+    _ = @import("dns/resolver_test.zig");
     _ = http.parser;
     _ = http.render;
     _ = http.router;

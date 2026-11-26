@@ -593,10 +593,67 @@ pub const dns_label_bytes_max: u16 = 63;
 /// name has.
 pub const dns_lookup_queue_entries: u16 = 64;
 
+/// The largest DNS reply #481's resolver takes, and the UDP payload its
+/// queries advertise in EDNS0 (RFC 6891): 1232 octets, the size the DNS
+/// flag day of 2020 settled on so a reply is never fragmented on an
+/// IPv6 path. A reply that would be larger arrives truncated, and the
+/// resolver keeps what it had (`dns_truncated`).
+pub const dns_message_bytes_max: u16 = 1232;
+
+/// A query: the header, the name in wire form (its text plus a length
+/// octet per label and the root's), the type and class, and the EDNS0
+/// OPT record.
+pub const dns_query_bytes_max: u16 = 12 + (dns_host_bytes_max + 2) + 4 + 11;
+
+/// Nameservers a resolver asks (#481), as many as `resolv.conf` names
+/// (resolv.conf(5)).
+pub const dns_nameservers_max: u8 = 3;
+
+/// One query's budget at one nameserver (#481): the stock value, as
+/// glibc's resolver waits five seconds and a proxy wants its answer
+/// sooner, and the bounds a config may state.
+pub const dns_timeout_ms_default: u32 = 2_000;
+pub const dns_timeout_ms_min: u32 = 10;
+pub const dns_timeout_ms_max: u32 = 30_000;
+
+/// The bounds a cluster's refresh is held between (#481): a TTL below
+/// the floor waits for it, one above the ceiling is cut to it. The stock
+/// floor keeps a zero TTL from asking every turn; the stock ceiling
+/// catches a moved name within a minute whatever its TTL promised.
+pub const dns_refresh_min_ms_default: u32 = 1_000;
+pub const dns_refresh_max_ms_default: u32 = 60_000;
+pub const dns_refresh_ms_min: u32 = 100;
+pub const dns_refresh_ms_max: u32 = 86_400_000;
+
+/// Addresses one name gives in each family it asks (#481): what its
+/// endpoint slots are sized from, a reply past it kept to the first in
+/// address order.
+pub const dns_addresses_max_default: u16 = 16;
+pub const dns_addresses_max: u16 = 64;
+
+/// CNAMEs one reply may chain through before its addresses (#481). A
+/// longer chain is refused as malformed rather than followed: a resolver
+/// flattens real chains far shorter than this.
+pub const dns_cname_chain_max: u8 = 8;
+
 comptime {
     assert(dns_host_bytes_max <= host_bytes_max);
     assert(dns_label_bytes_max < dns_host_bytes_max);
     assert(dns_lookup_queue_entries >= 16); // std's lookup promises not to block at 16.
+    assert(dns_query_bytes_max < dns_message_bytes_max);
+    // The smallest payload every DNS implementation must take (RFC 1035
+    // §4.2.1); EDNS0 only ever widens it.
+    assert(dns_message_bytes_max >= 512);
+    assert(dns_cname_chain_max >= 1);
+    assert(dns_nameservers_max >= 1);
+    assert(dns_timeout_ms_min <= dns_timeout_ms_default);
+    assert(dns_timeout_ms_default <= dns_timeout_ms_max);
+    assert(dns_refresh_ms_min <= dns_refresh_min_ms_default);
+    assert(dns_refresh_min_ms_default <= dns_refresh_max_ms_default);
+    assert(dns_refresh_max_ms_default <= dns_refresh_ms_max);
+    assert(dns_addresses_max_default <= dns_addresses_max);
+    // Every address of a full reply fits the room a reply has.
+    assert(@as(u32, dns_addresses_max) * 16 < dns_message_bytes_max);
 }
 
 /// Upper bound on one chunk-size line (hex size, extensions, CRLF) in a
@@ -1595,6 +1652,7 @@ pub fn inFlightOps(
     health_probes: u32,
     h2_origin_connections: u32,
     quic_endpoints: u32,
+    resolver_ops: u32,
 ) u32 {
     assert(conn_slots <= conn_slots_max);
     assert(stream_slots <= stream_slots_max);
@@ -1621,7 +1679,22 @@ pub fn inFlightOps(
         // A QUIC endpoint's receives, sends and the cancels a close arms
         // (#449); its connections hold none, and their exchanges' legs are
         // their streams', charged above.
-        quic_endpoints * quic_endpoint_ops_max;
+        quic_endpoints * quic_endpoint_ops_max +
+        // The resolver's (#481): `resolverOps`.
+        resolver_ops;
+}
+
+/// The resolver's ops at most (#481): each socket's receive and the
+/// cancel a drain arms on it, each query's send, and the refresh timer
+/// with its cancel. None without a resolver.
+pub fn resolverOps(sockets: u32, queries: u32) u32 {
+    if (queries == 0) {
+        assert(sockets == 0);
+        return 0;
+    }
+    assert(sockets >= 1);
+    assert(sockets <= 2); // One per address family.
+    return 2 * sockets + queries + 2;
 }
 
 /// One QUIC endpoint's ops at most: every receive and every send in
@@ -1757,11 +1830,12 @@ pub fn completionQueueDepthFor(
     health_probes: u32,
     h2_origin_connections: u32,
     quic_endpoints: u32,
+    resolver_ops: u32,
     cq_fill_eighths: u32,
 ) u32 {
     assert(cq_fill_eighths >= cq_fill_eighths_min);
     assert(cq_fill_eighths <= cq_fill_eighths_max);
-    const in_flight = inFlightOps(conn_slots, stream_slots, listeners, health_probes, h2_origin_connections, quic_endpoints);
+    const in_flight = inFlightOps(conn_slots, stream_slots, listeners, health_probes, h2_origin_connections, quic_endpoints, resolver_ops);
     // The shallowest ring whose fill budget covers every in-flight op;
     // eighths >= 1 is asserted above, so the divide never faults.
     const with_headroom = std.math.divCeil(u32, in_flight * 8, cq_fill_eighths) catch unreachable;
@@ -1791,11 +1865,12 @@ pub fn cqFillFits(
     health_probes: u32,
     h2_origin_connections: u32,
     quic_endpoints: u32,
+    resolver_ops: u32,
     cq_fill_eighths: u32,
 ) bool {
     assert(cq_fill_eighths >= cq_fill_eighths_min);
     assert(cq_fill_eighths <= cq_fill_eighths_max);
-    const in_flight = inFlightOps(conn_slots, stream_slots, listeners, health_probes, h2_origin_connections, quic_endpoints);
+    const in_flight = inFlightOps(conn_slots, stream_slots, listeners, health_probes, h2_origin_connections, quic_endpoints, resolver_ops);
     // The kernel CQ max is a power of two, so its fill budget is exact.
     return in_flight <= @divExact(completion_queue_entries_max, 8) * cq_fill_eighths;
 }
@@ -1812,7 +1887,7 @@ pub fn cqFillFits(
 /// this number — it only made it look derived from a ceiling that no
 /// longer exists.
 pub const completion_queue_entries: u32 =
-    completionQueueDepthFor(conn_slots_max, 0, 0, health_probe_concurrency_max, 0, 0, cq_fill_eighths_default);
+    completionQueueDepthFor(conn_slots_max, 0, 0, health_probe_concurrency_max, 0, 0, 0, cq_fill_eighths_default);
 
 /// The fds a deployment needs (§8: fds are pre-budgeted, not shed): stdio
 /// + ring + async eventfd + listeners (configured + admin) + two sockets
@@ -1839,6 +1914,7 @@ pub fn fdsRequired(
     health_probes: u32,
     h2_origin_connections: u32,
     quic_endpoints: u32,
+    resolver_sockets: u32,
 ) u32 {
     assert(conn_slots <= conn_slots_max);
     assert(upstream_slots <= upstream_slots_max);
@@ -1852,11 +1928,14 @@ pub fn fdsRequired(
     assert(health_probes <= health_probe_concurrency_max);
     assert(h2_origin_connections <= h2_origin_connections_max);
     assert(quic_endpoints <= listeners);
+    assert(resolver_sockets <= 2);
     // A QUIC endpoint is one UDP socket (#449); its connections hold none,
     // so the conn term's client socket is one each of them does not use.
     return 3 + 1 + 1 + (listeners + admin_listeners) +
         2 * conn_slots + 1 + admin_conns + upstream_slots + health_probes +
-        2 * access_log_files + h2_origin_connections + quic_endpoints;
+        2 * access_log_files + h2_origin_connections + quic_endpoints +
+        // The resolver's UDP sockets (#481), one per nameserver family.
+        resolver_sockets;
 }
 
 /// Default effective pool sizes when the config omits a `limits` block: a
@@ -1887,7 +1966,7 @@ pub const relay_buffers_default: u32 = conn_slots_default;
 /// stock 4096 `RLIMIT_NOFILE` rather than by admission: matching 1386
 /// would put the default at 4168 fds, over that line, for capacity an
 /// unconfigured proxy is not there to serve. 1311 is the largest value
-/// that still clears that line — `fdsRequired(conn_slots_default, x, 1, 1, 1, 0, 0)`
+/// that still clears that line — `fdsRequired(conn_slots_default, x, 1, 1, 1, 0, 0, 0)`
 /// is `2784 + x` (the health probe's reserved fd and the access log's
 /// possible file sink both included, the sink at its SIGHUP-reopen worst
 /// of two fds: naming a log file is not *tuning*, so the lean promise
@@ -1926,7 +2005,7 @@ comptime {
     assert(upstream_slots_default >= 1 and upstream_slots_default <= upstream_slots_max);
     assert(relay_buffers_max <= conn_slots_max);
     assert(relay_buffers_max >= 1);
-    assert(inFlightOps(conn_slots_max, 0, 0, health_probe_concurrency_max, 0, 0) <= completion_queue_entries);
+    assert(inFlightOps(conn_slots_max, 0, 0, health_probe_concurrency_max, 0, 0, 0) <= completion_queue_entries);
     assert(conn_slots_max - 1 <= std.math.maxInt(u16));
     assert(relay_buffer_bytes_min >= 512);
     assert(relay_buffer_bytes_min <= relay_buffer_bytes_default);
@@ -2259,6 +2338,10 @@ pub const PoolSizes = struct {
     /// request and its reply. Zero in a build whose policies consult
     /// nothing, and in a config that reserves no slots.
     consult_bytes: u64,
+    /// #481's resolver: its query table, each query's room for addresses,
+    /// its rounds and the set it builds; zero unless a cluster follows
+    /// names.
+    resolver_bytes: u64,
     /// The §5 head-buffer ring: how many buffers the deployment registered
     /// (`limits.head_buffers`; zero on an L4-only config) and the unit
     /// size of each. The total term is `count × (unit + 1)` — the slab
@@ -2441,7 +2524,7 @@ pub fn memoryBytesTotal(sizes: *const PoolSizes) u64 {
         @as(u64, sizes.relay_buffers) * sizes.relay_buffer_pair_bytes +
         @as(u64, sizes.upstream_slots) * sizes.upstream_bytes +
         sizes.access_log_bytes + sizes.log_header_bytes +
-        sizes.endpoint_table_bytes + sizes.metrics_bytes + sizes.answer_bytes + sizes.policy_edit_bytes + sizes.consult_bytes +
+        sizes.endpoint_table_bytes + sizes.metrics_bytes + sizes.answer_bytes + sizes.policy_edit_bytes + sizes.consult_bytes + sizes.resolver_bytes +
         @as(u64, sizes.tunnels) * sizes.tunnel_buffer_pair_bytes +
         @as(u64, sizes.head_buffers) * (sizes.head_buffer_bytes + 1) +
         bufferGroupDescriptorBytes(sizes.head_buffers) +
@@ -2495,11 +2578,11 @@ fn assertH3Terms(sizes: *const PoolSizes) void {
 }
 
 test "budgets: in-flight ops fit the completion queue with headroom" {
-    try std.testing.expect(inFlightOps(conn_slots_max, 0, 0, health_probe_concurrency_max, 0, 0) <= completion_queue_entries);
+    try std.testing.expect(inFlightOps(conn_slots_max, 0, 0, health_probe_concurrency_max, 0, 0, 0) <= completion_queue_entries);
     // Headroom is deliberate: at least an eighth of the CQ stays free for
     // completion bursts even at the worst-case armed-op count (the default
     // = loosest fill the ceiling is derived at).
-    try std.testing.expect(inFlightOps(conn_slots_max, 0, 0, health_probe_concurrency_max, 0, 0) <= @divExact(completion_queue_entries, 8) * cq_fill_eighths_default);
+    try std.testing.expect(inFlightOps(conn_slots_max, 0, 0, health_probe_concurrency_max, 0, 0, 0) <= @divExact(completion_queue_entries, 8) * cq_fill_eighths_default);
 }
 
 test "pressure: relay watermarks have a hysteresis gap at every capacity" {
@@ -2543,6 +2626,7 @@ test "budgets: HTTP/2 is priced by its own terms, and its shared streams by thei
         .answer_bytes = 0,
         .policy_edit_bytes = 0,
         .consult_bytes = 0,
+        .resolver_bytes = 0,
         .head_buffers = 0,
         .head_buffer_bytes = head_buffer_bytes_default,
         .upstream_head_buffers = 0,
@@ -2564,12 +2648,12 @@ test "budgets: HTTP/2 is priced by its own terms, and its shared streams by thei
     // per-connection divisor does not move.
     try std.testing.expectEqual(
         @as(u32, shared_streams) * stream_ops_max,
-        inFlightOps(64, shared_streams, 1, 1, 0, 0) - inFlightOps(64, 0, 1, 1, 0, 0),
+        inFlightOps(64, shared_streams, 1, 1, 0, 0, 0) - inFlightOps(64, 0, 1, 1, 0, 0, 0),
     );
     // And at the conn ceiling there is no room left for a shared pool at
     // the loosest fill: it is the ring that bounds HTTP/2's multiplexing,
     // which `cqFillFits` tells the operator at load.
-    try std.testing.expect(!cqFillFits(conn_slots_max, conn_slots_max, 0, 1, 0, 0, cq_fill_eighths_max));
+    try std.testing.expect(!cqFillFits(conn_slots_max, conn_slots_max, 0, 1, 0, 0, 0, cq_fill_eighths_max));
 }
 
 test "budgets: memory total matches the closed form" {
@@ -2630,6 +2714,7 @@ test "budgets: memory total matches the closed form" {
         .answer_bytes = 0,
         .policy_edit_bytes = 0,
         .consult_bytes = 0,
+        .resolver_bytes = 0,
         .head_buffers = conn_slots_max,
         .head_buffer_bytes = head_buffer_bytes_default,
         .upstream_head_buffers = upstream_slots_max,
@@ -2656,6 +2741,7 @@ test "budgets: memory total matches the closed form" {
         .answer_bytes = 0,
         .policy_edit_bytes = 0,
         .consult_bytes = 0,
+        .resolver_bytes = 0,
         // The L4-only shape: no ring, no upstream head pool, no scratch
         // terms — but the prober's buffer is unconditional.
         .head_buffers = 0,
@@ -2687,6 +2773,7 @@ test "budgets: memory total matches the closed form" {
         .answer_bytes = 0,
         .policy_edit_bytes = 0,
         .consult_bytes = 0,
+        .resolver_bytes = 0,
         .head_buffers = 0,
         .head_buffer_bytes = head_buffer_bytes_default,
         .upstream_head_buffers = 0,
@@ -2728,6 +2815,7 @@ test "budgets: memory total matches the closed form" {
         .answer_bytes = 0,
         .policy_edit_bytes = 0,
         .consult_bytes = 0,
+        .resolver_bytes = 0,
         .head_buffers = 0,
         .head_buffer_bytes = head_buffer_bytes_default,
         .upstream_head_buffers = 0,
@@ -2760,15 +2848,15 @@ test "budgets: c10k ceiling fd count needs a raised NOFILE" {
     // at startup (§8); this pins the ceiling closed form.
     try std.testing.expectEqual(
         @as(u32, 42987),
-        fdsRequired(conn_slots_max, upstream_slots_max, 0, 0, health_probe_concurrency_max, 0, 0),
+        fdsRequired(conn_slots_max, upstream_slots_max, 0, 0, health_probe_concurrency_max, 0, 0, 0),
     );
     // A file sink is two fds — held plus the SIGHUP-reopen transient —
     // at the ceiling as everywhere.
     try std.testing.expectEqual(
         @as(u32, 42989),
-        fdsRequired(conn_slots_max, upstream_slots_max, 0, 1, health_probe_concurrency_max, 0, 0),
+        fdsRequired(conn_slots_max, upstream_slots_max, 0, 1, health_probe_concurrency_max, 0, 0, 0),
     );
-    try std.testing.expect(fdsRequired(conn_slots_max, upstream_slots_max, 0, 1, health_probe_concurrency_max, 0, 0) <= 65536);
+    try std.testing.expect(fdsRequired(conn_slots_max, upstream_slots_max, 0, 1, health_probe_concurrency_max, 0, 0, 0) <= 65536);
     // The out-of-box side of this is pinned by "the default deployment is
     // lean" below, not restated here.
 }
@@ -2779,15 +2867,15 @@ test "budgets: the default deployment is lean" {
     // ceiling — operators opt up through `limits` (§5). One listener.
     // With the one file sink a config can name included: the lean line
     // holds whether or not the access log writes to a file.
-    try std.testing.expect(fdsRequired(conn_slots_default, upstream_slots_default, 1, 1, 1, 0, 0) < 4096);
+    try std.testing.expect(fdsRequired(conn_slots_default, upstream_slots_default, 1, 1, 1, 0, 0, 0) < 4096);
     try std.testing.expect(
-        completionQueueDepthFor(conn_slots_default, 0, 1, 1, 0, 0, cq_fill_eighths_default) <
+        completionQueueDepthFor(conn_slots_default, 0, 1, 1, 0, 0, 0, cq_fill_eighths_default) <
             completion_queue_entries,
     );
     // The effective CQ still covers the default's in-flight ops with the
     // ⅞ headroom, exactly as the ceiling does for its own.
-    const depth = completionQueueDepthFor(conn_slots_default, 0, 1, 1, 0, 0, cq_fill_eighths_default);
-    try std.testing.expect(inFlightOps(conn_slots_default, 0, 1, 1, 0, 0) <= @divExact(depth, 8) * cq_fill_eighths_default);
+    const depth = completionQueueDepthFor(conn_slots_default, 0, 1, 1, 0, 0, 0, cq_fill_eighths_default);
+    try std.testing.expect(inFlightOps(conn_slots_default, 0, 1, 1, 0, 0, 0) <= @divExact(depth, 8) * cq_fill_eighths_default);
 }
 
 test "budgets: conn slots sit at the completion-queue ceiling" {
@@ -2795,7 +2883,7 @@ test "budgets: conn slots sit at the completion-queue ceiling" {
     // caps concurrent connections; conn_slots_max is the largest value
     // that still satisfies it after the fixed reservations, so one more
     // slot would break the budget.
-    try std.testing.expect(inFlightOps(conn_slots_max, 0, 0, health_probe_concurrency_max, 0, 0) <= @divExact(completion_queue_entries, 8) * cq_fill_eighths_default);
+    try std.testing.expect(inFlightOps(conn_slots_max, 0, 0, health_probe_concurrency_max, 0, 0, 0) <= @divExact(completion_queue_entries, 8) * cq_fill_eighths_default);
     // One more connection costs both shares, because the counts are
     // pinned (#274): a conn slot the pool cannot pair a stream with could
     // never run an exchange. Spelled as the sum rather than through
@@ -2811,16 +2899,16 @@ test "budgets: conn slots sit at the completion-queue ceiling" {
 test "budgets: a tighter cq fill trades ceiling for burst headroom" {
     // More headroom (fewer eighths) never asks for a shallower ring: at a
     // fixed conn count the requested CQ is monotonic in the fill.
-    const loose = completionQueueDepthFor(conn_slots_default, 0, 1, 1, 0, 0, cq_fill_eighths_max);
-    const tight = completionQueueDepthFor(conn_slots_default, 0, 1, 1, 0, 0, cq_fill_eighths_min);
+    const loose = completionQueueDepthFor(conn_slots_default, 0, 1, 1, 0, 0, 0, cq_fill_eighths_max);
+    const tight = completionQueueDepthFor(conn_slots_default, 0, 1, 1, 0, 0, 0, cq_fill_eighths_min);
     try std.testing.expect(tight >= loose);
     // The conn-slot ceiling fits only at the max fill; one eighth tighter
     // overflows even the deepest kernel CQ — the loader must reject that
     // pairing (`cqFillFits` is the guard).
-    try std.testing.expect(cqFillFits(conn_slots_max, 0, 0, health_probe_concurrency_max, 0, 0, cq_fill_eighths_max));
-    try std.testing.expect(!cqFillFits(conn_slots_max, 0, 0, health_probe_concurrency_max, 0, 0, cq_fill_eighths_max - 1));
+    try std.testing.expect(cqFillFits(conn_slots_max, 0, 0, health_probe_concurrency_max, 0, 0, 0, cq_fill_eighths_max));
+    try std.testing.expect(!cqFillFits(conn_slots_max, 0, 0, health_probe_concurrency_max, 0, 0, 0, cq_fill_eighths_max - 1));
     // The lean default still fits with plenty of room to spare, even at the
     // old ¾ (= 6/8) fill and at the tightest floor.
-    try std.testing.expect(cqFillFits(conn_slots_default, 0, 1, 1, 0, 0, 6));
-    try std.testing.expect(cqFillFits(conn_slots_default, 0, 1, 1, 0, 0, cq_fill_eighths_min));
+    try std.testing.expect(cqFillFits(conn_slots_default, 0, 1, 1, 0, 0, 0, 6));
+    try std.testing.expect(cqFillFits(conn_slots_default, 0, 1, 1, 0, 0, 0, cq_fill_eighths_min));
 }

@@ -23,6 +23,8 @@ const shed = @import("shed.zig");
 const io_module = @import("io/io.zig");
 const Options = @import("Options.zig");
 const defaults = @import("defaults.zig");
+const dns_host = @import("dns/host.zig");
+const dns_endpoints = @import("dns/endpoints.zig");
 /// The ALPN vocabulary (#271). Public so the schema emitter states the
 /// same closed set the loader enforces.
 pub const alpn = @import("tls/alpn.zig");
@@ -144,6 +146,34 @@ pub const Config = struct {
     /// Where access-log lines go (§8), or null when no `access_log` block
     /// is configured — the log stays off and reserves nothing.
     access_log_sink: ?AccessLogSink = null,
+    /// The nameservers clusters that follow names ask (#481), or null
+    /// when none does.
+    resolver: ?Resolver = null,
+
+    pub const Resolver = struct {
+        nameservers: []const std.Io.net.IpAddress,
+        timeout_ms: u32,
+    };
+
+    /// The resolver's queries (#481): one per name and record type it
+    /// asks — a name's A records, its AAAA records, or both. What its
+    /// query table, its sends and the slots it fills are sized from.
+    pub fn dnsQueries(config: *const Config) u32 {
+        var queries: u32 = 0;
+        for (config.clusters) |*cluster| {
+            const dns = cluster.dns orelse continue;
+            queries += dns.queries();
+        }
+        if (config.resolver == null) assert(queries == 0);
+        return queries;
+    }
+
+    /// The resolver's UDP sockets (#481): one per address family its
+    /// nameservers are in, none without a resolver.
+    pub fn dnsSockets(config: *const Config) u32 {
+        const resolver = config.resolver orelse return 0;
+        return socketsFor(resolver.nameservers);
+    }
 
     /// Endpoints under §7 active checks: the sum of `endpoints.len` over
     /// every cluster that set a `check` block. Both the prober's own
@@ -765,6 +795,29 @@ pub const Config = struct {
         /// must reach — parsed from the `ca` bundle at load. Required by
         /// `h2`; with `http1` the origins speak HTTPS; never with `h2c`.
         tls: ?Tls = null,
+        /// The names this cluster follows while it serves (#481), or null.
+        /// A cluster with them has `slots`, sized for them.
+        dns: ?*const Dns = null,
+
+        /// A cluster's names, resolved (#481): each one's startup
+        /// addresses stay in the options, as `Options.Cluster.Dns.Name`
+        /// states them, for the resolver to begin from.
+        pub const Dns = struct {
+            names: []const Options.Cluster.Dns.Name,
+            /// The cluster's own IP addresses, in every set it takes.
+            literals: []const extension_module.EndpointSet.Endpoint,
+            refresh_min_ms: u32,
+            refresh_max_ms: u32,
+            addresses_max: u16,
+
+            /// One per name and record type the name asks for.
+            pub fn queries(dns: *const Dns) u32 {
+                var count: u32 = 0;
+                for (dns.names) |*name| count += familyQueries(name.family);
+                assert(count >= dns.names.len);
+                return count;
+            }
+        };
 
         pub const Protocol = enum(u2) {
             http1,
@@ -1119,6 +1172,29 @@ pub const ValidationError = error{
     EndpointWeightOverLimit,
     EndpointPriorityOverLimit,
     EndpointWeightsAllZero,
+    /// A cluster with `dns` and no resolver to ask (#481).
+    ResolverMissing,
+    /// A resolver no cluster asks: it would sit there inert (#481).
+    ResolverUnused,
+    /// No nameserver, or more than `dns_nameservers_max`.
+    ResolverNameserversOutOfRange,
+    ResolverNameserverPortZero,
+    ResolverTimeoutOutOfRange,
+    /// A `dns` block that names no host (#481).
+    ClusterDnsNamesEmpty,
+    /// A name not in the canonical form `dns.host` gives.
+    ClusterDnsNameInvalid,
+    /// `endpoint_slots` beside `dns`: the resolver sizes the cluster's
+    /// slots, and a build's own updates would race it.
+    ClusterDnsEndpointSlots,
+    /// A `unix:` endpoint beside `dns`: every set the resolver writes
+    /// names IP endpoints alone, so the socket would leave at the first.
+    ClusterDnsUnixEndpoint,
+    ClusterDnsRefreshOutOfRange,
+    ClusterDnsAddressesMaxOutOfRange,
+    /// A name's startup address outside its family or its port, or more
+    /// in one family than `addresses_max`.
+    ClusterDnsAddressInvalid,
     TimeoutZero,
     TimeoutOverLimit,
     TimeoutOrderInvalid,
@@ -1249,6 +1325,7 @@ pub fn resolve(arena: std.mem.Allocator, options: *const Options) ResolveError!C
     // ceiling, and its default was priced from the connect timeout.
     try validateTimeouts(&options.timeouts);
     const clusters = try resolveClusters(arena, options.clusters);
+    const resolver = try resolveResolver(options.resolver, clusters);
     // Emptiness outranks everything after the clusters (the limits
     // resolver asserts a non-empty set, so the gate fires first here),
     // and the count's `u16` edge is checked before anything is sized
@@ -1282,6 +1359,7 @@ pub fn resolve(arena: std.mem.Allocator, options: *const Options) ResolveError!C
             .h2_origin_tls = h2OriginTls(clusters),
             .upstream_tls_endpoints = upstreamTlsEndpointsOf(clusters),
         },
+        resolverOpsOf(resolver, clusters),
     );
     // Limits resolve before listeners: the route prefixes inside
     // `resolveListeners` are gated against the resolved
@@ -1308,7 +1386,21 @@ pub fn resolve(arena: std.mem.Allocator, options: *const Options) ResolveError!C
         .access_log_sink = access_log_sink,
         .log_headers = log_headers,
         .error_pages = error_pages,
+        .resolver = resolver,
     });
+}
+
+/// The resolver's share of the ring (#481), which `resolveCqFill` has to
+/// know before it accepts a fill: `constants.resolverOps` of the sockets
+/// its nameservers need and the queries the clusters ask.
+fn resolverOpsOf(resolver: ?Config.Resolver, clusters: []const Config.Cluster) u32 {
+    const stated = resolver orelse return 0;
+    var queries: u32 = 0;
+    for (clusters) |*cluster| {
+        if (cluster.dns) |dns| queries += dns.queries();
+    }
+    assert(queries >= 1); // `resolveResolver` refuses a resolver nothing asks.
+    return constants.resolverOps(socketsFor(stated.nameservers), queries);
 }
 
 /// What `resolve` compiled, gathered for `configOf`.
@@ -1319,6 +1411,7 @@ const Resolved = struct {
     access_log_sink: ?Config.AccessLogSink,
     log_headers: ResolvedLogHeaders,
     error_pages: []const *const Config.StaticPage,
+    resolver: ?Config.Resolver,
 };
 
 /// The `Config` the server runs, from the options and what was compiled
@@ -1350,6 +1443,7 @@ fn configOf(options: *const Options, resolved: Resolved) Config {
         .access_log_request_headers = resolved.log_headers.request,
         .access_log_response_headers = resolved.log_headers.response,
         .error_pages = resolved.error_pages,
+        .resolver = resolved.resolver,
     };
 }
 
@@ -1876,6 +1970,7 @@ fn resolveLimits(
     log_header_count: u32,
     health_probes: u32,
     origins: OriginDemand,
+    resolver_ops: u32,
 ) ValidationError!Config.Limits {
     assert(listeners_count >= 1);
     assert(health_probes >= 1);
@@ -1905,6 +2000,7 @@ fn resolveLimits(
         health_probes,
         origin_pools.connections,
         features.quic,
+        resolver_ops,
     );
     // Zero exactly when the log is off, so the one number says both how
     // big the staging buffers are and whether there are any (§8). A
@@ -2150,6 +2246,7 @@ fn resolveCqFill(
     health_probes: u32,
     origin_connections: u32,
     quic_endpoints: u32,
+    resolver_ops: u32,
 ) ValidationError!u32 {
     assert(conn_slots >= 1);
     assert(listeners_count >= 1);
@@ -2167,6 +2264,7 @@ fn resolveCqFill(
         health_probes,
         origin_connections,
         quic_endpoints,
+        resolver_ops,
         cq_fill_eighths,
     )) {
         return error.LimitConnSlotsOverCqFill;
@@ -2424,8 +2522,12 @@ fn resolveCluster(
         return error.ClusterNameTooLong;
     }
     const picked = try resolvePick(&stated.pick);
-    const endpoints = try resolveEndpoints(arena, stated.endpoints);
-    const priorities = try resolvePriorities(arena, stated.endpoints);
+    // A cluster that follows names (#481) starts from its addresses and
+    // every name's, each address once.
+    const plan: ?DnsPlan = if (stated.dns) |*dns| try resolveDns(arena, stated, dns) else null;
+    const stated_endpoints = if (plan) |dns_plan| dns_plan.endpoints else stated.endpoints;
+    const endpoints = try resolveEndpoints(arena, stated_endpoints);
+    const priorities = try resolvePriorities(arena, stated_endpoints);
     var cluster: Config.Cluster = .{
         .name = stated.name,
         .endpoints = endpoints.addresses,
@@ -2445,12 +2547,143 @@ fn resolveCluster(
         .protocol = stated.protocol,
         .tls = try resolveClusterTls(arena, stated.tls),
     };
-    assert(cluster.endpoints.len == stated.endpoints.len);
-    if (stated.endpoint_slots) |capacity| {
+    assert(cluster.endpoints.len == stated_endpoints.len);
+    if (plan) |dns_plan| {
+        cluster.dns = dns_plan.dns;
+        try reserveSlots(arena, &cluster, dns_plan.capacity);
+    } else if (stated.endpoint_slots) |capacity| {
         try reserveSlots(arena, &cluster, capacity);
     }
     assert(cluster.name.len >= 1);
     return cluster;
+}
+
+/// What a cluster that follows names starts from (#481).
+const DnsPlan = struct {
+    /// Its addresses and every name's startup addresses, each once.
+    endpoints: []const Options.Cluster.Endpoint,
+    dns: *const Config.Cluster.Dns,
+    /// Its own addresses, and twice every query's room: a whole new set
+    /// fits while the one it replaces drains out.
+    capacity: u16,
+};
+
+fn resolveDns(
+    arena: std.mem.Allocator,
+    stated: *const Options.Cluster,
+    dns: *const Options.Cluster.Dns,
+) ResolveError!DnsPlan {
+    if (stated.endpoint_slots != null) return error.ClusterDnsEndpointSlots;
+    try validateDnsPace(dns);
+    if (dns.names.len == 0) return error.ClusterDnsNamesEmpty;
+    const literals = try arena.alloc(extension_module.EndpointSet.Endpoint, stated.endpoints.len);
+    var initial: std.ArrayList(Options.Cluster.Endpoint) = try .initCapacity(arena, stated.endpoints.len);
+    for (stated.endpoints, literals) |*endpoint, *literal| {
+        const ip = switch (endpoint.address) {
+            .ip => |ip| ip,
+            .unix => return error.ClusterDnsUnixEndpoint,
+        };
+        literal.* = .{ .address = ip, .weight = endpoint.weight, .priority = endpoint.priority };
+        initial.appendAssumeCapacity(endpoint.*);
+    }
+    var queries: u32 = 0;
+    for (dns.names) |*name| {
+        try validateDnsName(name, dns.addresses_max);
+        queries += familyQueries(name.family);
+        // A name's addresses in `dns.endpoints` order, as the resolver
+        // lays every later answer out.
+        const sorted = try arena.dupe(std.Io.net.IpAddress, name.addresses);
+        dns_endpoints.sortAddresses(sorted);
+        for (sorted) |address| {
+            try initial.append(arena, .{ .address = .{ .ip = address }, .weight = name.weight, .priority = name.priority });
+        }
+    }
+    const kept = dns_endpoints.mergeDuplicates(Options.Cluster.Endpoint, initial.items);
+    const capacity = literals.len + 2 * @as(u64, queries) * dns.addresses_max;
+    if (capacity > @as(u32, constants.endpoint_index_max) + 1) return error.EndpointSlotsOutOfRange;
+    const resolved = try arena.create(Config.Cluster.Dns);
+    resolved.* = .{
+        .names = dns.names,
+        .literals = literals,
+        .refresh_min_ms = dns.refresh_min_ms,
+        .refresh_max_ms = dns.refresh_max_ms,
+        .addresses_max = dns.addresses_max,
+    };
+    assert(resolved.queries() == queries);
+    assert(kept <= capacity);
+    return .{ .endpoints = initial.items[0..kept], .dns = resolved, .capacity = @intCast(capacity) };
+}
+
+fn validateDnsPace(dns: *const Options.Cluster.Dns) ValidationError!void {
+    if (dns.refresh_min_ms < constants.dns_refresh_ms_min) return error.ClusterDnsRefreshOutOfRange;
+    if (dns.refresh_max_ms > constants.dns_refresh_ms_max) return error.ClusterDnsRefreshOutOfRange;
+    if (dns.refresh_min_ms > dns.refresh_max_ms) return error.ClusterDnsRefreshOutOfRange;
+    if (dns.addresses_max == 0) return error.ClusterDnsAddressesMaxOutOfRange;
+    if (dns.addresses_max > constants.dns_addresses_max) return error.ClusterDnsAddressesMaxOutOfRange;
+    assert(dns.refresh_min_ms >= 1);
+}
+
+fn validateDnsName(name: *const Options.Cluster.Dns.Name, addresses_max: u16) ValidationError!void {
+    assert(addresses_max >= 1);
+    if (!dns_host.isCanonical(name.host)) return error.ClusterDnsNameInvalid;
+    if (name.port == 0) return error.EndpointPortZero;
+    if (name.weight > constants.endpoint_weight_max) return error.EndpointWeightOverLimit;
+    if (name.priority > constants.endpoint_priority_max) return error.EndpointPriorityOverLimit;
+    var four: u32 = 0;
+    var six: u32 = 0;
+    for (name.addresses) |*address| {
+        if (!name.family.admits(address)) return error.ClusterDnsAddressInvalid;
+        if (address.getPort() != name.port) return error.ClusterDnsAddressInvalid;
+        switch (address.*) {
+            .ip4 => four += 1,
+            .ip6 => six += 1,
+        }
+    }
+    if (four > addresses_max or six > addresses_max) return error.ClusterDnsAddressInvalid;
+    assert(four + six == name.addresses.len);
+}
+
+/// The queries a name asks: A, AAAA, or both.
+pub fn familyQueries(family: dns_host.Family) u32 {
+    return switch (family) {
+        .ipv4, .ipv6 => 1,
+        .any => 2,
+    };
+}
+
+/// The resolver's sockets for `nameservers`: one per family among them.
+fn socketsFor(nameservers: []const std.Io.net.IpAddress) u32 {
+    assert(nameservers.len >= 1);
+    var four = false;
+    var six = false;
+    for (nameservers) |*nameserver| switch (nameserver.*) {
+        .ip4 => four = true,
+        .ip6 => six = true,
+    };
+    const sockets = @as(u32, @intFromBool(four)) + @intFromBool(six);
+    assert(sockets >= 1);
+    return sockets;
+}
+
+/// The resolver the options state (#481), held to the clusters that ask
+/// it: one exactly when a cluster follows names.
+fn resolveResolver(stated: ?Options.Resolver, clusters: []const Config.Cluster) ValidationError!?Config.Resolver {
+    const asked = for (clusters) |*cluster| {
+        if (cluster.dns != null) break true;
+    } else false;
+    const resolver = stated orelse {
+        if (asked) return error.ResolverMissing;
+        return null;
+    };
+    if (!asked) return error.ResolverUnused;
+    if (resolver.nameservers.len == 0) return error.ResolverNameserversOutOfRange;
+    if (resolver.nameservers.len > constants.dns_nameservers_max) return error.ResolverNameserversOutOfRange;
+    for (resolver.nameservers) |*nameserver| {
+        if (nameserver.getPort() == 0) return error.ResolverNameserverPortZero;
+    }
+    if (resolver.timeout_ms < constants.dns_timeout_ms_min) return error.ResolverTimeoutOutOfRange;
+    if (resolver.timeout_ms > constants.dns_timeout_ms_max) return error.ResolverTimeoutOutOfRange;
+    return .{ .nameservers = resolver.nameservers, .timeout_ms = resolver.timeout_ms };
 }
 
 /// A cluster's room for endpoints added while serving (#428): every array
@@ -5174,4 +5407,100 @@ test "config: endpoint slots reserve room past the stated endpoints, free and we
     var short = stated;
     short.endpoint_slots = 1;
     try std.testing.expectError(error.EndpointSlotsOutOfRange, resolveCluster(arena, &short));
+}
+
+fn testIp(literal: []const u8) std.Io.net.IpAddress {
+    return std.Io.net.IpAddress.parseLiteral(literal) catch unreachable;
+}
+
+test "config: a cluster that follows names starts from them, with room for a new set (#481)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const stated: Options.Cluster = .{
+        .name = "api",
+        .endpoints = &.{.{ .address = .{ .ip = testIp("10.0.0.9:80") }, .priority = 1 }},
+        .pick = .p2c,
+        .dns = .{
+            .names = &.{
+                .{ .host = "api.internal", .port = 80, .addresses = &.{ testIp("10.0.0.2:80"), testIp("10.0.0.1:80") } },
+                // Both families, one of its addresses the literal's: kept once,
+                // the primary tier over the literal's standby.
+                .{ .host = "dual.internal", .port = 80, .weight = 2, .family = .any, .addresses = &.{ testIp("[fd00::1]:80"), testIp("10.0.0.9:80") } },
+            },
+            .refresh_min_ms = 1_000,
+            .refresh_max_ms = 60_000,
+            .addresses_max = 4,
+        },
+    };
+    const cluster = try resolveCluster(arena, &stated);
+    const dns = cluster.dns.?;
+    try std.testing.expectEqual(@as(u32, 3), dns.queries());
+    try std.testing.expectEqual(@as(usize, 1), dns.literals.len);
+    // One literal, and twice three queries' room of four.
+    try std.testing.expectEqual(@as(usize, 1 + 2 * 3 * 4), cluster.endpoints.len);
+    const slots = cluster.slots.?;
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(Config.EndpointState, slots.states, &.{.live}));
+    try std.testing.expect(cluster.endpoints[0].ip.eql(&testIp("10.0.0.9:80")));
+    try std.testing.expect(cluster.endpoints[1].ip.eql(&testIp("10.0.0.1:80")));
+    try std.testing.expect(cluster.endpoints[2].ip.eql(&testIp("10.0.0.2:80")));
+    try std.testing.expect(cluster.endpoints[3].ip.eql(&testIp("[fd00::1]:80")));
+    try std.testing.expectEqualSlices(u16, &.{ 2, 1, 1, 2 }, cluster.weights.?[0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, cluster.priorities.?[0..4]);
+}
+
+test "config: a cluster's names and its resolver are held to their rules (#481)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const name: Options.Cluster.Dns.Name = .{ .host = "api.internal", .port = 80, .addresses = &.{testIp("10.0.0.1:80")} };
+    const valid: Options.Cluster = .{
+        .name = "api",
+        .endpoints = &.{},
+        .pick = .p2c,
+        .dns = .{ .names = &.{name}, .refresh_min_ms = 1_000, .refresh_max_ms = 60_000, .addresses_max = 4 },
+    };
+    _ = try resolveCluster(arena, &valid);
+    var cluster = valid;
+    cluster.endpoint_slots = 8;
+    try std.testing.expectError(error.ClusterDnsEndpointSlots, resolveCluster(arena, &cluster));
+    cluster = valid;
+    cluster.endpoints = &.{.{ .address = .{ .unix = "/run/a.sock" } }};
+    try std.testing.expectError(error.ClusterDnsUnixEndpoint, resolveCluster(arena, &cluster));
+    cluster = valid;
+    cluster.dns.?.names = &.{};
+    try std.testing.expectError(error.ClusterDnsNamesEmpty, resolveCluster(arena, &cluster));
+    cluster = valid;
+    cluster.dns.?.refresh_min_ms = 60_001;
+    try std.testing.expectError(error.ClusterDnsRefreshOutOfRange, resolveCluster(arena, &cluster));
+    cluster = valid;
+    cluster.dns.?.addresses_max = 0;
+    try std.testing.expectError(error.ClusterDnsAddressesMaxOutOfRange, resolveCluster(arena, &cluster));
+    const bad_names = [_]Options.Cluster.Dns.Name{
+        .{ .host = "API.internal", .port = 80, .addresses = name.addresses },
+        .{ .host = "api.internal", .port = 80, .addresses = &.{testIp("10.0.0.1:81")} },
+        .{ .host = "api.internal", .port = 80, .addresses = &.{testIp("[fd00::1]:80")} },
+    };
+    const expected = [_]ValidationError{ error.ClusterDnsNameInvalid, error.ClusterDnsAddressInvalid, error.ClusterDnsAddressInvalid };
+    for (&bad_names, expected) |*bad, err| {
+        cluster = valid;
+        cluster.dns.?.names = bad[0..1];
+        try std.testing.expectError(err, resolveCluster(arena, &cluster));
+    }
+    // A name that has no address yet, beside no literal: the cluster
+    // would start sent nowhere, which `App` resolves before this.
+    cluster = valid;
+    cluster.dns.?.names = &.{.{ .host = "api.internal", .port = 80 }};
+    try std.testing.expectError(error.EndpointsEmpty, resolveCluster(arena, &cluster));
+
+    const resolved = [_]Config.Cluster{try resolveCluster(arena, &valid)};
+    const nameserver = [_]std.Io.net.IpAddress{testIp("10.0.0.53:53")};
+    try std.testing.expectError(error.ResolverMissing, resolveResolver(null, &resolved));
+    try std.testing.expectError(error.ResolverUnused, resolveResolver(.{ .nameservers = &nameserver, .timeout_ms = 1_000 }, &.{}));
+    try std.testing.expectError(error.ResolverNameserversOutOfRange, resolveResolver(.{ .nameservers = &.{}, .timeout_ms = 1_000 }, &resolved));
+    try std.testing.expectError(error.ResolverTimeoutOutOfRange, resolveResolver(.{ .nameservers = &nameserver, .timeout_ms = 1 }, &resolved));
+    try std.testing.expectError(error.ResolverNameserverPortZero, resolveResolver(.{ .nameservers = &.{testIp("10.0.0.53:0")}, .timeout_ms = 1_000 }, &resolved));
+    const sockets = [_]std.Io.net.IpAddress{ testIp("10.0.0.53:53"), testIp("[fd00::53]:53"), testIp("10.0.0.54:53") };
+    try std.testing.expectEqual(@as(u32, 2), socketsFor(&sockets));
+    try std.testing.expectEqual(@as(u32, 1), socketsFor(&nameserver));
 }
