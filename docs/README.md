@@ -1535,8 +1535,8 @@ finds the endpoints that are failing, and protects the ones that are busy.
 
 A cluster is a named set of endpoints plus a policy for choosing one.
 Endpoints are static `IP:port` literals or
-[`unix:` socket paths](#reaching-a-local-app-over-a-unix-socket), resolved
-once at load; dynamic DNS is out of scope. Only the config bounds cluster
+[`unix:` socket paths](#reaching-a-local-app-over-a-unix-socket), parsed
+once at load; zoxy resolves no host names. Only the config bounds cluster
 and endpoint counts (there is no compiled ceiling), and the startup banner
 prints what the endpoint tables cost.
 

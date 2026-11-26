@@ -71,11 +71,10 @@ Non-goals. Each is recorded so that it reads as a decision, not as drift:
   processes (§3).
 - **Config reload.** The config is parsed once, and a change means a
   restart. SIGHUP only reopens the access log's file (§8).
-- **DNS, and discovery at runtime.** zoxy resolves no name: an
-  endpoint is an IP address or a `unix:` path in the options. A build
-  that finds its endpoints — in DNS, or in a registry — does so in its
-  own code before the options exist (§13), and the set is fixed for the
-  process's life.
+- **Registry discovery.** Consul, Kubernetes' API and other registries
+  are a build's own code: it finds its endpoints before the options
+  exist, or replaces a cluster's set while it serves through the
+  `EndpointSet` it took at bind (§7, §13).
 - **xDS, multi-process orchestration, hot restart.**
 - **Production off Linux.** Production means Linux with io_uring.
   macOS builds ship for development, and correctness claims are made
@@ -1869,7 +1868,8 @@ extensions they list.
      credentials, install the signal dispositions;
   4. start, run until a drain completes, print the final tally.
 
-  Endpoint discovery is ordinary code that runs before step zero. There
+  Endpoint discovery is ordinary code: it runs before step zero, or
+  replaces a cluster's set while it serves (§7's endpoint slots). There
   is no hook for it.
 - **What stays in a binary** is what only it knows: its command line,
   and where its options come from. For the stock binary that is argv

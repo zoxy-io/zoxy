@@ -251,9 +251,9 @@ fn clusterOf(
 }
 
 /// An address as JSON spells it (#303): `unix:` and a path, or an IP
-/// literal (`parseLiteral` rejects hostnames, so the no-DNS non-goal
-/// holds structurally). Only the spelling is judged — a path's own rules
-/// are the library's, which an address written in code meets as well.
+/// literal (`parseLiteral` rejects hostnames, so nothing here resolves
+/// one). Only the spelling is judged — a path's own rules are the
+/// library's, which an address written in code meets as well.
 fn addressOf(literal: []const u8) ?io_module.Address {
     if (std.mem.startsWith(u8, literal, unix_address_prefix)) {
         const path = literal[unix_address_prefix.len..];
@@ -520,8 +520,7 @@ fn accessLogOf(access_log_json: ?AccessLogJson) ValidationError!?Options.AccessL
 }
 
 /// The JSON front-end's admin listener (§8): a present `bind` must be a
-/// static IP:port literal (hostnames rejected, like every other bind —
-/// DNS is a non-goal).
+/// static IP:port literal (hostnames rejected, like every other bind).
 fn adminOf(admin_json: ?AdminJson) ValidationError!?Options.Admin {
     const admin = admin_json orelse return null;
     const bind = std.Io.net.IpAddress.parseLiteral(admin.bind) catch
@@ -5155,8 +5154,7 @@ test "config: admin block resolves a bind literal, absent leaves it off" {
         try std.testing.expect(parsed.admin_bind != null);
         try std.testing.expectEqual(@as(u16, 9100), parsed.admin_bind.?.getPort());
     }
-    // A hostname (or any non-literal) is rejected — DNS is a non-goal, like
-    // every other bind.
+    // A hostname (or any non-literal) is rejected, like every other bind.
     try expectParseError(error.AdminBindInvalid, head ++ tail ++ ",\"admin\":{\"bind\":\"localhost:9100\"}}");
     // The admin object is strict: `bind` is required and extras are rejected.
     try expectParseError(error.MissingField, head ++ tail ++ ",\"admin\":{}}");
