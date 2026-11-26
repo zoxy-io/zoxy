@@ -2116,9 +2116,9 @@ zoxy --help                # usage summary (-h)
 zoxy --version             # print the version (-V)
 ```
 
-A release build prints its bare version, `zoxy 1.2.2`. A build from source
+A release build prints its bare version, `zoxy 1.3.0`. A build from source
 after a release adds a suffix that identifies it,
-`zoxy 1.2.2 (v1.2.2-5-gabc1234)`, plus `-dirty` if the tree had uncommitted
+`zoxy 1.3.0 (v1.3.0-5-gabc1234)`, plus `-dirty` if the tree had uncommitted
 changes, so the version in a bug report names the exact build. Packagers
 can name a build with `zig build -Dbuild-id=…`. The startup banner opens
 with the same line.
@@ -2158,7 +2158,7 @@ demand against `RLIMIT_NOFILE`. Then it exits without binding a port:
 
 ```console
 $ zoxy --check config.json
-zoxy 1.2.2
+zoxy 1.3.0
 budgets (DESIGN.md §5/§8; closed-form except where marked):
   memory  total 47937 KiB = conn slots 1386 x 608 B + stream slots 1386 x 1904 B
           + relay buffers 1386 x 32808 B
