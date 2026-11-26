@@ -62,6 +62,9 @@ const pending_ops_max: u32 = constants.inFlightOps(
     h2_origin_connections_max,
     // Its datagram ops are counted on their own, below.
     0,
+    // So are the resolver's (#481), all but its refresh timer and the
+    // cancel a drain arms on it.
+    2,
 ) + udp_pending_ops_max;
 const pending_signals_max: u8 = 8;
 

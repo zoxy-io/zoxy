@@ -91,6 +91,7 @@ pub fn Budget(comptime runtime: Runtime) type {
                     health_probes,
                     config.limits.h2_origin_connections,
                     ServerType.quicListenerCount(config),
+                    config.dnsSockets(),
                 ),
                 .cq_entries = constants.completionQueueDepthFor(
                     config.limits.conn_slots,
@@ -99,6 +100,7 @@ pub fn Budget(comptime runtime: Runtime) type {
                     health_probes,
                     config.limits.h2_origin_connections,
                     ServerType.quicListenerCount(config),
+                    constants.resolverOps(config.dnsSockets(), config.dnsQueries()),
                     config.limits.cq_fill_eighths,
                 ),
             };
@@ -149,6 +151,7 @@ pub fn Budget(comptime runtime: Runtime) type {
                     constants.streamSlotsFor(limits.conn_slots, limits.stream_slots),
                 ),
                 .consult_bytes = ServerType.consultBytes(config),
+                .resolver_bytes = ServerType.resolverBytes(config),
                 .head_buffers = limits.head_buffers,
                 .head_buffer_bytes = limits.head_buffer_bytes,
                 .upstream_head_buffers = limits.upstream_head_buffers,
@@ -342,6 +345,7 @@ pub fn Budget(comptime runtime: Runtime) type {
                 config.healthProbes(),
                 limits.h2_origin_connections,
                 ServerType.quicListenerCount(config),
+                constants.resolverOps(config.dnsSockets(), config.dnsQueries()),
             );
             const access_log_bytes = constants.accessLogBytes(limits.access_log_buffer_bytes);
             const sizes = poolSizesFor(config);
@@ -499,27 +503,32 @@ pub fn Budget(comptime runtime: Runtime) type {
                 sizes.tls_plaintext_bytes,
                 sizes.libcrypto_heap_bytes / 1024,
             });
-            try emitH2Banner(sink, sizes, config_arena_bytes);
+            try emitH2Banner(sink, sizes, config.dnsQueries(), config_arena_bytes);
         }
 
         /// Apart from the memory block only because one format call takes
         /// at most 32 arguments. The HTTP/2 terms read zero unless a
-        /// listener speaks HTTP/2 (#275), or a cluster does (§7) — printed
+        /// listener speaks HTTP/2 (#275), or a cluster does (§7), and the
+        /// resolver's unless a cluster follows names (#481) — printed
         /// rather than omitted, like the tunnel and TLS lines — and the
         /// arena stays last, the one term measured rather than derived.
         fn emitH2Banner(
             sink: Sink,
             sizes: *const constants.PoolSizes,
+            /// What the resolver's term is sized for (#481).
+            resolver_queries: u32,
             config_arena_bytes: u64,
         ) std.Io.Writer.Error!void {
             assert(sizes.h2_connections == 0 or sizes.h2_session_bytes > 0);
             assert(sizes.h2_origin_connections == 0 or sizes.h2_origin_bytes > 0);
             assert(sizes.upstream_tls_sessions == 0 or sizes.upstream_tls_session_bytes > 0);
+            assert((resolver_queries == 0) == (sizes.resolver_bytes == 0));
             try emit(sink,
                 \\          + h2 sessions {d} x {d} B + stream heads {d} x {d} B
                 \\          + h3 connections {d} x {d} B + quic endpoints {d} x {d} B + h3 scratch {d} B
                 \\          + h2 origins {d} x {d} B + origin streams {d} x {d} B
                 \\          + https origin sessions {d} x {d} B
+                \\          + dns resolver {d} B ({d} queries, for clusters that follow names)
                 \\          + config arena {d} KiB (measured, not closed-form)
                 \\
             , .{
@@ -538,6 +547,8 @@ pub fn Budget(comptime runtime: Runtime) type {
                 sizes.h2_origin_stream_bytes,
                 sizes.upstream_tls_sessions,
                 sizes.upstream_tls_session_bytes,
+                sizes.resolver_bytes,
+                resolver_queries,
                 config_arena_bytes / 1024,
             });
         }
