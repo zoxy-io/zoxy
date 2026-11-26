@@ -997,6 +997,22 @@ shed the request. A retry that has tried every routable endpoint answers
     `max_inflight`.
 - **Endpoints and `unix:` sockets.** An endpoint is `IP:port` or
   `unix:/absolute/path` (at most 103 bytes; no abstract namespace).
+  - **Names** (#480). The stock binary's config may also write
+    `name:port`. Its front-end resolves each name once, through the
+    system's resolver, before the options exist, so `Options` and
+    `config.resolve` see addresses alone. Every address the name has in
+    the entry's `family` (`ipv4` by default, `ipv6`, `any`) becomes an
+    endpoint with the entry's weight and tier, in the entry's place: a
+    name's addresses IPv4 first and then in address order, whatever order
+    the resolver answered in (`dns/endpoints.zig`). Each resolution is
+    printed on stderr before the banner.
+  - **One address, once.** A cluster that names a host keeps each
+    address once: of two entries giving one address, the endpoint takes
+    the stronger claim, the lower tier and then the higher weight. A
+    cluster of addresses alone keeps what it states.
+  - **A name that does not resolve** stops the start
+    (`EndpointNameUnresolved`), and `--check` exits `2` on it: the box's
+    verdict, not the config's.
   - **A `unix:` listener has no client address,** so the loader refuses
     what would need one: `forwarded`, `match.client`, `source_ip`
     hashing, and reaching a cluster that sends a PROXY header.
@@ -1638,7 +1654,10 @@ src/
   constants.zig         every static limit and the comptime asserts relating them
   config.zig            Options → arena-owned immutable Config; every rule a config is held to
   json/                 the stock binary's front-end, a module of its own the package does not export
-    loader.zig          strict JSON → Options: DTOs, schema metadata, spellings, file reads
+    loader.zig          strict JSON → Options: DTOs, schema metadata, spellings, file reads, names
+  dns/
+    host.zig            an endpoint's DNS name: what spelling is one, its canonical form, its family
+    endpoints.zig       a name's answers as endpoints: their order, an address kept once
     schema.zig          the schema emitter (zig build schema)
     validator.zig       the dialect validator behind the schema/loader differential gate
   balancer.zig          the pick: drain, tried, health, caps, tiers; p2c | rr | hash; cookies
@@ -1873,7 +1892,8 @@ extensions they list.
   is no hook for it.
 - **What stays in a binary** is what only it knows: its command line,
   and where its options come from. For the stock binary that is argv
-  and the JSON front-end.
+  and the JSON front-end, which reads the files a config names and
+  resolves its endpoints' names (#480).
 
 **Extensions.** A build lists types:
 `Extensions{ .pickers, .request_policies, .response_policies,
