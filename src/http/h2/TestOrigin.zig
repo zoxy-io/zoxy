@@ -42,6 +42,9 @@ pub fn TestOriginSized(comptime IoType: type, comptime conns_max_value: u32) typ
         slots_used: u32 = 0,
         /// Dials closed at once because every slot was still busy.
         refused: u32 = 0,
+        /// Requests no job was free for, so never answered: a muted or
+        /// unended stream holds a job until its stream is reset.
+        requests_dropped: u32 = 0,
 
         // -- the script --
         status: []const u8 = "200",
@@ -50,6 +53,10 @@ pub fn TestOriginSized(comptime IoType: type, comptime conns_max_value: u32) typ
         trailers: []const Pair = &.{},
         /// Read every request, and answer none.
         mute: bool = false,
+        /// Read every request whose path begins with this, and answer none
+        /// of those: a call left to its deadline beside streams that are
+        /// answered. Empty mutes nothing.
+        mute_path_prefix: []const u8 = "",
         /// Answer with the head and the body, and never end the stream.
         stall_after_body: bool = false,
         /// Answer at the request's head — the head and the body while the
@@ -111,6 +118,8 @@ pub fn TestOriginSized(comptime IoType: type, comptime conns_max_value: u32) typ
             request_ended: bool = false,
             head_sent: bool = false,
             body_offset: usize = 0,
+            /// Its path is under `mute_path_prefix`: it is never answered.
+            muted: bool = false,
         };
 
         pub const Conn = struct {
@@ -191,9 +200,12 @@ pub fn TestOriginSized(comptime IoType: type, comptime conns_max_value: u32) typ
                     if (std.mem.eql(u8, field.name, "content-type")) origin.last_content_type.set(value);
                 }
                 if (origin.goaway_after_first and origin.requests == 1) conn.session.goAway();
-                const job = conn.jobOf(0) orelse return; // As many jobs as streams.
-                job.* = .{ .stream = request.stream };
-                if (origin.answer_at_head and !origin.mute) {
+                const job = conn.jobOf(0) orelse { // As many jobs as streams.
+                    origin.requests_dropped += 1;
+                    return;
+                };
+                job.* = .{ .stream = request.stream, .muted = origin.mutes(request) };
+                if (origin.answer_at_head and !origin.mute and !job.muted) {
                     job.started = true;
                     conn.push(job);
                 }
@@ -205,7 +217,7 @@ pub fn TestOriginSized(comptime IoType: type, comptime conns_max_value: u32) typ
             fn requestEnded(conn: *Conn, stream: u31) void {
                 const job = conn.jobOf(stream) orelse return;
                 job.request_ended = true;
-                if (conn.origin.mute) return;
+                if (conn.origin.mute or job.muted) return;
                 job.started = true;
                 conn.push(job);
             }
@@ -363,6 +375,17 @@ pub fn TestOriginSized(comptime IoType: type, comptime conns_max_value: u32) typ
 
         fn armAccept(origin: *Self) void {
             origin.io.accept(origin.listener, &origin.accept_completion, Self, origin, onAccept);
+        }
+
+        /// Whether `request`'s path is one this origin leaves unanswered.
+        fn mutes(origin: *const Self, request: *const Session.Step.Request) bool {
+            if (origin.mute_path_prefix.len == 0) return false;
+            for (request.fields) |*field| {
+                if (!std.mem.eql(u8, field.name, ":path")) continue;
+                return std.mem.startsWith(u8, field.value, origin.mute_path_prefix);
+            }
+            assert(request.fields.len >= 1);
+            return false;
         }
 
         /// A slot for the next connection: a fresh one while any is left,

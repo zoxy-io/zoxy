@@ -1624,7 +1624,9 @@ external binaries. They and the speed gates run at merge.
       a ClientHello naming the route, another name, or none, or with
       bytes that are no hello;
     - L7 request scripts;
-    - h2c clients, including flooders;
+    - h2c clients, including flooders, and on a seed whose cluster speaks
+      HTTP/2, gRPC calls its origin never answers, left to their
+      `grpc-timeout`;
     - TLS clients, including resumers across key rotation, each naming
       one of the listener's certificates, an unknown name, or none, and,
       where the listener asks, presenting the client CA's leaf, another
@@ -1654,6 +1656,8 @@ external binaries. They and the speed gates run at merge.
     - no origin receives a malformed byte;
     - a forwarded-for chain holds only the hops a script claimed and,
       last, the observed client, written bare in either family;
+    - a gRPC call hears a `200` only as its deadline's Trailers-Only
+      answer, `grpc-status: 4` and no body;
     - a scrape is the admin head and a prefix of a well-formed
       exposition, each counter in order at no more than its final value;
     - a handshake shown a certificate was shown the one its name chooses,
@@ -1691,7 +1695,7 @@ external binaries. They and the speed gates run at merge.
     feature no seed turns on. The report does not gate; a gap in it
     should either be named in the list below or be a scenario to widen.
   - **Not swept, covered by directed tests and the live gate instead:**
-    - HTTPS clusters and gRPC deadlines;
+    - HTTPS clusters;
     - RSA: an RSA-PSS signature draws a fresh salt, so no seeded
       handshake on an RSA key replays byte-exact — and with it the choice
       between key types; certificate selection's wildcard tier and its

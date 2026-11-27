@@ -337,11 +337,6 @@ const uncovered = [_]Uncovered{
             "scenarios refuse chains",
     },
     .{
-        .name = "l7_grpc_deadline_exceeded",
-        .why = .unreached,
-        .reason = "the sweep's clients send no gRPC call; http_proxy_test's grpc deadline scenarios run one out",
-    },
-    .{
         .name = "health_probes_skipped",
         .why = .unreached,
         .reason = "the sweep's HTTP/2 clusters are checked by dial, since their scripted origin " ++
@@ -778,6 +773,9 @@ const Census = struct {
     /// Requests an origin received carrying a verified client's
     /// fingerprint (#304): mutual TLS, end to end.
     client_certs_forwarded: u64 = 0,
+    /// gRPC calls an HTTP/2 client heard answered at their deadline (§8),
+    /// Trailers-Only with `grpc-status: 4`.
+    grpc_deadlines_heard: u64 = 0,
 
     const Population = enum(u8) {
         http1,
@@ -867,6 +865,10 @@ const Census = struct {
             std.debug.print("sim census: no origin received a verified client's fingerprint (#304)\n", .{});
             return false;
         }
+        if (census.grpc_deadlines_heard == 0) {
+            std.debug.print("sim census: no gRPC call was answered at its deadline (§8)\n", .{});
+            return false;
+        }
         return true;
     }
 
@@ -895,6 +897,9 @@ const Census = struct {
         }
         for (harness.h3_clients[0..harness.h3_count]) |*client| {
             census.request_trailers[@backingInt(Population.http3)] += client.requestTrailersAnswered();
+        }
+        for (harness.h2_clients[0..harness.h2_count]) |*client| {
+            census.grpc_deadlines_heard += client.grpcDeadlinesHeard();
         }
         for (requests_before, census.request_trailers) |earlier, now| assert(now >= earlier);
     }

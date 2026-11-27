@@ -80,6 +80,9 @@ pub const ClientError = error{
     /// A PONG for a PING this client never sent: more than it sent, or
     /// any for a flood that sent none.
     PongUnexpected,
+    /// A gRPC call answered with a 200 that is not its deadline's
+    /// Trailers-Only one (§8).
+    GrpcDeadlineMissed,
     /// A stream answered past the last stream a GOAWAY named. RFC 9113
     /// §6.8: the server did not act on streams past that one, so none of
     /// them may carry a status. Every seed holds this. A drain, the idle
@@ -109,7 +112,7 @@ pub const Mode = enum {
 /// What an exchange's stream asks (#373): `get`'s GET, a POST whose
 /// body the origin checks octet by octet, its length declared or not, or
 /// `consult_get`'s GET under `canon.consult_prefix` (#437).
-pub const Ask = enum(u8) { get, post_declared, post_undeclared, consult_get };
+pub const Ask = enum(u8) { get, post_declared, post_undeclared, consult_get, grpc_call };
 
 /// `get`'s path, which every stream asks for but a consult's.
 const get_path = "/sim";
@@ -128,7 +131,7 @@ pub const Plan = struct {
     pub fn carriesBody(plan: Plan) bool {
         return switch (plan.ask) {
             .get, .consult_get => false,
-            .post_declared, .post_undeclared => true,
+            .post_declared, .post_undeclared, .grpc_call => true,
         };
     }
 
@@ -138,7 +141,7 @@ pub const Plan = struct {
         return switch (plan.ask) {
             .get => .get,
             .consult_get => .consult_get,
-            .post_declared, .post_undeclared => .post_sized,
+            .post_declared, .post_undeclared, .grpc_call => .post_sized,
         };
     }
 
@@ -146,7 +149,11 @@ pub const Plan = struct {
     pub fn path(plan: Plan) []const u8 {
         assert(canon.consult_prefix.len >= 1);
         assert(!std.mem.startsWith(u8, get_path, canon.consult_prefix));
-        return if (plan.ask == .consult_get) canon.consult_prefix else get_path;
+        return switch (plan.ask) {
+            .consult_get => canon.consult_prefix,
+            .grpc_call => canon.grpc_path,
+            else => get_path,
+        };
     }
 };
 
@@ -261,7 +268,7 @@ pub fn Client(comptime IoType: type) type {
         pub const streams_max: u8 = 4;
         const request_bytes_max: u32 = 64 * 1024;
         /// A POST's head: five short literals, a length and the mark.
-        const head_bytes_max: u32 = 160;
+        const head_bytes_max: u32 = 224;
         /// A POST's trailing HEADERS: its frame header and one literal.
         const trailers_bytes_max: u32 = 9 + 3 + canon.request_trailer_name.len + canon.request_trailer_value.len;
         /// Room for Rapid Reset's worst transcript: every round's stream
@@ -294,6 +301,9 @@ pub fn Client(comptime IoType: type) type {
             trailers: bool = false,
             /// The final head said a trailer section is coming.
             trailers_owed: bool = false,
+            /// The final head's `grpc-status`, when it carried one: a gRPC
+            /// call answered Trailers-Only (§8).
+            grpc_status: ?u8 = null,
         };
 
         /// One stream per plan. A flood counts them and asks nothing of
@@ -514,7 +524,11 @@ pub fn Client(comptime IoType: type) type {
                 if (goaway_last) |last| {
                     if (answer.status != 0 and streamId(@intCast(index)) > last) return error.StreamPastGoaway;
                 }
-                if (answer.status == 200) try checkBody(answer, client.clean);
+                if (plan.ask == .grpc_call) {
+                    try checkGrpcDeadline(answer);
+                } else if (answer.status == 200) {
+                    try checkBody(answer, client.clean);
+                }
                 // A whole answer carries the section its head owed and no
                 // other; a cut one may end before it (reset, never ended).
                 if (answer.ended and !answer.reset and answer.trailers != answer.trailers_owed) {
@@ -530,8 +544,41 @@ pub fn Client(comptime IoType: type) type {
                 // wants (RFC 9113 §8.1); the trailers go no further anyway.
                 if (answer.status != 200 or !answer.ended) return error.GoldenOutcomeMissed;
                 if (answer.reset) return error.GoldenOutcomeMissed;
-                if (answer.stopped and !plan.trailers) return error.GoldenOutcomeMissed;
+                // A gRPC call is answered at its deadline, which needs no
+                // more of it, so the rest of its half may be stopped too.
+                if (answer.stopped and !plan.trailers and plan.ask != .grpc_call) return error.GoldenOutcomeMissed;
             }
+        }
+
+        /// A gRPC call the origin never answers (§8) has one `200` it can
+        /// hear: the proxy's own, at the call's deadline — Trailers-Only,
+        /// no body, `grpc-status: 4` (DEADLINE_EXCEEDED). Any other 200 is
+        /// an answer that cannot have come from anywhere.
+        fn checkGrpcDeadline(answer: *const Answer) ClientError!void {
+            // Trailers-Only is one HEADERS: no second section can follow it.
+            assert(answer.status != 200 or !answer.trailers);
+            if (answer.status != 200) return;
+            if (answer.grpc_status != @as(?u8, 4)) return error.GrpcDeadlineMissed;
+            if (answer.body_len != 0) return error.GrpcDeadlineMissed;
+        }
+
+        /// Streams that heard a gRPC call's deadline answered (§8), for the
+        /// census; on `trailersHeard`'s terms.
+        pub fn grpcDeadlinesHeard(client: *const Self) u32 {
+            assert(client.streams >= 1);
+            if (client.mode != .exchange) return 0;
+            var answers: [streams_max]Answer = @splat(.{});
+            const plans = client.plans[0..client.streams];
+            const bytes = client.receive_buffer[0..client.received_len];
+            _ = readAnswers(bytes, plans, &answers) catch |err| {
+                std.debug.panic("grpcDeadlinesHeard after a failed verify: {s}", .{@errorName(err)});
+            };
+            var heard: u32 = 0;
+            for (answers[0..client.streams], plans) |*answer, plan| {
+                heard += @intFromBool(plan.ask == .grpc_call and answer.status == 200 and answer.grpc_status == @as(?u8, 4));
+            }
+            assert(heard <= client.streams);
+            return heard;
         }
 
         /// What a flood may hear back: whole frames; on its streams only
@@ -802,6 +849,9 @@ pub fn Client(comptime IoType: type) type {
                     if (ResponseReader.value(fields, "trailer") != null) return error.FieldsCorrupted;
                     answer.status = status;
                     answer.trailers_owed = ResponseReader.value(fields, canon.response_trailer_owed_header) != null;
+                    if (ResponseReader.value(fields, "grpc-status")) |grpc| {
+                        answer.grpc_status = std.fmt.parseUnsigned(u8, grpc, 10) catch return error.FieldsCorrupted;
+                    }
                 },
                 frame_data => {
                     if (answer.status == 0) return error.StreamUnexpected;
@@ -965,7 +1015,17 @@ pub fn Client(comptime IoType: type) type {
             const mark = std.fmt.bufPrint(&mark_bytes, "{d}.{d}", .{ plan.body_len, salt }) catch unreachable;
             const marked = [_][2][]const u8{.{ canon.request_body_header, mark }};
             const declared = [_][2][]const u8{ .{ "content-length", length }, marked[0] };
-            const extra: []const [2][]const u8 = if (plan.ask == .post_declared) &declared else &marked;
+            const grpc = [_][2][]const u8{
+                .{ "content-type", "application/grpc" },
+                .{ "te", "trailers" },
+                .{ "grpc-timeout", canon.grpc_timeout },
+                marked[0],
+            };
+            const extra: []const [2][]const u8 = switch (plan.ask) {
+                .post_declared => &declared,
+                .grpc_call => &grpc,
+                else => &marked,
+            };
             writeHeadTraced(out, len, id, "POST", plan.path(), flag_end_headers, canon.log_request_value, extra);
             assert(len.* - start <= head_bytes_max);
         }

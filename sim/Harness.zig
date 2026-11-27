@@ -280,6 +280,10 @@ admin_scrapers: []AdminScraper,
 /// TLS to the origin fixture. Drawn from a stream of its own.
 http_protocol: zoxy.Options.Cluster.Protocol,
 h2_origin: H2Origin,
+/// §8: on a seed whose http cluster speaks HTTP/2, a third of an HTTP/2
+/// client's declared POSTs are gRPC calls its origin never answers, so the
+/// proxy's deadline answers them. Their own stream.
+grpc_prng: std.Random.DefaultPrng,
 quic_http: bool,
 quic_connections: u32,
 h3_prng: std.Random.DefaultPrng,
@@ -2383,6 +2387,7 @@ const admin_address: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 
 /// in `origin_http`'s place, with the canonical sized 200 every client
 /// already judges.
 fn drawHttpProtocol(harness: *Harness, seed: u64) void {
+    harness.grpc_prng = std.Random.DefaultPrng.init(seed ^ 0x0004_0004_0004_0004);
     var protocol_prng = std.Random.DefaultPrng.init(seed ^ 0x0275_0275_0275_0275);
     const random = protocol_prng.random();
     harness.http_protocol = switch (random.uintLessThan(u8, 6)) {
@@ -2718,6 +2723,8 @@ fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: st
         .tls = harness.http_protocol == .h2,
         .headers = &h2_origin_headers,
         .body = l7.canon.sized_body,
+        // §8: a gRPC call is left to its deadline.
+        .mute_path_prefix = l7.canon.grpc_mute_prefix,
     };
     // One of the two answers at the http endpoint's address — the address
     // the #178 pinned tag is minted from, so a sticky cookie names the same
@@ -2802,7 +2809,14 @@ fn prepareH2Client(harness: *Harness, random: std.Random) void {
     // Its lines need the staging `h2_rapid_reset` sized for them.
     if (mode == .rapid_reset and !harness.h2_rapid_reset) mode = .exchange;
     var plans: [H2Client.streams_max]l7.H2Plan = @splat(.{});
-    for (plans[0..streams]) |*plan| plan.* = drawH2Plan(random, harness.h2_consult_prng.random());
+    for (plans[0..streams]) |*plan| {
+        plan.* = drawH2Plan(random, harness.h2_consult_prng.random());
+        if (!harness.http_protocol.http2()) continue;
+        if (plan.ask != .post_declared) continue;
+        if (harness.grpc_prng.random().uintLessThan(u8, 3) != 0) continue;
+        plan.ask = .grpc_call;
+        plan.trailers = false;
+    }
     client.prepare(&harness.io, httpBindAddress(), plans[0..streams], salt, harness.clean, mode);
     client.on_ended = clientEndedHook;
     client.context = harness;
@@ -3810,6 +3824,9 @@ pub fn verify(harness: *Harness) !void {
     // one — relayed whole from HTTP/1.1, never from HTTP/2 or HTTP/3, and
     // never one that names a header the proxy manages.
     if (harness.origin_http.trailer_mismatches != 0) return error.OriginSawWrongTrailers;
+    // #275, §8: the HTTP/2 origin answered or reset every stream it took;
+    // one dropped for want of a job would read as the proxy's silence.
+    if (harness.h2_origin.requests_dropped != 0) return error.H2OriginDroppedRequest;
     // §7: a forwarded-for chain holds the scripts' hops and, last, the
     // client the proxy observed, written bare in either family.
     if (harness.origin_http.forwarded_mismatches != 0) return error.OriginSawWrongForwardedFor;
