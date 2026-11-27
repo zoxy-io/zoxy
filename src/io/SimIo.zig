@@ -107,6 +107,9 @@ const wall_clock_base_ns: u64 = 1_577_836_800 * std.time.ns_per_s;
 /// The address block simulated clients dial from (RFC 5737 TEST-NET-2), so
 /// a log line read out of the sink is recognizably the simulator's.
 const client_ip_bytes: [4]u8 = .{ 198, 51, 100, 1 };
+/// And the IPv6 address they dial from when a scenario says so
+/// (`client_ip6`): 2001:db8:1::1, from the documentation prefix (RFC 3849).
+const client_ip6_bytes: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
 /// The first ephemeral port a simulated client connects from; each new
 /// virtual pair takes the next one, so every client in a run is
 /// distinguishable in the access log by address alone.
@@ -250,6 +253,10 @@ pending_log_reopen_errors: u8,
 log_reopen_count: u32,
 /// The ephemeral port the next simulated client connects from.
 next_client_port: u16,
+/// Simulated stream clients dial from `client_ip6_bytes` instead of the
+/// IPv4 block: the scenario's choice, made before any dial, so every
+/// accepted socket's peer is one family or the other for the whole run.
+client_ip6: bool,
 /// The provided-buffer group (§5): one slab, a free flag per buffer, and
 /// the in-use count the asserts ride on. Selection happens at delivery
 /// time — an armed `recv_group` holds nothing — mirroring the kernel's
@@ -668,6 +675,7 @@ pub fn init(io: *SimIo, arena: std.mem.Allocator, options: Options) error{OutOfM
     io.pending_log_reopen_errors = 0;
     io.log_reopen_count = 0;
     io.next_client_port = client_port_base;
+    io.client_ip6 = false;
     io.group_slab = try arena.alloc(
         u8,
         @as(usize, options.buffer_group_count) * options.buffer_group_bytes,
@@ -2338,10 +2346,10 @@ fn finishConnect(
         .ip => |ip| ip,
         .unix => .{ .ip4 = .loopback(0) },
     };
-    server_entry.peer_address = .{ .ip4 = .{
-        .bytes = client_ip_bytes,
-        .port = io.next_client_port,
-    } };
+    server_entry.peer_address = if (io.client_ip6)
+        .{ .ip6 = .{ .bytes = client_ip6_bytes, .port = io.next_client_port } }
+    else
+        .{ .ip4 = .{ .bytes = client_ip_bytes, .port = io.next_client_port } };
     // Local addresses mirror the pair: each end's own address is what
     // the other end names it (§6 send's destination field).
     client_entry.local_address = server_entry.peer_address;

@@ -97,6 +97,17 @@ pub fn HttpOrigin(comptime IoType: type) type {
         /// Owed trailer sections that arrived exactly: the census's proof
         /// that HTTP/1.1's relay of a request's trailers was walked.
         trailers_verified: u32 = 0,
+        /// The hops the scripts claim in their own forwarded-for lines:
+        /// all a §7 chain may hold besides the observed client.
+        forwarded_hops: []const []const u8 = &.{},
+        /// The client the proxy observed, as `bareAddress` writes it — set
+        /// by the harness for the seed's address family.
+        observed_client: []const u8 = "",
+        /// Chains that held anything else, or the observed client
+        /// anywhere but last. Checked by the harness verify.
+        forwarded_mismatches: u32 = 0,
+        /// Chains that ended in an IPv6 observed client, read exactly.
+        forwarded_ip6_verified: u32 = 0,
         /// Where a chunked body is dechunked for its trailer check, so
         /// the wire it is read from stays as it came for the mark check.
         scratch: [request_buffer_bytes]u8 = undefined,
@@ -377,6 +388,11 @@ pub fn HttpOrigin(comptime IoType: type) type {
                     conn.close();
                     return false;
                 }
+                if (!conn.forwardedForValid(&request)) {
+                    conn.origin.forwarded_mismatches += 1;
+                    conn.close();
+                    return false;
+                }
                 switch (request.framing) {
                     .none => conn.framing_tag = .none,
                     .content_length => |length| {
@@ -407,6 +423,42 @@ pub fn HttpOrigin(comptime IoType: type) type {
                 }
                 conn.phase = .body;
                 return true;
+            }
+
+            /// Every element of every `X-Forwarded-For` line is a hop a
+            /// script claimed or the observed client, and the client, if
+            /// there, ends the last line (§7): `append` puts it after the
+            /// chain, `replace` alone. A client address rendered any other
+            /// way — an IPv6 one bracketed, a port left on — is neither.
+            fn forwardedForValid(conn: *Conn, request: *const parser.RequestHead) bool {
+                const origin = conn.origin;
+                assert(origin.observed_client.len >= 1);
+                var client_seen = false;
+                for (request.headers) |header| {
+                    if (!std.ascii.eqlIgnoreCase(header.name, "x-forwarded-for")) continue;
+                    var elements = std.mem.splitSequence(u8, header.value, ", ");
+                    while (elements.next()) |element| {
+                        if (client_seen) return false;
+                        if (std.mem.eql(u8, element, origin.observed_client)) {
+                            client_seen = true;
+                            continue;
+                        }
+                        if (!isScriptHop(origin.forwarded_hops, element)) return false;
+                    }
+                }
+                const ip6 = std.mem.indexOfScalar(u8, origin.observed_client, ':') != null;
+                if (client_seen and ip6) origin.forwarded_ip6_verified += 1;
+                // A chain with no client is only ever hops a script named.
+                assert(client_seen or origin.forwarded_hops.len >= 1);
+                return true;
+            }
+
+            fn isScriptHop(hops: []const []const u8, element: []const u8) bool {
+                assert(hops.len >= 1);
+                for (hops) |hop| {
+                    if (std.mem.eql(u8, hop, element)) return true;
+                }
+                return false;
             }
 
             /// The mark's `<length>.<salt>`, if the request's framing can

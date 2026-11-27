@@ -831,6 +831,13 @@ const Census = struct {
     /// are streams answered whole after their trailers, which the origin's
     /// oracle held to arriving without them (§7).
     request_trailers: [Population.count]u64 = @splat(0),
+    /// Origin connections whose #142 header announced an IPv6 client:
+    /// the inbound TCP6 and INET6 parse and the proxy's TCP6 and INET6
+    /// writers, reached. No counter tells an address's family apart.
+    upstream_ip6_announced: u64 = 0,
+    /// Forwarded-for chains (§7) an origin read ending in an IPv6 client,
+    /// exactly as `bareAddress` writes one.
+    forwarded_ip6_verified: u64 = 0,
 
     const Population = enum(u8) {
         http1,
@@ -873,6 +880,33 @@ const Census = struct {
         census.bodies_verified += harness.origin_http.bodies_verified;
         assert(census.bodies_verified >= bodies_before);
         census.addTrailers(harness);
+        const ip6_before = census.upstream_ip6_announced;
+        for (harness.origin.conns[0..harness.origin.conns_count]) |*conn| {
+            if (!conn.header_done) continue;
+            const announced = conn.announced orelse continue;
+            if (announced == .ip6) census.upstream_ip6_announced += 1;
+        }
+        assert(census.upstream_ip6_announced >= ip6_before);
+        const forwarded_before = census.forwarded_ip6_verified;
+        census.forwarded_ip6_verified += harness.origin_http.forwarded_ip6_verified;
+        assert(census.forwarded_ip6_verified >= forwarded_before);
+    }
+
+    /// Some origin must hear an IPv6 client announced (#142): every other
+    /// address in the sweep is IPv4, so without one the TCP6 and INET6
+    /// forms are written by no seed.
+    fn verifyIp6(census: *const Census) bool {
+        var held = true;
+        if (census.upstream_ip6_announced == 0) {
+            std.debug.print("sim census: no origin heard an IPv6 client announced in this sweep\n", .{});
+            held = false;
+        }
+        if (census.forwarded_ip6_verified == 0) {
+            std.debug.print("sim census: no origin read a forwarded-for chain ending in an IPv6 client\n", .{});
+            held = false;
+        }
+        assert(held == (census.upstream_ip6_announced >= 1 and census.forwarded_ip6_verified >= 1));
+        return held;
     }
 
     /// Run only on a seed whose `verify` passed, as every tally here is:
@@ -980,7 +1014,8 @@ const Census = struct {
         const extensions_held = census.verifyExtensionCounters() and census.verifyResponsePolicy() and
             census.verifyProbeRounds();
         const trailers_held = census.verifyTrailers();
-        return census.verifyBodies() and ops_held and extensions_held and trailers_held and held;
+        const ip6_held = census.verifyIp6();
+        return census.verifyBodies() and ops_held and extensions_held and trailers_held and ip6_held and held;
     }
 
     /// Every counter the scripted extensions declare moved somewhere in
@@ -1293,7 +1328,7 @@ fn checkCensus(options: *const Sweep, census: *const Census) bool {
         return true;
     }
     if (!census.verify(options.iterations)) return false;
-    std.debug.print("sim: census ok, {d} counter(s) fired, {d} exempt; {d} extension counter(s) fired; {d} seam op(s), {d} exempt; {d} body(ies) verified; trailers heard {d}/{d}/{d}, sent {d}/{d}/{d} (http1/2/3)\n", .{
+    std.debug.print("sim: census ok, {d} counter(s) fired, {d} exempt; {d} extension counter(s) fired; {d} seam op(s), {d} exempt; {d} body(ies) verified; trailers heard {d}/{d}/{d}, sent {d}/{d}/{d} (http1/2/3); IPv6 clients {d} announced upstream, {d} forwarded\n", .{
         Counters.names.len - uncovered.len,
         uncovered.len,
         extension_counters.len,
@@ -1306,6 +1341,8 @@ fn checkCensus(options: *const Sweep, census: *const Census) bool {
         census.request_trailers[@backingInt(Census.Population.http1)],
         census.request_trailers[@backingInt(Census.Population.http2)],
         census.request_trailers[@backingInt(Census.Population.http3)],
+        census.upstream_ip6_announced,
+        census.forwarded_ip6_verified,
     });
     return true;
 }
