@@ -138,6 +138,17 @@ jobs:
       - name: Measure coverage (kcov)
         run: zig build coverage
 
+      # What only the unit tests reach (DESIGN.md §9): the whole report in
+      # this log, its totals and per-file table in the job summary.
+      - name: Report the sim gap
+        run: |
+          cat zig-out/coverage/sim-gap.txt
+          {
+            echo '```'
+            awk '/^== the serving-path gap/ { exit } { print }' zig-out/coverage/sim-gap.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload to Coveralls
         uses: coverallsapp/github-action@v2
         with:
