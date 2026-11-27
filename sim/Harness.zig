@@ -45,6 +45,9 @@ const H2Client = l7.H2Client(SimIo);
 const H3Client = l7.H3Client(SimIo);
 const EchoClient = l4.Client(SimIo);
 const AdminScraper = admin.Scraper(SimIo);
+/// The HTTP/2 origin of a seed whose http cluster speaks it (#275): enough
+/// connections for a pool the adversary keeps redialing.
+const H2Origin = zoxy.http.h2.TestOriginSized(SimIo, 32);
 const TlsClient = zoxy.tls.TestClient(SimIo);
 
 const assert = std.debug.assert;
@@ -272,6 +275,11 @@ h3_count: u8,
 /// on a seed that binds one. From the arena, since each holds a whole
 /// response; drawn from a stream of their own, so no other draw moves.
 admin_scrapers: []AdminScraper,
+/// #275: what the http cluster's origins speak — HTTP/1.1 to `origin_http`
+/// on most seeds, HTTP/2 to `h2_origin` on the rest, in the clear or over
+/// TLS to the origin fixture. Drawn from a stream of its own.
+http_protocol: zoxy.Options.Cluster.Protocol,
+h2_origin: H2Origin,
 quic_http: bool,
 quic_connections: u32,
 h3_prng: std.Random.DefaultPrng,
@@ -689,6 +697,7 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
     harness.drain_at_ns = deriveDrainAt(harness.clean, random);
     harness.drawSni(seed);
     harness.drawL4Sni(seed);
+    harness.drawHttpProtocol(seed);
     try harness.drawClientCa(arena, seed);
     harness.deriveTopology(random);
     try harness.drawAdmin(arena, seed);
@@ -864,7 +873,8 @@ fn injectOneShotFaults(harness: *Harness, random: std.Random) void {
 /// still holds parked connections.
 fn onHttpOriginStop(harness: *Harness, result: Io.TimerError!void) void {
     result catch return;
-    harness.origin_http.stopListening();
+    // Whichever origin answers at the http endpoint (#275).
+    if (harness.http_protocol == .http1) harness.origin_http.stopListening() else harness.h2_origin.stopListening();
 }
 
 /// The #428 churn's two updates, when this seed churns: only a cluster
@@ -1124,7 +1134,9 @@ fn deriveRetries(harness: *Harness, random: std.Random) void {
         1 + random.uintAtMost(u16, zoxy.constants.cluster_retries_max - 1)
     else
         0;
-    if (budget == 0 or harness.force_exhaustion) {
+    // An HTTP/2 cluster (#275) retries nothing (`ClusterRetriesOnHttp2`):
+    // a request is a stream on a shared connection, not a dial of its own.
+    if (budget == 0 or harness.force_exhaustion or harness.http_protocol != .http1) {
         harness.retries_http = 0;
         harness.endpoints_http_count = 1;
         return;
@@ -1147,7 +1159,11 @@ fn deriveRetries(harness: *Harness, random: std.Random) void {
 /// caps only under the adversary. An adversarial seed draws a pool small
 /// enough to run out, which is what reaches the §8 tunnel rung.
 fn deriveUpgrades(harness: *Harness, random: std.Random) void {
-    if (random.uintLessThan(u8, 3) != 0) {
+    // Drawn either way, so the stream after it is unmoved; an upgrade has
+    // no HTTP/2 origin to tunnel to (`ClusterH2cWithUpgrades`), so a seed
+    // whose http cluster speaks it (#275) takes none.
+    const drawn = random.uintLessThan(u8, 3) == 0;
+    if (!drawn or harness.http_protocol != .http1) {
         harness.upgrades_http = false;
         harness.tunnels = 0;
         return;
@@ -1236,7 +1252,7 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     // since the L4 origin draws its modes on every seed — which fail-open
     // makes harmless.
     const connect_timeout_ms: u32 = 20 + random.uintAtMost(u32, 40);
-    const health = deriveHealthChecks(harness.clean, random, connect_timeout_ms);
+    const health = deriveHealthChecks(harness.clean, random, connect_timeout_ms, harness.http_protocol != .http1);
     harness.http_origin_stop_at_ns = health.http_origin_stop_at_ns;
     harness.proxy_protocol_send_l4 = deriveProxyProtocolSend(random);
     // #174 weights on a single-endpoint topology: the share itself is
@@ -1419,6 +1435,11 @@ fn httpCluster(
         .retries = .{ .count = harness.retries_http, .budget = retry_budget },
         // #428: room for the set and the one endpoint draining out of it.
         .endpoint_slots = if (harness.churns()) 3 else null,
+        .protocol = harness.http_protocol,
+        .tls = if (harness.http_protocol == .h2)
+            .{ .server_name = zoxy.tls.testdata.origin_host_name, .ca_pem = zoxy.tls.testdata.origin_ca_pem }
+        else
+            null,
     };
 }
 
@@ -1552,6 +1573,11 @@ fn limitsStated(harness: *const Harness) zoxy.Options.Limits {
         .tunnels = if (harness.upgrades_http) harness.tunnels else null,
         .h2_streams = if (multiplexes) harness.stream_slots else null,
         .quic_connections = if (harness.quic_http) harness.quic_connections else null,
+        // #275: an `h2` cluster's TLS connections share the engines' heap
+        // (`LimitUpstreamH2TlsOverEngines`), and the default engine count
+        // fills it alone. `Server.init`'s own count is drawn apart; this
+        // is only what the loader is shown, so it fits beside them.
+        .tls_engines = if (harness.http_protocol == .h2 and harness.tls_clients >= 1) 64 else null,
     };
     assert(!harness.upgrades_http or harness.tunnels >= 1);
     if (multiplexes) assert(harness.stream_slots >= 1);
@@ -1827,7 +1853,7 @@ fn derivePassiveEjection(clean: bool, random: std.Random) ?PassiveEjection {
 /// conn table, while the stopped HTTP origin refuses its probes and a
 /// refused probe consumes no origin conn. Everyone else paces from the
 /// `health_interval_floor_ms` the origin-capacity bound is derived at.
-fn deriveHealthChecks(clean: bool, random: std.Random, timeout_ms: u32) HealthDraw {
+fn deriveHealthChecks(clean: bool, random: std.Random, timeout_ms: u32, http2: bool) HealthDraw {
     assert(timeout_ms >= 1);
     const outage = !clean and random.uintLessThan(u8, 8) == 0;
     // Thresholds draw around their defaults so a configured fall/rise —
@@ -1850,6 +1876,9 @@ fn deriveHealthChecks(clean: bool, random: std.Random, timeout_ms: u32) HealthDr
         .path = "/health",
         .expect_status = if (random.uintLessThan(u8, 4) == 0) 599 else 200,
     } };
+    // An HTTP/2 cluster (#275) is never probed by HTTP/1.1, which its
+    // origin need not speak (`ClusterH2cHttpCheck`): its check is the dial.
+    if (http2) http_check = tcp_check;
     const checked_http = outage or random.boolean();
     const draw: HealthDraw = .{
         // The L4 origin echoes bytes rather than speaking HTTP, so only
@@ -2101,7 +2130,7 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
             .protocol = .{ .http = .{
                 .target = .{ .routes = &harness.routes_http },
                 .request_filters = &harness.request_filters_http,
-                .request_policies = &harness.policy_selections,
+                .request_policies = harness.requestPolicies(),
                 .response_policies = &harness.response_policy_selections,
                 .response_filters = &harness.response_filters_http,
                 .forwarded = forwarded,
@@ -2153,7 +2182,7 @@ fn terminatingListener(harness: *Harness) zoxy.Options.Listener {
                 .http = .{
                     .target = .{ .routes = &harness.routes_tls },
                     .request_filters = &harness.request_filters_http,
-                    .request_policies = &harness.policy_selections,
+                    .request_policies = harness.requestPolicies(),
                     .response_policies = &harness.response_policy_selections,
                     .response_filters = &harness.response_filters_http,
                     // No #236 body cap, stated rather than inherited: the cap
@@ -2232,6 +2261,21 @@ fn deriveAccessLogBuffer(harness: *const Harness) u32 {
 /// resolved `config.limits`: a starved seed sizes pools past what options
 /// may state (`limitsStated`).
 fn deriveInitOptions(harness: *const Harness, random: std.Random) ServerSim.InitOptions {
+    var options = harness.derivePoolOptions(random);
+    // #275: the HTTP/2 origin pools, which only an HTTP/2 cluster has. The
+    // limits here are built rather than resolved, so they would be the
+    // type's zeros; the connections are what the loader derived, and the
+    // streams every upstream slot, as the loader's own default is.
+    if (harness.http_protocol != .http1) {
+        options.h2_origin_connections = harness.config.limits.h2_origin_connections;
+        options.h2_origin_streams = options.upstream_slots;
+        assert(options.h2_origin_connections >= 1);
+    }
+    assert(options.h2_origin_streams <= options.upstream_slots);
+    return options;
+}
+
+fn derivePoolOptions(harness: *const Harness, random: std.Random) ServerSim.InitOptions {
     const force_exhaustion = harness.force_exhaustion;
     const access_log_buffer_bytes = harness.deriveAccessLogBuffer();
     return if (force_exhaustion)
@@ -2332,6 +2376,42 @@ fn drawAdmin(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
 
 /// The admin listener's bind, apart from every data-path address.
 const admin_address: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9100 } };
+
+/// #275's draw: a third of seeds' http cluster speaks HTTP/2 to its
+/// origins — in the clear by prior knowledge on half of those, over TLS
+/// (ALPN `h2`) to the origin fixture on the rest — and `h2_origin` answers
+/// in `origin_http`'s place, with the canonical sized 200 every client
+/// already judges.
+fn drawHttpProtocol(harness: *Harness, seed: u64) void {
+    var protocol_prng = std.Random.DefaultPrng.init(seed ^ 0x0275_0275_0275_0275);
+    const random = protocol_prng.random();
+    harness.http_protocol = switch (random.uintLessThan(u8, 6)) {
+        0 => .h2c,
+        1 => .h2,
+        else => .http1,
+    };
+    // HTTP/2 or not, the cluster's origin answers at one address: the one
+    // the #178 sticky tag is minted from.
+    assert(harness.http_protocol.http2() == (harness.http_protocol != .http1));
+}
+
+/// The canonical sized 200 in HTTP/2's terms: the length stated, so the
+/// proxy frames it for HTTP/1.1 clients as the HTTP/1.1 origin does, and
+/// the logged header the access-log oracle reads.
+const h2_origin_headers = [_]zoxy.http.h2.Pair{
+    .{ "content-length", "32" },
+    .{ l7.canon.log_response_header, l7.canon.log_response_value },
+};
+
+/// The http listeners' request policies: the listener's own, then the
+/// #437 consult — except where the http cluster speaks HTTP/2 (#275), which
+/// no consult may ask (`extension.consultable`), so its `consult_get`
+/// routes as a plain GET there.
+fn requestPolicies(harness: *const Harness) []const zoxy.extension.Selection {
+    assert(harness.policy_selections.len == 2);
+    const count: usize = if (harness.http_protocol == .http1) 2 else 1;
+    return harness.policy_selections[0..count];
+}
 
 /// #298's draw: a third of seeds have the L4 listener choose its route by
 /// the ClientHello's name — one named route, and on half of those an
@@ -2634,7 +2714,19 @@ fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: st
         .observed_client = if (harness.io.client_ip6) "2001:db8:1::1" else "198.51.100.1",
         .client_cert_sha256 = zoxy.tls.testdata.client_cert_sha256,
     };
-    try harness.origin_http.start(&harness.io, Harness.httpOriginAddress());
+    harness.h2_origin = .{
+        .tls = harness.http_protocol == .h2,
+        .headers = &h2_origin_headers,
+        .body = l7.canon.sized_body,
+    };
+    // One of the two answers at the http endpoint's address — the address
+    // the #178 pinned tag is minted from, so a sticky cookie names the same
+    // endpoint whichever protocol reaches it.
+    if (harness.http_protocol == .http1) {
+        try harness.origin_http.start(&harness.io, Harness.httpOriginAddress());
+    } else {
+        try harness.h2_origin.start(arena, &harness.io, &.{ .ip = Harness.httpOriginAddress() });
+    }
 }
 
 /// The terminating population's per-scenario state: the storage, the
@@ -3488,9 +3580,12 @@ fn strandCanExplainStuck(harness: *const Harness) bool {
     const admin_stuck = !harness.server.admin.isQuiescent();
     const log_stuck = !harness.server.access_log.isQuiescent();
     const health_stuck = !harness.server.health.isQuiescent();
-    // `onDrainStuck` aborts only when one of the four is unfinished, so a
-    // give-up with all four done is the backstop firing at nothing.
-    assert(conns_stuck or admin_stuck or log_stuck or health_stuck);
+    // The HTTP/2 origin connections (#275); QUIC's endpoints are reported
+    // with them, though no strand kind here can hold one.
+    const origins_stuck = !harness.server.h2_origins.isFullyReleased();
+    // `onDrainStuck` aborts only when a plane is unfinished, so a give-up
+    // with every plane done is the backstop firing at nothing.
+    assert(conns_stuck or admin_stuck or log_stuck or health_stuck or origins_stuck);
     return switch (kind) {
         // The head ring is the connection path's alone (§5).
         .recv_group => conns_stuck,
@@ -3499,17 +3594,17 @@ fn strandCanExplainStuck(harness: *const Harness) bool {
         // Connections read, the admin plane reads its scrape, and the
         // prober reads its probe; all three dial except the admin one, and
         // all three write.
-        .recv, .send => conns_stuck or admin_stuck or health_stuck,
-        .connect => conns_stuck or health_stuck,
+        // An HTTP/2 origin connection reads, writes and dials too.
+        .recv, .send => conns_stuck or admin_stuck or health_stuck or origins_stuck,
+        .connect => conns_stuck or health_stuck or origins_stuck,
         // A listener's accept feeds admission and the admin plane.
         .accept => conns_stuck or admin_stuck,
         // Timers, and the cancels that chase them, belong to a conn's
         // deadline, the prober's pacing or the admin plane's scrape. The
         // access log arms none, which is why it is absent from both.
-        .timer, .timer_cancel => conns_stuck or admin_stuck or health_stuck,
-        // Only the first two of those three dial, so only they can have a
-        // connect to cancel.
-        .connect_cancel => conns_stuck or health_stuck,
+        .timer, .timer_cancel => conns_stuck or admin_stuck or health_stuck or origins_stuck,
+        // Only those that dial can have a connect to cancel.
+        .connect_cancel => conns_stuck or health_stuck or origins_stuck,
         // `submitClose` is the proxy's only `io.close`, and it is the admin
         // plane's; a connection's closes are `closeNow`, which leaves no
         // completion to strand. No seed has reached this arm — `close` has
@@ -3624,6 +3719,7 @@ fn endScenario(harness: *Harness) void {
     harness.armTeardownStrand();
     harness.origin.stopListening();
     harness.origin_http.stopListening();
+    if (harness.http_protocol != .http1) harness.h2_origin.stopListening();
 }
 
 /// Free what the arena cannot (§4): a `Credentials` owns a libcrypto key
@@ -3681,6 +3777,7 @@ pub fn verify(harness: *Harness) !void {
     for (harness.admin_scrapers) |*scraper| scraper.closeIfOpen();
     harness.origin.closeRemaining();
     harness.origin_http.closeRemaining();
+    if (harness.http_protocol != .http1) harness.h2_origin.closeRemaining();
 
     if (harness.io.abortedWith()) |code| {
         return harness.verifyGaveUp(code, pending_ops_live);

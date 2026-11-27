@@ -303,47 +303,38 @@ const uncovered = [_]Uncovered{
         .reason = "no cluster follows a name in the sweep; src/dns/resolver_test.zig runs the " ++
             "resolver against scripted nameservers, under the datagram adversary",
     },
-    // §7 HTTP/2 to the origin. The sweep's origins speak HTTP/1.1 — the
-    // byte-exact integrity oracle reads their wire — and no cluster it
-    // builds is h2c, so nothing here dials an HTTP/2 origin. The leg and
-    // the connection run under `SimIo` in `src/http_proxy_test.zig`'s
-    // `h2 origin:` scenarios, against `TestOrigin` (a `Session` on the
-    // server role), partial-io seeds included; `client_session_test.zig`
-    // drives the session's client role frame by frame.
-    .{
-        .name = "h2_origin_connections",
-        .why = .unreached,
-        .reason = "no h2c cluster in the sweep; http_proxy_test's h2 origin scenarios dial one",
-    },
-    .{
-        .name = "h2_origin_connect_failed",
-        .why = .unreached,
-        .reason = "no h2c cluster in the sweep; the h2 origin 502 scenario dials one nothing listens on",
-    },
-    .{
-        .name = "h2_origin_idle_closed",
-        .why = .unreached,
-        .reason = "no h2c cluster in the sweep; an idle origin connection is ended by the drain first",
-    },
+    // §7 HTTP/2 to the origin (#275). A third of seeds' http cluster
+    // speaks it, h2c or over TLS, to `TestOrigin` answering the canonical
+    // sized 200, so the pool dials, idles and fails to dial under the
+    // adversary. What that origin never does is misbehave at the HTTP/2
+    // layer, and these are the counters only that reaches; the leg's
+    // refusals run under `SimIo` in `src/http_proxy_test.zig`'s `h2 origin:`
+    // scenarios, and `client_session_test.zig` drives the session's client
+    // role frame by frame.
     .{
         .name = "h2_origin_streams_reset",
         .why = .unreached,
-        .reason = "no h2c cluster in the sweep; client_session_test covers the reset and GOAWAY refusals",
+        .reason = "the sweep's HTTP/2 origin answers every stream it is sent; " ++
+            "client_session_test covers the reset and GOAWAY refusals",
     },
     .{
         .name = "h2_origin_refused_heads",
         .why = .unreached,
-        .reason = "no h2c cluster in the sweep; origin.zig's tests and fuzz cover the refused mappings",
+        .reason = "the sweep's HTTP/2 origin answers a canonical head; " ++
+            "origin.zig's tests and fuzz cover the refused mappings",
     },
     .{
         .name = "h2_origin_refused_answers",
         .why = .unreached,
-        .reason = "no h2c cluster in the sweep; origin.zig's tests and fuzz cover the refused answers",
+        .reason = "the sweep's HTTP/2 origin answers a canonical answer; " ++
+            "origin.zig's tests and fuzz cover the refused answers",
     },
     .{
         .name = "h2_origin_tls_failed",
         .why = .unreached,
-        .reason = "no h2 cluster in the sweep; OriginClient's tests and the h2 origin TLS scenarios refuse chains",
+        .reason = "the sweep's HTTP/2 origin serves the chain its cluster trusts, and the " ++
+            "adversary never corrupts a byte; OriginClient's tests and the h2 origin TLS " ++
+            "scenarios refuse chains",
     },
     .{
         .name = "l7_grpc_deadline_exceeded",
@@ -353,7 +344,8 @@ const uncovered = [_]Uncovered{
     .{
         .name = "health_probes_skipped",
         .why = .unreached,
-        .reason = "no h2c cluster in the sweep, so no grpc check; http_proxy_test's grpc probe scenarios fill the pool",
+        .reason = "the sweep's HTTP/2 clusters are checked by dial, since their scripted origin " ++
+            "answers no gRPC health call; http_proxy_test's grpc probe scenarios fill the pool",
     },
     .{
         .name = "upstream_tls_handshakes",
@@ -373,12 +365,15 @@ const uncovered = [_]Uncovered{
     .{
         .name = "l7_shed_h2_origin_connections",
         .why = .unreached,
-        .reason = "no h2c cluster in the sweep, so neither origin pool exists to run dry",
+        .reason = "the sweep's HTTP/2 clusters have one endpoint and the loader's two " ++
+            "connections for it, which multiplex every request the upstream slots admit; " ++
+            "http_proxy_test's h2 origin scenarios starve the pool",
     },
     .{
         .name = "l7_shed_h2_origin_streams",
         .why = .unreached,
-        .reason = "no h2c cluster in the sweep, so neither origin pool exists to run dry",
+        .reason = "the stream pool is the upstream slots' size, as the loader's default is, " ++
+            "so the slot rung answers first; http_proxy_test's h2 origin scenarios starve it",
     },
     .{
         .name = "health_probe_deadline_raced",
@@ -878,6 +873,10 @@ const Census = struct {
     /// Run only on a seed whose `verify` passed, as every tally here is:
     /// a client's count is of sections its oracle has already judged.
     fn addTrailers(census: *Census, harness: *const Harness) void {
+        // A seed whose drain gave up is judged by its backstop alone, never
+        // by its clients' oracles, so nothing they heard is counted here:
+        // every count below is of what an oracle has already judged.
+        if (harness.io.abortedWith() != null) return;
         const before = census.trailers_heard;
         for (harness.l7_clients[0..harness.l7_count]) |*client| {
             census.trailers_heard[@backingInt(Population.http1)] += client.trailersHeard();
