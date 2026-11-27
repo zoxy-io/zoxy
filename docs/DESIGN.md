@@ -1616,9 +1616,10 @@ external binaries. They and the speed gates run at merge.
     - misbehaving origins;
     - an IPv6 peer for every stream client on a third of seeds, and
       PROXY headers announcing IPv6 clients (v1 TCP6, v2 INET6);
-    - an http cluster speaking HTTP/2 to its origin on a third of seeds,
-      h2c or over TLS, answered by a scripted origin with the canonical
-      sized 200 every client already judges.
+    - an http cluster speaking HTTP/2 to its origin on a quarter of
+      seeds, h2c or over TLS, or HTTP/1.1 over TLS on an eighth, answered
+      by a scripted origin with the canonical sized 200 every client
+      already judges.
   - **Who connects:**
     - L4 echo clients, which on a listener that routes by SNI open with
       a ClientHello naming the route, another name, or none, or with
@@ -1695,7 +1696,6 @@ external binaries. They and the speed gates run at merge.
     feature no seed turns on. The report does not gate; a gap in it
     should either be named in the list below or be a scenario to widen.
   - **Not swept, covered by directed tests and the live gate instead:**
-    - HTTPS clusters;
     - RSA: an RSA-PSS signature draws a fresh salt, so no seeded
       handshake on an RSA key replays byte-exact — and with it the choice
       between key types; certificate selection's wildcard tier and its

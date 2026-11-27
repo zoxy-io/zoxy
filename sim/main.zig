@@ -343,19 +343,16 @@ const uncovered = [_]Uncovered{
             "answers no gRPC health call; http_proxy_test's grpc probe scenarios fill the pool",
     },
     .{
-        .name = "upstream_tls_handshakes",
-        .why = .unreached,
-        .reason = "no HTTPS cluster in the sweep; http_proxy_test's https origin scenarios handshake",
-    },
-    .{
         .name = "upstream_tls_failed",
         .why = .unreached,
-        .reason = "no HTTPS cluster in the sweep; the https origin scenarios refuse a misnamed chain",
+        .reason = "the sweep's HTTPS origin (#296) serves the chain its cluster trusts, and the " ++
+            "adversary never corrupts a byte; the https origin scenarios refuse a misnamed chain",
     },
     .{
         .name = "l7_shed_upstream_tls",
         .why = .unreached,
-        .reason = "no HTTPS cluster in the sweep, so no session pool to run dry",
+        .reason = "the sweep's HTTPS cluster holds as many sessions as upstream slots, so the " ++
+            "slot rung answers first; http_proxy_test's https origin scenarios starve the pool",
     },
     .{
         .name = "l7_shed_h2_origin_connections",

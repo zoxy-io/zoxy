@@ -144,6 +144,9 @@ pub const tls = struct {
 /// suites can drive the same origin double instead of growing their own.
 pub const testing = struct {
     pub const Origin = @import("testing/origin.zig").Origin;
+    /// An HTTPS origin (#296): HTTP/1.1 behind TLS, for a sweep's HTTPS
+    /// clusters and the directed scenarios alike.
+    pub const HttpsOrigin = @import("testing/https_origin.zig").HttpsOrigin;
     pub const Mode = @import("testing/origin.zig").Mode;
     /// Comptime byte repetition, for the simulator's canned wire bytes.
     pub const repeat = @import("testing/bytes.zig").repeat;
