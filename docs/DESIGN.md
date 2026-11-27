@@ -1729,9 +1729,13 @@ external binaries. They and the speed gates run at merge.
     points. `zig build coverage` also reports the sweep's line coverage
     on its own, and `scripts/sim_gap.zig` lists the serving-path
     functions only unit tests reach. Each is a branch no seed takes or a
-    feature no seed turns on. The report does not gate; a gap in it
-    should be a scenario to widen, or a census exemption that says what
-    covers it instead.
+    feature no seed turns on. What the sweep cannot reach by construction
+    is set apart with its reason: a loader line that refuses a config,
+    a function only startup code names, and a table of named functions
+    (the serving watchdog). A table entry the sweep reaches any line of,
+    or that excuses no gap, is stale and fails the report. The rest does
+    not gate; a gap in it should be a scenario to widen, or an exemption
+    that says what covers it instead.
 - **Fuzzing.** Twenty-one `std.testing.fuzz` targets cover every parser
   edge:
   - the HTTP/1.1 head and chunked parsers, and the render;

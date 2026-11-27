@@ -16,6 +16,13 @@
 //! - test-helper: never compiled into the sim, and nothing outside tests and
 //!   fuzz targets names it — not a gap at all, so set aside.
 //!
+//! A gap the sweep cannot reach by construction is set apart with its
+//! reason, as the census exempts a counter: a loader line that refuses a
+//! config (the sim builds only configs zoxy accepts), a function only
+//! startup code names, and the functions `exemptions` names. An exemption
+//! that matches no gap is stale, and fails the report — widening a scenario
+//! deletes its excuse.
+//!
 //! The last split is a heuristic. Callers are found by name across src/,
 //! so two functions that share a name read as calling each other. That errs
 //! toward listing a helper as a gap, never toward hiding a gap as a helper.
@@ -66,6 +73,38 @@ const placements = [_]Placement{
     },
 };
 
+/// A serving-path function the sweep does not reach by design, and why.
+/// Its gap lines are set apart under the reason. An entry is stale — and
+/// fails the report — when its function has no gap left, or when the sweep
+/// reaches any line of it: a design that keeps the sweep out keeps it out
+/// of the whole function.
+const Exemption = struct {
+    path: []const u8,
+    owner: []const u8,
+    reason: []const u8,
+};
+
+const exemptions = [_]Exemption{
+    .{
+        .path = "Server.zig",
+        .owner = "armLoopWatchdog",
+        .reason = "the serving watchdog is off for the sweep (`loop_watchdog_ms = null`): a tick every " ++
+            "second of virtual time would move every schedule; server_test.zig provokes it",
+    },
+    .{
+        .path = "Server.zig",
+        .owner = "onLoopWatchdogTick",
+        .reason = "the serving watchdog is off for the sweep (`loop_watchdog_ms = null`); server_test.zig provokes it",
+    },
+};
+
+/// The file whose refusals are the loader's: a line of it that does no
+/// more than return an error refuses a config, and the sim builds only
+/// configs zoxy accepts (`config.resolve`, before `Server.init`).
+const loader_path = "config.zig";
+const refusal_reason = "a loader refusal: the sim builds only configs zoxy accepts";
+const startup_reason = "named only from startup or outside code, which the sim does not run";
+
 /// Code that exists to test or to simulate, beside the two patterns
 /// `isHarness` matches by name (`*_test.zig`, `Test*.zig`).
 const harness_paths = [_][]const u8{ "testing/", "io/SimIo.zig", "tls_heap_proof.zig" };
@@ -101,15 +140,25 @@ const Tree = struct {
     /// blocks, in helper-named functions, and `fn` declaration lines are
     /// not counted, nor a function naming itself.
     callers: std.StringHashMapUnmanaged(u32) = .empty,
+    /// The same count over serving-path files alone.
+    serving_callers: std.StringHashMapUnmanaged(u32) = .empty,
     harness_seen: [harness_paths.len]bool = @splat(false),
+    /// Which `exemptions` matched a gap: one that matched none is stale.
+    exemptions_seen: [exemptions.len]bool = @splat(false),
+    /// Which matched a function the sweep reaches part of: stale too.
+    exemptions_reached: [exemptions.len]bool = @splat(false),
 };
 
-const Kind = enum(u8) { executed_never, unreferenced, test_helper };
+const Kind = enum(u8) { executed_never, unreferenced, test_helper, exempt };
 
 const Group = struct {
     owner: []const u8,
     kind: Kind,
     numbers: std.ArrayList(u32),
+    /// A loader refusal's lines, kept apart from the rest of their owner.
+    refusal: bool = false,
+    /// Why an `.exempt` group is set apart.
+    reason: []const u8 = "",
 };
 
 const Tally = struct {
@@ -118,6 +167,7 @@ const Tally = struct {
     executed_never: u32 = 0,
     unreferenced: u32 = 0,
     test_helper: u32 = 0,
+    exempt: u32 = 0,
 
     fn add(tally: *Tally, other: *const Tally) void {
         const before = tally.instrumented;
@@ -126,6 +176,7 @@ const Tally = struct {
         tally.executed_never += other.executed_never;
         tally.unreferenced += other.unreferenced;
         tally.test_helper += other.test_helper;
+        tally.exempt += other.exempt;
         assert(tally.instrumented >= before);
         assert(tally.sim_hit <= tally.instrumented);
     }
@@ -136,9 +187,11 @@ const Tally = struct {
         return tally.instrumented - tally.test_helper;
     }
 
+    /// The gap nothing explains: a scenario to widen, or an exemption to
+    /// write.
     fn gap(tally: *const Tally) u32 {
         const total = tally.executed_never + tally.unreferenced;
-        assert(total <= tally.instrumented);
+        assert(total + tally.exempt <= tally.instrumented);
         return total;
     }
 };
@@ -173,7 +226,21 @@ pub fn main(init: std.process.Init) !u8 {
     var file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
     try writeReport(&file_writer.interface, rows);
     try file_writer.interface.flush();
-    return 0;
+    return if (exemptionsHold(&tree)) 0 else 1;
+}
+
+/// Every exemption must still excuse a gap: one whose function the sweep
+/// now reaches, or that no longer exists, would read as though it did.
+fn exemptionsHold(tree: *const Tree) bool {
+    var holds = true;
+    for (exemptions, tree.exemptions_seen, tree.exemptions_reached) |exemption, seen, reached| {
+        assert(exemption.reason.len >= 1);
+        if (seen and !reached) continue;
+        const why = if (seen) "the sweep reaches part of it" else "it excuses no gap";
+        std.debug.print("sim_gap: exemption {s}:{s} is stale, {s}\n", .{ exemption.path, exemption.owner, why });
+        holds = false;
+    }
+    return holds;
 }
 
 /// Every production `.zig` file under the root, with its test blocks and
@@ -196,6 +263,7 @@ fn loadTree(arena: std.mem.Allocator, io: std.Io, root: std.Io.Dir, tree: *Tree)
         const contents = try root.readFileAlloc(io, path, arena, .limited(source_bytes_max));
         const source = try loadSource(arena, path, contents);
         try countCallers(arena, &tree.callers, &source);
+        if (source.bucket == .serving) try countCallers(arena, &tree.serving_callers, &source);
         try tree.sources.append(arena, source);
     }
     assert(tree.sources.items.len >= 1);
@@ -298,10 +366,12 @@ fn countCallers(
     source: *const Source,
 ) !void {
     assert(source.lines.len == source.marks.len);
-    for (source.lines, source.marks, source.owners) |line, mark, owner| {
+    for (source.lines, source.marks, source.owners) |full_line, mark, owner| {
         if (mark.in_test_block) continue;
-        if (fnName(line) != null) continue;
+        if (fnName(full_line) != null) continue;
         if (isHelperName(owner)) continue;
+        // A comment naming a function is not a caller of it.
+        const line = full_line[0..codeEnd(full_line)];
         var index: usize = 0;
         while (index < line.len) {
             if (!isIdentifierByte(line[index])) {
@@ -318,6 +388,27 @@ fn countCallers(
         }
         assert(index == line.len);
     }
+}
+
+/// Where a line's code ends: at a `//` outside any string literal, or the
+/// line's end. A `//` inside a literal (a URL) is code, so the count never
+/// loses a caller written after one.
+fn codeEnd(line: []const u8) usize {
+    var quotes: u32 = 0;
+    var index: usize = 0;
+    while (index + 1 < line.len) : (index += 1) {
+        if (line[index] == '\\') {
+            index += 1;
+            continue;
+        }
+        if (line[index] == '"') quotes += 1;
+        if (quotes % 2 == 0 and line[index] == '/' and line[index + 1] == '/') {
+            assert(std.mem.startsWith(u8, line[index..], "//"));
+            return index;
+        }
+    }
+    assert(quotes <= line.len);
+    return line.len;
 }
 
 /// Every placement and every harness path must name something under the
@@ -415,7 +506,7 @@ fn attribute(element: []const u8, comptime name: []const u8) ?[]const u8 {
     return element[start .. start + length];
 }
 
-fn buildRows(arena: std.mem.Allocator, tree: *const Tree) ![]Row {
+fn buildRows(arena: std.mem.Allocator, tree: *Tree) ![]Row {
     assert(tree.sources.items.len >= 1);
     const rows = try arena.alloc(Row, tree.sources.items.len);
     for (tree.sources.items, rows) |*source, *row| {
@@ -429,28 +520,77 @@ fn buildRows(arena: std.mem.Allocator, tree: *const Tree) ![]Row {
 
 /// The lines the tests run and the sim does not, grouped by owner and
 /// judged per group.
-fn groupGaps(arena: std.mem.Allocator, tree: *const Tree, source: *const Source) ![]Group {
+fn groupGaps(arena: std.mem.Allocator, tree: *Tree, source: *const Source) ![]Group {
     assert(source.marks.len == source.owners.len);
     var groups: std.ArrayList(Group) = .empty;
-    for (source.marks, source.owners, 1..) |mark, owner, number| {
+    const loader = std.mem.eql(u8, source.path, loader_path);
+    for (source.marks, source.owners, source.lines, 1..) |mark, owner, line, number| {
         if (!isGap(mark)) continue;
-        const group = try groupFor(arena, &groups, owner);
+        const group = try groupFor(arena, &groups, owner, loader and isRefusal(line));
         try group.numbers.append(arena, @intCast(number));
     }
-    for (groups.items) |*group| group.kind = kindOf(tree, source, group);
+    for (groups.items) |*group| judge(tree, source, group);
     std.mem.sort(Group, groups.items, {}, groupBefore);
     assert(groups.items.len <= source.marks.len);
     return groups.items;
 }
 
-/// The group for `owner`, opened on its first gap line. The pointer is
-/// good until the next group opens.
-fn groupFor(arena: std.mem.Allocator, groups: *std.ArrayList(Group), owner: []const u8) !*Group {
+/// A group's kind, and for a serving-path one set apart, its reason.
+fn judge(tree: *Tree, source: *const Source, group: *Group) void {
+    assert(group.numbers.items.len >= 1);
+    group.kind = kindOf(tree, source, group);
+    if (group.kind == .test_helper) return;
+    // Only the serving path's gaps are scenarios to widen; the others are
+    // set apart whole by their placement.
+    if (source.bucket != .serving) return;
+    if (group.refusal) return exempt(group, refusal_reason);
+    for (exemptions, &tree.exemptions_seen, &tree.exemptions_reached) |exemption, *seen, *reached| {
+        if (!std.mem.eql(u8, exemption.path, source.path)) continue;
+        if (!std.mem.eql(u8, exemption.owner, group.owner)) continue;
+        seen.* = true;
+        reached.* = reached.* or ownerReached(source, group.owner);
+        return exempt(group, exemption.reason);
+    }
+    if (group.kind == .unreferenced and (tree.serving_callers.get(group.owner) orelse 0) == 0) {
+        assert((tree.callers.get(group.owner) orelse 0) >= 1);
+        return exempt(group, startup_reason);
+    }
+}
+
+/// Whether the sweep runs any line `owner` holds.
+fn ownerReached(source: *const Source, owner: []const u8) bool {
+    assert(source.marks.len == source.owners.len);
+    for (source.marks, source.owners) |mark, line_owner| {
+        if (mark.sim_hit and std.mem.eql(u8, line_owner, owner)) return true;
+    }
+    return false;
+}
+
+fn exempt(group: *Group, reason: []const u8) void {
+    assert(reason.len >= 1);
+    assert(group.kind != .test_helper);
+    group.kind = .exempt;
+    group.reason = reason;
+}
+
+/// A loader line that does no more than refuse: `return error.X;`, alone
+/// or after its condition.
+fn isRefusal(line: []const u8) bool {
+    const code = std.mem.trim(u8, line, " \r");
+    assert(code.len <= line.len);
+    if (std.mem.startsWith(u8, code, "return error.")) return true;
+    if (!std.mem.startsWith(u8, code, "if (")) return false;
+    return std.mem.indexOf(u8, code, ") return error.") != null;
+}
+
+/// The group for `owner` (its refusals apart), opened on its first gap
+/// line. The pointer is good until the next group opens.
+fn groupFor(arena: std.mem.Allocator, groups: *std.ArrayList(Group), owner: []const u8, refusal: bool) !*Group {
     assert(owner.len >= 1);
     for (groups.items) |*group| {
-        if (std.mem.eql(u8, group.owner, owner)) return group;
+        if (group.refusal == refusal and std.mem.eql(u8, group.owner, owner)) return group;
     }
-    try groups.append(arena, .{ .owner = owner, .kind = .unreferenced, .numbers = .empty });
+    try groups.append(arena, .{ .owner = owner, .kind = .unreferenced, .numbers = .empty, .refusal = refusal });
     const group = &groups.items[groups.items.len - 1];
     assert(group.numbers.items.len == 0);
     return group;
@@ -480,10 +620,11 @@ fn tallyOf(source: *const Source, groups: []const Group) Tally {
             .executed_never => tally.executed_never += count,
             .unreferenced => tally.unreferenced += count,
             .test_helper => tally.test_helper += count,
+            .exempt => tally.exempt += count,
         }
     }
     assert(tally.sim_hit <= tally.instrumented);
-    assert(tally.gap() + tally.test_helper <= tally.instrumented);
+    assert(tally.gap() + tally.test_helper + tally.exempt <= tally.instrumented);
     return tally;
 }
 
@@ -497,6 +638,22 @@ fn writeReport(writer: *std.Io.Writer, rows: []const Row) !void {
     try writePlacements(writer);
     try writeFiles(writer, rows);
     try writeFunctions(writer, rows);
+    try writeExempt(writer, rows);
+}
+
+fn writeExempt(writer: *std.Io.Writer, rows: []const Row) !void {
+    assert(rows.len >= 1);
+    try writer.writeAll("\n== the serving-path lines set apart, with their reasons ==\n");
+    for (rows) |*row| {
+        if (row.source.bucket != .serving) continue;
+        for (row.groups) |*group| {
+            if (group.kind != .exempt) continue;
+            assert(group.reason.len >= 1);
+            try writer.print("  {s}:{s} ({d}): {s}\n", .{
+                row.source.path, group.owner, group.numbers.items.len, group.reason,
+            });
+        }
+    }
 }
 
 fn writeTotals(writer: *std.Io.Writer, rows: []const Row) !void {
@@ -512,11 +669,13 @@ fn writeTotals(writer: *std.Io.Writer, rows: []const Row) !void {
         try writer.print("{s}: {d} lines ({d} test-helper lines set aside)\n", .{
             label, tally.lines(), tally.test_helper,
         });
-        try writer.print("  sim reaches        {d: >6} ", .{tally.sim_hit});
+        try writer.print("  sim reaches              {d: >6} ", .{tally.sim_hit});
         try writePercent(writer, tally.sim_hit, tally.lines());
-        try writer.print("\n  tests only         {d: >6} ", .{tally.gap()});
+        try writer.print("\n  set apart, reasons given {d: >6} ", .{tally.exempt});
+        try writePercent(writer, tally.exempt, tally.lines());
+        try writer.print("\n  tests only, unexplained  {d: >6} ", .{tally.gap()});
         try writePercent(writer, tally.gap(), tally.lines());
-        try writer.print("\n    executed-never   {d: >6}\n    unreferenced     {d: >6}\n", .{
+        try writer.print("\n    executed-never         {d: >6}\n    unreferenced           {d: >6}\n", .{
             tally.executed_never, tally.unreferenced,
         });
     }
@@ -560,7 +719,7 @@ fn writeFunctions(writer: *std.Io.Writer, rows: []const Row) !void {
         if (row.tally.gap() == 0) continue;
         try writer.print("\n{s} ({d} lines)\n", .{ row.source.path, row.tally.gap() });
         for (row.groups) |*group| {
-            if (group.kind == .test_helper) continue;
+            if (group.kind == .test_helper or group.kind == .exempt) continue;
             const tag: u8 = if (group.kind == .executed_never) 'N' else 'U';
             try writer.print("  {c} {d: >4}  {s: <40} ", .{ tag, group.numbers.items.len, group.owner });
             try writeRanges(writer, group.numbers.items);
@@ -736,4 +895,24 @@ test "bucketOf and isHarness: the tables route files where the report says" {
     try std.testing.expect(isHarness("tls/TestClient.zig"));
     try std.testing.expect(isHarness("testing/origin.zig"));
     try std.testing.expect(!isHarness("io/XevIo.zig"));
+}
+
+test "isRefusal: a loader line that only returns an error" {
+    try std.testing.expect(isRefusal("            return error.FilterClientPrefixTooNarrow;"));
+    try std.testing.expect(isRefusal("    if (dns.refresh_min_ms > max) return error.ClusterDnsRefreshOutOfRange;"));
+    try std.testing.expect(!isRefusal("    const value = try resolveThing(arena) orelse return error.X;"));
+    try std.testing.expect(!isRefusal("    if (x) {"));
+    try std.testing.expect(!isRefusal("    errdefer arena.free(x);"));
+}
+
+test "codeEnd: a comment ends the code, a URL in a literal does not" {
+    try std.testing.expectEqual(@as(usize, 12), codeEnd("    call(); // see `other`"));
+    try std.testing.expectEqual(@as(usize, 0), codeEnd("/// `originTls` decides"));
+    // A char literal's quote flips the parity: the comment is kept, which
+    // over-counts callers — the direction that never hides a gap.
+    const char_quote = "    x == '\"' // `f`";
+    try std.testing.expectEqual(char_quote.len, codeEnd(char_quote));
+    const url = "    const u = \"http://x\"; // note";
+    try std.testing.expectEqual(std.mem.indexOf(u8, url, " //").? + 1, codeEnd(url));
+    try std.testing.expectEqual(@as(usize, 10), codeEnd("    a = b;"));
 }
