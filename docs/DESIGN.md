@@ -1617,7 +1617,9 @@ external binaries. They and the speed gates run at merge.
     - L7 request scripts;
     - h2c clients, including flooders;
     - TLS clients, including resumers across key rotation, each naming
-      one of the listener's certificates, an unknown name, or none;
+      one of the listener's certificates, an unknown name, or none, and,
+      where the listener asks, presenting the client CA's leaf, another
+      CA's, or nothing;
     - admin scrapers, on a third of seeds: each reads the exposition to
       the plane's FIN, and some hold their half open for the drain to
       tear down.
@@ -1647,6 +1649,9 @@ external binaries. They and the speed gates run at merge.
       exposition, each counter in order at no more than its final value;
     - a handshake shown a certificate was shown the one its name chooses,
       and proved it holds that certificate's key;
+    - a client the client CA must refuse hears nothing but the refusal,
+      one it admits is never refused, and none resumes past it; an
+      origin reads a client's fingerprint once and only the verified one;
     - a request's trailer section reaches its origin iff its head owes
       one: HTTP/1.1's relayed, a managed field's or an HTTP/2 or HTTP/3
       client's never;
@@ -1674,8 +1679,8 @@ external binaries. They and the speed gates run at merge.
     feature no seed turns on. The report does not gate; a gap in it
     should either be named in the list below or be a scenario to widen.
   - **Not swept, covered by directed tests and the live gate instead:**
-    - HTTP/2 to origins, HTTPS clusters, SNI routing, mutual TLS, and
-      gRPC deadlines;
+    - HTTP/2 to origins, HTTPS clusters, SNI routing, and gRPC
+      deadlines;
     - RSA: an RSA-PSS signature draws a fresh salt, so no seeded
       handshake on an RSA key replays byte-exact — and with it the choice
       between key types; certificate selection's wildcard tier and its

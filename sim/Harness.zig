@@ -321,6 +321,15 @@ tls_names: [tls_client_slots][]const u8,
 tls_sni_credentials: [2]?zoxy.tls.Credentials,
 tls_certificate_choices: [3]zoxy.tls.certificate_set.Choice,
 tls_certificate_sets: [3][]const zoxy.tls.certificate_set.Choice,
+/// #304: on a seed that draws it, the terminating listener asks every
+/// client for a certificate chaining to the client CA — optionally or
+/// requiring one — and each TLS slot presents nothing, the leaf that CA
+/// signed, or a leaf from another CA, which must be refused.
+tls_client_verify: ?zoxy.Options.Listener.ClientVerify,
+tls_client_presents: [tls_client_slots]ClientPresents,
+tls_client_identities: [2]?zoxy.tls.Credentials,
+/// Slots the client CA turned away, as the TLS verdict found them.
+tls_client_refusals: u32,
 /// How many handshakes were shown each choice, as the TLS verdict found
 /// them: the census's proof that every certificate was chosen by a name.
 tls_choices_shown: [3]u32,
@@ -672,6 +681,7 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
     }
     harness.drain_at_ns = deriveDrainAt(harness.clean, random);
     harness.drawSni(seed);
+    try harness.drawClientCa(arena, seed);
     harness.deriveTopology(random);
     try harness.drawAdmin(arena, seed);
     try harness.startServerAndOrigins(arena, random);
@@ -983,6 +993,10 @@ fn deriveHttp3(harness: *Harness) void {
     if (!random.boolean()) return;
     harness.quic_http = true;
     harness.h3_count = 1 + random.uintLessThan(u8, h3_clients_max);
+    // The HTTP/3 clients present no certificate, so a listener requiring
+    // one (#304) would refuse every one of them and leave their oracle
+    // nothing to judge: such a seed's client CA is optional instead.
+    if (harness.tls_client_verify == .required) harness.tls_client_verify = .optional;
     const starved = !harness.clean and random.uintLessThan(u8, 3) == 0;
     harness.quic_connections = if (starved) 1 else @as(u32, harness.h3_count) + 1;
     // Its exchanges run on the shared streams HTTP/2's do.
@@ -2106,6 +2120,10 @@ fn terminatingListener(harness: *Harness) zoxy.Options.Listener {
         // #297: stated so the config prices them; the harness loads the
         // set itself, as it loads the default (`loadCertificateSet`).
         .certificates = if (harness.tls_sni) &sni_certificates else &.{},
+        .client_ca = if (harness.tls_client_verify) |client_verify|
+            .{ .ca_pem = zoxy.tls.testdata.client_ca_pem, .verify = client_verify }
+        else
+            null,
     } else null;
     return .{
         .bind = .{ .ip = tlsBindAddress() },
@@ -2322,6 +2340,93 @@ const sni_certificates = [_]zoxy.Options.Listener.Certificate{
 /// Half of seeds give the terminating listener `sni_certificates`, and
 /// then each slot draws a name from `sni_names`; the rest name the default
 /// alone, as every seed did before. A stream of its own.
+/// What a TLS slot answers a #304 CertificateRequest with.
+const ClientPresents = enum(u8) {
+    /// Nothing: an unauthenticated session where the CA is optional, a
+    /// `certificate_required` refusal where it is required.
+    none,
+    /// The leaf the client CA signed: verified, so its fingerprint goes
+    /// on to the origin and the log.
+    issued,
+    /// A leaf another CA signed (the origin fixture): refused either way,
+    /// since a certificate that is presented must verify.
+    foreign,
+};
+
+/// Half of seeds ask no client for a certificate; the rest split between
+/// an optional and a required client CA, and each slot then draws what it
+/// presents. Both identities sign deterministically, so a seed replays.
+/// A stream of its own.
+fn drawClientCa(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
+    var client_ca_prng = std.Random.DefaultPrng.init(seed ^ 0x0304_0304_0304_0304);
+    const random = client_ca_prng.random();
+    harness.tls_client_identities = .{ null, null };
+    harness.tls_client_presents = @splat(.none);
+    harness.tls_client_refusals = 0;
+    harness.tls_client_verify = switch (random.uintLessThan(u8, 4)) {
+        0 => .optional,
+        1 => .required,
+        else => null,
+    };
+    if (harness.tls_client_verify == null) return;
+    for (&harness.tls_client_presents) |*presents| presents.* = random.enumValue(ClientPresents);
+    const testdata = zoxy.tls.testdata;
+    const deterministic: zoxy.tls.Credentials.Options = .{ .deterministic_nonce = true };
+    harness.tls_client_identities[0] =
+        try zoxy.tls.Credentials.load(arena, testdata.client_cert_pem, testdata.client_key_pem, deterministic);
+    harness.tls_client_identities[1] =
+        try zoxy.tls.Credentials.load(arena, testdata.origin_cert_pem, testdata.origin_key_pem, deterministic);
+    assert(harness.tls_client_identities[0] != null);
+}
+
+/// The identity slot `index` presents, as the test client takes one.
+fn clientIdentity(harness: *Harness, index: u8) ?*const zoxy.tls.ClientIdentity {
+    assert(index < tls_client_slots);
+    const slot: usize = switch (harness.tls_client_presents[index]) {
+        .none => return null,
+        .issued => 0,
+        .foreign => 1,
+    };
+    assert(harness.tls_client_verify != null);
+    return &harness.tls_client_identities[slot].?.inner;
+}
+
+/// #304: whether slot `index` must be turned away by its listener's client
+/// CA — no certificate where one is required, or one that cannot verify.
+fn clientRefusalOwed(harness: *const Harness, index: usize) bool {
+    const client_verify = harness.tls_client_verify orelse return false;
+    return switch (harness.tls_client_presents[index]) {
+        .none => client_verify == .required,
+        .issued => false,
+        .foreign => true,
+    };
+}
+
+/// A slot its client CA turns away hears nothing back but the refusal —
+/// which a clean seed must have delivered — and one it admits is never
+/// refused. True when the slot was a refusal, and so is accounted for.
+fn verifyClientCertificate(harness: *Harness, client: *const TlsClient, index: usize, back: []const u8) !bool {
+    assert(index < tls_client_slots);
+    // A listener that asks for a certificate resumes nothing: a ticket
+    // seals the PSK alone, and a resumed handshake asks for no certificate
+    // (RFC 8446 §4.3.2), so a resumed session would carry no identity to
+    // the origin. A session completed and shown no certificate resumed.
+    if (harness.tls_client_verify != null and client.handshake_done and client.serverPublicKey() == null) {
+        return error.TlsResumedPastClientCa;
+    }
+    if (!harness.clientRefusalOwed(index)) {
+        if (client.refusedForClientCertificate()) return error.TlsClientRefusedWrongly;
+        return false;
+    }
+    if (back.len != 0) return error.TlsClientRefusalServed;
+    // A missing certificate is told with `certificate_required`; a chain
+    // that fails is a bare teardown (§4), whose witness is the counter.
+    const told = harness.tls_client_presents[index] == .none;
+    if (harness.clean and told and !client.refusedForClientCertificate()) return error.TlsClientRefusalMissing;
+    harness.tls_client_refusals += 1;
+    return true;
+}
+
 fn drawSni(harness: *Harness, seed: u64) void {
     var sni_prng = std.Random.DefaultPrng.init(seed ^ 0x0297_0297_0297_0297);
     const random = sni_prng.random();
@@ -2427,6 +2532,7 @@ fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: st
         // As `bareAddress` writes the peer `SimIo` gives every stream
         // client: the brackets and the port come off an IPv6 one.
         .observed_client = if (harness.io.client_ip6) "2001:db8:1::1" else "198.51.100.1",
+        .client_cert_sha256 = zoxy.tls.testdata.client_cert_sha256,
     };
     try harness.origin_http.start(&harness.io, Harness.httpOriginAddress());
 }
@@ -2858,6 +2964,7 @@ fn startTlsClient(
     const pairs = harness.tls_protocol == .http and entry.routed_canonical;
     client.start(&harness.io, Harness.tlsBindAddress(), .{
         .host_name = harness.tls_names[index],
+        .client_credentials = harness.clientIdentity(index),
         .resume_with = resume_with,
         .alpn = harness.tls_alpn_offers[index].protocols(),
         // An echo token for a relayed session, a real request for a
@@ -3423,6 +3530,12 @@ fn endScenario(harness: *Harness) void {
 /// arena would leak one key per seed — twice over, since every seed runs
 /// twice for the determinism check.
 pub fn tearDown(harness: *Harness) void {
+    for (&harness.tls_client_identities) |*slot| {
+        if (slot.*) |*credentials| {
+            credentials.deinit();
+            slot.* = null;
+        }
+    }
     for (&harness.tls_sni_credentials) |*slot| {
         if (slot.*) |*credentials| {
             credentials.deinit();
@@ -3502,6 +3615,8 @@ pub fn verify(harness: *Harness) !void {
     // §7: a forwarded-for chain holds the scripts' hops and, last, the
     // client the proxy observed, written bare in either family.
     if (harness.origin_http.forwarded_mismatches != 0) return error.OriginSawWrongForwardedFor;
+    // §4: a verified client's fingerprint, once, and no forgery or stale one.
+    if (harness.origin_http.client_cert_mismatches != 0) return error.OriginSawWrongClientCert;
     // #142 send: on any seed, garbage where a header belongs is zoxy's
     // bug — the writers are pure and the adversary splits deliveries but
     // never corrupts bytes, so a cut lands as EOF, not as a violation.
@@ -3526,6 +3641,18 @@ pub fn verify(harness: *Harness) !void {
     }
     for (harness.admin_scrapers) |*scraper| try scraper.verify(&harness.server.counters);
     try harness.verifyTlsSessions();
+    try harness.verifyClientRefusalCount();
+}
+
+/// #304: every refusal the client CA made was owed — the counter never
+/// passes the slots the verdict found owed one — and on a clean seed,
+/// where every refused client reaches its certificate step, it is exactly
+/// that many. A chain refused by a bare teardown is told by nothing else.
+fn verifyClientRefusalCount(harness: *const Harness) !void {
+    const refused = harness.server.counters.get("tls_client_cert_refused");
+    if (harness.tls_client_verify == null) assert(refused == 0);
+    if (refused > harness.tls_client_refusals) return error.TlsClientRefusalsMiscounted;
+    if (harness.clean and refused != harness.tls_client_refusals) return error.TlsClientRefusalsMiscounted;
 }
 
 /// #297: a handshake that was shown a leaf was shown the one its name
@@ -3594,6 +3721,7 @@ fn verifyTlsSessions(harness: *Harness) !void {
         try harness.verifyTlsCertificate(client, index);
         const back = client.app_received[0..client.app_received_len];
         if (try harness.verifyTlsAlpn(client, index, back, &refusals)) continue;
+        if (try harness.verifyClientCertificate(client, index, back)) continue;
         if (harness.tls_protocol == .http) {
             // What this slot drew, and the same pairing rule
             // `startTlsClient` sent it under: a `routed_canonical` script

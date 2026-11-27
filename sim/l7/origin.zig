@@ -108,6 +108,13 @@ pub fn HttpOrigin(comptime IoType: type) type {
         forwarded_mismatches: u32 = 0,
         /// Chains that ended in an IPv6 observed client, read exactly.
         forwarded_ip6_verified: u32 = 0,
+        /// The fingerprint a verified client's requests carry (#304), as
+        /// the header spells it, and the requests that carried it. Any
+        /// other value — a client's own forgery, or another client's — or
+        /// the header twice, counts as a forwarded-for mismatch does.
+        client_cert_sha256: []const u8 = "",
+        client_certs_verified: u32 = 0,
+        client_cert_mismatches: u32 = 0,
         /// Where a chunked body is dechunked for its trailer check, so
         /// the wire it is read from stays as it came for the mark check.
         scratch: [request_buffer_bytes]u8 = undefined,
@@ -393,6 +400,11 @@ pub fn HttpOrigin(comptime IoType: type) type {
                     conn.close();
                     return false;
                 }
+                if (!conn.clientCertValid(&request)) {
+                    conn.origin.client_cert_mismatches += 1;
+                    conn.close();
+                    return false;
+                }
                 switch (request.framing) {
                     .none => conn.framing_tag = .none,
                     .content_length => |length| {
@@ -450,6 +462,24 @@ pub fn HttpOrigin(comptime IoType: type) type {
                 if (client_seen and ip6) origin.forwarded_ip6_verified += 1;
                 // A chain with no client is only ever hops a script named.
                 assert(client_seen or origin.forwarded_hops.len >= 1);
+                return true;
+            }
+
+            /// `X-Client-Cert-SHA256` once at most, and then the verified
+            /// client's own: the proxy strips every inbound copy and sets
+            /// the one it verified (§4).
+            fn clientCertValid(conn: *Conn, request: *const parser.RequestHead) bool {
+                const origin = conn.origin;
+                assert(origin.client_cert_sha256.len == 64);
+                var seen: u32 = 0;
+                for (request.headers) |header| {
+                    if (!std.ascii.eqlIgnoreCase(header.name, "x-client-cert-sha256")) continue;
+                    seen += 1;
+                    if (!std.mem.eql(u8, header.value, origin.client_cert_sha256)) return false;
+                }
+                if (seen > 1) return false;
+                origin.client_certs_verified += seen;
+                assert(seen <= 1);
                 return true;
             }
 
