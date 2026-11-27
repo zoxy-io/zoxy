@@ -17,6 +17,36 @@ const zssl = @import("zssl");
 
 const assert = std.debug.assert;
 
+/// What a test client's hello offers in `signature_algorithms` (#411):
+/// zssl's default list, ECDSA then RSA-PSS, or a narrower one, for a gate
+/// asking which key type a listener chooses for an offer.
+pub const SchemeOffer = enum(u8) {
+    all,
+    /// ECDSA on both curves zssl signs on.
+    ecdsa,
+    /// ECDSA on P-256 alone: a P-384 leaf is no use to it.
+    p256,
+    /// RSA-PSS alone, under all three digests.
+    rsa,
+
+    const Scheme = zssl.backend.SignatureScheme;
+    const ecdsa_schemes = [_]Scheme{ .ecdsa_secp256r1_sha256, .ecdsa_secp384r1_sha384 };
+    const p256_schemes = [_]Scheme{.ecdsa_secp256r1_sha256};
+    const rsa_schemes = [_]Scheme{ .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 };
+
+    pub fn schemes(offer: SchemeOffer) []const Scheme {
+        const list: []const Scheme = switch (offer) {
+            .all => &zssl.client_messages.signature_schemes_default,
+            .ecdsa => &ecdsa_schemes,
+            .p256 => &p256_schemes,
+            .rsa => &rsa_schemes,
+        };
+        assert(list.len >= 1);
+        assert(list.len <= zssl.client_messages.signature_schemes_default.len);
+        return list;
+    }
+};
+
 /// What a client captures from one session and offers on the next.
 /// Owned rather than re-exported: zssl hands a ticket out as views into
 /// the handshake's reassembly buffer, valid only until the next record,
@@ -97,6 +127,9 @@ pub fn TestClient(comptime IoType: type) type {
         /// Set when the session established, when the peer sent
         /// close_notify, and when the client is finished with the socket.
         handshake_done: bool,
+        /// The ClientHello went out whole: past here, a server that hangs
+        /// up has read what it is refusing.
+        hello_sent: bool,
         saw_close: bool,
         ended: bool,
         /// Application data to send once the handshake completes, and the
@@ -237,6 +270,9 @@ pub fn TestClient(comptime IoType: type) type {
             /// interesting cases are the names the server does not speak.
             /// The storage is the caller's and must outlive the client.
             alpn: []const []const u8 = &.{},
+            /// The signature schemes the hello offers, and so the ones the
+            /// server's CertificateVerify may use (#411).
+            scheme_offer: SchemeOffer = .all,
             /// Seeds for the two keyshares and the client random.
             x25519_seed: [32]u8 = @splat(0x61),
             p256_seed: [32]u8 = @splat(0x62),
@@ -273,6 +309,7 @@ pub fn TestClient(comptime IoType: type) type {
                 else
                     null,
                 .alpn_protocols = options.alpn,
+                .verify_schemes = options.scheme_offer.schemes(),
                 .reassembly = &client.reassembly,
                 .client_credentials = options.client_credentials,
                 .client_auth_flight = if (options.client_credentials != null) &client.auth_flight else &.{},
@@ -284,6 +321,7 @@ pub fn TestClient(comptime IoType: type) type {
             client.recv_completion = .{};
             client.send_completion = .{};
             client.pending_send = &.{};
+            client.hello_sent = false;
             client.handshake_done = false;
             client.saw_close = false;
             client.ended = false;
@@ -381,6 +419,9 @@ pub fn TestClient(comptime IoType: type) type {
             };
             assert(sent <= client.pending_send.len);
             client.pending_send = client.pending_send[sent..];
+            // The first flight is the ClientHello alone, so the first time
+            // it drains is the hello written whole.
+            if (client.pending_send.len == 0) client.hello_sent = true;
             client.nextStep();
         }
 
@@ -741,6 +782,13 @@ pub fn TestClient(comptime IoType: type) type {
         /// offers no ALPN at all, the `l4` listener's case.
         pub fn alpnSelected(client: *const Self) ?[]const u8 {
             return client.hs.alpnSelected();
+        }
+
+        /// Whether this client's ClientHello was written whole (#411): what
+        /// a refusal of its offer needs before it can be owed.
+        pub fn helloSent(client: *const Self) bool {
+            assert(!client.handshake_done or client.hello_sent);
+            return client.hello_sent;
         }
 
         /// Whether the server turned this handshake away with RFC 7301's

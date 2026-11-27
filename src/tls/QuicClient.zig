@@ -6,8 +6,10 @@
 //! zoxy serves QUIC and never dials it, so nothing on the serving path
 //! uses this. It is the client the HTTP/3 tests and the simulator's
 //! HTTP/3 clients handshake with — the reason it lives here, where zssl
-//! may be imported, rather than beside them. It verifies no certificate:
-//! a test's chain is throwaway, and what is under test is the server.
+//! may be imported, rather than beside them. It verifies no chain or name:
+//! a test's chain is throwaway, and what is under test is the server. The
+//! leaf's signature it does verify, and keeps the leaf's key, for a gate
+//! asking which certificate a name chose (#297).
 
 const std = @import("std");
 const zssl = @import("zssl");
@@ -27,6 +29,10 @@ connected: bool,
 /// NewSessionTickets the server sent, counted and otherwise dropped:
 /// nothing here resumes.
 tickets: u32,
+/// The leaf's public key, copied out once the handshake connects (#297):
+/// the transport deinits `hs` when it ends, and a gate reads this after.
+server_key: [zssl.peer_certificate.public_key_bytes_max]u8,
+server_key_bytes: u16,
 
 /// What a server's flight may need reassembled before the client reads it:
 /// a certificate chain of a few kilobytes, with room to spare.
@@ -48,18 +54,40 @@ pub fn init(client: *QuicClient, config: *const Config, sink: *const Engine.Quic
     assert(config.server_name.len >= 1);
     client.connected = false;
     client.tickets = 0;
+    client.server_key_bytes = 0;
     client.hs = zssl.ClientHandshake.init(&.{
         .client_random = config.seed[0..32].*,
         .x25519_private = config.seed[32..64].*,
         .server_name = config.server_name,
         .alpn_protocols = Engine.quic_alpn,
-        .certificate_policy = .insecure_no_verification,
+        .certificate_policy = .leaf_signature,
         .reassembly = &client.reassembly,
         .quic = .{ .transport_parameters = config.transport_parameters },
     });
     const hello = client.hs.startCrypto();
     assert(hello.level == .initial);
     try sink.crypto(sink.ctx, hello.level, hello.bytes);
+}
+
+/// The public key the server's leaf carried (#297), as
+/// `std.crypto.Certificate` reads one out of a leaf; null for a handshake
+/// that never connected. Readable after `deinit`.
+pub fn serverPublicKey(client: *const QuicClient) ?[]const u8 {
+    if (client.server_key_bytes == 0) return null;
+    assert(client.connected);
+    return client.server_key[0..client.server_key_bytes];
+}
+
+fn keepServerKey(client: *QuicClient) void {
+    assert(client.connected);
+    const peer = &client.hs.peer;
+    // `leaf_signature` verified it before the server's Finished could.
+    assert(peer.seen and !peer.empty);
+    const key = peer.publicKey();
+    assert(key.len >= 1);
+    assert(key.len <= client.server_key.len);
+    @memcpy(client.server_key[0..key.len], key);
+    client.server_key_bytes = @intCast(key.len);
 }
 
 pub fn deinit(client: *QuicClient) void {
@@ -81,6 +109,7 @@ pub fn deliver(client: *QuicClient, level: Engine.QuicLevel, bytes: []const u8, 
             .connected => {
                 assert(!client.connected);
                 client.connected = true;
+                client.keepServerKey();
                 sink.connected(sink.ctx);
             },
         }

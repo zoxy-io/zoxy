@@ -369,7 +369,10 @@ const uncovered = [_]Uncovered{
             "mid-flight: a scenario force-ended at its 2 s cap with a " ++
             "handshake still in the air, or a client whose own send the " ++
             "adversary failed. Both are the harness ending a session the " ++
-            "proxy was serving correctly. A reading past the allowance is " ++
+            "proxy was serving correctly. A slot whose signature offer no " ++
+            "certificate its name reaches can sign under (#411) is owed its " ++
+            "failure by the draw, and is not held against the allowance. " ++
+            "A reading past the allowance is " ++
             "not that: it is handshakes failing on their own account, which " ++
             "is a bug report. src/server_test.zig sends plaintext at a TLS " ++
             "port, which is the shape a misdirected client or a scanner " ++
@@ -403,16 +406,6 @@ const uncovered = [_]Uncovered{
             "splits deliveries but never alters a byte, so no schedule it " ++
             "can produce reaches this — and no directed test drives it " ++
             "either, which is the honest gap",
-    },
-    .{
-        .name = "tls_rsa_signed",
-        .why = .unreached,
-        .reason = "the sweep's listeners sign ECDSA under RFC 6979 nonces so a " ++
-            "seed replays byte-exact, and RSA-PSS draws a fresh salt per " ++
-            "signature — zssl refuses an RSA key that was asked for " ++
-            "deterministic signing (#411). engine_test drives RSA handshakes " ++
-            "and the choice between key types; the smoke gate's RSA leg " ++
-            "reads this counter off the shipped binary",
     },
     .{
         .name = "l7_no_route",
@@ -711,7 +704,7 @@ const Census = struct {
     forwarded_ip6_verified: u64 = 0,
     /// Handshakes shown each of a #297 listener's certificates — the
     /// default, the P-384 one, the second P-256 one — by the name asked.
-    certificates_shown: [3]u64 = @splat(0),
+    certificates_shown: [Harness.sni_choices_count]u64 = @splat(0),
     /// Requests an origin received carrying a verified client's
     /// fingerprint (#304): mutual TLS, end to end.
     client_certs_forwarded: u64 = 0,
@@ -730,7 +723,15 @@ const Census = struct {
     fn add(census: *Census, harness: *const Harness) void {
         inline for (Counters.names, 0..) |name, index| {
             const before = census.totals[index];
-            census.totals[index] += harness.server.counters.get(name);
+            const counted = harness.server.counters.get(name);
+            // #411: a slot whose offer no certificate could sign under is
+            // owed its failed handshake, by the harness's own draw — held
+            // against the allowance below only past what was owed.
+            const excused = if (comptime std.mem.eql(u8, name, "tls_handshake_failed"))
+                @min(counted, harness.tls_scheme_refusals)
+            else
+                0;
+            census.totals[index] += counted - excused;
             // A sweep is bounded by `iterations`, so no honest total can
             // wrap — one that did would read as a rung going quiet.
             assert(census.totals[index] >= before);

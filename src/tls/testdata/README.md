@@ -17,9 +17,9 @@ openssl req -new -x509 -key key.pem -subj "/CN=spike.zoxy.test" \
 `rsa2048-key.pem` and `rsa2048-cert.pem` are a throwaway RSA-2048 key and
 its self-signed certificate (#411), for `DNS:rsa.zoxy.test` and also
 `DNS:spike.zoxy.test`, the ECDSA fixture's name, so one name has both key
-types behind it. The engine tests and the smoke gate use them to check
-that ECDSA is chosen wherever a client can verify it, and that an RSA-PSS
-handshake completes where it cannot.
+types behind it. The engine tests, the smoke gate and the simulator use
+them to check that ECDSA is chosen wherever a client can verify it, and
+that an RSA-PSS handshake completes where it cannot.
 
 `rsa4096-key.pem` and `rsa4096-cert.pem` are the largest RSA key zoxy
 admits, for `DNS:rsa4096.zoxy.test`. They exist so `zig build
@@ -66,6 +66,28 @@ openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3065 \
   -pkeyopt rsa_keygen_primes:3 -out rsa3065-key.pem
 openssl req -new -x509 -key rsa3065-key.pem -subj "/CN=rsa3065.zoxy.test" \
   -addext "subjectAltName=DNS:rsa3065.zoxy.test" -days 3650 -sha256 -out rsa3065-cert.pem
+```
+
+## Wildcard fixtures (#297, certificate selection's second tier)
+
+Two self-signed leaves for `DNS:*.wild.zoxy.test`, one per key type, so
+the simulator can ask a wildcard name and check which key type the
+listener chooses: `wild-key.pem` and `wild-cert.pem` are a fresh P-256
+pair, and `rsa2048-wild-cert.pem` is issued to `rsa2048-other-key.pem`
+above, a key no other certificate here carries. Every leaf a listener
+chooses among has a public key of its own, which is how a client can
+tell which one it was shown. Valid 2019 to 2049, like the origin
+fixtures below. Same warning as above: committed on purpose, trusted by
+nothing.
+
+```sh
+openssl ecparam -name prime256v1 -genkey -noout -out wild-key.pem
+openssl req -new -x509 -key wild-key.pem -subj "/CN=*.wild.zoxy.test" \
+  -addext "subjectAltName=DNS:*.wild.zoxy.test" \
+  -not_before 20190101000000Z -not_after 20490101000000Z -sha256 -out wild-cert.pem
+openssl req -new -x509 -key rsa2048-other-key.pem -subj "/CN=*.wild.zoxy.test" \
+  -addext "subjectAltName=DNS:*.wild.zoxy.test" \
+  -not_before 20190101000000Z -not_after 20490101000000Z -sha256 -out rsa2048-wild-cert.pem
 ```
 
 ## Origin trust fixtures (§7, TLS to an HTTP/2 origin)

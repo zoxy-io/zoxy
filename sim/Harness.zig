@@ -356,8 +356,15 @@ l4_sni_route_count: u8,
 l4_hello_kinds: [clients_max]?HelloKind,
 l4_sni_prng: std.Random.DefaultPrng,
 tls_names: [tls_client_slots][]const u8,
-tls_sni_credentials: [2]?zoxy.tls.Credentials,
-tls_certificate_choices: [3]zoxy.tls.certificate_set.Choice,
+/// #411: the signature schemes each TLS slot's hello offers — every one
+/// zssl knows, but on a #297 seed narrowed to one key type or one curve —
+/// so the listener's choice between key types is swept, and so is the
+/// refusal of an offer no certificate the name reaches can sign under.
+tls_scheme_offers: [tls_client_slots]zoxy.tls.SchemeOffer,
+/// #297 over QUIC: the name each HTTP/3 client's hello asks for.
+h3_names: [h3_clients_max][]const u8,
+tls_sni_credentials: [sni_certificates.len]?zoxy.tls.Credentials,
+tls_certificate_choices: [sni_choices_count]zoxy.tls.certificate_set.Choice,
 tls_certificate_sets: [3][]const zoxy.tls.certificate_set.Choice,
 /// #304: on a seed that draws it, the terminating listener asks every
 /// client for a certificate chaining to the client CA — optionally or
@@ -368,9 +375,14 @@ tls_client_presents: [tls_client_slots]ClientPresents,
 tls_client_identities: [2]?zoxy.tls.Credentials,
 /// Slots the client CA turned away, as the TLS verdict found them.
 tls_client_refusals: u32,
-/// How many handshakes were shown each choice, as the TLS verdict found
-/// them: the census's proof that every certificate was chosen by a name.
-tls_choices_shown: [3]u32,
+/// How many handshakes were shown each choice, as the TLS and HTTP/3
+/// verdicts found them: the census's proof that every certificate was
+/// chosen by a name.
+tls_choices_shown: [sni_choices_count]u32,
+/// #411: TLS slots turned away for an offer no certificate the name
+/// reaches signs under, as the TLS verdict found them — each a failed
+/// handshake the census does not hold against the proxy.
+tls_scheme_refusals: u32,
 /// The #142 gate drawn for the l4 listener; `populateClients` reads it
 /// to decide whether its clients open with headers.
 proxy_protocol_l4: ?zoxy.config.Config.Listener.ProxyProtocol,
@@ -2627,21 +2639,52 @@ fn verifySniCounters(harness: *const Harness) !void {
     if (catch_all) assert(owed[2] == 0);
 }
 
-/// The names a TLS slot may ask for (#297): nothing, the default's, each
-/// further certificate's, and one no certificate covers.
+/// The names a TLS slot may ask for (#297): nothing; the default's, which
+/// an RSA leaf covers too; each further certificate's exact name, one of
+/// them in another case; a name under the wildcard, in either case; the
+/// wildcard's apex and a name two labels under it, which it does not
+/// cover (RFC 9525 §6.3); and one nothing covers.
 const sni_names = [_][]const u8{
     "",
     zoxy.tls.testdata.host_name,
     zoxy.tls.testdata.p384_host_name,
     zoxy.tls.testdata.origin_host_name,
+    zoxy.tls.testdata.rsa_host_name,
+    "RSA.Zoxy.Test",
+    "api." ++ zoxy.tls.testdata.wild_domain,
+    "Api.WILD.zoxy.test",
+    zoxy.tls.testdata.wild_domain,
+    "a.b." ++ zoxy.tls.testdata.wild_domain,
     "other.zoxy.test",
 };
 
-/// The two further certificates a #297 seed's terminating listener holds.
+/// The further certificates a #297 seed's terminating listener holds,
+/// after the default (index 0, P-256 for `host_name`): P-384, a second
+/// P-256, RSA for `rsa_host_name` and `host_name`, and a P-256 and an RSA
+/// leaf for `*.wild.zoxy.test`. Every leaf has a key of its own.
 const sni_certificates = [_]zoxy.Options.Listener.Certificate{
     .{ .cert_pem = zoxy.tls.testdata.p384_cert_pem, .key_pem = zoxy.tls.testdata.p384_key_pem, .label = "the P-384 fixture" },
     .{ .cert_pem = zoxy.tls.testdata.origin_cert_pem, .key_pem = zoxy.tls.testdata.origin_key_pem, .label = "the second P-256 fixture" },
+    .{ .cert_pem = zoxy.tls.testdata.rsa_cert_pem, .key_pem = zoxy.tls.testdata.rsa_key_pem, .label = "the RSA fixture" },
+    .{ .cert_pem = zoxy.tls.testdata.wild_cert_pem, .key_pem = zoxy.tls.testdata.wild_key_pem, .label = "the P-256 wildcard" },
+    .{ .cert_pem = zoxy.tls.testdata.rsa_wild_cert_pem, .key_pem = zoxy.tls.testdata.rsa_wild_key_pem, .label = "the RSA wildcard" },
 };
+
+/// Which of `sni_certificates` carry an RSA key: those load without RFC
+/// 6979 nonces, which zssl refuses an RSA key (#411). A seed still
+/// replays: the trace folds in lengths, never octets, and a PSS
+/// signature is its modulus's length whatever salt it drew — where an
+/// ECDSA one's DER length moves with its nonce, which is why those sign
+/// deterministically.
+const sni_certificate_rsa = [_]bool{ false, false, true, false, true };
+
+/// The default and `sni_certificates`: what a #297 listener chooses among.
+pub const sni_choices_count = sni_certificates.len + 1;
+
+comptime {
+    assert(sni_certificate_rsa.len == sni_certificates.len);
+    assert(sni_choices_count <= zoxy.constants.tls_certificates_max);
+}
 
 /// Half of seeds give the terminating listener `sni_certificates`, and
 /// then each slot draws a name from `sni_names`; the rest name the default
@@ -2675,6 +2718,12 @@ fn drawClientCa(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
         else => null,
     };
     if (harness.tls_client_verify == null) return;
+    // No slot of a client-CA seed is shown an RSA leaf
+    // (`rsaSaltContained`): one that would be offers ECDSA instead.
+    for (&harness.tls_scheme_offers, 0..) |*offer, index| {
+        if (harness.slotShownRsa(index)) offer.* = .ecdsa;
+        assert(!harness.slotShownRsa(index));
+    }
     for (&harness.tls_client_presents) |*presents| presents.* = random.enumValue(ClientPresents);
     const testdata = zoxy.tls.testdata;
     const deterministic: zoxy.tls.Credentials.Options = .{ .deterministic_nonce = true };
@@ -2737,11 +2786,27 @@ fn drawSni(harness: *Harness, seed: u64) void {
     var sni_prng = std.Random.DefaultPrng.init(seed ^ 0x0297_0297_0297_0297);
     const random = sni_prng.random();
     harness.tls_sni = random.boolean();
-    harness.tls_sni_credentials = .{ null, null };
+    harness.tls_sni_credentials = @splat(null);
     harness.tls_choices_shown = @splat(0);
+    harness.tls_scheme_refusals = 0;
     harness.tls_certificate_sets = .{ &.{}, &.{}, &.{} };
-    for (&harness.tls_names) |*name| {
+    for (&harness.tls_names, &harness.tls_scheme_offers) |*name, *offer| {
         name.* = if (harness.tls_sni) sni_names[random.uintLessThan(u8, sni_names.len)] else zoxy.tls.testdata.host_name;
+        // #411: half of a #297 seed's slots narrow their offer — to ECDSA,
+        // to P-256 alone, or to RSA-PSS alone — and the rest offer all.
+        offer.* = if (!harness.tls_sni) .all else switch (random.uintLessThan(u8, 8)) {
+            0 => .ecdsa,
+            1 => .p256,
+            2, 3 => .rsa,
+            else => .all,
+        };
+    }
+    // QUIC's hello always names a host (`QuicClient`): a #297 seed's
+    // HTTP/3 clients draw a name past the empty one, and the rest name
+    // what the HTTP/3 tests do, which nothing covers.
+    for (&harness.h3_names) |*name| {
+        name.* = if (harness.tls_sni) sni_names[1 + random.uintLessThan(u8, sni_names.len - 1)] else "localhost";
+        assert(name.len >= 1);
     }
     if (!harness.tls_sni) assert(std.mem.eql(u8, harness.tls_names[0], zoxy.tls.testdata.host_name));
 }
@@ -2756,9 +2821,10 @@ fn loadCertificateSet(harness: *Harness, arena: std.mem.Allocator) !void {
         .names = try zoxy.tls.trust.dnsNames(arena, default.chain[0]),
         .schemes = default.schemes(),
     };
-    for (sni_certificates, &harness.tls_sni_credentials, harness.tls_certificate_choices[1..]) |certificate, *slot, *choice| {
-        // Deterministic, as the default's: a seed replays byte-exact.
-        slot.* = try zoxy.tls.Credentials.load(arena, certificate.cert_pem, certificate.key_pem, .{ .deterministic_nonce = true });
+    for (sni_certificates, sni_certificate_rsa, &harness.tls_sni_credentials, harness.tls_certificate_choices[1..]) |certificate, rsa, *slot, *choice| {
+        // An ECDSA key signs deterministically, as the default's does, and
+        // an RSA key cannot (`sni_certificate_rsa`).
+        slot.* = try zoxy.tls.Credentials.load(arena, certificate.cert_pem, certificate.key_pem, .{ .deterministic_nonce = !rsa });
         const credentials = &slot.*.?;
         choice.* = .{
             .credentials = credentials,
@@ -2771,18 +2837,84 @@ fn loadCertificateSet(harness: *Harness, arena: std.mem.Allocator) !void {
     harness.server.setTlsCertificateSets(harness.tls_certificate_sets[0..harness.listeners_count]);
 }
 
-/// Which of the listener's certificates a name must be shown (#297,
-/// `certificate_set.select`): the one whose leaf names it exactly, and the
-/// default — index 0 — for a name nothing covers or no name at all. This
-/// client offers every ECDSA scheme, so each certificate is usable.
-fn expectedChoice(sni: bool, name: []const u8) usize {
-    // The three names are told apart by equality alone: no two alike.
-    comptime assert(!std.mem.eql(u8, zoxy.tls.testdata.p384_host_name, zoxy.tls.testdata.origin_host_name));
-    comptime assert(!std.mem.eql(u8, zoxy.tls.testdata.host_name, zoxy.tls.testdata.origin_host_name));
-    if (!sni) return 0;
-    if (std.mem.eql(u8, name, zoxy.tls.testdata.p384_host_name)) return 1;
-    if (std.mem.eql(u8, name, zoxy.tls.testdata.origin_host_name)) return 2;
-    return 0;
+/// Which of the listener's certificates a hello must be shown (#297,
+/// #411), or null for one it must be refused. Written out per name from
+/// `certificate_set.select`'s contract rather than computed by the same
+/// walk: an exact name (any case) before a one-label wildcard before the
+/// default; within a tier only a key the offer can verify, and ECDSA
+/// before RSA; and a refusal when no tier holds a usable key.
+fn expectedChoice(sni: bool, name: []const u8, offer: zoxy.tls.SchemeOffer) ?usize {
+    // A listener of one certificate chooses nothing, and only a #297 seed
+    // narrows an offer.
+    if (!sni) {
+        assert(offer == .all);
+        return 0;
+    }
+    const testdata = zoxy.tls.testdata;
+    // By offer, in `SchemeOffer`'s order: all, ecdsa, p256, rsa.
+    const row: [4]?usize = if (std.ascii.eqlIgnoreCase(name, testdata.host_name))
+        // The default and the RSA leaf both name it.
+        .{ 0, 0, 0, 3 }
+    else if (std.ascii.eqlIgnoreCase(name, testdata.p384_host_name))
+        // P-256 alone passes the P-384 leaf over for the default.
+        .{ 1, 1, 0, null }
+    else if (std.ascii.eqlIgnoreCase(name, testdata.origin_host_name))
+        .{ 2, 2, 2, null }
+    else if (std.ascii.eqlIgnoreCase(name, testdata.rsa_host_name))
+        // An offer without RSA-PSS passes it over for the default.
+        .{ 3, 0, 0, 3 }
+    else if (std.ascii.eqlIgnoreCase(name, "api." ++ testdata.wild_domain))
+        .{ 4, 4, 4, 5 }
+    else
+        // Nothing, the apex, two labels deep, a name nobody holds.
+        .{ 0, 0, 0, null };
+    comptime assert(@backingInt(zoxy.tls.SchemeOffer.rsa) == 3);
+    return row[@backingInt(offer)];
+}
+
+/// Whether slot `index` offers nothing the certificates its name reaches
+/// can sign under (#411), and so is refused unless it resumes.
+fn schemeRefusable(harness: *const Harness, index: usize) bool {
+    assert(index < tls_client_slots);
+    const offer = harness.tls_scheme_offers[index];
+    return expectedChoice(harness.tls_sni, harness.tls_names[index], offer) == null;
+}
+
+/// Whether slot `index`'s full handshake is signed by an RSA leaf.
+///
+/// `rsaSaltContained`: the salt PSS draws is the one randomness a seed
+/// does not choose, and nothing that reaches the trace may depend on it.
+/// The signature itself never does — the trace folds in lengths, and a
+/// PSS signature is its modulus's length — but it enters the transcript,
+/// and so whatever signs or seals over that transcript afterwards. Two
+/// things here do, and both are kept off RSA sessions: a client's own
+/// CertificateVerify (#304), an ECDSA signature whose DER length moves
+/// with what it signs, so no slot of a client-CA seed is shown an RSA
+/// leaf; and the ticket the resuming slot offers, whose sealed secret
+/// derives from the transcript and whose bytes a refused resumption's
+/// full handshake then signs, so no RSA session issues it.
+fn slotShownRsa(harness: *const Harness, index: usize) bool {
+    assert(index < tls_client_slots);
+    const choice = expectedChoice(harness.tls_sni, harness.tls_names[index], harness.tls_scheme_offers[index]) orelse
+        return false;
+    if (choice == 0) return false;
+    return sni_certificate_rsa[choice - 1];
+}
+
+/// The credentials behind choice `choice` of a #297 listener.
+fn choiceCredentials(harness: *const Harness, choice: usize) *const zoxy.tls.Credentials {
+    assert(choice < sni_choices_count);
+    if (choice == 0) return &harness.tls_credentials[2].?;
+    return &harness.tls_sni_credentials[choice - 1].?;
+}
+
+/// A leaf a client was shown is choice `choice`'s, octet for octet.
+fn verifyShown(harness: *Harness, shown: []const u8, choice: usize) !void {
+    if (!std.mem.eql(u8, shown, try leafPublicKey(harness.choiceCredentials(choice)))) {
+        return error.TlsShownWrongCertificate;
+    }
+    harness.tls_choices_shown[choice] += 1;
+    assert(harness.tls_choices_shown[choice] <= tls_client_slots + h3_clients_max);
 }
 
 /// A loaded certificate's leaf public key, read the way a client reads the
@@ -2812,8 +2944,8 @@ fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: st
             zoxy.tls.testdata.cert_pem,
             zoxy.tls.testdata.key_pem,
             // The deterministic nonce is not optional here: without it the
-            // CertificateVerify signature varies run to run, and this
-            // gate's whole verdict is that one seed replays byte-exact.
+            // CertificateVerify's DER length varies run to run, and with
+            // it the trace this gate's verdict is that a seed replays.
             .{ .deterministic_nonce = true },
         );
         // One slot per listener, non-null exactly at the terminating one.
@@ -3081,7 +3213,7 @@ fn prepareH3Clients(harness: *Harness) void {
         // A key share's private half may not be zero; one octet set is
         // enough to make sure of it.
         seed[32] |= 1;
-        client.prepare(&harness.io, tlsBindAddress(), plans[0..streams], @intCast(index), harness.clean, seed);
+        client.prepare(&harness.io, tlsBindAddress(), plans[0..streams], @intCast(index), harness.clean, seed, harness.h3_names[index]);
         client.on_ended = clientEndedHook;
         client.context = harness;
     }
@@ -3298,6 +3430,7 @@ fn startTlsClient(
     const pairs = harness.tls_protocol == .http and entry.routed_canonical;
     client.start(&harness.io, Harness.tlsBindAddress(), .{
         .host_name = harness.tls_names[index],
+        .scheme_offer = harness.tls_scheme_offers[index],
         .client_credentials = harness.clientIdentity(index),
         .resume_with = resume_with,
         .alpn = harness.tls_alpn_offers[index].protocols(),
@@ -3392,8 +3525,10 @@ fn ticketIssuer(harness: *Harness) ?*TlsClient {
     // never offered again, and its slot may not even exist yet.
     assert(harness.tls_clients >= 1);
     assert(harness.tls_clients <= harness.tls_clients_live);
-    for (harness.tls_clients_storage[0..harness.tls_clients]) |*client| {
+    for (harness.tls_clients_storage[0..harness.tls_clients], 0..) |*client, index| {
         if (!client.isEnded()) continue;
+        // Never a session an RSA leaf signed (`rsaSaltContained`).
+        if (harness.slotShownRsa(index)) continue;
         if (client.capturedTicket() != null) return client;
     }
     return null;
@@ -3987,8 +4122,9 @@ pub fn verify(harness: *Harness) !void {
         try client.verify();
     }
     const max_lifetime_ns = @as(u64, harness.server.config.max_lifetime_ms) * std.time.ns_per_ms;
-    for (harness.h3_clients[0..harness.h3_count]) |*client| {
+    for (harness.h3_clients[0..harness.h3_count], 0..) |*client, index| {
         try client.verify(max_lifetime_ns);
+        try harness.verifyH3Certificate(client, index);
     }
     for (harness.admin_scrapers) |*scraper| try scraper.verify(&harness.server.counters);
     try harness.verifyTlsSessions();
@@ -4041,11 +4177,47 @@ fn verifyClientRefusalCount(harness: *const Harness) !void {
 fn verifyTlsCertificate(harness: *Harness, client: *const TlsClient, index: usize) !void {
     assert(index < tls_client_slots);
     const shown = client.serverPublicKey() orelse return;
-    const choice = expectedChoice(harness.tls_sni, harness.tls_names[index]);
-    const credentials = if (choice == 0) &harness.tls_credentials[2].? else &harness.tls_sni_credentials[choice - 1].?;
-    if (!std.mem.eql(u8, shown, try leafPublicKey(credentials))) return error.TlsShownWrongCertificate;
-    harness.tls_choices_shown[choice] += 1;
-    assert(harness.tls_choices_shown[choice] <= tls_client_slots);
+    const offer = harness.tls_scheme_offers[index];
+    // An offer nothing the name reaches can sign under is refused before
+    // any Certificate goes out (#411).
+    const choice = expectedChoice(harness.tls_sni, harness.tls_names[index], offer) orelse
+        return error.TlsShownRefusedOffer;
+    try harness.verifyShown(shown, choice);
+}
+
+/// #297 over QUIC: an HTTP/3 client shown a leaf was shown the one its
+/// name chooses. It offers every scheme, so it is never refused.
+fn verifyH3Certificate(harness: *Harness, client: *const H3Client, index: usize) !void {
+    assert(index < h3_clients_max);
+    const shown = client.serverPublicKey() orelse return;
+    const choice = expectedChoice(harness.tls_sni, harness.h3_names[index], .all).?;
+    try harness.verifyShown(shown, choice);
+}
+
+/// #411's verdict for one terminating client whose offer nothing the name
+/// reaches can sign under: refused in the handshake — a bare teardown,
+/// counted as a failed one — unless it resumed, which signs nothing and
+/// so is judged as any session. True when it was refused, and so fully
+/// judged here.
+fn verifyTlsSchemes(harness: *Harness, client: *const TlsClient, index: usize, back: []const u8) !bool {
+    if (!harness.schemeRefusable(index)) return false;
+    if (client.handshake_done) {
+        assert(client.serverPublicKey() == null); // `verifyTlsCertificate` ran first.
+        return false;
+    }
+    if (back.len != 0) return error.TlsSchemeRefusalServed;
+    harness.noteSchemeRefusal(client);
+    return true;
+}
+
+/// A refused slot whose hello went out whole is owed one failed handshake
+/// (#411), which the census then holds against nothing. One the adversary
+/// ended before that never reached a handshake to fail.
+fn noteSchemeRefusal(harness: *Harness, client: *const TlsClient) void {
+    assert(!client.handshake_done);
+    if (!client.helloSent()) return;
+    harness.tls_scheme_refusals += 1;
+    assert(harness.tls_scheme_refusals <= tls_client_slots);
 }
 
 /// What a terminated session owes (§4).
@@ -4099,60 +4271,7 @@ fn verifyTlsSessions(harness: *Harness) !void {
     var closed_count: u8 = 0;
     var refusals: TlsAlpnRefusals = .{};
     for (harness.tls_clients_storage[0..harness.tls_clients_live], 0..) |*client, index| {
-        try harness.verifyTlsCertificate(client, index);
-        const back = client.app_received[0..client.app_received_len];
-        if (try harness.verifyTlsAlpn(client, index, back, &refusals)) continue;
-        if (try harness.verifyClientCertificate(client, index, back)) continue;
-        if (harness.tls_protocol == .http) {
-            // What this slot drew, and the same pairing rule
-            // `startTlsClient` sent it under: a `routed_canonical` script
-            // took a follow-up GET, so its transcript is the pair's;
-            // anything else sent one request and owes its own script's
-            // transcript exactly.
-            const drawn = l7.scripts.spec(harness.tls_scripts[index]);
-            const entry = if (drawn.routed_canonical)
-                l7.scripts.terminating_pair
-            else
-                drawn;
-            // The spec the walk judges by describes what this session was
-            // asked to send, so what went out cannot exceed it — the check
-            // that catches the two drifting apart, since a wider send
-            // would be judged against a transcript that never mentions it.
-            assert(client.requestsSent() <= entry.payloadsSent());
-            const walk = HttpClient.walkResponses(
-                back,
-                entry,
-                .{ .sticky = harness.sticky_http, .terminated = true },
-            );
-            if (walk.violation) |violation| return violation;
-            // #204: never more answers than questions. The framing rule
-            // the client ends its exchanges on is what lets it count them
-            // at all, and a count that ran ahead of what it asked for
-            // would mean the transform delivered a response this session
-            // never earned — another connection's, or one duplicated
-            // across the head source's turnaround. Sound on every seed,
-            // since a short schedule can only leave the count *behind*.
-            // Kept beside the walk rather than folded into it: the walk
-            // bounds responses by the transcript, this bounds them by
-            // what this session actually sent.
-            if (client.responsesReceived() > client.requestsSent()) {
-                return error.TlsResponseCountDiverged;
-            }
-            // Response bytes, not `handshake_done`: a client believes it
-            // is connected once it has processed the server's flight,
-            // which is one step before the server has seen its Finished —
-            // so the client's own view can legitimately lead the server's
-            // counter. A relayed response cannot.
-            if (back.len >= 1) closed_count += 1;
-            continue;
-        }
-        const sent = harness.tls_tokens[index][0..tls_token_bytes];
-        if (back.len > sent.len) return error.TlsEchoOverrun;
-        if (!std.mem.eql(u8, sent[0..back.len], back)) return error.TlsEchoCorrupted;
-        if (client.close_sent) {
-            closed_count += 1;
-            if (back.len != sent.len) return error.TlsEchoTruncated;
-        }
+        if (try harness.verifyTlsSlot(client, index, &refusals)) closed_count += 1;
     }
     // A session that closed in protocol necessarily completed its
     // handshake, so the counter cannot read lower than that — which is
@@ -4168,6 +4287,77 @@ fn verifyTlsSessions(harness: *Harness) !void {
     const refused = harness.server.counters.get("tls_alpn_refused");
     if (refused < refusals.heard) return error.TlsAlpnRefusalsDiverged;
     if (refused > refusals.possible) return error.TlsAlpnRefusalsDiverged;
+    // #411: on a clean seed every hello reaches the listener, so each slot
+    // refused for its offer is one failed handshake the counter holds.
+    const failed = harness.server.counters.get("tls_handshake_failed");
+    if (harness.clean and failed < harness.tls_scheme_refusals) return error.TlsSchemeRefusalsDiverged;
+}
+
+/// One terminating client's verdict, for `verifyTlsSessions`: true when
+/// the session closed having said it got everything — a proxied one that
+/// heard a response, a relayed one that sent its close_notify — which
+/// the handshake counter must then account for.
+fn verifyTlsSlot(harness: *Harness, client: *const TlsClient, index: usize, refusals: *TlsAlpnRefusals) !bool {
+    assert(index < harness.tls_clients_live);
+    try harness.verifyTlsCertificate(client, index);
+    const back = client.app_received[0..client.app_received_len];
+    if (try harness.verifyTlsAlpn(client, index, back, refusals)) {
+        // Refusable on both counts, a slot is refused for its offer:
+        // zssl picks a scheme before it reads ALPN. Unless it resumed,
+        // which signs nothing, and so heard ALPN's alert instead.
+        if (!client.refusedForAlpn() and harness.schemeRefusable(index)) harness.noteSchemeRefusal(client);
+        return false;
+    }
+    if (try harness.verifyTlsSchemes(client, index, back)) return false;
+    if (try harness.verifyClientCertificate(client, index, back)) return false;
+    if (harness.tls_protocol == .http) {
+        // What this slot drew, and the same pairing rule
+        // `startTlsClient` sent it under: a `routed_canonical` script
+        // took a follow-up GET, so its transcript is the pair's;
+        // anything else sent one request and owes its own script's
+        // transcript exactly.
+        const drawn = l7.scripts.spec(harness.tls_scripts[index]);
+        const entry = if (drawn.routed_canonical)
+            l7.scripts.terminating_pair
+        else
+            drawn;
+        // The spec the walk judges by describes what this session was
+        // asked to send, so what went out cannot exceed it — the check
+        // that catches the two drifting apart, since a wider send
+        // would be judged against a transcript that never mentions it.
+        assert(client.requestsSent() <= entry.payloadsSent());
+        const walk = HttpClient.walkResponses(
+            back,
+            entry,
+            .{ .sticky = harness.sticky_http, .terminated = true },
+        );
+        if (walk.violation) |violation| return violation;
+        // #204: never more answers than questions. The framing rule
+        // the client ends its exchanges on is what lets it count them
+        // at all, and a count that ran ahead of what it asked for
+        // would mean the transform delivered a response this session
+        // never earned — another connection's, or one duplicated
+        // across the head source's turnaround. Sound on every seed,
+        // since a short schedule can only leave the count *behind*.
+        // Kept beside the walk rather than folded into it: the walk
+        // bounds responses by the transcript, this bounds them by
+        // what this session actually sent.
+        if (client.responsesReceived() > client.requestsSent()) {
+            return error.TlsResponseCountDiverged;
+        }
+        // Response bytes, not `handshake_done`: a client believes it
+        // is connected once it has processed the server's flight,
+        // which is one step before the server has seen its Finished —
+        // so the client's own view can legitimately lead the server's
+        // counter. A relayed response cannot.
+        return back.len >= 1;
+    }
+    const sent = harness.tls_tokens[index][0..tls_token_bytes];
+    if (back.len > sent.len) return error.TlsEchoOverrun;
+    if (!std.mem.eql(u8, sent[0..back.len], back)) return error.TlsEchoCorrupted;
+    if (!client.close_sent) return false;
+    if (back.len != sent.len) return error.TlsEchoTruncated;
+    return true;
 }
 
 const TlsAlpnRefusals = struct {
