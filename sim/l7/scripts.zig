@@ -373,6 +373,10 @@ comptime {
 /// is actually sent instead of one that would keep passing after an edit.
 const forwarded_inbound_lines = [_][]const u8{ "1.1.1.1", "2.2.2.2, 3.3.3.3" };
 
+/// Every hop a script claims in its own `X-Forwarded-For`: what the origin
+/// may read in a chain besides the client the proxy observed (§7).
+pub const forwarded_hops = [_][]const u8{ "1.1.1.1", "2.2.2.2", "3.3.3.3", "10.11.12.13" };
+
 /// An inbound chain small enough that every mode carries it whole.
 const forwarded_inbound_head = "GET /sim HTTP/1.1\r\nHost: sim\r\n" ++
     "X-Forwarded-For: " ++ forwarded_inbound_lines[0] ++ "\r\n" ++
@@ -383,7 +387,7 @@ const forwarded_inbound_head = "GET /sim HTTP/1.1\r\nHost: sim\r\n" ++
 /// the constant rather than a literal, so raising the bound keeps the
 /// script oversize instead of silently making it a second `get`.
 const forwarded_oversize_line = blk: {
-    const hop = "10.11.12.13";
+    const hop = forwarded_hops[3];
     const target = @divFloor(@as(usize, constants.forwarded_chain_bytes_max) * 3, 4);
     var chain: []const u8 = hop;
     while (chain.len + 2 + hop.len <= target) chain = chain ++ ", " ++ hop;

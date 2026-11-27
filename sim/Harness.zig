@@ -633,6 +633,12 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
         // and a gate whose output scrolls is a gate nobody reads.
         .dump_on_abort = false,
     });
+    // A third of seeds have every stream client dial from an IPv6 peer,
+    // so the §7 forwarded-for line, the access log and a #142 header the
+    // proxy writes from an observed client meet the other family. Its own
+    // stream, so the shared one is unmoved.
+    var family_prng = std.Random.DefaultPrng.init(seed ^ 0x0006_0006_0006_0006);
+    harness.io.client_ip6 = family_prng.random().uintLessThan(u8, 3) == 0;
     // Which cause the sim reports for every failure it injects (§8).
     // Production reads it off an errno; a virtual socket table has none,
     // so the scenario states one — and drawing it per seed is what makes
@@ -2282,6 +2288,10 @@ fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: st
     harness.origin_http = .{
         .mode_selector = pickHttpOriginMode,
         .context = harness,
+        .forwarded_hops = &l7.scripts.forwarded_hops,
+        // As `bareAddress` writes the peer `SimIo` gives every stream
+        // client: the brackets and the port come off an IPv6 one.
+        .observed_client = if (harness.io.client_ip6) "2001:db8:1::1" else "198.51.100.1",
     };
     try harness.origin_http.start(&harness.io, Harness.httpOriginAddress());
 }
@@ -2518,11 +2528,14 @@ fn drawH3Plan(random: std.Random) l7.H2Plan {
 /// the sweep reaches the refusal too (the random token then opens the
 /// stream, and `require` closes on its first byte; the rare token that
 /// happens to open like a header meets the connect-budget reap instead).
-/// The spread covers both spec versions and both verdict families:
-/// announcing headers (v1 TCP4, v2 INET) carry a per-client distinct
-/// address that is recorded for the clean-seed log oracle, and
-/// non-announcing ones (v1 UNKNOWN, v2 LOCAL) are the health-check shape
-/// that must keep the observed peer.
+/// The spread covers both spec versions, both address families and both
+/// verdict families: announcing headers (v1 TCP4 and TCP6, v2 INET and
+/// INET6) carry a per-client distinct address that is recorded for the
+/// clean-seed log oracle — and, where the cluster sends a header on, for
+/// the origin's, so an IPv6 client also makes the proxy write the TCP6
+/// forms with an IPv4 destination mapped beside it — and non-announcing
+/// ones (v1 UNKNOWN, v2 LOCAL) are the health-check shape that must keep
+/// the observed peer.
 fn deriveProxyHeader(
     harness: *Harness,
     random: std.Random,
@@ -2536,7 +2549,7 @@ fn deriveProxyHeader(
     }
     const octet: u8 = l4_index + 1;
     const port: u16 = 40_000 + @as(u16, l4_index);
-    switch (random.uintLessThan(u8, 7)) {
+    switch (random.uintLessThan(u8, 9)) {
         0 => return "",
         1 => return "PROXY UNKNOWN\r\n",
         2 => {
@@ -2566,6 +2579,26 @@ fn deriveProxyHeader(
             harness.l4_denied_count += 1;
             return line;
         },
+        7 => {
+            // v1 TCP6 announcing 2001:db8::<octet>:<port>.
+            const line = std.fmt.bufPrint(
+                buffer,
+                "PROXY TCP6 2001:db8::{x} 2001:db8::1 {d} 443\r\n",
+                .{ octet, port },
+            ) catch unreachable; // 50 bytes at most, into 64.
+            harness.recordAnnouncedV6(l4_index, octet, port);
+            return line;
+        },
+        8 => {
+            // v2 PROXY INET6 announcing the same.
+            @memcpy(buffer[0..16], "\r\n\r\n\x00\r\nQUIT\n" ++ "\x21\x21\x00\x24");
+            buffer[16..32].* = announcedV6Bytes(octet);
+            buffer[32..48].* = announcedV6Bytes(1);
+            std.mem.writeInt(u16, buffer[48..50], port, .big);
+            std.mem.writeInt(u16, buffer[50..52], 443, .big);
+            harness.recordAnnouncedV6(l4_index, octet, port);
+            return buffer[0..52];
+        },
         else => {
             // v1 TCP4, the same announcement in text.
             const line = std.fmt.bufPrint(
@@ -2577,6 +2610,35 @@ fn deriveProxyHeader(
             return line;
         },
     }
+}
+
+/// 2001:db8::<host>, the documentation prefix's (RFC 3849) host `host`.
+fn announcedV6Bytes(host: u8) [16]u8 {
+    assert(host >= 1);
+    var bytes: [16]u8 = @splat(0);
+    bytes[0..4].* = .{ 0x20, 0x01, 0x0d, 0xb8 };
+    bytes[15] = host;
+    assert(bytes[14] == 0);
+    return bytes;
+}
+
+/// `recordAnnounced` for an IPv6 announcement, its text written out the
+/// way RFC 5952 compresses it — not by the formatter the log itself
+/// uses, so a log that rendered it some other way fails the oracle.
+fn recordAnnouncedV6(harness: *Harness, l4_index: u8, octet: u8, port: u16) void {
+    assert(l4_index < clients_max);
+    assert(octet >= 1);
+    const text = std.fmt.bufPrint(
+        &harness.l4_announced[l4_index],
+        "[2001:db8::{x}]:{d}",
+        .{ octet, port },
+    ) catch unreachable; // 19 bytes, into announced_bytes_max.
+    // The host octet is `l4_index + 1`, at most `clients_max`, so one hex
+    // digit, and the port five decimal ones.
+    comptime assert(clients_max <= 0xf);
+    assert(text.len == 19);
+    harness.l4_announced_len[l4_index] = @intCast(text.len);
+    harness.l4_announced_address[l4_index] = .{ .ip6 = .{ .bytes = announcedV6Bytes(octet), .port = port } };
 }
 
 fn recordAnnounced(harness: *Harness, l4_index: u8, network: [3]u8, octet: u8, port: u16) void {
@@ -3292,6 +3354,9 @@ pub fn verify(harness: *Harness) !void {
     // one — relayed whole from HTTP/1.1, never from HTTP/2 or HTTP/3, and
     // never one that names a header the proxy manages.
     if (harness.origin_http.trailer_mismatches != 0) return error.OriginSawWrongTrailers;
+    // §7: a forwarded-for chain holds the scripts' hops and, last, the
+    // client the proxy observed, written bare in either family.
+    if (harness.origin_http.forwarded_mismatches != 0) return error.OriginSawWrongForwardedFor;
     // #142 send: on any seed, garbage where a header belongs is zoxy's
     // bug — the writers are pure and the adversary splits deliveries but
     // never corrupts bytes, so a cut lands as EOF, not as a violation.
