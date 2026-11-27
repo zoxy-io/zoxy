@@ -41,7 +41,17 @@ pub const ClientError = error{
     BodyCorrupted,
     /// A clean seed whose streams did not all end in a whole 200.
     GoldenOutcomeMissed,
+    /// A trailer section (§7) other than the trailing origin's one field,
+    /// after anything but its whole chunked 200, or more than one.
+    TrailersCorrupted,
+    /// A stream that finished whole without the trailer section its head
+    /// owed, or with one it did not; or a head that carried HTTP/1.1's
+    /// `Trailer` announcement across the mapping.
+    TrailersMismatched,
 };
+
+/// The trailing origin's section as the test client keeps it.
+const canonical_trailer_line = canon.response_trailer_name ++ ": " ++ canon.response_trailer_value ++ "\r\n";
 
 /// `<length>.<salt>` at its widest, and a length's digits.
 const mark_bytes_max: u32 = 24;
@@ -193,11 +203,66 @@ pub fn Client(comptime IoType: type) type {
                 if (answer.status != 0 and std.mem.indexOfScalar(u16, allowed, answer.status) == null) {
                     return error.StatusUnexpected;
                 }
+                try checkTrailers(answer);
+                try checkTrailersOwed(answer);
                 if (answer.status == 200) try checkBody(answer, client.clean);
                 if (!client.clean or capped) continue;
                 if (answer.status != 200) return error.GoldenOutcomeMissed;
                 if (!answer.finished) return error.GoldenOutcomeMissed;
             }
+        }
+
+        /// Streams whose trailer section reached this client, for the
+        /// census (§9); read once `verify` has passed.
+        pub fn trailersHeard(client: *const Self) u32 {
+            assert(client.streams >= 1);
+            var heard: u32 = 0;
+            for (client.transport.answers[0..client.streams]) |*answer| {
+                heard += @intFromBool(answer.trailer_sections == 1);
+            }
+            assert(heard <= client.streams);
+            return heard;
+        }
+
+        /// Trailers come once, after the whole chunked body, and say the
+        /// trailing origin's one field (§7): HTTP/3 carries the section
+        /// the origin's chunked framing ended with as trailing HEADERS.
+        fn checkTrailers(answer: *const TestClient.Answer) ClientError!void {
+            if (answer.trailer_sections == 0) return;
+            assert(answer.trailerBytes().len <= TestClient.trailer_bytes_max);
+            if (answer.trailers_malformed) return error.TrailersCorrupted;
+            if (answer.trailer_sections != 1) return error.TrailersCorrupted;
+            if (answer.status != 200) return error.TrailersCorrupted;
+            if (answer.body_len != h2_client.canonical_chunked_body.len) return error.TrailersCorrupted;
+            if (!std.mem.eql(u8, answer.bodyBytes(), h2_client.canonical_chunked_body)) return error.TrailersCorrupted;
+            if (answer.trailers_len != canonical_trailer_line.len) return error.TrailersCorrupted;
+            if (!std.mem.eql(u8, answer.trailerBytes(), canonical_trailer_line)) return error.TrailersCorrupted;
+        }
+
+        /// A whole answer carries the section its head owed and no other,
+        /// and its head never HTTP/1.1's announcement (§7), as HTTP/2's
+        /// oracle has it.
+        fn checkTrailersOwed(answer: *const TestClient.Answer) ClientError!void {
+            assert(answer.head_len <= TestClient.head_bytes_max);
+            const head = answer.headBytes();
+            if (headLine(head, "trailer") != null) return error.TrailersMismatched;
+            if (!answer.finished or answer.reset) return;
+            const owed = if (headLine(head, canon.response_trailer_owed_header)) |value| std.mem.eql(u8, value, "1") else false;
+            if (owed != (answer.trailer_sections >= 1)) return error.TrailersMismatched;
+        }
+
+        /// The value of the head line named `name`, as the test client keeps
+        /// the head: `name: value` lines, names lower-case as HTTP/3 has them.
+        fn headLine(head: []const u8, name: []const u8) ?[]const u8 {
+            assert(name.len >= 1);
+            var lines = std.mem.splitSequence(u8, head, "\r\n");
+            while (lines.next()) |line| {
+                if (line.len < name.len + 2) continue;
+                if (!std.mem.eql(u8, line[0..name.len], name)) continue;
+                if (!std.mem.eql(u8, line[name.len..][0..2], ": ")) continue;
+                return line[name.len + 2 ..];
+            }
+            return null;
         }
 
         /// A 200's body is a canonical one — whole once the stream ended,

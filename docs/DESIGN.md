@@ -1627,7 +1627,8 @@ external binaries. They and the speed gates run at merge.
     its diagnostic or watchdog backstop (§8). The simulator checks that
     sockets referenced by pending ops are still live at that exit.
   - **The census.** A sweep of at least 4096 seeds must fire every
-    counter and every seam op kind.
+    counter and every seam op kind, and bring each client population
+    (HTTP/1.1, HTTP/2, HTTP/3) a trailer section its oracle judged.
     - Exemptions are named, each with its reason.
     - An exemption that *does* fire fails the census too, so widening a
       scenario deletes its excuse.
@@ -1642,7 +1643,10 @@ external binaries. They and the speed gates run at merge.
   - **Not swept, covered by directed tests and the live gate instead:**
     - HTTP/2 to origins, HTTPS clusters, SNI routing and certificate
       selection, RSA, mutual TLS, and gRPC deadlines;
-    - trailers, in every protocol: no script or origin sends one;
+    - request trailers, in every protocol: no script sends one. An
+      origin's trailers are swept: one origin mode ends its chunked
+      answer with a section its head announces, and every client demands
+      it on a whole answer;
     - IPv6: every address a seed uses is IPv4, so the TCP6 forms of the
       PROXY header are never written;
     - clusters that follow names, whose resolver runs under `SimIo`

@@ -28,6 +28,10 @@ const assert = std.debug.assert;
 pub const requests_max: u32 = 4;
 /// An answer's body kept at most; past it the octets are counted, not kept.
 pub const body_bytes_max: u32 = 4096;
+/// An answer's trailer sections, as `name: value` lines, at most.
+pub const trailer_bytes_max: u32 = 256;
+/// Its final head's fields past the pseudo-fields, the same way.
+pub const head_bytes_max: u32 = 1024;
 /// A request's body at most: it goes in the same write as its head, and
 /// the two fit one stream's send buffer.
 pub const request_body_bytes_max: u32 = 8 * 1024;
@@ -67,9 +71,50 @@ pub const Answer = struct {
     finished: bool = false,
     /// The server reset the stream instead.
     reset: bool = false,
+    /// Trailer sections after the final head, each field kept as a
+    /// `name: value\r\n` line in arrival order; `trailers_len` counts
+    /// every octet, kept or not, as `body_len` does.
+    trailer_sections: u8 = 0,
+    trailers: [trailer_bytes_max]u8 = undefined,
+    trailers_len: u32 = 0,
+    /// The final head's fields but its pseudo-fields, as `name: value\r\n`
+    /// lines; `head_len` counts every octet, kept or not.
+    head: [head_bytes_max]u8 = undefined,
+    head_len: u32 = 0,
+    /// A trailer section that did not decode as one, pseudo-fields
+    /// included: recorded, so a judge cannot mistake it for none.
+    trailers_malformed: bool = false,
 
     pub fn bodyBytes(answer: *const Answer) []const u8 {
         return answer.body[0..@min(answer.body_len, body_bytes_max)];
+    }
+
+    pub fn trailerBytes(answer: *const Answer) []const u8 {
+        return answer.trailers[0..@min(answer.trailers_len, trailer_bytes_max)];
+    }
+
+    pub fn headBytes(answer: *const Answer) []const u8 {
+        return answer.head[0..@min(answer.head_len, head_bytes_max)];
+    }
+
+    /// Keeps `fields` as lines in `buffer`, as far as it reaches, and
+    /// counts every octet in `len` whether kept or not.
+    fn appendLines(buffer: []u8, len: *u32, fields: []const Field) void {
+        assert(buffer.len >= 1);
+        const before = len.*;
+        var kept: u32 = 0;
+        for (fields) |field| {
+            if (field.name.len >= 1 and field.name[0] == ':') continue;
+            kept += 1;
+            inline for (.{ field.name, ": ", field.value, "\r\n" }) |bytes| {
+                const start = @min(len.*, buffer.len);
+                const take = @min(bytes.len, buffer.len - start);
+                @memcpy(buffer[start..][0..take], bytes[0..take]);
+                len.* += @intCast(bytes.len);
+            }
+        }
+        // Every kept field is at least its separator and line end.
+        assert(len.* >= before + kept * 4);
     }
 };
 
@@ -287,11 +332,35 @@ pub fn TestClient(comptime IoType: type) type {
             }
         }
 
+        /// Keeps a trailer section for the caller to judge, decoded under
+        /// RFC 9114 §4.3's rules for one: no pseudo-field may appear.
+        fn recordTrailers(client: *Self, answer: *Answer, section: []const u8) void {
+            assert(section.len <= 1 << 16);
+            // Saturating: a server that sends sections without end is the
+            // judge's finding, not this client's crash.
+            answer.trailer_sections +|= 1;
+            const decoded = h3.http3_server.decodeSection(
+                section,
+                .{ .kind = .trailer },
+                1 << 16,
+                &client.decode_scratch,
+                &client.decode_storage,
+                &client.decode_fields,
+            ) catch {
+                answer.trailers_malformed = true;
+                return;
+            };
+            // A trailer section has no pseudo-fields to skip: the decoder
+            // refused the section if it carried one.
+            Answer.appendLines(&answer.trailers, &answer.trailers_len, decoded.fields);
+            assert(answer.trailers_len >= decoded.fields.len * 4);
+        }
+
         fn onEvent(client: *Self, event: *const h3.http3.Event) void {
             switch (event.*) {
                 .headers => |headers| {
                     const answer = client.answerFor(headers.stream) orelse return;
-                    if (headers.trailers) return;
+                    if (headers.trailers) return client.recordTrailers(answer, headers.section);
                     const decoded = h3.http3_server.decodeSection(
                         headers.section,
                         .{ .kind = .response },
@@ -300,13 +369,18 @@ pub fn TestClient(comptime IoType: type) type {
                         &client.decode_storage,
                         &client.decode_fields,
                     ) catch return;
+                    var final = false;
                     for (decoded.fields) |field| {
                         if (!std.mem.eql(u8, field.name, ":status")) continue;
                         const status = std.fmt.parseInt(u16, field.value, 10) catch 0;
                         // An interim head (RFC 9110 §15.2) is not the answer:
                         // the final one is still to come.
-                        if (status >= 200) answer.status = status;
+                        if (status >= 200) {
+                            answer.status = status;
+                            final = true;
+                        }
                     }
+                    if (final) Answer.appendLines(&answer.head, &answer.head_len, decoded.fields);
                 },
                 .data => |data| {
                     const answer = client.answerFor(data.stream) orelse return;
