@@ -166,6 +166,10 @@ pub const max_forwards_forwarded = "2";
 /// checks every forwarded head for them, and only that one script can
 /// produce them, which makes a global check a precise one.
 pub const overridden_host = "overridden.example";
+/// The host every HTTP/1.1 script under a filtered or routed prefix
+/// names — `/reject`, `/respond`, `/edit`, `/guarded`, `/handled` — and
+/// what those rules hold for (§7, #302).
+pub const script_host = "sim";
 
 /// The one Location a sim 301 may carry (#176): the harness's redirect
 /// rule composes scheme + the request's own host and canonical path,

@@ -245,15 +245,15 @@ clusters: [2]zoxy.Options.Cluster,
 /// The catch-all, behind #417's guarded route — a longer prefix carrying
 /// a route-phase policy, which only the `route_policy_reject` script
 /// reaches — and #434's handler route, which answers `/handled` itself.
-routes_http: [3]zoxy.Options.Listener.Route,
-request_filters_http: [7]zoxy.Options.Listener.Filter,
+routes_http: [5]zoxy.Options.Listener.Route,
+request_filters_http: [12]zoxy.Options.Listener.Filter,
 /// The #175 response rules beside them: the always-on stamp the client
 /// oracle requires on every proxied 200, and the 5xx rule whose edit
 /// must never appear (the scripted origin answers no 5xx).
-response_filters_http: [2]zoxy.Options.Listener.ResponseFilter,
+response_filters_http: [4]zoxy.Options.Listener.ResponseFilter,
 /// On an http draw the plaintext listener's two routes, guarded route
 /// included — a terminator runs the http chain whole.
-routes_tls: [3]zoxy.Options.Listener.Route,
+routes_tls: [5]zoxy.Options.Listener.Route,
 listener_options: [3]zoxy.Options.Listener,
 /// How many of `listener_options` this seed actually binds: two on a
 /// plaintext seed, three when it drew TLS clients (§4).
@@ -1069,24 +1069,82 @@ fn deriveHttp3(harness: *Harness) void {
 /// An http chain's route table (#417): the guarded route and the #434
 /// handler route ahead of the catch-all — the order resolving sorts them
 /// into anyway, the longer prefixes first.
-fn httpRoutes(harness: *Harness) [3]zoxy.Options.Listener.Route {
+fn httpRoutes(harness: *Harness) [5]zoxy.Options.Listener.Route {
     assert(harness.route_policy_selections.len == 1);
     assert(l7.canon.guarded_prefix.len > 1);
+    const handler = zoxy.extension.select(runtime.extensions.handlers, &harness.handler);
     return .{
+        // #302's predicates, each with an answer a script would notice.
+        // The guarded route asks for a header every script under it
+        // sends, so a header test that missed would lose the route's
+        // policy; the handler's asks for the host every script under it
+        // names, so a host test that missed would send it to the origin.
         .{
             .prefix = l7.canon.guarded_prefix,
+            .header = .{ .name = "host", .predicate = .present },
             .cluster = http_cluster_name,
             .request_policies = &harness.route_policy_selections,
             .name = l7.canon.guarded_route_name,
         },
         // #434: answered by the build's own handler, no cluster at all.
+        .{ .host = l7.canon.script_host, .prefix = l7.canon.handler_prefix, .handler = handler },
+        // Decoys: the root prefix, which every request meets, and a host
+        // or a header value no request carries. Either test misfiring
+        // hands every request to the handler.
+        .{ .host = decoy_host, .prefix = "/", .handler = handler },
         .{
-            .prefix = l7.canon.handler_prefix,
-            .handler = zoxy.extension.select(runtime.extensions.handlers, &harness.handler),
+            .prefix = "/",
+            .header = .{ .name = l7.canon.log_request_header, .predicate = .{ .equals = decoy_value } },
+            .handler = handler,
         },
         .{ .prefix = "/", .cluster = http_cluster_name },
     };
 }
+
+/// A host and a header value no client of the sweep sends: what the
+/// decoy routes and filters match on, and must never meet.
+const decoy_host = "decoy.sim.test";
+const decoy_value = "never";
+
+/// #177's client prefixes for the http listeners, whose peer is always
+/// `SimIo`'s 198.51.100.1 or 2001:db8:1::1 — PROXY headers are the l4
+/// listener's alone. Any-of, so the first, which no client is in, is
+/// judged a miss before the next holds: a rule carrying these holds for
+/// every request those listeners see.
+const sweep_client_prefixes = [_]zoxy.Options.Listener.Cidr{
+    .{ .address = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 0 }, .port = 0 } }, .prefix_len = 24 },
+    .{ .address = .{ .ip4 = .{ .bytes = .{ 198, 51, 100, 0 }, .port = 0 } }, .prefix_len = 24 },
+    .{ .address = .{ .ip6 = .{ .bytes = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, .port = 0 } }, .prefix_len = 32 },
+};
+
+/// A substring of `script_host`, for a `contains` the scripts meet.
+const script_host_fragment = "im";
+
+comptime {
+    assert(std.mem.indexOf(u8, l7.canon.script_host, script_host_fragment) != null);
+}
+
+/// Prefixes none of the sweep's clients come from, one per family.
+const decoy_client_prefixes = [_]zoxy.Options.Listener.Cidr{
+    .{ .address = .{ .ip4 = .{ .bytes = .{ 10, 66, 0, 0 }, .port = 0 } }, .prefix_len = 16 },
+    .{ .address = .{ .ip6 = .{ .bytes = .{ 0xfd, 0x66, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, .port = 0 } }, .prefix_len = 16 },
+};
+
+/// Methods no script, HTTP/2 or HTTP/3 client sends.
+const decoy_methods: std.EnumSet(zoxy.Options.Listener.Method) = blk: {
+    var set: std.EnumSet(zoxy.Options.Listener.Method) = .{};
+    set.insert(.put);
+    set.insert(.delete);
+    set.insert(.patch);
+    break :blk set;
+};
+
+/// The one method the filtered scripts send.
+const get_only: std.EnumSet(zoxy.Options.Listener.Method) = blk: {
+    var set: std.EnumSet(zoxy.Options.Listener.Method) = .{};
+    set.insert(.get);
+    break :blk set;
+};
 
 const l4_cluster_name = "origin-l4";
 /// Its place in `harness.clusters`: the L4 cluster is the first.
@@ -2103,71 +2161,124 @@ const log_response_headers = [_][]const u8{l7.canon.log_response_header};
 /// listener's chain took it past the length limit; the two halves are
 /// what a listener is made of, in the order the config reads.
 fn wireFilters(harness: *Harness) void {
-    harness.request_filters_http = .{
-        .{
-            .match = .{ .path_prefix = "/reject" },
-            .actions = &.{.{ .reject = 403 }},
-        },
-        .{
-            // #176: composed target, no host override — the Location the
-            // client oracle demands is scheme + the request's own host +
-            // its canonical path, `l7.canon.redirect_location` exactly.
-            .match = .{ .path_prefix = "/redirect" },
-            .actions = &.{.{ .redirect = .{ .status = 301, .target = .{ .composed = .{
-                .scheme = .https,
-            } } } }},
-        },
-        .{
-            // #159: answered from a configured body, before any
-            // post-parse resource is acquired and without reaching an
-            // origin, so the sweep exercises the static path's
-            // body-carrying arm.
-            .match = .{ .path_prefix = "/respond" },
-            .actions = &.{.{ .respond = .{ .status = 200, .body = respond_body_name } }},
-        },
-        .{
-            .match = .{ .path_prefix = "/edit" },
-            .actions = &.{.{ .header_set = .{ .name = "X-Sim-Filter", .value = "on" } }},
-        },
-        .{
-            .match = .{ .path_prefix = "/rewrite" },
-            .actions = &.{.{ .rewrite_prefix = .{ .from = "/rewrite", .to = "/sim" } }},
-        },
-        // #331's pair, and the only rules here whose meaning is in their
-        // *order*: the allow stops the walk, so the reject beneath it
-        // never fires — and a sweep where it did would answer 403 to a
-        // script whose golden outcome is the origin's 200. The reject is
-        // what makes the allow observable at all; without it the first
-        // rule would be indistinguishable from no rule.
-        .{
-            .match = .{ .path_prefix = "/allow" },
-            .actions = &.{.allow},
-        },
-        .{
-            .match = .{ .path_prefix = "/allow" },
-            .actions = &.{.{ .reject = 403 }},
-        },
-    };
-    // #175 response rules, always on: every response the render forwards
-    // gains the stamp — so the client can require it on every 200 and
-    // refuse it on every static, which is what separates the two render
-    // paths from outside — and the 5xx rule matches a class the scripted
-    // origin never answers, so its edit appearing anywhere is the class
-    // predicate misfiring under some schedule.
-    harness.response_filters_http = .{
-        .{
-            .match = .{},
-            .actions = &.{.{ .header_set = .{
-                .name = l7.canon.response_edit_name,
-                .value = l7.canon.response_edit_value,
-            } }},
-        },
-        .{
-            .match = .{ .status_class = .@"5xx" },
-            .actions = &.{.{ .header_set = .{ .name = l7.canon.response_never_name, .value = "1" } }},
-        },
-    };
+    harness.request_filters_http = request_filters_sim;
+    harness.response_filters_http = response_filters_sim;
+    assert(harness.request_filters_http.len == request_filters_sim.len);
+    assert(harness.response_filters_http.len == response_filters_sim.len);
 }
+
+/// The request rules, in the order the walk meets them.
+const request_filters_sim = [_]zoxy.Options.Listener.Filter{
+    // Decoys first, each the root prefix every request meets and one
+    // predicate none does: a predicate that misfired would answer
+    // every request 403.
+    .{ .match = .{ .path_prefix = "/", .clients = &decoy_client_prefixes }, .actions = &.{.{ .reject = 403 }} },
+    .{ .match = .{ .path_prefix = "/", .methods = decoy_methods }, .actions = &.{.{ .reject = 403 }} },
+    .{ .match = .{ .path_prefix = "/", .host = decoy_host }, .actions = &.{.{ .reject = 403 }} },
+    .{
+        .match = .{ .path_prefix = "/", .headers = &.{.{
+            .name = l7.canon.log_request_header,
+            .predicate = .{ .equals = decoy_value },
+        }} },
+        .actions = &.{.{ .reject = 403 }},
+    },
+    .{
+        .match = .{ .path_prefix = "/", .headers = &.{.{
+            .name = l7.canon.log_request_header,
+            .predicate = .{ .contains = decoy_value },
+        }} },
+        .actions = &.{.{ .reject = 403 }},
+    },
+    // The rules the scripts aim at carry every predicate kind as well,
+    // each one their requests meet: only the HTTP/1.1 scripts reach
+    // these prefixes, each a GET naming `script_host`, from a sweep
+    // client. A predicate that missed would leave its script without
+    // the answer it is owed.
+    .{
+        .match = .{
+            .path_prefix = "/reject",
+            .methods = get_only,
+            .host = l7.canon.script_host,
+            .clients = &sweep_client_prefixes,
+        },
+        .actions = &.{.{ .reject = 403 }},
+    },
+    .{
+        // #176: composed target, no host override — the Location the
+        // client oracle demands is scheme + the request's own host +
+        // its canonical path, `l7.canon.redirect_location` exactly.
+        .match = .{ .path_prefix = "/redirect" },
+        .actions = &.{.{ .redirect = .{ .status = 301, .target = .{ .composed = .{
+            .scheme = .https,
+        } } } }},
+    },
+    .{
+        // #159: answered from a configured body, before any
+        // post-parse resource is acquired and without reaching an
+        // origin, so the sweep exercises the static path's
+        // body-carrying arm.
+        .match = .{ .path_prefix = "/respond", .headers = &.{.{
+            .name = "host",
+            .predicate = .{ .contains = script_host_fragment },
+        }} },
+        .actions = &.{.{ .respond = .{ .status = 200, .body = respond_body_name } }},
+    },
+    .{
+        .match = .{ .path_prefix = "/edit", .headers = &.{.{
+            .name = "Host",
+            .predicate = .{ .equals = l7.canon.script_host },
+        }} },
+        .actions = &.{.{ .header_set = .{ .name = "X-Sim-Filter", .value = "on" } }},
+    },
+    .{
+        .match = .{ .path_prefix = "/rewrite" },
+        .actions = &.{.{ .rewrite_prefix = .{ .from = "/rewrite", .to = "/sim" } }},
+    },
+    // #331's pair, and the only rules here whose meaning is in their
+    // *order*: the allow stops the walk, so the reject beneath it
+    // never fires — and a sweep where it did would answer 403 to a
+    // script whose golden outcome is the origin's 200. The reject is
+    // what makes the allow observable at all; without it the first
+    // rule would be indistinguishable from no rule.
+    .{
+        .match = .{ .path_prefix = "/allow" },
+        .actions = &.{.allow},
+    },
+    .{
+        .match = .{ .path_prefix = "/allow" },
+        .actions = &.{.{ .reject = 403 }},
+    },
+};
+
+/// #175 response rules, always on: every response the render forwards
+/// gains the stamp — so the client can require it on every 200 and
+/// refuse it on every static, which is what separates the two render
+/// paths from outside — and the 5xx rule matches a class the scripted
+/// origin never answers, so its edit appearing anywhere is the class
+/// predicate misfiring under some schedule.
+const response_filters_sim = [_]zoxy.Options.Listener.ResponseFilter{
+    .{
+        .match = .{},
+        .actions = &.{.{ .header_set = .{
+            .name = l7.canon.response_edit_name,
+            .value = l7.canon.response_edit_value,
+        } }},
+    },
+    .{
+        .match = .{ .status_class = .@"5xx" },
+        .actions = &.{.{ .header_set = .{ .name = l7.canon.response_never_name, .value = "1" } }},
+    },
+    // The same never-edit behind a status no origin answers, and
+    // behind a header value none sends.
+    .{
+        .match = .{ .statuses = &.{ 207, 299 } },
+        .actions = &.{.{ .header_set = .{ .name = l7.canon.response_never_name, .value = "1" } }},
+    },
+    .{
+        .match = .{ .headers = &.{.{ .name = "content-length", .predicate = .{ .equals = decoy_value } }} },
+        .actions = &.{.{ .header_set = .{ .name = l7.canon.response_never_name, .value = "1" } }},
+    },
+};
 
 fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forwarded) void {
     harness.wireFilters();
