@@ -1613,7 +1613,9 @@ external binaries. They and the speed gates run at merge.
     - an IPv6 peer for every stream client on a third of seeds, and
       PROXY headers announcing IPv6 clients (v1 TCP6, v2 INET6).
   - **Who connects:**
-    - L4 echo clients;
+    - L4 echo clients, which on a listener that routes by SNI open with
+      a ClientHello naming the route, another name, or none, or with
+      bytes that are no hello;
     - L7 request scripts;
     - h2c clients, including flooders;
     - TLS clients, including resumers across key rotation, each naming
@@ -1649,6 +1651,9 @@ external binaries. They and the speed gates run at merge.
       exposition, each counter in order at no more than its final value;
     - a handshake shown a certificate was shown the one its name chooses,
       and proved it holds that certificate's key;
+    - the SNI peek counts each hello as what it named — routed, absent,
+      unrouted, invalid — exactly, on a clean seed reading no PROXY
+      header;
     - a client the client CA must refuse hears nothing but the refusal,
       one it admits is never refused, and none resumes past it; an
       origin reads a client's fingerprint once and only the verified one;
@@ -1679,8 +1684,7 @@ external binaries. They and the speed gates run at merge.
     feature no seed turns on. The report does not gate; a gap in it
     should either be named in the list below or be a scenario to widen.
   - **Not swept, covered by directed tests and the live gate instead:**
-    - HTTP/2 to origins, HTTPS clusters, SNI routing, and gRPC
-      deadlines;
+    - HTTP/2 to origins, HTTPS clusters, and gRPC deadlines;
     - RSA: an RSA-PSS signature draws a fresh salt, so no seeded
       handshake on an RSA key replays byte-exact — and with it the choice
       between key types; certificate selection's wildcard tier and its

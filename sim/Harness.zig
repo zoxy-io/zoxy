@@ -317,6 +317,13 @@ tls_credentials: [3]?zoxy.tls.Credentials,
 /// and each TLS slot names one of them, the default's, an unknown name, or
 /// nothing, so the choice a ClientHello's name makes is swept.
 tls_sni: bool,
+/// #298: the L4 listener's SNI table on a seed that draws one, and what
+/// each L4 client opened with (null for a silent one, or no table).
+l4_sni: bool,
+l4_sni_routes: [2]zoxy.Options.Listener.SniRoute,
+l4_sni_route_count: u8,
+l4_hello_kinds: [clients_max]?HelloKind,
+l4_sni_prng: std.Random.DefaultPrng,
 tls_names: [tls_client_slots][]const u8,
 tls_sni_credentials: [2]?zoxy.tls.Credentials,
 tls_certificate_choices: [3]zoxy.tls.certificate_set.Choice,
@@ -681,6 +688,7 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
     }
     harness.drain_at_ns = deriveDrainAt(harness.clean, random);
     harness.drawSni(seed);
+    harness.drawL4Sni(seed);
     try harness.drawClientCa(arena, seed);
     harness.deriveTopology(random);
     try harness.drawAdmin(arena, seed);
@@ -1192,7 +1200,7 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     deriveHttp2(harness, random);
     harness.max_body_bytes = deriveMaxBodyBytes(harness.clean, random);
     harness.keepalive_requests = deriveKeepaliveRequests(harness.clean, random);
-    harness.relay_buffer_bytes = deriveRelayBufferBytes(harness.clean, random);
+    harness.relay_buffer_bytes = deriveRelayBufferBytes(harness.clean, harness.l4_sni, random);
     // A quarter of seeds. Clean ones included, deliberately: an
     // adversarial seed only holds the transcript to a legal *prefix*, so
     // a proxy that settled on the interim and dropped the real answer
@@ -1657,13 +1665,14 @@ fn deriveKeepaliveRequests(clean: bool, random: std.Random) u32 {
 /// stream's DATA frame can then outrun its room and be held, and with it
 /// its connection's input (#373). The default is the ceiling: a
 /// terminating listener's relay buffer may be no larger than one TLS
-/// record's plaintext. No seed routes by SNI, whose floor is that same
-/// record (`LimitRelayBufferUnderSniRouting`). One that did would have to
-/// keep the default.
-fn deriveRelayBufferBytes(clean: bool, random: std.Random) u32 {
+/// record's plaintext. A seed that routes by SNI (#298) keeps the default:
+/// its floor is that same record (`LimitRelayBufferUnderSniRouting`), and
+/// the limits handed to `Server.init` here pass no loader that would say so.
+fn deriveRelayBufferBytes(clean: bool, sni: bool, random: std.Random) u32 {
     const default = zoxy.constants.relay_buffer_bytes_default;
     const smallest = zoxy.constants.relay_buffer_bytes_min;
     if (clean) return default;
+    if (sni) return default;
     if (random.uintLessThan(u8, 3) != 0) return default;
     const bytes = smallest + random.uintLessThan(u32, default - smallest + 1);
     assert(bytes >= smallest);
@@ -2078,7 +2087,10 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
         .{
             .bind = .{ .ip = bindAddress() },
             .protocol = .{ .l4 = .{
-                .target = .{ .cluster = l4_cluster_name },
+                .target = if (harness.l4_sni)
+                    .{ .routes = harness.l4_sni_routes[0..harness.l4_sni_route_count] }
+                else
+                    .{ .cluster = l4_cluster_name },
                 .proxy_protocol = harness.proxy_protocol_l4,
             } },
             .connection_policies = &harness.connection_policy_selections,
@@ -2320,6 +2332,94 @@ fn drawAdmin(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
 
 /// The admin listener's bind, apart from every data-path address.
 const admin_address: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9100 } };
+
+/// #298's draw: a third of seeds have the L4 listener choose its route by
+/// the ClientHello's name — one named route, and on half of those an
+/// any-name route too — and each of their L4 clients that speaks sends a
+/// hello naming the route, another name, nothing, or bytes that are no
+/// hello at all. Its own stream, here and per client.
+fn drawL4Sni(harness: *Harness, seed: u64) void {
+    harness.l4_sni_prng = std.Random.DefaultPrng.init(seed ^ 0x0298_0298_0298_0298);
+    const random = harness.l4_sni_prng.random();
+    harness.l4_sni = random.uintLessThan(u8, 3) == 0;
+    harness.l4_hello_kinds = @splat(null);
+    harness.l4_sni_routes[0] = .{ .sni = sni_route_name, .cluster = l4_cluster_name };
+    harness.l4_sni_routes[1] = .{ .sni = null, .cluster = l4_cluster_name };
+    harness.l4_sni_route_count = if (random.boolean()) 2 else 1;
+    assert(harness.l4_sni_route_count >= 1);
+}
+
+/// The name the #298 table routes, and one it does not.
+const sni_route_name = "route.zoxy.test";
+const sni_other_name = "elsewhere.zoxy.test";
+
+/// What one of a #298 seed's L4 clients opens with.
+const HelloKind = enum(u8) { named, other, absent, garbage };
+
+/// The token a #298 seed's speaking L4 client sends in place of random
+/// bytes, written into `token`, and its length; null where the seed routes
+/// no name or the client is silent.
+fn drawHello(harness: *Harness, l4_index: u8, silent: bool, token: *[l4.token_bytes_max]u8) ?u8 {
+    assert(l4_index < clients_max);
+    if (!harness.l4_sni or silent) return null;
+    const random = harness.l4_sni_prng.random();
+    const kind = random.enumValue(HelloKind);
+    harness.l4_hello_kinds[l4_index] = kind;
+    const salt = l4_index + 1;
+    const hello = switch (kind) {
+        .named => l4.clientHello(token, sni_route_name, salt),
+        .other => l4.clientHello(token, sni_other_name, salt),
+        .absent => l4.clientHello(token, null, salt),
+        .garbage => garbage: {
+            // Not a TLS record: a handshake record begins 0x16.
+            @memset(token[0..24], salt);
+            token[0] = 0x00;
+            break :garbage token[0..24];
+        },
+    };
+    assert(hello.len >= 1);
+    return @intCast(hello.len);
+}
+
+/// What the peek must have counted (#298), from what each client opened
+/// with: never more than that on any seed — a client cut before its hello
+/// is read is counted by nothing — and exactly that on a clean seed whose
+/// listener reads no PROXY header, which could close a client first.
+fn verifySniCounters(harness: *const Harness) !void {
+    const counters = &harness.server.counters;
+    const names = [_][]const u8{ "l4_sni_routed", "l4_sni_absent", "l4_sni_no_route", "l4_sni_invalid" };
+    if (!harness.l4_sni) {
+        // No listener routes by name on this seed, so no verdict is taken.
+        inline for (names) |name| assert(counters.get(name) == 0);
+        return;
+    }
+    const catch_all = harness.l4_sni_route_count == 2;
+    // What is owed, in `names`' order: routed, absent, unrouted, invalid.
+    var owed: [4]u64 = @splat(0);
+    for (harness.l4_hello_kinds[0..harness.l4_count]) |hello_kind| {
+        const kind = hello_kind orelse continue;
+        switch (kind) {
+            .named => owed[0] += 1,
+            .other => if (catch_all) {
+                owed[0] += 1;
+            } else {
+                owed[2] += 1;
+            },
+            .absent => owed[1] += 1,
+            .garbage => owed[3] += 1,
+        }
+    }
+    const exact = harness.clean and harness.proxy_protocol_l4 == null;
+    inline for (names, owed) |name, expected| {
+        const counted = counters.get(name);
+        if (counted > expected) return error.L4SniMiscounted;
+        if (exact and counted != expected) return error.L4SniMiscounted;
+    }
+    // One verdict a client at most; and a table with an any-name route
+    // leaves no name unrouted.
+    assert(owed[0] + owed[1] + owed[2] + owed[3] <= harness.l4_count);
+    if (catch_all) assert(owed[2] == 0);
+}
 
 /// The names a TLS slot may ask for (#297): nothing, the default's, each
 /// further certificate's, and one no certificate covers.
@@ -2703,9 +2803,10 @@ fn populateClients(harness: *Harness, random: std.Random) void {
             const l4_index = harness.l4_count;
             harness.l4_count += 1;
             var token: [l4.token_bytes_max]u8 = undefined;
-            const token_len = 1 + random.uintLessThan(u8, l4.token_bytes_max);
-            random.bytes(token[0..token_len]);
+            const random_len = 1 + random.uintLessThan(u8, l4.random_token_bytes_max);
+            random.bytes(token[0..random_len]);
             const silent = random.uintLessThan(u8, 5) == 0;
+            const token_len = harness.drawHello(l4_index, silent, &token) orelse random_len;
             // A silent client sends nothing, header included: on a
             // require-listener it is the connect-budget reap's fodder,
             // and drawing it a header it would never send would teach
@@ -3642,6 +3743,7 @@ pub fn verify(harness: *Harness) !void {
     for (harness.admin_scrapers) |*scraper| try scraper.verify(&harness.server.counters);
     try harness.verifyTlsSessions();
     try harness.verifyClientRefusalCount();
+    try harness.verifySniCounters();
 }
 
 /// #304: every refusal the client CA made was owed — the counter never

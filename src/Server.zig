@@ -774,6 +774,14 @@ pub fn Server(comptime runtime: Runtime) type {
             // that cannot fail.
             try server.streams.init(arena, options.conn_slots);
             assert(server.streams.capacity() == server.conns.capacity());
+            // The §6 peek stages a whole ClientHello in a relay half — the
+            // peek's own bound plus the room a sending cluster's PROXY
+            // header is prepended into — and the loader refuses a narrower
+            // one under SNI routing (`LimitRelayBufferUnderSniRouting`).
+            // Limits handed in by code pass no loader, so the same floor
+            // is held here, before anything is allocated: a narrower half
+            // would be read past by the first long hello.
+            if (routesBySni(config)) assert(options.relay_buffer_bytes >= constants.client_hello_bytes_max);
             try server.relay_buffers.init(arena, options.relay_buffers);
             try wireRelayHalves(arena, server.relay_buffers.slots, options.relay_buffer_bytes);
             try server.initTunnelBuffers(arena, &options);
@@ -1431,6 +1439,15 @@ pub fn Server(comptime runtime: Runtime) type {
         ///
         /// Pages become resident as relays use them (§5). The pump reads
         /// only bytes already written into the buffer.
+        /// Whether any listener chooses its route by the ClientHello's name.
+        fn routesBySni(config: *const config_module.Config) bool {
+            assert(config.listeners.len >= 1);
+            for (config.listeners) |*listener| {
+                if (listener.sni_routes.len >= 1) return true;
+            }
+            return false;
+        }
+
         fn wireRelayHalves(
             arena: std.mem.Allocator,
             slots: []relay.RelayBuffer,
