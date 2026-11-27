@@ -110,6 +110,24 @@ pub const chunked_trailers_response = chunked_trailers_head ++ chunked_trailers_
 /// terminating CRLF is shared, so a client knows which one it is reading
 /// from the first octet after them.
 pub const chunked_shared_bytes: u32 = chunked_wire.len - 2;
+
+// A request's trailers (§7): HTTP/1.1 relays them, and HTTP/2 and HTTP/3
+// end the client's half with them and carry them no further. So the
+// origin holds every request to one rule — a section iff the head owes
+// one — and a forwarded managed trailer, or a client's HTTP/2 trailers
+// that went on, fail it as surely as one dropped.
+
+/// The one field a request's trailer section carries.
+pub const request_trailer_name = "x-sim-request-trailer";
+/// Its one value.
+pub const request_trailer_value = "sim-request-trailer-1";
+/// The head field that says a request's trailer section is coming.
+pub const request_trailer_owed_header = "x-sim-request-trailer-owed";
+/// The trailer section as the dechunker leaves it: every octet after the
+/// last chunk's size line, the closing CRLF included.
+pub const request_trailer_section = request_trailer_name ++ ": " ++ request_trailer_value ++ "\r\n\r\n";
+/// An empty section, as it reads on the same terms.
+pub const empty_trailer_section = "\r\n";
 pub const until_close_body = "until-close-stream";
 pub const until_close_head = "HTTP/1.1 200 OK\r\n\r\n";
 pub const until_close_response = until_close_head ++ until_close_body;

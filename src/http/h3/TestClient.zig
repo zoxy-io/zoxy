@@ -58,6 +58,9 @@ pub const Request = struct {
     /// Further fields, after the pseudo-fields.
     headers: []const Field = &.{},
     body: []const u8 = &.{},
+    /// A trailer section sent after the body, ending the request (RFC 9114
+    /// §4.1); none when empty.
+    trailers: []const Field = &.{},
     /// A field section sent as it is, in place of the one the fields above
     /// encode to: what a test of the server's QPACK decoder sends.
     raw_section: ?[]const u8 = null,
@@ -311,6 +314,10 @@ pub fn TestClient(comptime IoType: type) type {
                     octets += ClientHttp3.writeData(frames[octets..], request.body.len) catch unreachable;
                     @memcpy(frames[octets..][0..request.body.len], request.body);
                     octets += request.body.len;
+                }
+                if (request.trailers.len >= 1) {
+                    assert(request.trailers.len <= request_headers_max);
+                    octets += client.http3.writeHeaders(frames[octets..], request.trailers) catch unreachable; // Short fields.
                 }
                 const id = quic.stream_id.make(.client_bidirectional, @intCast(index));
                 _ = client.quic.write(id, frames[0..octets], true) catch {

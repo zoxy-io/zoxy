@@ -45,6 +45,14 @@ pub const Script = enum(u8) {
     /// the silent-teardown-instead-of-400 shape (§7): clean seeds
     /// demand the 400.
     post_chunked_malformed,
+    /// A chunked POST that ends with a trailer section its head owes
+    /// (§7): relayed verbatim, so the origin must read it exactly; 200.
+    post_chunked_trailers,
+    /// A chunked POST whose trailer names a header the proxy manages — a
+    /// `Content-Length` after the body, the smuggling shape (§7). It
+    /// arrives with the head, so clean seeds demand the 400; a later one
+    /// is a teardown, and the origin never reads the field either way.
+    post_chunked_trailer_managed,
     /// A bare-LF head terminator (smuggling shape); 400.
     malformed_head,
     /// A request line alone overflowing the proxy's 8 KiB head buffer;
@@ -479,6 +487,31 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .allowed_statuses = statuses_routed_body,
         .carries_body = true,
         .routed_canonical = true,
+    },
+    .post_chunked_trailers = .{
+        .request = "POST /sim HTTP/1.1\r\nHost: sim\r\n" ++
+            "Transfer-Encoding: chunked\r\n" ++
+            canon.request_trailer_owed_header ++ ": 1\r\n\r\n" ++
+            "8\r\nabcdefgh\r\n0\r\n" ++ canon.request_trailer_section,
+        .expected_responses = 1,
+        .transcript_cap = 1,
+        .golden_status = 200,
+        .method = .post,
+        .allowed_statuses = statuses_routed_body,
+        .carries_body = true,
+        .routed_canonical = true,
+    },
+    .post_chunked_trailer_managed = .{
+        // Owes no trailer, so the origin's oracle fails the seed if the
+        // managed field is ever forwarded.
+        .request = "POST /sim HTTP/1.1\r\nHost: sim\r\n" ++
+            "Transfer-Encoding: chunked\r\n\r\n" ++
+            "8\r\nabcdefgh\r\n0\r\nContent-Length: 8\r\n\r\n",
+        .expected_responses = 1,
+        .transcript_cap = 1,
+        .golden_status = 400,
+        .method = .post,
+        .allowed_statuses = statuses_body_reject,
     },
     .post_chunked_malformed = .{
         // "Z" is no chunk-size digit: the framing violation is in the
@@ -931,6 +964,8 @@ pub const terminating_scripts = [_]Script{
     .post_chunked,
     .post_chunked_big,
     .post_chunked_malformed,
+    .post_chunked_trailers,
+    .post_chunked_trailer_managed,
     .malformed_head,
     .oversize_uri,
     .connect_method,

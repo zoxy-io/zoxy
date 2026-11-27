@@ -120,6 +120,10 @@ pub const Plan = struct {
     ask: Ask = .get,
     body_len: u32 = 0,
     frames: u8 = 0,
+    /// A POST ends its half with a trailer section instead of DATA's
+    /// END_STREAM (§7). It owes the origin none: the proxy ends the
+    /// request there and carries the section no further.
+    trailers: bool = false,
 
     pub fn carriesBody(plan: Plan) bool {
         return switch (plan.ask) {
@@ -258,6 +262,8 @@ pub fn Client(comptime IoType: type) type {
         const request_bytes_max: u32 = 64 * 1024;
         /// A POST's head: five short literals, a length and the mark.
         const head_bytes_max: u32 = 160;
+        /// A POST's trailing HEADERS: its frame header and one literal.
+        const trailers_bytes_max: u32 = 9 + 3 + canon.request_trailer_name.len + canon.request_trailer_value.len;
         /// Room for Rapid Reset's worst transcript: every round's stream
         /// answered whole before its reset arrived — which an adversary
         /// splitting a round's send can arrange — beside its PONG.
@@ -267,7 +273,7 @@ pub fn Client(comptime IoType: type) type {
             // The preface, its SETTINGS, and every round.
             assert(64 + rounds_max * round_bytes_max <= request_bytes_max);
             // Or every stream's head and body, each frame's header too.
-            const stream_bytes_max = head_bytes_max + body_bytes_max + body_frames_max * 9;
+            const stream_bytes_max = head_bytes_max + body_bytes_max + body_frames_max * 9 + trailers_bytes_max;
             assert(64 + @as(u32, streams_max) * stream_bytes_max <= request_bytes_max);
             // Every body inside the default connection window (RFC 9113
             // §6.9.2), which this client never sees grow.
@@ -468,6 +474,25 @@ pub fn Client(comptime IoType: type) type {
             for (answers[0..client.streams]) |*answer| heard += @intFromBool(answer.trailers);
             assert(heard <= client.streams);
             return heard;
+        }
+
+        /// Streams that ended their half with a trailer section and were
+        /// answered whole, for the census (§9); read once `verify` passed.
+        pub fn requestTrailersAnswered(client: *const Self) u32 {
+            assert(client.streams >= 1);
+            if (client.mode != .exchange) return 0;
+            var answers: [streams_max]Answer = @splat(.{});
+            const plans = client.plans[0..client.streams];
+            const bytes = client.receive_buffer[0..client.received_len];
+            _ = readAnswers(bytes, plans, &answers) catch |err| {
+                std.debug.panic("requestTrailersAnswered after a failed verify: {s}", .{@errorName(err)});
+            };
+            var answered: u32 = 0;
+            for (answers[0..client.streams], plans) |*answer, plan| {
+                answered += @intFromBool(plan.trailers and answer.status == 200 and answer.ended and !answer.reset);
+            }
+            assert(answered <= client.streams);
+            return answered;
         }
 
         /// The oracle, over everything this client received.
@@ -880,11 +905,31 @@ pub fn Client(comptime IoType: type) type {
                     const size = if (last) plan.body_len - written[index] else plan.body_len / plan.frames;
                     assert(size >= 1);
                     const id = streamId(@intCast(index));
-                    writeBody(&client.request, len, id, client.bodySalt(id), written[index], size, last);
+                    const ends = last and !plan.trailers;
+                    writeBody(&client.request, len, id, client.bodySalt(id), written[index], size, ends);
                     written[index] += size;
                 }
             }
             for (plans, written[0..plans.len]) |plan, sent| assert(sent == plan.body_len);
+            for (plans, 0..) |plan, index| {
+                if (plan.trailers) writeTrailers(&client.request, len, streamId(@intCast(index)));
+            }
+        }
+
+        /// A request's trailer section, after its last DATA: it ends the
+        /// client's half (RFC 9113 §8.1), so it carries END_STREAM.
+        fn writeTrailers(out: *[request_bytes_max]u8, len: *u32, id: u31) void {
+            const start = len.*;
+            len.* += 9;
+            append(out, len, "\x00");
+            literal(out, len, canon.request_trailer_name);
+            literal(out, len, canon.request_trailer_value);
+            const header = out[start..][0..9];
+            std.mem.writeInt(u24, header[0..3], @intCast(len.* - start - 9), .big);
+            header[3] = frame_headers;
+            header[4] = flag_end_stream | flag_end_headers;
+            std.mem.writeInt(u32, header[5..9], id, .big);
+            assert(len.* - start <= trailers_bytes_max);
         }
 
         /// Stream `id`'s body salt: this client's, then the stream's own.
