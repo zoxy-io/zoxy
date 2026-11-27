@@ -360,8 +360,10 @@ test "credentials: an RSA-2048 pair loads, signing under the three RSA-PSS diges
         &.{ .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 },
         credentials.schemes(),
     );
-    // PSS draws a fresh salt per signature, so an RSA key cannot give the
-    // simulator the replayable flights it asks for — refused, not faked.
+    // PSS draws a fresh salt per signature, so an RSA key cannot sign
+    // deterministically — refused, not faked. The simulator loads its RSA
+    // leaves without asking: a PSS signature is the modulus's length
+    // whatever its salt, and its trace folds in lengths alone.
     try std.testing.expectError(
         error.DeterministicNonceUnsupported,
         Credentials.load(arena_state.allocator(), fixture_rsa_cert_pem, fixture_rsa_key_pem, .{ .deterministic_nonce = true }),

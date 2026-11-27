@@ -104,6 +104,7 @@ pub const tls = struct {
     pub const trust = @import("tls/trust.zig");
     pub const TestClient = @import("tls/TestClient.zig").TestClient;
     pub const ClientIdentity = @import("tls/TestClient.zig").ClientIdentity;
+    pub const SchemeOffer = @import("tls/TestClient.zig").SchemeOffer;
     /// What a client captures from one session to offer on the next. Named
     /// here so a gate can hold one without naming zssl itself (§4).
     pub const SessionTicket = @import("tls/TestClient.zig").SessionTicket;
@@ -125,14 +126,28 @@ pub const tls = struct {
         pub const host_name = "spike.zoxy.test";
         /// A P-384 pair for `p384_host_name`, and a second P-256 one for
         /// `origin_host_name` (#297): what a listener holding several
-        /// certificates chooses among. ECDSA both, so a seeded handshake
-        /// on either replays byte-exact, as an RSA-PSS one cannot.
+        /// certificates chooses among. Signed under RFC 6979 nonces, an
+        /// ECDSA leaf's CertificateVerify is the same length on every run;
+        /// RSA-PSS's is the modulus's whatever its salt.
         pub const p384_cert_pem = @embedFile("tls/testdata/p384-cert.pem");
         pub const p384_key_pem = @embedFile("tls/testdata/p384-key.pem");
         pub const p384_host_name = "p384.zoxy.test";
         pub const origin_cert_pem = @embedFile("tls/testdata/origin-cert.pem");
         pub const origin_key_pem = @embedFile("tls/testdata/origin-key.pem");
         pub const origin_host_name = "origin.zoxy.test";
+        /// An RSA-2048 pair for `rsa_host_name` and `host_name` both (#411),
+        /// so one name has both key types behind it.
+        pub const rsa_cert_pem = @embedFile("tls/testdata/rsa2048-cert.pem");
+        pub const rsa_key_pem = @embedFile("tls/testdata/rsa2048-key.pem");
+        pub const rsa_host_name = "rsa.zoxy.test";
+        /// Two leaves for `*.wild.zoxy.test` (#297), P-256 and RSA-2048,
+        /// each with a key no other fixture carries: the wildcard tier,
+        /// and the key-type choice within it.
+        pub const wild_cert_pem = @embedFile("tls/testdata/wild-cert.pem");
+        pub const wild_key_pem = @embedFile("tls/testdata/wild-key.pem");
+        pub const rsa_wild_cert_pem = @embedFile("tls/testdata/rsa2048-wild-cert.pem");
+        pub const rsa_wild_key_pem = @embedFile("tls/testdata/rsa2048-other-key.pem");
+        pub const wild_domain = "wild.zoxy.test";
         /// The client leaf `client_ca_pem` signed (#304), its key, and its
         /// SHA-256 fingerprint as the origin's header and the log spell it.
         pub const client_cert_pem = @embedFile("tls/testdata/client-cert.pem");

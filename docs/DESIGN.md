@@ -1633,9 +1633,12 @@ external binaries. They and the speed gates run at merge.
       HTTP/2, gRPC calls its origin never answers, left to their
       `grpc-timeout`;
     - TLS clients, including resumers across key rotation, each naming
-      one of the listener's certificates, an unknown name, or none, and,
-      where the listener asks, presenting the client CA's leaf, another
-      CA's, or nothing;
+      one of the listener's certificates exactly or under a wildcard, in
+      any case, a name the wildcard does not cover, an unknown name, or
+      none; offering every signature scheme, or only ECDSA, P-256 or
+      RSA-PSS; and, where the listener asks, presenting the client CA's
+      leaf, another CA's, or nothing;
+    - HTTP/3 clients, which name a certificate the same way;
     - admin scrapers, on a third of seeds: each reads the exposition to
       the plane's FIN, and some hold their half open for the drain to
       tear down.
@@ -1643,7 +1646,14 @@ external binaries. They and the speed gates run at merge.
     reach each script's exact golden outcome.
   - **Replay.** Every seed runs twice, and the two trace hashes must
     match. A failure, or a panic, prints its seed, and
-    `zig build sim -- <seed>` replays it.
+    `zig build sim -- <seed>` replays it. The trace folds in op kinds,
+    lengths and errors, never payload octets. So an RSA-PSS signature,
+    whose salt is the one randomness no seed chooses, still replays: it
+    is the modulus's length whatever it drew. ECDSA signs under RFC 6979
+    nonces because its DER length moves with the nonce, and with what it
+    signs. That is why the salt is kept out of everything that signs or
+    seals over its transcript: no client-CA seed shows an RSA leaf, and
+    no RSA session issues the ticket a resumer offers.
   - **Hangs.** Neither the deadlock check nor the virtual-time alarm
     sees a seed that never ends: a spin inside one callback, or ops
     forever ready while the virtual clock is frozen. A wall-clock
@@ -1665,8 +1675,11 @@ external binaries. They and the speed gates run at merge.
       answer, `grpc-status: 4` and no body;
     - a scrape is the admin head and a prefix of a well-formed
       exposition, each counter in order at no more than its final value;
-    - a handshake shown a certificate was shown the one its name chooses,
-      and proved it holds that certificate's key;
+    - a handshake shown a certificate was shown the one its name and its
+      offer choose — exact before wildcard before the default, ECDSA
+      before RSA — and proved it holds that certificate's key; an offer
+      no certificate the name reaches can sign under is refused unless it
+      resumes;
     - a cluster that follows a name serves no address its nameservers'
       answers could not make it, `addresses_max` applied and a reply under
       the wrong ID refused;
@@ -1701,13 +1714,8 @@ external binaries. They and the speed gates run at merge.
     on its own, and `scripts/sim_gap.zig` lists the serving-path
     functions only unit tests reach. Each is a branch no seed takes or a
     feature no seed turns on. The report does not gate; a gap in it
-    should either be named in the list below or be a scenario to widen.
-  - **Not swept, covered by directed tests and the live gate instead:**
-    - RSA: an RSA-PSS signature draws a fresh salt, so no seeded
-      handshake on an RSA key replays byte-exact — and with it the choice
-      between key types; certificate selection's wildcard tier and its
-      QUIC path (the HTTP/3 client names one host) are directed tests'
-      too.
+    should be a scenario to widen, or a census exemption that says what
+    covers it instead.
 - **Fuzzing.** Twenty-one `std.testing.fuzz` targets cover every parser
   edge:
   - the HTTP/1.1 head and chunked parsers, and the render;

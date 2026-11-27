@@ -74,6 +74,8 @@ pub fn Client(comptime IoType: type) type {
         transport: Transport,
         io: *IoType,
         address: std.Io.net.IpAddress,
+        /// The name its hello asks for (#297).
+        server_name: []const u8,
         plans: [requests_max]Plan,
         streams: u8,
         salt: u32,
@@ -99,11 +101,14 @@ pub fn Client(comptime IoType: type) type {
             salt: u32,
             clean: bool,
             seed: [64]u8,
+            server_name: []const u8,
         ) void {
             assert(plans.len >= 1);
             assert(plans.len <= requests_max);
+            assert(server_name.len >= 1);
             client.io = io;
             client.address = address;
+            client.server_name = server_name;
             client.streams = @intCast(plans.len);
             client.salt = salt;
             client.clean = clean;
@@ -152,14 +157,21 @@ pub fn Client(comptime IoType: type) type {
         pub fn begin(client: *Self) void {
             assert(!client.began);
             client.began = true;
-            client.transport.start(
+            client.transport.startNamed(
                 client.io,
                 client.address,
                 client.requests[0..client.streams],
                 client.seed,
+                client.server_name,
                 onDone,
                 client,
             ) catch return client.end(); // No socket to bind: nothing ran.
+        }
+
+        /// The public key of the leaf the server showed, or null before
+        /// one arrived (#297).
+        pub fn serverPublicKey(client: *const Self) ?[]const u8 {
+            return client.transport.serverPublicKey();
         }
 
         fn onDone(context: *anyopaque) void {

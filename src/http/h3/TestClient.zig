@@ -185,6 +185,22 @@ pub fn TestClient(comptime IoType: type) type {
             on_done: *const fn (*anyopaque) void,
             context: *anyopaque,
         ) !void {
+            return client.startNamed(io, server, requests, seed, "localhost", on_done, context);
+        }
+
+        /// `start`, naming `server_name` in the hello (#297): what a
+        /// listener holding several certificates chooses by.
+        pub fn startNamed(
+            client: *Self,
+            io: *IoType,
+            server: IpAddress,
+            requests: []const Request,
+            seed: [64]u8,
+            server_name: []const u8,
+            on_done: *const fn (*anyopaque) void,
+            context: *anyopaque,
+        ) !void {
+            assert(server_name.len >= 1);
             assert(requests.len >= 1);
             assert(requests.len <= requests_max);
             // Field by field: the client is hundreds of KiB, and a literal of
@@ -235,7 +251,7 @@ pub fn TestClient(comptime IoType: type) type {
             var parameters: [ClientQuic.local_transport_parameters_octets_max]u8 = undefined;
             const sink = client.engineSink();
             try client.tls.init(&.{
-                .server_name = "localhost",
+                .server_name = server_name,
                 .transport_parameters = try client.quic.localTransportParameters(&parameters),
                 .seed = seed,
             }, &sink);
@@ -409,6 +425,12 @@ pub fn TestClient(comptime IoType: type) type {
             const index = id / 4;
             if (index >= client.requests.len) return null;
             return &client.answers[@intCast(index)];
+        }
+
+        /// The public key the server's leaf carried (#297), or null before
+        /// its Certificate arrived.
+        pub fn serverPublicKey(client: *const Self) ?[]const u8 {
+            return client.tls.serverPublicKey();
         }
 
         /// Whether the server ended the connection gracefully, observed no
