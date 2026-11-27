@@ -20,10 +20,76 @@ const Io = zoxy.Io;
 
 const assert = std.debug.assert;
 
-pub const token_bytes_max: u8 = 48;
+/// Room for the longest token a client sends: random bytes, or a #298
+/// ClientHello naming the longest of the harness's names.
+pub const token_bytes_max: u8 = 128;
+/// A random token's length at most: what every seed drew before hellos.
+pub const random_token_bytes_max: u8 = 48;
+
+comptime {
+    assert(random_token_bytes_max <= token_bytes_max);
+}
 /// Fits every header shape the harness scripts (#142): the longest is a
 /// v1 TCP4 line at 46 bytes; v2 LOCAL and INET are 16 and 28.
 pub const prefix_bytes_max: u8 = 64;
+
+/// A minimal ClientHello in one record (RFC 8446 §4.1.2), naming `name` in
+/// `server_name` (RFC 6066 §3) or naming nothing: what a #298 listener
+/// peeks at to choose a route. A hello naming nothing takes, by `salt`'s
+/// parity, both shapes one does in the field: no extensions at all (TLS
+/// 1.2's), or a block of them without `server_name` (a TLS 1.3 client's,
+/// `supported_versions` in it). `salt` fills the random, so two clients'
+/// hellos — and so their echoes — never coincide.
+pub fn clientHello(out: *[token_bytes_max]u8, name: ?[]const u8, salt: u8) []const u8 {
+    const record_header_bytes: usize = 5;
+    const handshake_header_bytes: usize = 4;
+    var len: usize = record_header_bytes + handshake_header_bytes;
+    const body_start = len;
+    // legacy_version, random, empty legacy_session_id, one cipher suite
+    // (TLS_AES_128_GCM_SHA256), and the null compression method.
+    append(out, &len, &.{ 0x03, 0x03 });
+    @memset(out[len..][0..32], salt);
+    len += 32;
+    append(out, &len, &.{ 0x00, 0x00, 0x02, 0x13, 0x01, 0x01, 0x00 });
+    if (name == null and salt % 2 == 0) {
+        // supported_versions, offering TLS 1.3 alone.
+        appendInt(out, &len, 7);
+        append(out, &len, &.{ 0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04 });
+    }
+    if (name) |host| {
+        assert(host.len >= 1);
+        assert(host.len <= 64);
+        const entry_bytes: u16 = @intCast(3 + host.len);
+        const list_bytes: u16 = entry_bytes;
+        const extension_bytes: u16 = 2 + list_bytes;
+        appendInt(out, &len, 4 + extension_bytes); // The extensions block.
+        appendInt(out, &len, 0x0000); // server_name.
+        appendInt(out, &len, extension_bytes);
+        appendInt(out, &len, list_bytes);
+        append(out, &len, &.{0x00}); // host_name.
+        appendInt(out, &len, @intCast(host.len));
+        append(out, &len, host);
+    }
+    const body_bytes = len - body_start;
+    out[0..5].* = .{ 0x16, 0x03, 0x01, 0, 0 };
+    std.mem.writeInt(u16, out[3..5], @intCast(len - record_header_bytes), .big);
+    out[5] = 0x01; // client_hello.
+    std.mem.writeInt(u24, out[6..9], @intCast(body_bytes), .big);
+    assert(len <= token_bytes_max);
+    return out[0..len];
+}
+
+fn append(out: *[token_bytes_max]u8, len: *usize, bytes: []const u8) void {
+    assert(len.* + bytes.len <= token_bytes_max);
+    @memcpy(out[len.*..][0..bytes.len], bytes);
+    len.* += bytes.len;
+}
+
+fn appendInt(out: *[token_bytes_max]u8, len: *usize, value: u16) void {
+    assert(len.* + 2 <= token_bytes_max);
+    std.mem.writeInt(u16, out[len.*..][0..2], value, .big);
+    len.* += 2;
+}
 
 /// A verify-time verdict over everything the client received.
 pub const ClientError = error{
