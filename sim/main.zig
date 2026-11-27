@@ -236,72 +236,17 @@ const uncovered = [_]Uncovered{
             "datagram's version field, with the datagram still 1200 octets, reaches it, " ++
             "and src/http/h3/server_test.zig sends one on purpose",
     },
-    // #481's resolver: the sweep's clusters follow no name.
-    .{
-        .name = "dns_queries_sent",
-        .why = .unreached,
-        .reason = "no cluster follows a name in the sweep; src/dns/resolver_test.zig runs the " ++
-            "resolver against scripted nameservers, under the datagram adversary",
-    },
-    .{
-        .name = "dns_answered",
-        .why = .unreached,
-        .reason = "no cluster follows a name in the sweep; src/dns/resolver_test.zig runs the " ++
-            "resolver against scripted nameservers, under the datagram adversary",
-    },
-    .{
-        .name = "dns_nxdomain",
-        .why = .unreached,
-        .reason = "no cluster follows a name in the sweep; src/dns/resolver_test.zig runs the " ++
-            "resolver against scripted nameservers, under the datagram adversary",
-    },
-    .{
-        .name = "dns_servfail",
-        .why = .unreached,
-        .reason = "no cluster follows a name in the sweep; src/dns/resolver_test.zig runs the " ++
-            "resolver against scripted nameservers, under the datagram adversary",
-    },
-    .{
-        .name = "dns_truncated",
-        .why = .unreached,
-        .reason = "no cluster follows a name in the sweep; src/dns/resolver_test.zig runs the " ++
-            "resolver against scripted nameservers, under the datagram adversary",
-    },
-    .{
-        .name = "dns_timed_out",
-        .why = .unreached,
-        .reason = "no cluster follows a name in the sweep; src/dns/resolver_test.zig runs the " ++
-            "resolver against scripted nameservers, under the datagram adversary",
-    },
-    .{
-        .name = "dns_canceled",
-        .why = .unreached,
-        .reason = "no cluster follows a name in the sweep; src/dns/resolver_test.zig runs the " ++
-            "resolver against scripted nameservers, under the datagram adversary",
-    },
-    .{
-        .name = "dns_replies_dropped",
-        .why = .unreached,
-        .reason = "no cluster follows a name in the sweep; src/dns/resolver_test.zig runs the " ++
-            "resolver against scripted nameservers, under the datagram adversary",
-    },
-    .{
-        .name = "dns_answers_truncated",
-        .why = .unreached,
-        .reason = "no cluster follows a name in the sweep; src/dns/resolver_test.zig runs the " ++
-            "resolver against scripted nameservers, under the datagram adversary",
-    },
-    .{
-        .name = "dns_updates_applied",
-        .why = .unreached,
-        .reason = "no cluster follows a name in the sweep; src/dns/resolver_test.zig runs the " ++
-            "resolver against scripted nameservers, under the datagram adversary",
-    },
+    // #481's resolver. A quarter of seeds' L4 cluster follows a name its
+    // scripted nameservers answer, each by a drawn behaviour under the
+    // datagram adversary, so every outcome of a query is reached; what is
+    // left is the one only a later round meets.
     .{
         .name = "dns_updates_refused",
         .why = .unreached,
-        .reason = "no cluster follows a name in the sweep; src/dns/resolver_test.zig runs the " ++
-            "resolver against scripted nameservers, under the datagram adversary",
+        .reason = "reachable, and unreached in the range: the sweep's nameservers answer a set no " ++
+            "cluster can take (none at all) from 150 ms on, so only a seed whose second round, " ++
+            "past the 100 ms refresh floor, meets an answering nameserver refuses one, and none " ++
+            "of seeds 1..4096 does; src/dns/resolver_test.zig refuses one",
     },
     // §7 HTTP/2 to the origin (#275). A third of seeds' http cluster
     // speaks it, h2c or over TLS, to `TestOrigin` answering the canonical

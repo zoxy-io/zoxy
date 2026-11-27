@@ -35,117 +35,10 @@ fn ip(literal: []const u8) IpAddress {
 const nameserver_addresses = [_]IpAddress{ ip("10.53.0.1:53"), ip("10.53.0.2:53") };
 
 /// What a nameserver does with each query.
-const Behavior = enum {
-    answer,
-    servfail,
-    nxdomain,
-    truncated,
-    silent,
-    /// A reply under another ID first, then the answer.
-    wrong_id_first,
-};
-
-/// The zone the scripted nameservers serve: the name's addresses, which
-/// change by phase — each phase's from its start until the next's.
-const Zone = struct {
-    phases: []const Phase,
-    behaviors: [2]Behavior,
-    /// The simulator's clock when the server started: phases count from it.
-    start_ns: u64,
-    /// The TTL every answer carries.
-    ttl_s: u32,
-    queries_seen: u32 = 0,
-
-    const Phase = struct {
-        from_ns: u64,
-        addresses: []const IpAddress,
-    };
-
-    fn addressesAt(zone: *const Zone, now_ns: u64) []const IpAddress {
-        assert(zone.phases.len >= 1);
-        assert(now_ns >= zone.start_ns);
-        var current = zone.phases[0].addresses;
-        for (zone.phases) |*phase| {
-            if (phase.from_ns <= now_ns - zone.start_ns) current = phase.addresses;
-        }
-        return current;
-    }
-};
-
-/// One scripted nameserver on the simulator's datagrams.
-const Nameserver = struct {
-    io: *SimIo,
-    zone: *Zone,
-    index: u8,
-    socket: SimIo.UdpSocket,
-    buffer: [SimIo.datagram_bytes_max]u8,
-    receive: SimIo.DatagramCompletion,
-    sends: [8]Send,
-
-    const Send = struct {
-        bytes: [constants.dns_message_bytes_max]u8,
-        completion: SimIo.DatagramCompletion,
-        armed: bool,
-    };
-
-    fn start(nameserver: *Nameserver, io: *SimIo, zone: *Zone, index: u8) !void {
-        nameserver.* = .{
-            .io = io,
-            .zone = zone,
-            .index = index,
-            .socket = try io.udpBind(nameserver_addresses[index]),
-            .buffer = undefined,
-            .receive = .{},
-            .sends = undefined,
-        };
-        for (&nameserver.sends) |*send| send.* = .{ .bytes = undefined, .completion = .{}, .armed = false };
-        io.recvFrom(nameserver.socket, &nameserver.buffer, &nameserver.receive, Nameserver, nameserver, onReceive);
-    }
-
-    fn onReceive(nameserver: *Nameserver, result: Io.RecvFromError!Io.Datagram) void {
-        // The run ends with the server's drain; nothing cancels this.
-        const datagram = result catch unreachable;
-        nameserver.answer(nameserver.buffer[0..datagram.len], &datagram.peer);
-        nameserver.io.recvFrom(nameserver.socket, &nameserver.buffer, &nameserver.receive, Nameserver, nameserver, onReceive);
-    }
-
-    fn answer(nameserver: *Nameserver, bytes: []const u8, peer: *const IpAddress) void {
-        // A corrupted datagram may be no query at all.
-        const question = message.readQuery(bytes) orelse return;
-        nameserver.zone.queries_seen += 1;
-        const addresses = nameserver.zone.addressesAt(nameserver.io.nowNs());
-        switch (nameserver.zone.behaviors[nameserver.index]) {
-            .silent => {},
-            .answer => nameserver.reply(&question, &.{ .addresses = addresses, .ttl_s = nameserver.zone.ttl_s }, peer),
-            .servfail => nameserver.reply(&question, &.{ .rcode = 2 }, peer),
-            .nxdomain => nameserver.reply(&question, &.{ .rcode = 3 }, peer),
-            .truncated => nameserver.reply(&question, &.{ .truncated = true, .addresses = addresses }, peer),
-            .wrong_id_first => {
-                nameserver.reply(&question, &.{ .addresses = &.{ip("10.66.0.66:9000")}, .id = question.id +% 1 }, peer);
-                nameserver.reply(&question, &.{ .addresses = addresses, .ttl_s = nameserver.zone.ttl_s }, peer);
-            },
-        }
-    }
-
-    fn reply(nameserver: *Nameserver, question: *const message.Question, script: *const message.Answer, peer: *const IpAddress) void {
-        // A nameserver with every send out drops the query, as a busy one
-        // would; the resolver's timeout is what answers that.
-        const send = for (&nameserver.sends) |*send| {
-            if (!send.armed) break send;
-        } else return;
-        const bytes = message.writeReply(&send.bytes, question, script);
-        send.armed = true;
-        nameserver.io.sendTo(nameserver.socket, bytes, 0, peer, &send.completion, Send, send, onSend);
-    }
-
-    fn onSend(send: *Send, result: Io.SendToError!u32) void {
-        // A reply the network lost is the resolver's timeout to answer,
-        // which is what these scenarios hold it to.
-        _ = result catch {};
-        assert(send.armed);
-        send.armed = false;
-    }
-};
+const scripted = @import("../testing/nameserver.zig");
+const Behavior = scripted.Behavior;
+const Zone = scripted.Zone;
+const Nameserver = scripted.Nameserver(SimIo);
 
 /// A server whose one cluster follows `api.test`, starting at 10.0.0.1,
 /// beside a literal of its own when `literal` says so.
@@ -156,6 +49,7 @@ const Scenario = struct {
     config: config_module.Config,
     server: ServerSim,
     zone: Zone,
+    behaviors: [2]Behavior,
     nameservers: [2]Nameserver,
 
     const Settings = struct {
@@ -205,14 +99,15 @@ const Scenario = struct {
         });
         try scenario.server.init(arena, &scenario.sim_io, &scenario.config, limits);
         try scenario.server.bindExtensions(&.{ .arena = arena });
+        scenario.behaviors = settings.behaviors;
         scenario.zone = .{
             .phases = settings.phases,
-            .behaviors = settings.behaviors,
+            .behaviors = &scenario.behaviors,
             .start_ns = scenario.sim_io.nowNs(),
             .ttl_s = settings.ttl_s,
         };
         for (&scenario.nameservers, 0..) |*nameserver, index| {
-            try nameserver.start(&scenario.sim_io, &scenario.zone, @intCast(index));
+            try nameserver.start(&scenario.sim_io, &scenario.zone, @intCast(index), nameserver_addresses[index]);
         }
         try scenario.server.start();
     }
