@@ -523,14 +523,6 @@ const uncovered = [_]Uncovered{
             "reads this counter off the shipped binary",
     },
     .{
-        .name = "tls_client_cert_refused",
-        .why = .unreached,
-        .reason = "no listener in the sweep asks for a client certificate " ++
-            "(#304); engine_test drives every refusal — none presented " ++
-            "where one is required, a chain to another CA — and " ++
-            "server_test counts one end to end through the transport",
-    },
-    .{
         .name = "l7_no_route",
         .why = .unreached,
         .reason = "the sim's route table is a single \"/\" prefix, which no " ++
@@ -828,6 +820,9 @@ const Census = struct {
     /// Handshakes shown each of a #297 listener's certificates — the
     /// default, the P-384 one, the second P-256 one — by the name asked.
     certificates_shown: [3]u64 = @splat(0),
+    /// Requests an origin received carrying a verified client's
+    /// fingerprint (#304): mutual TLS, end to end.
+    client_certs_forwarded: u64 = 0,
 
     const Population = enum(u8) {
         http1,
@@ -877,6 +872,7 @@ const Census = struct {
             if (announced == .ip6) census.upstream_ip6_announced += 1;
         }
         assert(census.upstream_ip6_announced >= ip6_before);
+        census.client_certs_forwarded += harness.origin_http.client_certs_verified;
         if (harness.tls_sni) {
             for (&census.certificates_shown, harness.tls_choices_shown) |*total, shown| total.* += shown;
         }
@@ -912,6 +908,10 @@ const Census = struct {
             return false;
         }
         assert(std.mem.min(u64, &census.certificates_shown) >= 1);
+        if (census.client_certs_forwarded == 0) {
+            std.debug.print("sim census: no origin received a verified client's fingerprint (#304)\n", .{});
+            return false;
+        }
         return true;
     }
 

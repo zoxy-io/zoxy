@@ -521,9 +521,14 @@ pub fn Client(comptime IoType: type) type {
                 if (!client.clean) continue;
                 // A clean seed meets no adversary: every stream is answered,
                 // whole, by its origin, which answers a POST only once its
-                // body is in, so none is stopped.
+                // body is in, so none is stopped — but one whose half ends
+                // with trailers (§7). Its END_STREAM rides them, so the
+                // answer can finish before the server has read them, and
+                // RST_STREAM(NO_ERROR) then ends the half it no longer
+                // wants (RFC 9113 §8.1); the trailers go no further anyway.
                 if (answer.status != 200 or !answer.ended) return error.GoldenOutcomeMissed;
-                if (answer.reset or answer.stopped) return error.GoldenOutcomeMissed;
+                if (answer.reset) return error.GoldenOutcomeMissed;
+                if (answer.stopped and !plan.trailers) return error.GoldenOutcomeMissed;
             }
         }
 
