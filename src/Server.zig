@@ -3311,7 +3311,16 @@ pub fn Server(comptime runtime: Runtime) type {
                 // Only once a key is installed: before that the engine
                 // would offer resumption it could not honour, and every
                 // ticket it opened would be one it never sealed.
-                .tickets = if (server.tls_tickets.ready()) &server.tls_tickets else null,
+                //
+                // And never where the listener asks for client
+                // certificates (#304): a ticket seals the PSK alone, and
+                // a resumed handshake asks for no certificate (RFC 8446
+                // §4.3.2), so a resumed session would reach the origin
+                // with no identity at all — on a `required` listener, an
+                // unauthenticated session of exactly the kind it exists
+                // to refuse. No keys means no ticket issued, and none
+                // opened.
+                .tickets = if (client_ca == null and server.tls_tickets.ready()) &server.tls_tickets else null,
                 .now_unix = server.nowUnix(),
                 .alpn_protocols = alpn_protocols,
                 .client_auth = if (client_ca) |ca| .{
@@ -4204,11 +4213,20 @@ pub fn Server(comptime runtime: Runtime) type {
                 );
                 return;
             }
-            // A refusal's alert has drained: there is nothing left to say
-            // and nothing to read, so the connection ends here.
+            // A refusal's alert has drained: there is nothing left to say.
+            // The client may still be talking, though — a TLS 1.3 client
+            // sends its first request straight after its Finished, before
+            // it can know a `certificate_required` (#304) is coming — and
+            // closing on bytes not read is a reset, which can overtake the
+            // alert and leave the client nothing but a dead connection. So
+            // the close lingers (§7): the write side ends, what arrives is
+            // discarded, and the client's own end — or the deadline the
+            // TLS phase already runs under — finishes it.
             if (engine.isRefused()) {
                 assert(!engine.isConnected());
-                server.beginTeardown(conn);
+                assert(conn.armed.deadline);
+                server.io.shutdown(conn.clientSocket(), .write);
+                server.armTlsRefusalDrain(conn);
                 return;
             }
             assert(conn.tls_session_up or !engine.isConnected());
@@ -4217,6 +4235,44 @@ pub fn Server(comptime runtime: Runtime) type {
             } else {
                 server.armTlsRecv(conn);
             }
+        }
+
+        /// One discarding read of a refused connection's lingering close,
+        /// into the shared drain sink (§7) — nobody reads what lands.
+        fn armTlsRefusalDrain(server: *Self, conn: *ConnType) void {
+            assert(conn.state == .tls_handshaking);
+            assert(conn.tls.?.isRefused());
+            conn.stream.arm(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
+            server.io.recv(
+                conn.clientSocket(),
+                server.drainSink(),
+                &conn.stream.op_data_client_to_upstream.completion,
+                ConnType,
+                conn,
+                onTlsRefusalDrainRecv,
+            );
+        }
+
+        fn onTlsRefusalDrainRecv(conn: *ConnType, result: Io.RecvError!u32) void {
+            const server = conn.server;
+            conn.stream.delivered(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
+            if (conn.isTearingDown()) {
+                server.continueTeardown(conn);
+                return;
+            }
+            assert(conn.state == .tls_handshaking);
+            assert(conn.tls.?.isRefused());
+            const discarded = result catch |err| {
+                // EOF or error: the client's side is done, so the close is
+                // a FIN rather than a reset. Pressure on the read is still
+                // witnessed (§8), as every drain's is.
+                server.witnessKernelPressure(.recv, err);
+                server.beginTeardown(conn);
+                return;
+            };
+            // Landed in the sink, which nobody reads.
+            assert(discarded >= 1);
+            server.armTlsRefusalDrain(conn);
         }
 
         /// Issue this session's NewSessionTickets, returning whether any

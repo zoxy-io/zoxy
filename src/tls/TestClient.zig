@@ -63,6 +63,11 @@ const ticket_identity_bytes_max: usize = 512;
 
 /// Generic over the Io backend so the simulator and any socket-backed
 /// test drive the same client.
+/// What a client presents to a CertificateRequest (#304): a loaded
+/// `Credentials`' `inner`, named here so a gate outside `src/tls/` can hold
+/// one without importing zssl.
+pub const ClientIdentity = zssl.Credentials;
+
 pub fn TestClient(comptime IoType: type) type {
     return struct {
         io: *IoType,
@@ -744,8 +749,23 @@ pub fn TestClient(comptime IoType: type) type {
         /// alert byte says which one this was.
         pub fn refusedForAlpn(client: *const Self) bool {
             const description = client.hs.peer_alert_description orelse return false;
+            // Only ALPN's refusal is bound to come before the client's
+            // Finished; `certificate_required` (#304) comes after it.
+            if (description != @backingInt(zssl.alert.Description.no_application_protocol)) return false;
             assert(!client.handshake_done);
-            return description == @backingInt(zssl.alert.Description.no_application_protocol);
+            return true;
+        }
+
+        /// The server refused this client's certificate (#304): none
+        /// presented where its listener requires one (`certificate_required`,
+        /// sent after the client's Finished, so the handshake may look done
+        /// from here), or a chain that did not verify (`bad_certificate`).
+        pub fn refusedForClientCertificate(client: *const Self) bool {
+            const description = client.hs.peer_alert_description orelse return false;
+            const required = @backingInt(zssl.alert.Description.certificate_required);
+            const bad = @backingInt(zssl.alert.Description.bad_certificate);
+            assert(required != bad);
+            return description == required or description == bad;
         }
 
         /// The ticket this session was issued, for a later client to offer
