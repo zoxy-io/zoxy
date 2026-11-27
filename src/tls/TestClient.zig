@@ -254,11 +254,15 @@ pub fn TestClient(comptime IoType: type) type {
             client.hs = .init(&.{
                 .client_random = options.random,
                 .x25519_private = options.x25519_seed,
-                .server_name = options.host_name,
-                // The test fixtures are self-signed and these gates are
-                // about zoxy's record layer, not this client's trust
-                // decisions — the same call the smoke client makes.
-                .certificate_policy = .insecure_no_verification,
+                // Empty names nothing: a hello with no `server_name` at all.
+                .server_name = if (options.host_name.len == 0) null else options.host_name,
+                // The fixtures are self-signed, so no chain or name is
+                // checked — these gates are about zoxy's handshakes and
+                // record layer, not this client's trust decisions. The
+                // leaf's signature is: the server proves it holds the key
+                // of the certificate it showed, and that key is kept for
+                // a gate asking which certificate a name chose (#297).
+                .certificate_policy = .leaf_signature,
                 .resume_session = if (options.resume_with) |ticket|
                     ticket.resumption()
                 else
@@ -713,6 +717,18 @@ pub fn TestClient(comptime IoType: type) type {
         /// there — what a scenario asks before deciding it may wind down.
         pub fn isEnded(client: *const Self) bool {
             return client.ended;
+        }
+
+        /// The public key the server's leaf carried (#297), as
+        /// `std.crypto.Certificate` reads one out of a leaf: for a gate that
+        /// asks which certificate a name chose. Null when no Certificate
+        /// arrived, as on a resumed session.
+        pub fn serverPublicKey(client: *const Self) ?[]const u8 {
+            const peer = &client.hs.peer;
+            if (!peer.seen or peer.empty) return null;
+            assert(peer.key_bytes <= peer.key.len);
+            assert(peer.kind != .none);
+            return peer.publicKey();
         }
 
         /// The protocol the server selected from `Options.alpn`, or null if

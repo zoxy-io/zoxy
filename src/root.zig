@@ -118,6 +118,16 @@ pub const tls = struct {
         /// The certificate's SAN: a client offering any other name fails
         /// verification for a reason unrelated to what is under test.
         pub const host_name = "spike.zoxy.test";
+        /// A P-384 pair for `p384_host_name`, and a second P-256 one for
+        /// `origin_host_name` (#297): what a listener holding several
+        /// certificates chooses among. ECDSA both, so a seeded handshake
+        /// on either replays byte-exact, as an RSA-PSS one cannot.
+        pub const p384_cert_pem = @embedFile("tls/testdata/p384-cert.pem");
+        pub const p384_key_pem = @embedFile("tls/testdata/p384-key.pem");
+        pub const p384_host_name = "p384.zoxy.test";
+        pub const origin_cert_pem = @embedFile("tls/testdata/origin-cert.pem");
+        pub const origin_key_pem = @embedFile("tls/testdata/origin-key.pem");
+        pub const origin_host_name = "origin.zoxy.test";
     };
 };
 /// Shared test-support harness pieces, factored out so multiple test

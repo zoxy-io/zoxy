@@ -1603,7 +1603,8 @@ external binaries. They and the speed gates run at merge.
     - L4 echo clients;
     - L7 request scripts;
     - h2c clients, including flooders;
-    - TLS clients, including resumers across key rotation;
+    - TLS clients, including resumers across key rotation, each naming
+      one of the listener's certificates, an unknown name, or none;
     - admin scrapers, on a third of seeds: each reads the exposition to
       the plane's FIN, and some hold their half open for the drain to
       tear down.
@@ -1631,6 +1632,8 @@ external binaries. They and the speed gates run at merge.
       last, the observed client, written bare in either family;
     - a scrape is the admin head and a prefix of a well-formed
       exposition, each counter in order at no more than its final value;
+    - a handshake shown a certificate was shown the one its name chooses,
+      and proved it holds that certificate's key;
     - a request's trailer section reaches its origin iff its head owes
       one: HTTP/1.1's relayed, a managed field's or an HTTP/2 or HTTP/3
       client's never;
@@ -1644,7 +1647,8 @@ external binaries. They and the speed gates run at merge.
     counter and every seam op kind. Each client population (HTTP/1.1,
     HTTP/2, HTTP/3) must also hear an origin's trailer section and have
     a request that ended with one answered, and an IPv6 client must be
-    announced to an origin and forwarded to one.
+    announced to an origin and forwarded to one, and every certificate of
+    a listener that holds several must be chosen by a name.
     - Exemptions are named, each with its reason.
     - An exemption that *does* fire fails the census too, so widening a
       scenario deletes its excuse.
@@ -1657,8 +1661,13 @@ external binaries. They and the speed gates run at merge.
     feature no seed turns on. The report does not gate; a gap in it
     should either be named in the list below or be a scenario to widen.
   - **Not swept, covered by directed tests and the live gate instead:**
-    - HTTP/2 to origins, HTTPS clusters, SNI routing and certificate
-      selection, RSA, mutual TLS, and gRPC deadlines;
+    - HTTP/2 to origins, HTTPS clusters, SNI routing, mutual TLS, and
+      gRPC deadlines;
+    - RSA: an RSA-PSS signature draws a fresh salt, so no seeded
+      handshake on an RSA key replays byte-exact — and with it the choice
+      between key types; certificate selection's wildcard tier and its
+      QUIC path (the HTTP/3 client names one host) are directed tests'
+      too;
     - clusters that follow names, whose resolver runs under `SimIo`
       against scripted nameservers and the datagram adversary in
       `dns/resolver_test.zig`.

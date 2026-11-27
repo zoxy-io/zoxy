@@ -825,6 +825,9 @@ const Census = struct {
     /// Forwarded-for chains (§7) an origin read ending in an IPv6 client,
     /// exactly as `bareAddress` writes one.
     forwarded_ip6_verified: u64 = 0,
+    /// Handshakes shown each of a #297 listener's certificates — the
+    /// default, the P-384 one, the second P-256 one — by the name asked.
+    certificates_shown: [3]u64 = @splat(0),
 
     const Population = enum(u8) {
         http1,
@@ -874,6 +877,9 @@ const Census = struct {
             if (announced == .ip6) census.upstream_ip6_announced += 1;
         }
         assert(census.upstream_ip6_announced >= ip6_before);
+        if (harness.tls_sni) {
+            for (&census.certificates_shown, harness.tls_choices_shown) |*total, shown| total.* += shown;
+        }
         const forwarded_before = census.forwarded_ip6_verified;
         census.forwarded_ip6_verified += harness.origin_http.forwarded_ip6_verified;
         assert(census.forwarded_ip6_verified >= forwarded_before);
@@ -894,6 +900,19 @@ const Census = struct {
         }
         assert(held == (census.upstream_ip6_announced >= 1 and census.forwarded_ip6_verified >= 1));
         return held;
+    }
+
+    /// Every certificate of a #297 listener must be chosen by a name
+    /// somewhere in the range: one no name reaches is a choice
+    /// `certificate_set.select` never made under the adversary.
+    fn verifyCertificates(census: *const Census) bool {
+        for (census.certificates_shown, 0..) |shown, choice| {
+            if (shown >= 1) continue;
+            std.debug.print("sim census: no handshake was shown certificate {d} of a #297 listener\n", .{choice});
+            return false;
+        }
+        assert(std.mem.min(u64, &census.certificates_shown) >= 1);
+        return true;
     }
 
     /// Run only on a seed whose `verify` passed, as every tally here is:
@@ -1002,7 +1021,8 @@ const Census = struct {
             census.verifyProbeRounds();
         const trailers_held = census.verifyTrailers();
         const ip6_held = census.verifyIp6();
-        return census.verifyBodies() and ops_held and extensions_held and trailers_held and ip6_held and held;
+        const certificates_held = census.verifyCertificates();
+        return census.verifyBodies() and ops_held and extensions_held and trailers_held and ip6_held and certificates_held and held;
     }
 
     /// Every counter the scripted extensions declare moved somewhere in
