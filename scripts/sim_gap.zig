@@ -59,7 +59,6 @@ const placements = [_]Placement{
     .{ .path = "dns/startup.zig", .bucket = .startup, .reason = "the first answer for a name, before Server.init" },
     .{ .path = "main.zig", .bucket = .outside, .reason = "the CLI; the sim builds a Server directly" },
     .{ .path = "io/XevIo.zig", .bucket = .outside, .reason = "the real backend; the sim runs SimIo" },
-    .{ .path = "admin.zig", .bucket = .outside, .reason = "the sweep configures no admin listener" },
     .{
         .path = "tls/libcrypto_heap.zig",
         .bucket = .outside,

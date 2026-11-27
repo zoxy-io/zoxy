@@ -1603,7 +1603,10 @@ external binaries. They and the speed gates run at merge.
     - L4 echo clients;
     - L7 request scripts;
     - h2c clients, including flooders;
-    - TLS clients, including resumers across key rotation.
+    - TLS clients, including resumers across key rotation;
+    - admin scrapers, on a third of seeds: each reads the exposition to
+      the plane's FIN, and some hold their half open for the drain to
+      tear down.
   - **Clean seeds.** A quarter of seeds run with no adversary and must
     reach each script's exact golden outcome.
   - **Replay.** Every seed runs twice, and the two trace hashes must
@@ -1626,6 +1629,8 @@ external binaries. They and the speed gates run at merge.
     - no origin receives a malformed byte;
     - a forwarded-for chain holds only the hops a script claimed and,
       last, the observed client, written bare in either family;
+    - a scrape is the admin head and a prefix of a well-formed
+      exposition, each counter in order at no more than its final value;
     - a request's trailer section reaches its origin iff its head owes
       one: HTTP/1.1's relayed, a managed field's or an HTTP/2 or HTTP/3
       client's never;

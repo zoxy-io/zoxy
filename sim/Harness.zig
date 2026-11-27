@@ -17,6 +17,7 @@ const std = @import("std");
 
 const zoxy = @import("zoxy");
 
+const admin = @import("admin.zig");
 const l4 = @import("l4.zig");
 const l7 = @import("l7.zig");
 
@@ -43,6 +44,7 @@ const HttpClient = l7.Client(SimIo);
 const H2Client = l7.H2Client(SimIo);
 const H3Client = l7.H3Client(SimIo);
 const EchoClient = l4.Client(SimIo);
+const AdminScraper = admin.Scraper(SimIo);
 const TlsClient = zoxy.tls.TestClient(SimIo);
 
 const assert = std.debug.assert;
@@ -137,6 +139,8 @@ const announced_network = [3]u8{ 203, 0, 113 };
 const denied_network = [3]u8{ 192, 0, 2 };
 /// Virtual time from scenario start after which stuck work is force-ended.
 const scenario_end_ns: u64 = 2_000_000_000;
+/// Scrapers one seed sends the admin listener at most.
+const admin_scrapers_max: u8 = 2;
 /// How far a #202 seed steps the wall clock: one whole rotation interval
 /// plus a second, so the key is unambiguously overdue rather than
 /// balanced on the boundary the directed tests already pin.
@@ -264,6 +268,10 @@ h2_count: u8,
 /// and drew one. Drawn from `h3_prng`, so no other draw of a seed moves.
 h3_clients: [h3_clients_max]H3Client,
 h3_count: u8,
+/// The admin plane's population (§8): scrapers of the metrics listener,
+/// on a seed that binds one. From the arena, since each holds a whole
+/// response; drawn from a stream of their own, so no other draw moves.
+admin_scrapers: []AdminScraper,
 quic_http: bool,
 quic_connections: u32,
 h3_prng: std.Random.DefaultPrng,
@@ -652,6 +660,7 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
     }
     harness.drain_at_ns = deriveDrainAt(harness.clean, random);
     harness.deriveTopology(random);
+    try harness.drawAdmin(arena, seed);
     try harness.startServerAndOrigins(arena, random);
     harness.injectOneShotFaults(random);
     harness.populateClients(random);
@@ -2252,6 +2261,32 @@ fn deriveInitOptions(harness: *const Harness, random: std.Random) ServerSim.Init
         };
 }
 
+/// A third of seeds bind the admin listener (§8) and scrape it once or
+/// twice. On an adversarial seed a scraper may hold its half open after
+/// the plane's FIN, so the plane is still draining it when the scenario's
+/// drain tears it down; a clean seed's read to the end and close.
+fn drawAdmin(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
+    var admin_prng = std.Random.DefaultPrng.init(seed ^ 0x0008_0008_0008_0008);
+    const random = admin_prng.random();
+    harness.admin_scrapers = &.{};
+    if (random.uintLessThan(u8, 3) != 0) return;
+    const count = 1 + random.uintLessThan(u8, admin_scrapers_max);
+    assert(count >= 1);
+    assert(count <= admin_scrapers_max);
+    harness.admin_scrapers = try arena.alloc(AdminScraper, count);
+    for (harness.admin_scrapers) |*scraper| {
+        scraper.* = .{};
+        const hold = !harness.clean and random.boolean();
+        scraper.prepare(&harness.io, admin_address, hold, harness.clean);
+        scraper.on_ended = clientEndedHook;
+        scraper.context = harness;
+    }
+    assert(harness.admin_scrapers.len <= admin_scrapers_max);
+}
+
+/// The admin listener's bind, apart from every data-path address.
+const admin_address: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9100 } };
+
 fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: std.Random) !void {
     // Resolved by the library, as every build's options are: a seed whose
     // draws make a config zoxy would refuse fails here, by name, rather
@@ -2277,6 +2312,7 @@ fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: st
             harness.tls_credentials[0..harness.listeners_count],
         );
     }
+    if (harness.admin_scrapers.len > 0) harness.server.setAdminBind(admin_address);
     try harness.server.start();
 
     harness.origin = .{
@@ -2411,7 +2447,8 @@ fn populateClients(harness: *Harness, random: std.Random) void {
     const plaintext_count = 1 + random.uintLessThan(u8, clients_max);
     // The terminating clients are part of the population the wind-down
     // waits on, so they join the count `clientEnded` compares against.
-    harness.clients_count = plaintext_count + harness.tls_clients + harness.h3_count;
+    harness.clients_count = plaintext_count + harness.tls_clients + harness.h3_count +
+        @as(u8, @intCast(harness.admin_scrapers.len));
     harness.l4_count = 0;
     harness.l7_count = 0;
     harness.h2_count = 0;
@@ -2487,7 +2524,7 @@ fn populateClients(harness: *Harness, random: std.Random) void {
     }
     harness.prepareH3Clients();
     assert(harness.l4_count + harness.l7_count + harness.h2_count + harness.tls_clients +
-        harness.h3_count == harness.clients_count);
+        harness.h3_count + harness.admin_scrapers.len == harness.clients_count);
 }
 
 /// The HTTP/3 population (#449): each client's requests drawn as HTTP/2's
@@ -2660,10 +2697,11 @@ fn recordAnnounced(harness: *Harness, l4_index: u8, network: [3]u8, octet: u8, p
 pub fn startClients(harness: *Harness) void {
     assert(harness.clients_count >= 1);
     assert(harness.l4_count + harness.l7_count + harness.h2_count + harness.tls_clients +
-        harness.h3_count == harness.clients_count);
+        harness.h3_count + harness.admin_scrapers.len == harness.clients_count);
     for (harness.clients[0..harness.l4_count]) |*client| {
         client.begin();
     }
+    for (harness.admin_scrapers) |*scraper| scraper.begin();
     for (harness.l7_clients[0..harness.l7_count]) |*client| {
         client.begin();
     }
@@ -3274,6 +3312,7 @@ fn endScenario(harness: *Harness) void {
     for (harness.tls_clients_storage[0..harness.tls_clients_live]) |*client| {
         client.cancelIfStuck();
     }
+    for (harness.admin_scrapers) |*scraper| scraper.cancelIfStuck();
     harness.server.beginDrain();
     harness.armTeardownStrand();
     harness.origin.stopListening();
@@ -3320,6 +3359,7 @@ pub fn verify(harness: *Harness) !void {
     for (harness.h3_clients[0..harness.h3_count]) |*client| {
         client.closeIfOpen();
     }
+    for (harness.admin_scrapers) |*scraper| scraper.closeIfOpen();
     harness.origin.closeRemaining();
     harness.origin_http.closeRemaining();
 
@@ -3379,6 +3419,7 @@ pub fn verify(harness: *Harness) !void {
     for (harness.h3_clients[0..harness.h3_count]) |*client| {
         try client.verify(max_lifetime_ns);
     }
+    for (harness.admin_scrapers) |*scraper| try scraper.verify(&harness.server.counters);
     try harness.verifyTlsSessions();
 }
 
