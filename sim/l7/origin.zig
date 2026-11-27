@@ -90,6 +90,16 @@ pub fn HttpOrigin(comptime IoType: type) type {
         /// Marked bodies that arrived whole: the census's proof that the
         /// check above ever ran.
         bodies_verified: u32 = 0,
+        /// Chunked request bodies whose trailer section was not what
+        /// their head owed (§7): one missing, one that should not have
+        /// come, or the wrong bytes. Checked by the harness verify.
+        trailer_mismatches: u32 = 0,
+        /// Owed trailer sections that arrived exactly: the census's proof
+        /// that HTTP/1.1's relay of a request's trailers was walked.
+        trailers_verified: u32 = 0,
+        /// Where a chunked body is dechunked for its trailer check, so
+        /// the wire it is read from stays as it came for the mark check.
+        scratch: [request_buffer_bytes]u8 = undefined,
 
         const Self = @This();
         /// Sized for the HTTP/1.1 worst case: client-driven dials (fresh,
@@ -150,6 +160,10 @@ pub fn HttpOrigin(comptime IoType: type) type {
             chunk_scanner: parser.ChunkedScanner = .{},
             /// The request in flight's body mark, if it carries one.
             marked: ?MarkedBody = null,
+            /// Where the request in flight's body starts in the buffer.
+            body_start: u32 = 0,
+            /// The request in flight's head said a trailer section comes.
+            trailer_owed: bool = false,
             mode: OriginMode = .sized,
             /// What this connection answers with, per its mode.
             response_bytes: []const u8 = canon.sized_response,
@@ -378,6 +392,11 @@ pub fn HttpOrigin(comptime IoType: type) type {
                 }
                 conn.request_offset += request.head_len;
                 assert(conn.request_offset <= conn.request_len);
+                conn.body_start = conn.request_offset;
+                conn.trailer_owed = if (parser.headerValue(request.headers, canon.request_trailer_owed_header)) |value|
+                    std.mem.eql(u8, value, "1")
+                else
+                    false;
                 conn.marked = null;
                 if (parser.headerValue(request.headers, canon.request_body_header)) |value| {
                     conn.marked = markedBody(value, &request, conn.request_offset) orelse {
@@ -433,6 +452,39 @@ pub fn HttpOrigin(comptime IoType: type) type {
                 return true;
             }
 
+            /// A whole request's trailer section is what its head owed (§7):
+            /// exactly the canonical one where the head says one comes,
+            /// none where it does not. A length-delimited body has nowhere
+            /// to carry one, so it may not be owed one. Dechunked from a
+            /// copy, so the mark check after it reads the wire as it came.
+            fn trailersMatch(conn: *Conn) bool {
+                assert(conn.phase == .body);
+                assert(conn.body_start <= conn.request_offset);
+                if (conn.framing_tag != .chunked) return !conn.trailer_owed;
+                const wire = conn.request_buffer[conn.body_start..conn.request_offset];
+                const copy = conn.origin.scratch[0..wire.len];
+                @memcpy(copy, wire);
+                // `consumeBody`'s scanner already passed these octets as a
+                // whole chunked body, and this is the same scanner: either
+                // failure below is a framing violation, so it is counted as
+                // one rather than as a trailer that came wrong.
+                var scanner: parser.ChunkedScanner = .{};
+                const dechunked = scanner.dechunk(copy) catch {
+                    conn.origin.violations += 1;
+                    return false;
+                };
+                if (!dechunked.done) {
+                    conn.origin.violations += 1;
+                    return false;
+                }
+                assert(dechunked.trailer_len <= dechunked.consumed);
+                const section = copy[dechunked.consumed - dechunked.trailer_len .. dechunked.consumed];
+                const expected = if (conn.trailer_owed) canon.request_trailer_section else canon.empty_trailer_section;
+                if (!std.mem.eql(u8, section, expected)) return false;
+                if (conn.trailer_owed) conn.origin.trailers_verified += 1;
+                return true;
+            }
+
             /// Returns true when the body completed and the phase moved
             /// on; false when it armed a recv or closed on a violation.
             fn consumeBody(conn: *Conn) bool {
@@ -469,6 +521,12 @@ pub fn HttpOrigin(comptime IoType: type) type {
                     },
                 }
                 assert(conn.request_offset <= conn.request_len);
+                const violations_before = conn.origin.violations;
+                if (!conn.trailersMatch()) {
+                    if (conn.origin.violations == violations_before) conn.origin.trailer_mismatches += 1;
+                    conn.close();
+                    return false;
+                }
                 if (conn.marked) |marked| {
                     if (!conn.bodyMatches(marked)) {
                         conn.origin.body_mismatches += 1;

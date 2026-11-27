@@ -1621,14 +1621,20 @@ external binaries. They and the speed gates run at merge.
     - counters reconcile (§8);
     - no completion reaches a freed slot;
     - the access log equals the counted outcomes;
-    - no origin receives a malformed byte.
+    - no origin receives a malformed byte;
+    - a request's trailer section reaches its origin iff its head owes
+      one: HTTP/1.1's relayed, a managed field's or an HTTP/2 or HTTP/3
+      client's never;
+    - a whole answer carries an origin's trailer section iff its head
+      owes one, as HTTP/1.1's relay or as trailing HEADERS.
   - **Missing completions.** The adversary can withhold an armed op or
     an op submitted during teardown. The drain may then exit through
     its diagnostic or watchdog backstop (§8). The simulator checks that
     sockets referenced by pending ops are still live at that exit.
   - **The census.** A sweep of at least 4096 seeds must fire every
-    counter and every seam op kind, and bring each client population
-    (HTTP/1.1, HTTP/2, HTTP/3) a trailer section its oracle judged.
+    counter and every seam op kind. Each client population (HTTP/1.1,
+    HTTP/2, HTTP/3) must also hear an origin's trailer section and have
+    a request that ended with one answered.
     - Exemptions are named, each with its reason.
     - An exemption that *does* fire fails the census too, so widening a
       scenario deletes its excuse.
@@ -1643,10 +1649,6 @@ external binaries. They and the speed gates run at merge.
   - **Not swept, covered by directed tests and the live gate instead:**
     - HTTP/2 to origins, HTTPS clusters, SNI routing and certificate
       selection, RSA, mutual TLS, and gRPC deadlines;
-    - request trailers, in every protocol: no script sends one. An
-      origin's trailers are swept: one origin mode ends its chunked
-      answer with a section its head announces, and every client demands
-      it on a whole answer;
     - IPv6: every address a seed uses is IPv4, so the TCP6 forms of the
       PROXY header are never written;
     - clusters that follow names, whose resolver runs under `SimIo`

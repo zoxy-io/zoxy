@@ -2370,7 +2370,9 @@ fn prepareH2Client(harness: *Harness, random: std.Random) void {
 /// (#437), evenly, by a coin from `consult_random`, so no other draw of
 /// the seed's moves for it. A body is short or up to the largest, evenly,
 /// so seeds meet both one small frame and frames past a small relay
-/// buffer's room. It is cut into up to `h2_body_frames_max` DATA frames.
+/// buffer's room. It is cut into up to `h2_body_frames_max` DATA frames,
+/// and half of POSTs end their half with a trailer section instead of the
+/// last frame's END_STREAM (§7).
 fn drawH2Plan(random: std.Random, consult_random: std.Random) l7.H2Plan {
     if (random.boolean()) {
         const ask: l7.H2Ask = if (consult_random.boolean()) .consult_get else .get;
@@ -2385,6 +2387,8 @@ fn drawH2Plan(random: std.Random, consult_random: std.Random) l7.H2Plan {
         .ask = ask,
         .body_len = body_len,
         .frames = 1 + random.uintLessThan(u8, frames_max),
+        // §7: a client's request trailers end its half and go no further.
+        .trailers = random.boolean(),
     };
     assert(plan.frames <= plan.body_len);
     assert(plan.body_len <= l7.h2_body_bytes_max);
@@ -3284,6 +3288,10 @@ pub fn verify(harness: *Harness) !void {
     if (harness.origin_http.violations != 0) return error.OriginSawMalformedBytes;
     // #373: a marked body reaches its origin exactly as its client sent it.
     if (harness.origin_http.body_mismatches != 0) return error.OriginSawWrongBody;
+    // §7: a request's trailer section reaches its origin iff its head owed
+    // one — relayed whole from HTTP/1.1, never from HTTP/2 or HTTP/3, and
+    // never one that names a header the proxy manages.
+    if (harness.origin_http.trailer_mismatches != 0) return error.OriginSawWrongTrailers;
     // #142 send: on any seed, garbage where a header belongs is zoxy's
     // bug — the writers are pure and the adversary splits deliveries but
     // never corrupts bytes, so a cut lands as EOF, not as a violation.

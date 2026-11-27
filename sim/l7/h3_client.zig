@@ -53,6 +53,12 @@ pub const ClientError = error{
 /// The trailing origin's section as the test client keeps it.
 const canonical_trailer_line = canon.response_trailer_name ++ ": " ++ canon.response_trailer_value ++ "\r\n";
 
+/// A POST's trailer section, when its plan ends with one (§7): the proxy
+/// ends the request there and carries it no further.
+const request_trailers = [_]TestClient.Field{
+    .{ .name = canon.request_trailer_name, .value = canon.request_trailer_value },
+};
+
 /// `<length>.<salt>` at its widest, and a length's digits.
 const mark_bytes_max: u32 = 24;
 const length_bytes_max: u32 = 10;
@@ -137,7 +143,8 @@ pub fn Client(comptime IoType: type) type {
             }
             const body = client.bodies[index][0..plan.body_len];
             for (body, 0..) |*octet, position| octet.* = canon.requestBodyOctet(salt, @intCast(position));
-            return .{ .method = "POST", .path = plan.path(), .headers = headers[0..count], .body = body };
+            const trailers: []const TestClient.Field = if (plan.trailers) &request_trailers else &.{};
+            return .{ .method = "POST", .path = plan.path(), .headers = headers[0..count], .body = body, .trailers = trailers };
         }
 
         pub fn begin(client: *Self) void {
@@ -222,6 +229,18 @@ pub fn Client(comptime IoType: type) type {
             }
             assert(heard <= client.streams);
             return heard;
+        }
+
+        /// Streams that ended with a trailer section and were answered
+        /// whole, for the census (§9); read once `verify` has passed.
+        pub fn requestTrailersAnswered(client: *const Self) u32 {
+            assert(client.streams >= 1);
+            var answered: u32 = 0;
+            for (client.plans[0..client.streams], client.transport.answers[0..client.streams]) |plan, *answer| {
+                answered += @intFromBool(plan.trailers and answer.status == 200 and answer.finished and !answer.reset);
+            }
+            assert(answered <= client.streams);
+            return answered;
         }
 
         /// Trailers come once, after the whole chunked body, and say the

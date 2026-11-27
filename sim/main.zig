@@ -825,6 +825,12 @@ const Census = struct {
     /// counter says a trailer went through, so the census asks the
     /// clients whose oracles judged one.
     trailers_heard: [Population.count]u64 = @splat(0),
+    /// Requests that ended with a trailer section and were answered, by
+    /// population: HTTP/1.1's are the sections an origin read exactly as
+    /// their head owed them (its relay, reached); HTTP/2's and HTTP/3's
+    /// are streams answered whole after their trailers, which the origin's
+    /// oracle held to arriving without them (§7).
+    request_trailers: [Population.count]u64 = @splat(0),
 
     const Population = enum(u8) {
         http1,
@@ -883,6 +889,15 @@ const Census = struct {
             census.trailers_heard[@backingInt(Population.http3)] += client.trailersHeard();
         }
         for (before, census.trailers_heard) |earlier, now| assert(now >= earlier);
+        const requests_before = census.request_trailers;
+        census.request_trailers[@backingInt(Population.http1)] += harness.origin_http.trailers_verified;
+        for (harness.h2_clients[0..harness.h2_count]) |*client| {
+            census.request_trailers[@backingInt(Population.http2)] += client.requestTrailersAnswered();
+        }
+        for (harness.h3_clients[0..harness.h3_count]) |*client| {
+            census.request_trailers[@backingInt(Population.http3)] += client.requestTrailersAnswered();
+        }
+        for (requests_before, census.request_trailers) |earlier, now| assert(now >= earlier);
     }
 
     /// Every population must hear a trailer section somewhere in the
@@ -899,7 +914,17 @@ const Census = struct {
             );
             held = false;
         }
-        assert(held == (std.mem.min(u64, &census.trailers_heard) >= 1));
+        for (std.enums.values(Population), census.request_trailers) |population, answered| {
+            if (answered >= 1) continue;
+            std.debug.print(
+                "sim census: no {s} request trailer section was judged in this sweep " ++
+                    "(http1: read by an origin as owed; http2, http3: answered after one)\n",
+                .{@tagName(population)},
+            );
+            held = false;
+        }
+        assert(held == (std.mem.min(u64, &census.trailers_heard) >= 1 and
+            std.mem.min(u64, &census.request_trailers) >= 1));
         return held;
     }
 
@@ -1268,7 +1293,7 @@ fn checkCensus(options: *const Sweep, census: *const Census) bool {
         return true;
     }
     if (!census.verify(options.iterations)) return false;
-    std.debug.print("sim: census ok, {d} counter(s) fired, {d} exempt; {d} extension counter(s) fired; {d} seam op(s), {d} exempt; {d} body(ies) verified; trailers heard {d}/{d}/{d} (http1/2/3)\n", .{
+    std.debug.print("sim: census ok, {d} counter(s) fired, {d} exempt; {d} extension counter(s) fired; {d} seam op(s), {d} exempt; {d} body(ies) verified; trailers heard {d}/{d}/{d}, sent {d}/{d}/{d} (http1/2/3)\n", .{
         Counters.names.len - uncovered.len,
         uncovered.len,
         extension_counters.len,
@@ -1278,6 +1303,9 @@ fn checkCensus(options: *const Sweep, census: *const Census) bool {
         census.trailers_heard[@backingInt(Census.Population.http1)],
         census.trailers_heard[@backingInt(Census.Population.http2)],
         census.trailers_heard[@backingInt(Census.Population.http3)],
+        census.request_trailers[@backingInt(Census.Population.http1)],
+        census.request_trailers[@backingInt(Census.Population.http2)],
+        census.request_trailers[@backingInt(Census.Population.http3)],
     });
     return true;
 }
