@@ -711,6 +711,11 @@ const Census = struct {
     /// gRPC calls an HTTP/2 client heard answered at their deadline (§8),
     /// Trailers-Only with `grpc-status: 4`.
     grpc_deadlines_heard: u64 = 0,
+    /// HTTP/2 clients whose throttled stream the server filled to the
+    /// window and no further (RFC 9113 §6.9), and those that lowered their
+    /// HPACK table and heard the encoder's resize (RFC 7541 §4.2).
+    h2_windows_met: u64 = 0,
+    h2_table_resizes: u64 = 0,
 
     const Population = enum(u8) {
         http1,
@@ -812,6 +817,14 @@ const Census = struct {
             std.debug.print("sim census: no gRPC call was answered at its deadline (§8)\n", .{});
             return false;
         }
+        if (census.h2_windows_met == 0) {
+            std.debug.print("sim census: no HTTP/2 server send stopped at a client's window\n", .{});
+            return false;
+        }
+        if (census.h2_table_resizes == 0) {
+            std.debug.print("sim census: no HTTP/2 client heard its HPACK table resized\n", .{});
+            return false;
+        }
         return true;
     }
 
@@ -843,6 +856,9 @@ const Census = struct {
         }
         for (harness.h2_clients[0..harness.h2_count]) |*client| {
             census.grpc_deadlines_heard += client.grpcDeadlinesHeard();
+            const tuning = client.tuningHeard();
+            census.h2_windows_met += @intFromBool(tuning.window_met);
+            census.h2_table_resizes += @intFromBool(tuning.resized);
         }
         for (requests_before, census.request_trailers) |earlier, now| assert(now >= earlier);
     }
@@ -1242,7 +1258,7 @@ fn checkCensus(options: *const Sweep, census: *const Census) bool {
         return true;
     }
     if (!census.verify(options.iterations)) return false;
-    std.debug.print("sim: census ok, {d} counter(s) fired, {d} exempt; {d} extension counter(s) fired; {d} seam op(s), {d} exempt; {d} body(ies) verified; trailers heard {d}/{d}/{d}, sent {d}/{d}/{d} (http1/2/3); IPv6 clients {d} announced upstream, {d} forwarded\n", .{
+    std.debug.print("sim: census ok, {d} counter(s) fired, {d} exempt; {d} extension counter(s) fired; {d} seam op(s), {d} exempt; {d} body(ies) verified; trailers heard {d}/{d}/{d}, sent {d}/{d}/{d} (http1/2/3); IPv6 clients {d} announced upstream, {d} forwarded; HTTP/2 windows met {d}, table resizes heard {d}\n", .{
         Counters.names.len - uncovered.len,
         uncovered.len,
         extension_counters.len,
@@ -1257,6 +1273,8 @@ fn checkCensus(options: *const Sweep, census: *const Census) bool {
         census.request_trailers[@backingInt(Census.Population.http3)],
         census.upstream_ip6_announced,
         census.forwarded_ip6_verified,
+        census.h2_windows_met,
+        census.h2_table_resizes,
     });
     return true;
 }

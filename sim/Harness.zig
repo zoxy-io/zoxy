@@ -303,6 +303,9 @@ nameservers: [2]Nameserver,
 /// client's declared POSTs are gRPC calls its origin never answers, so the
 /// proxy's deadline answers them. Their own stream.
 grpc_prng: std.Random.DefaultPrng,
+/// RFC 9113 §6.5.2's SETTINGS an exchange client opens with: its own
+/// stream, so the tuning moves no other draw.
+h2_tuning_prng: std.Random.DefaultPrng,
 quic_http: bool,
 quic_connections: u32,
 h3_prng: std.Random.DefaultPrng,
@@ -2562,6 +2565,7 @@ const admin_address: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 
 /// already judges.
 fn drawHttpProtocol(harness: *Harness, seed: u64) void {
     harness.grpc_prng = std.Random.DefaultPrng.init(seed ^ 0x0004_0004_0004_0004);
+    harness.h2_tuning_prng = std.Random.DefaultPrng.init(seed ^ 0x0009_0113_0009_0113);
     var protocol_prng = std.Random.DefaultPrng.init(seed ^ 0x0275_0275_0275_0275);
     const random = protocol_prng.random();
     const roll = random.uintLessThan(u8, 8);
@@ -3187,9 +3191,35 @@ fn prepareH2Client(harness: *Harness, random: std.Random) void {
         plan.ask = .grpc_call;
         plan.trailers = false;
     }
-    client.prepare(&harness.io, httpBindAddress(), plans[0..streams], salt, harness.clean, mode);
+    client.prepare(&harness.io, httpBindAddress(), plans[0..streams], salt, harness.clean, mode, harness.drawH2Tuning(mode));
     client.on_ended = clientEndedHook;
     client.context = harness;
+}
+
+/// A throttled stream's window: under any canonical body, so a server
+/// that honours it must stop part-way and wait for credit.
+const h2_throttle_window: u32 = 5;
+
+/// What an exchange client's opening SETTINGS ask: a third throttle
+/// their streams to a few octets of window, granted more only once the
+/// first DATA is back, and a third lower their HPACK table — to nothing,
+/// or below the default — each independently. A flood's SETTINGS are its
+/// budget's, so it asks for nothing.
+fn drawH2Tuning(harness: *Harness, mode: l7.H2Mode) l7.H2Tuning {
+    const random = harness.h2_tuning_prng.random();
+    const throttle = random.uintLessThan(u8, 3) == 0;
+    const table = random.uintLessThan(u8, 3);
+    if (mode != .exchange) return .{};
+    const tuning: l7.H2Tuning = .{
+        .throttle_window = if (throttle) h2_throttle_window else null,
+        .header_table_size = switch (table) {
+            0 => 0,
+            1 => 256,
+            else => null,
+        },
+    };
+    assert(tuning.header_table_size orelse 0 < 4096);
+    return tuning;
 }
 
 /// One stream's request (#373): half are a GET, and half POST a marked
