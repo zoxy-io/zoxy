@@ -1563,6 +1563,10 @@ flowchart TB
 
 - **The drain deadline.** `drain_deadline_ms` defaults to `0`, which means
   no cap: the supervisor's own `SIGKILL` is the bound.
+  - Layer 2 asks every plane the drain waits on — connections, the admin
+    plane, the access log, the prober and resolver, and the origin
+    connections (HTTP/2 to origins, QUIC endpoints) — and names each that
+    is still holding it.
   - Stragglers are still bounded by their own deadlines: `idle_ms`
     always, plus `request_ms` and `max_lifetime_ms` when set.
   - Layer 3 is armed only when a deadline is configured.

@@ -2252,6 +2252,16 @@ pub fn Server(comptime runtime: Runtime) type {
         /// drain failed" from "the config was bad" without parsing output.
         pub const drain_stuck_exit_code: u8 = 4;
 
+        /// Which of the planes a drain waits on had finished when its grace
+        /// ran out (`onDrainStuck`).
+        const DrainPlanes = struct {
+            conns: bool,
+            admin: bool,
+            access_log: bool,
+            health: bool,
+            origins: bool,
+        };
+
         /// The drain could not finish. Say what it is waiting on and stop.
         ///
         /// Exiting rather than force-releasing: a slot with an armed op is
@@ -2265,18 +2275,30 @@ pub fn Server(comptime runtime: Runtime) type {
             assert(server.draining);
             result catch unreachable;
             // The ordinary case: everything finished inside the grace and
-            // the loop is already stopping. Ask the same *four* questions
+            // the loop is already stopping. Ask every question
             // `maybeStopAfterDrain` does, not just the first — asking only
             // about conn slots is how the first version of this reported
             // "nothing stuck" while the admin plane held an armed accept
-            // that would never be delivered (#203).
+            // that would never be delivered (#203), and asking all but the
+            // origins is how a later one stayed silent while an HTTP/2
+            // origin connection held the drain, leaving the watchdog to say
+            // only that the loop had stopped.
             const conns_done = server.conns.isFullyReleased();
             const admin_done = server.admin.isQuiescent();
             const log_done = server.access_log.isQuiescent();
             // The resolver (#481) is a background plane as the prober is,
             // and is reported with it.
             const health_done = server.health.isQuiescent() and server.resolver.isQuiescent();
-            if (conns_done and admin_done and log_done and health_done) return;
+            // The connections the proxy holds toward origins and over
+            // QUIC (#275, #449), which outlive the listeners' sockets.
+            // QUIC's endpoints are asked, as `maybeStopAfterDrain` asks
+            // them, only once every connection is gone: before that the
+            // conns plane is what is stuck, and closing them is its due.
+            // So "done" here can mean "not yet askable": the conns plane
+            // then reads STUCK, which is the report that matters.
+            const quic_done = !conns_done or !server.h3_slots.isFullyReleased() or server.quicEndpointsClosed();
+            const origins_done = server.h2_origins.isFullyReleased() and quic_done;
+            if (conns_done and admin_done and log_done and health_done and origins_done) return;
             // The forensics are for an operator reading the last thing
             // this process will ever say. A gate that provokes this path
             // on purpose wants none of them: stderr from a passing step
@@ -2286,7 +2308,13 @@ pub fn Server(comptime runtime: Runtime) type {
             // that the give-up happened, with the code that names it, and
             // that the plane it blames is the one that is actually stuck.
             if (server.io.wantsOperatorDump()) {
-                server.reportStuckDrain(conns_done, admin_done, log_done, health_done);
+                server.reportStuckDrain(.{
+                    .conns = conns_done,
+                    .admin = admin_done,
+                    .access_log = log_done,
+                    .health = health_done,
+                    .origins = origins_done,
+                });
             }
             // Through the seam, not `std.process.exit`: a raw exit here
             // would be a syscall outside `src/io/` (§4), and — the reason
@@ -2302,23 +2330,18 @@ pub fn Server(comptime runtime: Runtime) type {
         /// Split from the decision above so that decision stays readable,
         /// and because a gate provoking this path wants the give-up
         /// without the forensics (`wantsOperatorDump`).
-        fn reportStuckDrain(
-            server: *const Self,
-            conns_done: bool,
-            admin_done: bool,
-            log_done: bool,
-            health_done: bool,
-        ) void {
-            assert(!(conns_done and admin_done and log_done and health_done));
+        fn reportStuckDrain(server: *const Self, done: DrainPlanes) void {
+            assert(!(done.conns and done.admin and done.access_log and done.health and done.origins));
             std.debug.print(
                 "zoxy: drain did not finish {d}s after its deadline (#203). " ++
-                    "conns={s} admin={s} access_log={s} health={s}\n",
+                    "conns={s} admin={s} access_log={s} health={s} origins={s}\n",
                 .{
                     drain_stuck_grace_ns / std.time.ns_per_s,
-                    if (conns_done) "done" else "STUCK",
-                    if (admin_done) "done" else "STUCK",
-                    if (log_done) "done" else "STUCK",
-                    if (health_done) "done" else "STUCK",
+                    if (done.conns) "done" else "STUCK",
+                    if (done.admin) "done" else "STUCK",
+                    if (done.access_log) "done" else "STUCK",
+                    if (done.health) "done" else "STUCK",
+                    if (done.origins) "done" else "STUCK",
                 },
             );
             for (server.conns.slots, 0..) |*conn, index| {

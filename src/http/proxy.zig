@@ -2364,20 +2364,26 @@ pub fn Proxy(comptime runtime: Runtime) type {
             // pool cannot have been emptied in between.
             server.releaseUpstream(failed);
             stream.upstream = null;
-            const storage = server.borrowHeaderScratch();
-            defer server.returnHeaderScratch();
-            const request = parser.parseRequestHead(
-                headBytes(server, stream)[0..stream.head_len],
-                false,
-                storage,
-                null,
-            ) catch unreachable;
-            // Re-derived rather than remembered, like the replay's
-            // framing: same bytes, same key. A cookie cluster's #178
-            // announcement still names whichever endpoint finally serves,
-            // because `sticky_cookie` records what the *client* asked for
-            // and that has not changed.
-            const pick = pickAgain(server, stream, &request) orelse return;
+            // The scratch is held for the parse and the pick that reads it,
+            // and back before the dial: a dial to a multiplexed origin
+            // renders at once, and the render borrows it too (#275).
+            const pick = pick: {
+                const storage = server.borrowHeaderScratch();
+                defer server.returnHeaderScratch();
+                const request = parser.parseRequestHead(
+                    headBytes(server, stream)[0..stream.head_len],
+                    false,
+                    storage,
+                    null,
+                ) catch unreachable;
+                // Re-derived rather than remembered, like the replay's
+                // framing: same bytes, same key. A cookie cluster's #178
+                // announcement still names whichever endpoint finally
+                // serves, because `sticky_cookie` records what the *client*
+                // asked for and that has not changed.
+                break :pick pickAgain(server, stream, &request) orelse return;
+            };
+            assert(!server.headerScratchLent());
             assert(pick.endpoint_index != stream.l7.tried[stream.l7.tried_count - 1]);
             stream.l7.retries_used += 1;
             server.counters.increment("upstream_retried");
@@ -4865,52 +4871,61 @@ pub fn Proxy(comptime runtime: Runtime) type {
             // cannot fail; the framing tracker MUST re-derive from the
             // parse — the coalesced excess was already fed once and will
             // be fed again on the fresh try.
-            const storage = server.borrowHeaderScratch();
-            defer server.returnHeaderScratch();
-            const request = parser.parseRequestHead(
-                headBytes(server, stream)[0..stream.head_len],
-                false,
-                storage,
-                null,
-            ) catch unreachable;
-            assert(request.head_len == stream.l7.request_head_len);
-            stream.l7 = .{
-                .request_method = stream.l7.request_method,
-                .request_framing = framingFromParsed(request.framing),
-                .request_head_len = stream.l7.request_head_len,
-                .client_keep_alive = stream.l7.client_keep_alive,
-                .replay_used = true,
-                // The §8 cap rides across too: a replay is the *same*
-                // client-visible request taking its one free retry, not a
-                // new exchange, so it must not win itself a fresh budget.
-                // Dropping it here would silently uncap the rest of the
-                // exchange, since `storeDeadline` stops clamping at zero.
-                .request_deadline_ns = stream.l7.request_deadline_ns,
-                // And whose deadline it is, which decides its answer.
-                .grpc_deadline = stream.l7.grpc_deadline,
-                // The #180 claim rides across, and must: the tunnel
-                // buffer is held on the connection, so a rebuild that
-                // dropped this flag would re-render the head *without*
-                // its participating `Upgrade` — the origin would answer
-                // an ordinary request, the client would get a `200` it
-                // never asked for, and the claim would sit unspent until
-                // the connection closed. Found by the simulator, on a
-                // seed where a stale checkout replayed a handshake.
-                .upgrade_requested = stream.l7.upgrade_requested,
-                // upstream_was_reused stays default-false: the replay try
-                // is a fresh dial, and a second early failure answers 502.
-            };
-            stream.directions = .{ .{}, .{} };
-            // A fresh pick and a fresh dial — never another checkout (§7):
-            // the endpoint's whole idle list may be stale the same way.
             //
-            // The replay is a fresh try against the same cluster, so it
-            // meets the same §8 cap; its budget is already spent (§7), so
-            // a cap hit here answers rather than replaying again — and
-            // the same request key (#178), re-derived from the re-parse
-            // exactly like the framing: same bytes, same key.
-            stream.l7.sticky_cookie = stickyCookieOf(server, stream, &request);
-            const pick = pickAgain(server, stream, &request) orelse return;
+            // The scratch is held for that parse and what reads it, and is
+            // back before the dial: a dial to a multiplexed origin renders
+            // at once, and the render borrows it too (#275). Holding it
+            // across the dial crashed the simulator on its first HTTP/2
+            // cluster replay.
+            const pick = pick: {
+                const storage = server.borrowHeaderScratch();
+                defer server.returnHeaderScratch();
+                const request = parser.parseRequestHead(
+                    headBytes(server, stream)[0..stream.head_len],
+                    false,
+                    storage,
+                    null,
+                ) catch unreachable;
+                assert(request.head_len == stream.l7.request_head_len);
+                stream.l7 = .{
+                    .request_method = stream.l7.request_method,
+                    .request_framing = framingFromParsed(request.framing),
+                    .request_head_len = stream.l7.request_head_len,
+                    .client_keep_alive = stream.l7.client_keep_alive,
+                    .replay_used = true,
+                    // The §8 cap rides across too: a replay is the *same*
+                    // client-visible request taking its one free retry, not a
+                    // new exchange, so it must not win itself a fresh budget.
+                    // Dropping it here would silently uncap the rest of the
+                    // exchange, since `storeDeadline` stops clamping at zero.
+                    .request_deadline_ns = stream.l7.request_deadline_ns,
+                    // And whose deadline it is, which decides its answer.
+                    .grpc_deadline = stream.l7.grpc_deadline,
+                    // The #180 claim rides across, and must: the tunnel
+                    // buffer is held on the connection, so a rebuild that
+                    // dropped this flag would re-render the head *without*
+                    // its participating `Upgrade` — the origin would answer
+                    // an ordinary request, the client would get a `200` it
+                    // never asked for, and the claim would sit unspent until
+                    // the connection closed. Found by the simulator, on a
+                    // seed where a stale checkout replayed a handshake.
+                    .upgrade_requested = stream.l7.upgrade_requested,
+                    // upstream_was_reused stays default-false: the replay try
+                    // is a fresh dial, and a second early failure answers 502.
+                };
+                stream.directions = .{ .{}, .{} };
+                // A fresh pick and a fresh dial — never another checkout (§7):
+                // the endpoint's whole idle list may be stale the same way.
+                //
+                // The replay is a fresh try against the same cluster, so it
+                // meets the same §8 cap; its budget is already spent (§7), so
+                // a cap hit here answers rather than replaying again — and
+                // the same request key (#178), re-derived from the re-parse
+                // exactly like the framing: same bytes, same key.
+                stream.l7.sticky_cookie = stickyCookieOf(server, stream, &request);
+                break :pick pickAgain(server, stream, &request) orelse return;
+            };
+            assert(!server.headerScratchLent());
             dialUpstream(server, stream, pick, .fresh);
         }
 

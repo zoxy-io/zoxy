@@ -313,6 +313,12 @@ pub fn Mux(comptime runtime: Runtime) type {
             socket_open: bool,
             /// The dial's budget while connecting, the idle window after.
             deadline_ns: u64,
+            /// The close has cancelled the timer once (§8, #206). A cancel that
+            /// completes while the timer still has not delivered is not sent
+            /// again: a timer whose completion is lost would otherwise turn every
+            /// cancel's completion into the next cancel, a spin no virtual time
+            /// passes in, so the drain's own backstop could never fire.
+            timer_cancel_sent: bool = false,
             op_io: IoType.Completion,
             op_send: IoType.Completion,
             op_timer: IoType.Completion,
@@ -347,6 +353,7 @@ pub fn Mux(comptime runtime: Runtime) type {
                 slot.socket_open = false;
                 slot.tls_active = false;
                 slot.deadline_ns = 0;
+                slot.timer_cancel_sent = false;
                 slot.armed = .{};
                 assert(slot.buffers.inbound.len >= Session.frame_bytes_max);
             }
@@ -1588,11 +1595,15 @@ pub fn Mux(comptime runtime: Runtime) type {
             assert(slot.state == .closing);
             if (slot.armed.any()) {
                 // A timer still armed with nothing cancelling it: cancel it
-                // now that the connect's own cancel is done.
-                if (slot.armed.timer and !slot.armed.cancel) {
+                // now that the connect's own cancel is done — once. If the
+                // timer still has not delivered when that cancel has, the
+                // close waits on the timer's own completion.
+                if (slot.armed.timer and !slot.armed.cancel and !slot.timer_cancel_sent) {
+                    slot.timer_cancel_sent = true;
                     slot.armed.cancel = true;
                     server.io.timerCancel(&slot.op_timer, &slot.op_cancel, Slot, slot, onCancel);
                 }
+                assert(slot.timer_cancel_sent or !slot.armed.timer or slot.armed.cancel);
                 return;
             }
             if (slot.socket_open) server.io.closeNow(slot.socket);
