@@ -312,6 +312,18 @@ tls_scripts: [tls_client_slots]l7.Script,
 /// `verifyTlsSessions` to hold the outcome to what the listener implies.
 tls_alpn_offers: [tls_client_slots]TlsAlpnOffer,
 tls_credentials: [3]?zoxy.tls.Credentials,
+/// #297: on a seed that draws it, the terminating listener holds two more
+/// certificates beside its default — a P-384 one and a second P-256 one —
+/// and each TLS slot names one of them, the default's, an unknown name, or
+/// nothing, so the choice a ClientHello's name makes is swept.
+tls_sni: bool,
+tls_names: [tls_client_slots][]const u8,
+tls_sni_credentials: [2]?zoxy.tls.Credentials,
+tls_certificate_choices: [3]zoxy.tls.certificate_set.Choice,
+tls_certificate_sets: [3][]const zoxy.tls.certificate_set.Choice,
+/// How many handshakes were shown each choice, as the TLS verdict found
+/// them: the census's proof that every certificate was chosen by a name.
+tls_choices_shown: [3]u32,
 /// The #142 gate drawn for the l4 listener; `populateClients` reads it
 /// to decide whether its clients open with headers.
 proxy_protocol_l4: ?zoxy.config.Config.Listener.ProxyProtocol,
@@ -659,6 +671,7 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
         harness.io.setPressureCause(random.enumValue(Io.Pressure.Cause));
     }
     harness.drain_at_ns = deriveDrainAt(harness.clean, random);
+    harness.drawSni(seed);
     harness.deriveTopology(random);
     try harness.drawAdmin(arena, seed);
     try harness.startServerAndOrigins(arena, random);
@@ -2090,6 +2103,9 @@ fn terminatingListener(harness: *Harness) zoxy.Options.Listener {
         .cert_pem = zoxy.tls.testdata.cert_pem,
         .key_pem = zoxy.tls.testdata.key_pem,
         .label = "the harness's fixture",
+        // #297: stated so the config prices them; the harness loads the
+        // set itself, as it loads the default (`loadCertificateSet`).
+        .certificates = if (harness.tls_sni) &sni_certificates else &.{},
     } else null;
     return .{
         .bind = .{ .ip = tlsBindAddress() },
@@ -2287,6 +2303,88 @@ fn drawAdmin(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
 /// The admin listener's bind, apart from every data-path address.
 const admin_address: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9100 } };
 
+/// The names a TLS slot may ask for (#297): nothing, the default's, each
+/// further certificate's, and one no certificate covers.
+const sni_names = [_][]const u8{
+    "",
+    zoxy.tls.testdata.host_name,
+    zoxy.tls.testdata.p384_host_name,
+    zoxy.tls.testdata.origin_host_name,
+    "other.zoxy.test",
+};
+
+/// The two further certificates a #297 seed's terminating listener holds.
+const sni_certificates = [_]zoxy.Options.Listener.Certificate{
+    .{ .cert_pem = zoxy.tls.testdata.p384_cert_pem, .key_pem = zoxy.tls.testdata.p384_key_pem, .label = "the P-384 fixture" },
+    .{ .cert_pem = zoxy.tls.testdata.origin_cert_pem, .key_pem = zoxy.tls.testdata.origin_key_pem, .label = "the second P-256 fixture" },
+};
+
+/// Half of seeds give the terminating listener `sni_certificates`, and
+/// then each slot draws a name from `sni_names`; the rest name the default
+/// alone, as every seed did before. A stream of its own.
+fn drawSni(harness: *Harness, seed: u64) void {
+    var sni_prng = std.Random.DefaultPrng.init(seed ^ 0x0297_0297_0297_0297);
+    const random = sni_prng.random();
+    harness.tls_sni = random.boolean();
+    harness.tls_sni_credentials = .{ null, null };
+    harness.tls_choices_shown = @splat(0);
+    harness.tls_certificate_sets = .{ &.{}, &.{}, &.{} };
+    for (&harness.tls_names) |*name| {
+        name.* = if (harness.tls_sni) sni_names[random.uintLessThan(u8, sni_names.len)] else zoxy.tls.testdata.host_name;
+    }
+    if (!harness.tls_sni) assert(std.mem.eql(u8, harness.tls_names[0], zoxy.tls.testdata.host_name));
+}
+
+/// The terminating listener's choices, as `App` builds them: the default
+/// first, then each further certificate with the names its leaf covers.
+fn loadCertificateSet(harness: *Harness, arena: std.mem.Allocator) !void {
+    assert(harness.tls_sni);
+    const default = &harness.tls_credentials[2].?;
+    harness.tls_certificate_choices[0] = .{
+        .credentials = default,
+        .names = try zoxy.tls.trust.dnsNames(arena, default.chain[0]),
+        .schemes = default.schemes(),
+    };
+    for (sni_certificates, &harness.tls_sni_credentials, harness.tls_certificate_choices[1..]) |certificate, *slot, *choice| {
+        // Deterministic, as the default's: a seed replays byte-exact.
+        slot.* = try zoxy.tls.Credentials.load(arena, certificate.cert_pem, certificate.key_pem, .{ .deterministic_nonce = true });
+        const credentials = &slot.*.?;
+        choice.* = .{
+            .credentials = credentials,
+            .names = try zoxy.tls.trust.dnsNames(arena, credentials.chain[0]),
+            .schemes = credentials.schemes(),
+        };
+        assert(choice.names.len >= 1);
+    }
+    harness.tls_certificate_sets[2] = &harness.tls_certificate_choices;
+    harness.server.setTlsCertificateSets(harness.tls_certificate_sets[0..harness.listeners_count]);
+}
+
+/// Which of the listener's certificates a name must be shown (#297,
+/// `certificate_set.select`): the one whose leaf names it exactly, and the
+/// default — index 0 — for a name nothing covers or no name at all. This
+/// client offers every ECDSA scheme, so each certificate is usable.
+fn expectedChoice(sni: bool, name: []const u8) usize {
+    // The three names are told apart by equality alone: no two alike.
+    comptime assert(!std.mem.eql(u8, zoxy.tls.testdata.p384_host_name, zoxy.tls.testdata.origin_host_name));
+    comptime assert(!std.mem.eql(u8, zoxy.tls.testdata.host_name, zoxy.tls.testdata.origin_host_name));
+    if (!sni) return 0;
+    if (std.mem.eql(u8, name, zoxy.tls.testdata.p384_host_name)) return 1;
+    if (std.mem.eql(u8, name, zoxy.tls.testdata.origin_host_name)) return 2;
+    return 0;
+}
+
+/// A loaded certificate's leaf public key, read the way a client reads the
+/// leaf it is shown, so the two compare octet for octet.
+fn leafPublicKey(credentials: *const zoxy.tls.Credentials) ![]const u8 {
+    assert(credentials.chain.len >= 1);
+    const leaf: std.crypto.Certificate = .{ .buffer = credentials.chain[0], .index = 0 };
+    const parsed = try leaf.parse();
+    const key = parsed.pubKey();
+    assert(key.len >= 65);
+    return key;
+}
+
 fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: std.Random) !void {
     // Resolved by the library, as every build's options are: a seed whose
     // draws make a config zoxy would refuse fails here, by name, rather
@@ -2311,6 +2409,7 @@ fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: st
         harness.server.setTlsCredentials(
             harness.tls_credentials[0..harness.listeners_count],
         );
+        if (harness.tls_sni) try harness.loadCertificateSet(arena);
     }
     if (harness.admin_scrapers.len > 0) harness.server.setAdminBind(admin_address);
     try harness.server.start();
@@ -2758,7 +2857,7 @@ fn startTlsClient(
     const entry = l7.scripts.spec(harness.tls_scripts[index]);
     const pairs = harness.tls_protocol == .http and entry.routed_canonical;
     client.start(&harness.io, Harness.tlsBindAddress(), .{
-        .host_name = zoxy.tls.testdata.host_name,
+        .host_name = harness.tls_names[index],
         .resume_with = resume_with,
         .alpn = harness.tls_alpn_offers[index].protocols(),
         // An echo token for a relayed session, a real request for a
@@ -3324,6 +3423,12 @@ fn endScenario(harness: *Harness) void {
 /// arena would leak one key per seed — twice over, since every seed runs
 /// twice for the determinism check.
 pub fn tearDown(harness: *Harness) void {
+    for (&harness.tls_sni_credentials) |*slot| {
+        if (slot.*) |*credentials| {
+            credentials.deinit();
+            slot.* = null;
+        }
+    }
     for (&harness.tls_credentials) |*slot| {
         if (slot.*) |*credentials| {
             credentials.deinit();
@@ -3423,6 +3528,18 @@ pub fn verify(harness: *Harness) !void {
     try harness.verifyTlsSessions();
 }
 
+/// #297: a handshake that was shown a leaf was shown the one its name
+/// chooses, octet for octet. A resumed session is shown none.
+fn verifyTlsCertificate(harness: *Harness, client: *const TlsClient, index: usize) !void {
+    assert(index < tls_client_slots);
+    const shown = client.serverPublicKey() orelse return;
+    const choice = expectedChoice(harness.tls_sni, harness.tls_names[index]);
+    const credentials = if (choice == 0) &harness.tls_credentials[2].? else &harness.tls_sni_credentials[choice - 1].?;
+    if (!std.mem.eql(u8, shown, try leafPublicKey(credentials))) return error.TlsShownWrongCertificate;
+    harness.tls_choices_shown[choice] += 1;
+    assert(harness.tls_choices_shown[choice] <= tls_client_slots);
+}
+
 /// What a terminated session owes (§4).
 ///
 /// Prefix-legality holds on every seed: whatever came back must be the
@@ -3474,6 +3591,7 @@ fn verifyTlsSessions(harness: *Harness) !void {
     var closed_count: u8 = 0;
     var refusals: TlsAlpnRefusals = .{};
     for (harness.tls_clients_storage[0..harness.tls_clients_live], 0..) |*client, index| {
+        try harness.verifyTlsCertificate(client, index);
         const back = client.app_received[0..client.app_received_len];
         if (try harness.verifyTlsAlpn(client, index, back, &refusals)) continue;
         if (harness.tls_protocol == .http) {
