@@ -111,6 +111,17 @@ pub const chunked_trailers_response = chunked_trailers_head ++ chunked_trailers_
 /// from the first octet after them.
 pub const chunked_shared_bytes: u32 = chunked_wire.len - 2;
 
+/// A gRPC call the sweep's HTTP/2 origin never answers (§8): its path is
+/// under the origin's muted prefix, and its `grpc-timeout` short, so the
+/// proxy's own deadline ends it, as a Trailers-Only `200` saying
+/// `grpc-status: 4`, DEADLINE_EXCEEDED. Five milliseconds: under the
+/// least request deadline a seed draws (10 ms), so the call's own is the
+/// one that fires — the earlier deadline decides the answer, and a
+/// request deadline's is a `504`.
+pub const grpc_mute_prefix = "/sim.Stall/";
+pub const grpc_path = grpc_mute_prefix ++ "Call";
+pub const grpc_timeout = "5m";
+
 // A request's trailers (§7): HTTP/1.1 relays them, and HTTP/2 and HTTP/3
 // end the client's half with them and carry them no further. So the
 // origin holds every request to one rule — a section iff the head owes

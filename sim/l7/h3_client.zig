@@ -125,6 +125,8 @@ pub fn Client(comptime IoType: type) type {
         /// the origin checks octet by octet.
         fn requestFor(client: *Self, index: u8) TestClient.Request {
             const plan = client.plans[index];
+            // gRPC calls are HTTP/2's alone in the sweep (`prepareH2Client`).
+            assert(plan.ask != .grpc_call);
             const headers = &client.headers[index];
             headers[0] = .{ .name = canon.log_request_header, .value = canon.log_request_h3_value };
             if (!plan.carriesBody()) {
