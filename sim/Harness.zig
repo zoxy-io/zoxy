@@ -303,6 +303,9 @@ nameservers: [2]Nameserver,
 /// client's declared POSTs are gRPC calls its origin never answers, so the
 /// proxy's deadline answers them. Their own stream.
 grpc_prng: std.Random.DefaultPrng,
+/// §7: what the HTTP/2 origin answers the http cluster's gRPC health
+/// check with, on a seed that draws one.
+grpc_health: ?zoxy.http.h2.Answer,
 /// RFC 9113 §6.5.2's SETTINGS an exchange client opens with: its own
 /// stream, so the tuning moves no other draw.
 h2_tuning_prng: std.Random.DefaultPrng,
@@ -1358,10 +1361,8 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     // since the L4 origin draws its modes on every seed — which fail-open
     // makes harmless.
     const connect_timeout_ms: u32 = 20 + random.uintAtMost(u32, 40);
-    // An HTTP check is HTTP/1.1 in the clear: no HTTP/2 or HTTPS cluster
-    // takes one (`ClusterH2cHttpCheck`, #296).
-    const dial_only = harness.http_protocol != .http1 or harness.http_tls;
-    const health = deriveHealthChecks(harness.clean, random, connect_timeout_ms, dial_only);
+    const health = deriveHealthChecks(harness.clean, random, connect_timeout_ms, harness.probeShape());
+    harness.grpc_health = health.grpc_health;
     harness.http_origin_stop_at_ns = health.http_origin_stop_at_ns;
     harness.proxy_protocol_send_l4 = deriveProxyProtocolSend(random);
     // #174 weights on a single-endpoint topology: the share itself is
@@ -1896,11 +1897,31 @@ fn checkHttpDraw(
     return if (random.boolean()) http_check else tcp_check;
 }
 
+/// What a request check on the http cluster speaks: HTTP/1.1, gRPC's
+/// health call (an HTTP/2 cluster), or nothing past the dial (HTTPS).
+const ProbeShape = enum { http, grpc, dial };
+
+/// An HTTP check is HTTP/1.1 in the clear: no HTTP/2 or HTTPS cluster
+/// takes one (`ClusterH2cHttpCheck`, #296). An HTTP/2 cluster's request
+/// check is gRPC's health call, over the origin pool (§7); an HTTPS
+/// one's is the dial.
+fn probeShape(harness: *const Harness) ProbeShape {
+    if (harness.http_tls) {
+        assert(harness.http_protocol == .http1);
+        return .dial;
+    }
+    return if (harness.http_protocol.http2()) .grpc else .http;
+}
+
 /// The §7 health-check shape of one scenario: which clusters probe, how
 /// fast, and whether the HTTP origin dies mid-run.
 const HealthDraw = struct {
     check_l4: ?Check,
     check_http: ?Check,
+    /// When the http cluster's check is a gRPC call, what the HTTP/2
+    /// origin answers it with: SERVING, or on the quarter of request
+    /// checks drawn to fail, NOT_SERVING.
+    grpc_health: ?zoxy.http.h2.Answer,
     /// #230 passive ejection, drawn independently of the probes: the two
     /// compose rather than overlap, so a scenario must be able to run
     /// either alone as well as both.
@@ -1973,7 +1994,7 @@ fn derivePassiveEjection(clean: bool, random: std.Random) ?PassiveEjection {
 /// conn table, while the stopped HTTP origin refuses its probes and a
 /// refused probe consumes no origin conn. Everyone else paces from the
 /// `health_interval_floor_ms` the origin-capacity bound is derived at.
-fn deriveHealthChecks(clean: bool, random: std.Random, timeout_ms: u32, http2: bool) HealthDraw {
+fn deriveHealthChecks(clean: bool, random: std.Random, timeout_ms: u32, shape: ProbeShape) HealthDraw {
     assert(timeout_ms >= 1);
     const outage = !clean and random.uintLessThan(u8, 8) == 0;
     // Thresholds draw around their defaults so a configured fall/rise —
@@ -1992,19 +2013,22 @@ fn deriveHealthChecks(clean: bool, random: std.Random, timeout_ms: u32, http2: b
     // failure here is a transport failure, and a check that could not
     // tell those apart would be the whole point missed.
     var http_check = tcp_check;
-    http_check.kind = .{ .http = .{
-        .path = "/health",
-        .expect_status = if (random.uintLessThan(u8, 4) == 0) 599 else 200,
-    } };
+    const fails = random.uintLessThan(u8, 4) == 0;
     // An HTTP/2 cluster (#275) is never probed by HTTP/1.1, which its
-    // origin need not speak (`ClusterH2cHttpCheck`): its check is the dial.
-    if (http2) http_check = tcp_check;
+    // origin need not speak (`ClusterH2cHttpCheck`): it asks gRPC's health
+    // service instead, which fails the same quarter by NOT_SERVING.
+    http_check.kind = switch (shape) {
+        .http => .{ .http = .{ .path = "/health", .expect_status = if (fails) 599 else 200 } },
+        .grpc => .{ .grpc = .{} },
+        .dial => .tcp,
+    };
     const checked_http = outage or random.boolean();
-    const draw: HealthDraw = .{
+    var draw: HealthDraw = .{
         // The L4 origin echoes bytes rather than speaking HTTP, so only
         // the dial check is meaningful against it.
         .check_l4 = if (!outage and random.boolean()) tcp_check else null,
         .check_http = checkHttpDraw(checked_http, outage, random, tcp_check, http_check),
+        .grpc_health = null,
         .passive_l4 = derivePassiveEjection(clean, random),
         .passive_http = derivePassiveEjection(clean, random),
         .interval_ms = if (outage)
@@ -2016,6 +2040,9 @@ fn deriveHealthChecks(clean: bool, random: std.Random, timeout_ms: u32, http2: b
         else
             0,
     };
+    if (draw.check_http) |check| {
+        if (check.kind == .grpc) draw.grpc_health = if (fails) zoxy.http.h2.grpc_not_serving else zoxy.http.h2.grpc_serving;
+    }
     // An outage always probes the cluster it exists to eject, and the
     // instant always precedes the scenario-end backstop.
     assert(draw.http_origin_stop_at_ns == 0 or draw.check_http != null);
@@ -3094,6 +3121,7 @@ fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: st
         .body = l7.canon.sized_body,
         // §8: a gRPC call is left to its deadline.
         .mute_path_prefix = l7.canon.grpc_mute_prefix,
+        .health = harness.grpc_health,
     };
     // One of the two answers at the http endpoint's address — the address
     // the #178 pinned tag is minted from, so a sticky cookie names the same
@@ -4272,6 +4300,34 @@ pub fn verify(harness: *Harness) !void {
     try harness.verifyClientRefusalCount();
     try harness.verifySniCounters();
     try harness.verifyDnsSet();
+    try harness.verifyGrpcHealth();
+}
+
+/// Whether a seed's gRPC health answer is SERVING (§7).
+pub fn grpcHealthServing(answer: *const zoxy.http.h2.Answer) bool {
+    assert(answer.body.len == zoxy.http.h2.grpc_serving.body.len);
+    return std.mem.eql(u8, answer.body, zoxy.http.h2.grpc_serving.body);
+}
+
+/// §7's gRPC check, judged against the origin that answered it. The L4
+/// cluster's probes share these counters, so only a seed that checks the
+/// http cluster alone can tell its verdicts apart. On a NOT_SERVING seed
+/// every call the origin answered was a failed probe — but for one per
+/// endpoint the drain may have cut before the prober read it; a skipped
+/// probe opened no stream, so it answers for nothing — and on a clean
+/// SERVING one none failed.
+fn verifyGrpcHealth(harness: *const Harness) !void {
+    const answer = &(harness.grpc_health orelse return);
+    if (harness.clusters[l4_cluster_index].check != null) return;
+    assert(std.mem.eql(u8, harness.clusters[http_cluster_index].name, http_cluster_name));
+    const counters = &harness.server.counters;
+    const failed = counters.get("health_probes_failed");
+    const answered = harness.h2_origin.health_answered;
+    if (!grpcHealthServing(answer)) {
+        if (answered > failed + harness.endpoints_http_count) return error.GrpcHealthNotServingPassed;
+        return;
+    }
+    if (harness.clean and failed != 0) return error.GrpcHealthServingFailed;
 }
 
 /// #481: what the L4 cluster serves, when it follows a name, is never more

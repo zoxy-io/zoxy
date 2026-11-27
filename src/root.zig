@@ -66,6 +66,10 @@ pub const http = struct {
         /// and body (#275): the sweep's origin for an HTTP/2 cluster.
         pub const TestOriginSized = @import("http/h2/TestOrigin.zig").TestOriginSized;
         pub const Pair = @import("http/h2/TestOrigin.zig").Pair;
+        /// A scripted answer, and the gRPC health service's two (§7).
+        pub const Answer = @import("http/h2/TestOrigin.zig").Answer;
+        pub const grpc_serving = @import("http/h2/TestOrigin.zig").grpc_serving;
+        pub const grpc_not_serving = @import("http/h2/TestOrigin.zig").grpc_not_serving;
         pub const budgets = struct {
             const Session = @import("http/h2/Session.zig");
             pub const Calm = Session.Calm;
