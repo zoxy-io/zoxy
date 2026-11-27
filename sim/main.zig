@@ -820,6 +820,19 @@ const Census = struct {
     /// Seeds on which a build's check kind (#436) carried a probe past
     /// its first round: the multi-round path, reached.
     probes_past_first_round: u64 = 0,
+    /// Trailer sections (§7) a client heard whole, by population: the
+    /// HTTP/1.1 relay, and HTTP/2's and HTTP/3's trailing HEADERS. No
+    /// counter says a trailer went through, so the census asks the
+    /// clients whose oracles judged one.
+    trailers_heard: [Population.count]u64 = @splat(0),
+
+    const Population = enum(u8) {
+        http1,
+        http2,
+        http3,
+
+        const count = std.enums.values(Population).len;
+    };
 
     fn add(census: *Census, harness: *const Harness) void {
         inline for (Counters.names, 0..) |name, index| {
@@ -853,6 +866,41 @@ const Census = struct {
         const bodies_before = census.bodies_verified;
         census.bodies_verified += harness.origin_http.bodies_verified;
         assert(census.bodies_verified >= bodies_before);
+        census.addTrailers(harness);
+    }
+
+    /// Run only on a seed whose `verify` passed, as every tally here is:
+    /// a client's count is of sections its oracle has already judged.
+    fn addTrailers(census: *Census, harness: *const Harness) void {
+        const before = census.trailers_heard;
+        for (harness.l7_clients[0..harness.l7_count]) |*client| {
+            census.trailers_heard[@backingInt(Population.http1)] += client.trailersHeard();
+        }
+        for (harness.h2_clients[0..harness.h2_count]) |*client| {
+            census.trailers_heard[@backingInt(Population.http2)] += client.trailersHeard();
+        }
+        for (harness.h3_clients[0..harness.h3_count]) |*client| {
+            census.trailers_heard[@backingInt(Population.http3)] += client.trailersHeard();
+        }
+        for (before, census.trailers_heard) |earlier, now| assert(now >= earlier);
+    }
+
+    /// Every population must hear a trailer section somewhere in the
+    /// range: each relays it by a different path (§7), and a path no seed
+    /// walks is one the clients' trailer oracles never judged.
+    fn verifyTrailers(census: *const Census) bool {
+        var held = true;
+        for (std.enums.values(Population), census.trailers_heard) |population, heard| {
+            if (heard >= 1) continue;
+            std.debug.print(
+                "sim census: no {s} client heard a trailer section in this sweep; " ++
+                    "the trailing origin (`chunked_trailers`) never answered one\n",
+                .{@tagName(population)},
+            );
+            held = false;
+        }
+        assert(held == (std.mem.min(u64, &census.trailers_heard) >= 1));
+        return held;
     }
 
     /// True when every counter agrees with its side of `uncovered`. Each
@@ -906,7 +954,8 @@ const Census = struct {
         const ops_held = census.verifyOps();
         const extensions_held = census.verifyExtensionCounters() and census.verifyResponsePolicy() and
             census.verifyProbeRounds();
-        return census.verifyBodies() and ops_held and extensions_held and held;
+        const trailers_held = census.verifyTrailers();
+        return census.verifyBodies() and ops_held and extensions_held and trailers_held and held;
     }
 
     /// Every counter the scripted extensions declare moved somewhere in
@@ -1219,13 +1268,16 @@ fn checkCensus(options: *const Sweep, census: *const Census) bool {
         return true;
     }
     if (!census.verify(options.iterations)) return false;
-    std.debug.print("sim: census ok, {d} counter(s) fired, {d} exempt; {d} extension counter(s) fired; {d} seam op(s), {d} exempt; {d} body(ies) verified\n", .{
+    std.debug.print("sim: census ok, {d} counter(s) fired, {d} exempt; {d} extension counter(s) fired; {d} seam op(s), {d} exempt; {d} body(ies) verified; trailers heard {d}/{d}/{d} (http1/2/3)\n", .{
         Counters.names.len - uncovered.len,
         uncovered.len,
         extension_counters.len,
         std.enums.values(SimIo.OpKind).len - 1 - uncovered_ops.len,
         uncovered_ops.len,
         census.bodies_verified,
+        census.trailers_heard[@backingInt(Census.Population.http1)],
+        census.trailers_heard[@backingInt(Census.Population.http2)],
+        census.trailers_heard[@backingInt(Census.Population.http3)],
     });
     return true;
 }

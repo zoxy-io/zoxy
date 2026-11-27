@@ -28,6 +28,10 @@ pub const OriginMode = enum(u8) {
     sized,
     /// As `sized`, with the chunked canonical 200.
     chunked,
+    /// As `chunked`, with a trailer section after the last chunk (§7): a
+    /// field every client must hear, relayed verbatim to HTTP/1.1 and as
+    /// trailing HEADERS to HTTP/2 and HTTP/3.
+    chunked_trailers,
     /// Answer the until-close canonical 200 and close after it: the FIN
     /// delimits the body, and the connection is never reusable.
     until_close,
@@ -597,6 +601,10 @@ pub fn HttpOrigin(comptime IoType: type) type {
                     },
                     .chunked => {
                         conn.response_bytes = canon.chunked_response;
+                        conn.armRecv();
+                    },
+                    .chunked_trailers => {
+                        conn.response_bytes = canon.chunked_trailers_response;
                         conn.armRecv();
                     },
                     .until_close => {

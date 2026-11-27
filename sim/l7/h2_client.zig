@@ -67,6 +67,9 @@ pub const ClientError = error{
     BodyCorrupted,
     /// A clean seed whose streams did not all end in a whole 200.
     GoldenOutcomeMissed,
+    /// A stream that ended whole without the trailer section (§7) its
+    /// head owed, or with one its head did not.
+    TrailersMismatched,
     /// More octets than any legal transcript of this client holds.
     ResponseOverrun,
     /// A GOAWAY with a code the server has no cause to send this client:
@@ -154,9 +157,17 @@ pub const body_frames_max: u8 = 4;
 /// chunked one dechunked.
 pub const canonical_bodies = [_][]const u8{
     canon.sized_body,
-    "chunked-body-16b",
+    canonical_chunked_body,
     canon.until_close_body,
 };
+
+/// The chunked body's payload, which both chunked origins answer.
+pub const canonical_chunked_body = "chunked-body-16b";
+
+comptime {
+    assert(std.mem.indexOf(u8, canon.chunked_wire, canonical_chunked_body) != null);
+    assert(std.mem.indexOf(u8, canon.chunked_trailers_wire, canonical_chunked_body) != null);
+}
 
 /// The frame types and flags the client writes and the oracle reads
 /// (RFC 9113 §6).
@@ -272,6 +283,11 @@ pub fn Client(comptime IoType: type) type {
             reset: bool = false,
             /// A POST's RST_STREAM(NO_ERROR) after its answer ended.
             stopped: bool = false,
+            /// Trailing HEADERS (§7) ended the stream: the origin's trailer
+            /// section, which `checkTrailers` has already judged.
+            trailers: bool = false,
+            /// The final head said a trailer section is coming.
+            trailers_owed: bool = false,
         };
 
         /// One stream per plan. A flood counts them and asks nothing of
@@ -435,6 +451,25 @@ pub fn Client(comptime IoType: type) type {
             if (client.on_ended) |hook| hook(client.context);
         }
 
+        /// Streams whose trailer section reached this client, for the
+        /// census (§9). Read only once `verify` has passed: it walks the
+        /// very bytes `verify` walked, so a failure here is a caller that
+        /// broke that contract, and it says so rather than count.
+        pub fn trailersHeard(client: *const Self) u32 {
+            assert(client.streams >= 1);
+            if (client.mode != .exchange) return 0;
+            var answers: [streams_max]Answer = @splat(.{});
+            const plans = client.plans[0..client.streams];
+            const bytes = client.receive_buffer[0..client.received_len];
+            _ = readAnswers(bytes, plans, &answers) catch |err| {
+                std.debug.panic("trailersHeard after a failed verify: {s}", .{@errorName(err)});
+            };
+            var heard: u32 = 0;
+            for (answers[0..client.streams]) |*answer| heard += @intFromBool(answer.trailers);
+            assert(heard <= client.streams);
+            return heard;
+        }
+
         /// The oracle, over everything this client received.
         pub fn verify(client: *const Self) ClientError!void {
             assert(client.streams >= 1);
@@ -453,6 +488,11 @@ pub fn Client(comptime IoType: type) type {
                     if (answer.status != 0 and streamId(@intCast(index)) > last) return error.StreamPastGoaway;
                 }
                 if (answer.status == 200) try checkBody(answer, client.clean);
+                // A whole answer carries the section its head owed and no
+                // other; a cut one may end before it (reset, never ended).
+                if (answer.ended and !answer.reset and answer.trailers != answer.trailers_owed) {
+                    return error.TrailersMismatched;
+                }
                 if (!client.clean) continue;
                 // A clean seed meets no adversary: every stream is answered,
                 // whole, by its origin, which answers a POST only once its
@@ -635,6 +675,12 @@ pub fn Client(comptime IoType: type) type {
             if (answer.body_len > answer.body.len) return error.BodyCorrupted;
             const body = answer.body[0..answer.body_len];
             assert(body.len == answer.body_len);
+            // Trailers come after the whole body, and only the chunked
+            // origin's has any (§7).
+            if (answer.trailers) {
+                if (!std.mem.eql(u8, body, canonical_chunked_body)) return error.BodyCorrupted;
+                return;
+            }
             for (canonical_bodies) |canonical| {
                 if (answer.ended and std.mem.eql(u8, body, canonical)) return;
                 if (!answer.ended and std.mem.startsWith(u8, canonical, body)) return;
@@ -709,11 +755,21 @@ pub fn Client(comptime IoType: type) type {
                     // refused loudly rather than assembled.
                     if (flags & flag_end_headers == 0) return error.FieldsCorrupted;
                     const fields = reader.decode(payload) catch return error.FieldsCorrupted;
+                    if (answer.status != 0 and ResponseReader.value(fields, ":status") == null) {
+                        try checkTrailers(answer, fields, flags);
+                        answer.trailers = true;
+                        answer.ended = true;
+                        return;
+                    }
                     const value = ResponseReader.value(fields, ":status") orelse return error.FieldsCorrupted;
                     const status = std.fmt.parseUnsigned(u16, value, 10) catch return error.FieldsCorrupted;
                     if (status < 200) return; // Interim: the final one follows.
                     if (answer.status != 0) return error.StreamUnexpected;
+                    // HTTP/1.1's trailer announcement stops at the mapping
+                    // (§7); the origin's own field says one is owed.
+                    if (ResponseReader.value(fields, "trailer") != null) return error.FieldsCorrupted;
                     answer.status = status;
+                    answer.trailers_owed = ResponseReader.value(fields, canon.response_trailer_owed_header) != null;
                 },
                 frame_data => {
                     if (answer.status == 0) return error.StreamUnexpected;
@@ -726,6 +782,19 @@ pub fn Client(comptime IoType: type) type {
                 else => {},
             }
             if (endsStream(frame_type, flags)) answer.ended = true;
+        }
+
+        /// A field section after the final head is its trailers (§7): they
+        /// end the stream, follow only the trailing origin's chunked 200,
+        /// and carry its one field and nothing else, pseudo or otherwise.
+        fn checkTrailers(answer: *const Answer, fields: []const ResponseReader.Field, flags: u8) ClientError!void {
+            assert(answer.status != 0);
+            assert(!answer.ended);
+            if (flags & flag_end_stream == 0) return error.FieldsCorrupted;
+            if (answer.status != 200) return error.StreamUnexpected;
+            if (fields.len != 1) return error.FieldsCorrupted;
+            if (!std.mem.eql(u8, fields[0].name, canon.response_trailer_name)) return error.FieldsCorrupted;
+            if (!std.mem.eql(u8, fields[0].value, canon.response_trailer_value)) return error.FieldsCorrupted;
         }
 
         /// Past its answer's end, a POST's stream may hear one frame more:

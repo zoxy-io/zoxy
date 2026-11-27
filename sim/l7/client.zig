@@ -31,6 +31,10 @@ const assert = std.debug.assert;
 
 /// A verify-time verdict over everything the client received.
 pub const ClientError = error{
+    /// A whole chunked 200 whose trailer section (§7) is not what its head
+    /// owed: missing where `x-sim-trailer-owed` says one is coming,
+    /// present where it does not, or a `Trailer` announcement not relayed.
+    TrailersMismatched,
     /// Received bytes that no legal transcript starts with.
     ResponseCorrupted,
     /// A complete response carried a status outside the script's set.
@@ -378,6 +382,16 @@ pub fn Client(comptime IoType: type) type {
             }
         }
 
+        /// Responses whose trailer section reached this client whole, for
+        /// the census (§9); read once `verify` has passed.
+        pub fn trailersHeard(client: *const Self) u32 {
+            assert(client.received_len <= client.receive_buffer.len);
+            const bytes = client.receive_buffer[0..client.received_len];
+            const walk = walkResponses(bytes, scripts.spec(client.script), .{ .sticky = client.sticky });
+            assert(walk.violation == null);
+            return walk.trailers_count;
+        }
+
         /// The §9 verdict over everything received. Adversarial seeds get
         /// the prefix oracle; clean seeds additionally demand the exact
         /// golden outcome — count, status, and byte coverage all pinned,
@@ -430,6 +444,9 @@ pub fn Client(comptime IoType: type) type {
             /// Per-response persistence verdicts (§7): version defaults
             /// plus Connection tokens, as the parser computed them.
             keep_alives: [responses_max]bool,
+            /// Complete chunked responses whose trailer section (§7)
+            /// arrived whole: the census's proof the relay was walked.
+            trailers_count: u8,
             violation: ?ClientError,
 
             /// A walk that has read nothing yet. A decl on the type
@@ -442,6 +459,7 @@ pub fn Client(comptime IoType: type) type {
                 .offset = 0,
                 .statuses = @splat(0),
                 .keep_alives = @splat(false),
+                .trailers_count = 0,
                 .violation = null,
             };
         };
@@ -565,10 +583,10 @@ pub fn Client(comptime IoType: type) type {
                     return walk;
                 }
                 assert(verdict.body_len <= body.len);
-                walk.statuses[walk.complete_count] = response.status;
-                walk.keep_alives[walk.complete_count] = response.keep_alive;
-                walk.complete_count += 1;
-                walk.offset += response.head_len + verdict.body_len;
+                if (recordComplete(&walk, &response, verdict.body_len)) |violation| {
+                    walk.violation = violation;
+                    return walk;
+                }
                 // A complete response beyond the script's transcript is a
                 // duplication bug, not a legal prefix.
                 if (walk.complete_count > entry.transcript_cap) {
@@ -897,7 +915,11 @@ pub fn Client(comptime IoType: type) type {
                     if (response.status != 200 or page_body != null or entry.answered_here) {
                         return .{ .body_len = 0, .violation = ClientError.ResponseCorrupted };
                     }
-                    return prefixVerdict(body, canon.chunked_wire, canon.chunked_wire.len);
+                    // Two origins answer chunked, one with a trailer
+                    // section (§7) the proxy relays verbatim; the octet
+                    // after the last chunk's line says which this is.
+                    const wire = chunkedWireOf(body);
+                    return prefixVerdict(body, wire, @intCast(wire.len));
                 },
                 .until_close => {
                     if (response.status != 200 or page_body != null or entry.answered_here) {
@@ -924,6 +946,54 @@ pub fn Client(comptime IoType: type) type {
                     .violation = ClientError.ResponseCorrupted,
                 },
             }
+        }
+
+        /// Counts one complete response into the walk — its status, its
+        /// persistence, its trailer section — once every check of it has
+        /// passed but the trailer one, which needs the body's length.
+        fn recordComplete(walk: *Walk, response: *const parser.ResponseHead, body_len: u32) ?ClientError {
+            assert(walk.complete_count < responses_max);
+            if (trailerViolation(response, body_len)) |violation| return violation;
+            walk.statuses[walk.complete_count] = response.status;
+            walk.keep_alives[walk.complete_count] = response.keep_alive;
+            walk.complete_count += 1;
+            // Only the trailing wire is this long among chunked bodies, and
+            // `walkBody` passed it octet for octet. The framing is named
+            // because a sized body could share the length.
+            if (response.framing == .chunked and body_len == canon.chunked_trailers_wire.len) {
+                walk.trailers_count += 1;
+            }
+            walk.offset += response.head_len + body_len;
+            assert(walk.trailers_count <= walk.complete_count);
+            return null;
+        }
+
+        /// A whole chunked answer carries the trailer section its head owed,
+        /// and only then (§7): the proxy relays the section, and the head's
+        /// `Trailer` announcement with it, verbatim.
+        fn trailerViolation(response: *const parser.ResponseHead, body_len: u32) ?ClientError {
+            assert(response.status >= 100);
+            if (response.framing != .chunked) return null;
+            const owed = headerEquals(response.headers, canon.response_trailer_owed_header, "1");
+            const announced = headerEquals(response.headers, "Trailer", canon.response_trailer_name);
+            const heard = body_len == canon.chunked_trailers_wire.len;
+            assert(body_len == canon.chunked_wire.len or heard);
+            if (owed != heard) return ClientError.TrailersMismatched;
+            if (owed != announced) return ClientError.TrailersMismatched;
+            return null;
+        }
+
+        /// The canonical chunked wire `body` is a prefix of, if any: the
+        /// two agree up to `chunked_shared_bytes`, so a body no longer than
+        /// that is judged against either, and one longer by the octet
+        /// where they part. An octet that is neither's is judged against
+        /// the trailing wire and fails it.
+        fn chunkedWireOf(body: []const u8) []const u8 {
+            assert(canon.chunked_shared_bytes < canon.chunked_wire.len);
+            assert(canon.chunked_shared_bytes < canon.chunked_trailers_wire.len);
+            if (body.len <= canon.chunked_shared_bytes) return canon.chunked_wire;
+            if (body[canon.chunked_shared_bytes] == '\r') return canon.chunked_wire;
+            return canon.chunked_trailers_wire;
         }
 
         /// Verdict for a wire-exact canonical body: the received prefix
