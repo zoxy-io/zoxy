@@ -3880,6 +3880,85 @@ test "tls: a verified client's fingerprint reaches the origin and the log, and a
     try bed.expectDrained();
 }
 
+test "tls: a listener that asks for client certificates issues no ticket (#304)" {
+    // A ticket seals the PSK alone, and a resumed handshake asks for no
+    // certificate (RFC 8446 §4.3.2): a session resumed on this listener
+    // would reach the origin with no identity. So none is issued — the
+    // simulator found the resumption the ticket would have bought.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const anchors = try trust.parseAnchors(arena, @embedFile("tls/testdata/client-ca.pem"));
+    var client_credentials = try Credentials.load(
+        arena,
+        @embedFile("tls/testdata/client-cert.pem"),
+        @embedFile("tls/testdata/client-key.pem"),
+        .{},
+    );
+    defer client_credentials.deinit();
+
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 305,
+        .tls = true,
+        .tls_client_ca = .{ .anchors = anchors, .verify = .required },
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    var client: TlsClient = undefined;
+    try client.start(&bed.sim_io, Http1Bed.bindAddress(), .{
+        .host_name = fixture_host_name,
+        .app_data = "GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+        .exchange_end = .http_response,
+        .client_credentials = &client_credentials.inner,
+    });
+    var wind_down: TlsWindDown = .{ .bed = &bed };
+    wind_down.attach(&client);
+    try bed.sim_io.run();
+
+    try std.testing.expect(client.handshake_done);
+    try std.testing.expect(!client.ticket_captured);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("tls_handshakes_completed"));
+    try bed.expectDrained();
+}
+
+test "tls: a client refused for want of a certificate hears why, though it already sent its request (#304)" {
+    // `certificate_required` follows the client's Finished, and a TLS 1.3
+    // client sends its request straight after that. Closing on the unread
+    // request would be a reset that can overtake the alert, so the close
+    // lingers until the client's own end.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const anchors = try trust.parseAnchors(arena, @embedFile("tls/testdata/client-ca.pem"));
+
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 306,
+        .tls = true,
+        .tls_client_ca = .{ .anchors = anchors, .verify = .required },
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    var client: TlsClient = undefined;
+    try client.start(&bed.sim_io, Http1Bed.bindAddress(), .{
+        .host_name = fixture_host_name,
+        .app_data = "GET / HTTP/1.1\r\nHost: a\r\n\r\n",
+        .exchange_end = .http_response,
+    });
+    var wind_down: TlsWindDown = .{ .bed = &bed };
+    wind_down.attach(&client);
+    try bed.sim_io.run();
+
+    try std.testing.expect(client.refusedForClientCertificate());
+    try std.testing.expectEqual(@as(u32, 0), client.app_received_len);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("tls_client_cert_refused"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_responses"));
+    try bed.expectDrained();
+}
+
 /// Winds the scenario down once every one of `clients` clients has ended,
 /// where `TlsWindDown` does at the first: a client that ends early must
 /// not stop the origin under another's request.

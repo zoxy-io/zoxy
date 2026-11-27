@@ -302,6 +302,8 @@ listener parses it.
   - The PSK is sealed into the ticket itself (AES-256-GCM) under one of
     two rotating keys. The proxy keeps 64 bytes of keys, whatever the
     traffic.
+  - Only on a listener that asks for no client certificate (see Mutual
+    TLS).
   - A key seals for six hours; a ticket lives one hour.
   - Rotation is driven by sealing, not by a timer.
   - Keys never reach disk, so a restart costs each returning client one
@@ -333,6 +335,17 @@ listener parses it.
   - A client presenting nothing gets `certificate_required`. A chain
     that fails verification gets a bare teardown. Both count as
     `tls_client_cert_refused`.
+  - *A refusal's close lingers.* The alert follows the client's Finished,
+    and a TLS 1.3 client sends its request straight after that; closing
+    on the unread request would be a reset that can overtake the alert.
+    So the write side ends, what the client sends is discarded into the
+    drain sink (§7), and the client's own end — or the deadline the TLS
+    phase runs under — closes it.
+  - *No resumption.* A listener with `client_ca` issues no ticket and
+    opens none: a ticket seals the PSK alone, and a resumed handshake
+    asks for no certificate (RFC 8446 §4.3.2), so a resumed session
+    would reach the origin with no identity — on a `required` listener,
+    the unauthenticated session it exists to refuse.
   - *Identity.* The leaf's SHA-256 fingerprint. It reaches the origin
     on every request as `X-Client-Cert-SHA256`, and the access log as
     `client_cert_sha256`. An inbound copy of that header is stripped on

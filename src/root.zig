@@ -99,6 +99,7 @@ pub const tls = struct {
     /// names a listener's certificates are chosen by (#297).
     pub const trust = @import("tls/trust.zig");
     pub const TestClient = @import("tls/TestClient.zig").TestClient;
+    pub const ClientIdentity = @import("tls/TestClient.zig").ClientIdentity;
     /// What a client captures from one session to offer on the next. Named
     /// here so a gate can hold one without naming zssl itself (§4).
     pub const SessionTicket = @import("tls/TestClient.zig").SessionTicket;
@@ -128,6 +129,11 @@ pub const tls = struct {
         pub const origin_cert_pem = @embedFile("tls/testdata/origin-cert.pem");
         pub const origin_key_pem = @embedFile("tls/testdata/origin-key.pem");
         pub const origin_host_name = "origin.zoxy.test";
+        /// The client leaf `client_ca_pem` signed (#304), its key, and its
+        /// SHA-256 fingerprint as the origin's header and the log spell it.
+        pub const client_cert_pem = @embedFile("tls/testdata/client-cert.pem");
+        pub const client_key_pem = @embedFile("tls/testdata/client-key.pem");
+        pub const client_cert_sha256 = "f1fd192cff76490baf1534f777226e96dbb03d9751a657648e0955116d0d4fcb";
     };
 };
 /// Shared test-support harness pieces, factored out so multiple test
