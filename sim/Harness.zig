@@ -51,6 +51,8 @@ const H2Origin = zoxy.http.h2.TestOriginSized(SimIo, 32);
 /// The HTTPS origin of a seed whose http cluster speaks HTTP/1.1 over TLS
 /// (#296), sized as the HTTP/2 one.
 const HttpsOrigin = zoxy.testing.HttpsOrigin(SimIo, 32);
+/// The scripted nameservers a DNS-following seed's resolver asks (#481).
+const Nameserver = zoxy.testing.Nameserver(SimIo);
 const TlsClient = zoxy.tls.TestClient(SimIo);
 
 const assert = std.debug.assert;
@@ -287,6 +289,16 @@ h2_origin: H2Origin,
 /// behind TLS: `https_origin` answers, under the origin fixture's leaf.
 http_tls: bool,
 https_origin: HttpsOrigin,
+/// #481: on a seed that draws it, the L4 cluster follows a name its two
+/// scripted nameservers answer — the origin, and on an adversarial seed
+/// later the refusing address beside it — and each answers by a drawn
+/// behaviour, under the datagram adversary.
+dns_l4: bool,
+dns_zone: zoxy.testing.Zone,
+dns_phases: [2]zoxy.testing.Zone.Phase,
+dns_behaviors: [2]zoxy.testing.Behavior,
+dns_names: [1]zoxy.Options.Cluster.Dns.Name,
+nameservers: [2]Nameserver,
 /// §8: on a seed whose http cluster speaks HTTP/2, a third of an HTTP/2
 /// client's declared POSTs are gRPC calls its origin never answers, so the
 /// proxy's deadline answers them. Their own stream.
@@ -709,6 +721,7 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
     harness.drawSni(seed);
     harness.drawL4Sni(seed);
     harness.drawHttpProtocol(seed);
+    harness.drawDns(seed);
     try harness.drawClientCa(arena, seed);
     harness.deriveTopology(random);
     try harness.drawAdmin(arena, seed);
@@ -1064,6 +1077,8 @@ fn httpRoutes(harness: *Harness) [3]zoxy.Options.Listener.Route {
 }
 
 const l4_cluster_name = "origin-l4";
+/// Its place in `harness.clusters`: the L4 cluster is the first.
+const l4_cluster_index: u16 = 0;
 const http_cluster_name = "origin-http";
 /// The http cluster's place in the options, after the l4 one.
 const http_cluster_index: u16 = 1;
@@ -1406,6 +1421,16 @@ fn l4Cluster(
         .slow_start_ms = slow_start_ms,
         .max_total_inflight = max_total_inflight,
         .proxy_protocol_send = harness.proxy_protocol_send_l4,
+        // #481: a cluster following a name holds its IP literals alone in
+        // `endpoints`, and the origin arrives as the name's first answer.
+        .dns = if (harness.dns_l4) .{
+            .names = &harness.dns_names,
+            // The loader's floor (`dns_refresh_ms_min`): several rounds
+            // in a 2 s scenario, the first after the 20 ms move.
+            .refresh_min_ms = zoxy.constants.dns_refresh_ms_min,
+            .refresh_max_ms = 4 * zoxy.constants.dns_refresh_ms_min,
+            .addresses_max = 2,
+        } else null,
     };
 }
 
@@ -1576,6 +1601,7 @@ fn deriveServerConfig(
         // which is the opt-in rule stated as a property.
         .bodies = &bodies,
         .error_pages = &error_pages,
+        .resolver = if (harness.dns_l4) .{ .nameservers = &nameserver_addresses, .timeout_ms = 20 } else null,
     };
 }
 
@@ -2447,6 +2473,72 @@ fn requestPolicies(harness: *const Harness) []const zoxy.extension.Selection {
     return harness.policy_selections[0..count];
 }
 
+/// The two scripted nameservers' addresses (#481), on no other port.
+const nameserver_addresses = [_]std.Io.net.IpAddress{
+    .{ .ip4 = .{ .bytes = .{ 10, 53, 0, 1 }, .port = 53 } },
+    .{ .ip4 = .{ .bytes = .{ 10, 53, 0, 2 }, .port = 53 } },
+};
+
+/// The name a #481 seed's L4 cluster follows.
+const dns_origin_name = "origin.sim.test";
+
+/// #481's draw: a quarter of seeds have the L4 cluster follow a name. A
+/// clean seed's nameservers answer the origin alone, so the set never
+/// moves under its golden outcomes. An adversarial seed's each draw a
+/// behaviour and answer, from the first round on, the origin and two
+/// refusing addresses — past `addresses_max`, so the answer is cut to the
+/// first two and the set still moves — and from 150 ms on, nothing at all,
+/// a set no cluster can take. The first round is the one most scenarios
+/// see, since few outlast the refresh floor. Its own stream.
+fn drawDns(harness: *Harness, seed: u64) void {
+    var dns_prng = std.Random.DefaultPrng.init(seed ^ 0x0481_0481_0481_0481);
+    const random = dns_prng.random();
+    harness.dns_l4 = random.uintLessThan(u8, 4) == 0;
+    harness.dns_behaviors = .{ .answer, .answer };
+    if (!harness.clean) {
+        for (&harness.dns_behaviors) |*behavior| behavior.* = random.enumValue(zoxy.testing.Behavior);
+    }
+    // A clean seed's second phase is the first again, at the scenario's
+    // end: there only so both draws fill the same two-phase array.
+    harness.dns_phases = if (harness.clean) .{
+        .{ .from_ns = 0, .addresses = &dns_origin_only },
+        .{ .from_ns = scenario_end_ns, .addresses = &dns_origin_only },
+    } else .{
+        .{ .from_ns = 0, .addresses = &dns_origin_moved },
+        .{ .from_ns = 150 * std.time.ns_per_ms, .addresses = &.{} },
+    };
+    harness.dns_zone = .{
+        .phases = &harness.dns_phases,
+        .behaviors = &harness.dns_behaviors,
+        .start_ns = 0,
+        .ttl_s = random.uintAtMost(u32, 1),
+    };
+    // What `App` would have resolved before step zero: the sim builds the
+    // server itself, so it states the name's first answer.
+    harness.dns_names = .{.{ .host = dns_origin_name, .port = originAddress().getPort(), .addresses = &dns_origin_only }};
+    assert(harness.dns_phases[0].from_ns == 0);
+}
+
+const dns_origin_only = [_]std.Io.net.IpAddress{.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9000 } }};
+/// The origin and two hosts nobody listens on, in address order: one past
+/// the cluster's `addresses_max`, so the last is the one cut. Distinct
+/// hosts, since a record carries an address alone — the port is the
+/// name's own.
+const dns_origin_moved = [_]std.Io.net.IpAddress{
+    .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9000 } },
+    .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 2 }, .port = 9000 } },
+    .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 3 }, .port = 9000 } },
+};
+
+fn startNameservers(harness: *Harness) !void {
+    assert(harness.dns_l4);
+    harness.dns_zone.start_ns = harness.io.nowNs();
+    for (&harness.nameservers, 0..) |*nameserver, index| {
+        try nameserver.start(&harness.io, &harness.dns_zone, @intCast(index), nameserver_addresses[index]);
+    }
+    assert(harness.dns_zone.queries_seen == 0);
+}
+
 /// #298's draw: a third of seeds have the L4 listener choose its route by
 /// the ClientHello's name — one named route, and on half of those an
 /// any-name route too — and each of their L4 clients that speaks sends a
@@ -2731,6 +2823,7 @@ fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: st
         if (harness.tls_sni) try harness.loadCertificateSet(arena);
     }
     if (harness.admin_scrapers.len > 0) harness.server.setAdminBind(admin_address);
+    if (harness.dns_l4) try harness.startNameservers();
     try harness.server.start();
 
     harness.origin = .{
@@ -3627,7 +3720,9 @@ fn strandCanExplainStuck(harness: *const Harness) bool {
     const conns_stuck = !harness.server.conns.isFullyReleased();
     const admin_stuck = !harness.server.admin.isQuiescent();
     const log_stuck = !harness.server.access_log.isQuiescent();
-    const health_stuck = !harness.server.health.isQuiescent();
+    // The resolver (#481) is reported with the prober, as `onDrainStuck`
+    // reports it: a background plane, waited on by the drain alike.
+    const health_stuck = !harness.server.health.isQuiescent() or !harness.server.resolver.isQuiescent();
     // The HTTP/2 origin connections (#275); QUIC's endpoints are reported
     // with them, though no strand kind here can hold one.
     const origins_stuck = !harness.server.h2_origins.isFullyReleased();
@@ -3763,6 +3858,9 @@ fn endScenario(harness: *Harness) void {
         client.cancelIfStuck();
     }
     for (harness.admin_scrapers) |*scraper| scraper.cancelIfStuck();
+    if (harness.dns_l4) {
+        for (&harness.nameservers) |*nameserver| nameserver.stop();
+    }
     harness.server.beginDrain();
     harness.armTeardownStrand();
     harness.origin.stopListening();
@@ -3896,6 +3994,35 @@ pub fn verify(harness: *Harness) !void {
     try harness.verifyTlsSessions();
     try harness.verifyClientRefusalCount();
     try harness.verifySniCounters();
+    try harness.verifyDnsSet();
+}
+
+/// #481: what the L4 cluster serves, when it follows a name, is never more
+/// than the nameservers could make it — the origin and the next host in
+/// address order, `addresses_max` of an answer cut to two — and never an
+/// address a reply under the wrong ID named.
+fn verifyDnsSet(harness: *const Harness) !void {
+    if (!harness.dns_l4) return;
+    const cluster = &harness.server.config.clusters[l4_cluster_index];
+    assert(std.mem.eql(u8, cluster.name, l4_cluster_name));
+    const slots = cluster.slots orelse return error.DnsClusterWithoutSlots;
+    var live: u32 = 0;
+    for (slots.states, slots.addresses) |state, *address| {
+        if (state != .live) continue;
+        live += 1;
+        const ip = switch (address.*) {
+            .ip => |*ip| ip,
+            .unix => return error.DnsSetWrong,
+        };
+        // Never the address a reply under the wrong ID named, nor the host
+        // the cut left out: only the first two in address order.
+        if (ip.eql(&zoxy.testing.nameserver_stray_address)) return error.DnsSetWrong;
+        const allowed = for (dns_origin_moved[0..2]) |*wanted| {
+            if (ip.eql(wanted)) break true;
+        } else false;
+        if (!allowed) return error.DnsSetWrong;
+    }
+    if (live > 2) return error.DnsSetWrong;
 }
 
 /// #304: every refusal the client CA made was owed — the counter never

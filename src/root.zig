@@ -147,6 +147,11 @@ pub const testing = struct {
     /// An HTTPS origin (#296): HTTP/1.1 behind TLS, for a sweep's HTTPS
     /// clusters and the directed scenarios alike.
     pub const HttpsOrigin = @import("testing/https_origin.zig").HttpsOrigin;
+    /// Scripted nameservers and the zone they answer (#481).
+    pub const Nameserver = @import("testing/nameserver.zig").Nameserver;
+    pub const Zone = @import("testing/nameserver.zig").Zone;
+    pub const Behavior = @import("testing/nameserver.zig").Behavior;
+    pub const nameserver_stray_address = @import("testing/nameserver.zig").stray_address;
     pub const Mode = @import("testing/origin.zig").Mode;
     /// Comptime byte repetition, for the simulator's canned wire bytes.
     pub const repeat = @import("testing/bytes.zig").repeat;

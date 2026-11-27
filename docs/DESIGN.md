@@ -1616,6 +1616,10 @@ external binaries. They and the speed gates run at merge.
     - misbehaving origins;
     - an IPv6 peer for every stream client on a third of seeds, and
       PROXY headers announcing IPv6 clients (v1 TCP6, v2 INET6);
+    - an L4 cluster that follows a name on a quarter of seeds, asked of
+      two scripted nameservers, each answering by a drawn behaviour —
+      the addresses, an error, a truncated reply, silence, a reply under
+      the wrong ID first — under the datagram adversary;
     - an http cluster speaking HTTP/2 to its origin on a quarter of
       seeds, h2c or over TLS, or HTTP/1.1 over TLS on an eighth, answered
       by a scripted origin with the canonical sized 200 every client
@@ -1663,6 +1667,9 @@ external binaries. They and the speed gates run at merge.
       exposition, each counter in order at no more than its final value;
     - a handshake shown a certificate was shown the one its name chooses,
       and proved it holds that certificate's key;
+    - a cluster that follows a name serves no address its nameservers'
+      answers could not make it, `addresses_max` applied and a reply under
+      the wrong ID refused;
     - the SNI peek counts each hello as what it named — routed, absent,
       unrouted, invalid — exactly, on a clean seed reading no PROXY
       header;
@@ -1700,10 +1707,7 @@ external binaries. They and the speed gates run at merge.
       handshake on an RSA key replays byte-exact — and with it the choice
       between key types; certificate selection's wildcard tier and its
       QUIC path (the HTTP/3 client names one host) are directed tests'
-      too;
-    - clusters that follow names, whose resolver runs under `SimIo`
-      against scripted nameservers and the datagram adversary in
-      `dns/resolver_test.zig`.
+      too.
 - **Fuzzing.** Twenty-one `std.testing.fuzz` targets cover every parser
   edge:
   - the HTTP/1.1 head and chunked parsers, and the render;
