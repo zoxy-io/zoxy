@@ -1671,6 +1671,11 @@ external binaries. They and the speed gates run at merge.
     - no origin receives a malformed byte;
     - a forwarded-for chain holds only the hops a script claimed and,
       last, the observed client, written bare in either family;
+    - a route or filter rule takes a request only when every predicate
+      holds: a decoy rule pairs the root prefix with one predicate no
+      request meets (a client prefix, a method, a host, a header value or
+      substring, a response status or header), and never fires; the rules
+      the scripts aim at carry each kind too, and each holds;
     - a gRPC call hears a `200` only as its deadline's Trailers-Only
       answer, `grpc-status: 4` and no body;
     - a scrape is the admin head and a prefix of a well-formed

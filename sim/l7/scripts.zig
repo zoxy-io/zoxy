@@ -326,7 +326,7 @@ comptime {
     // the two route identically and any difference the sweep sees comes
     // from the form alone.
     assert(std.mem.indexOf(u8, absolute_form_request, "http://sim/sim") != null);
-    assert(std.mem.indexOf(u8, get_request, "Host: sim\r\n") != null);
+    assert(std.mem.indexOf(u8, get_request, "Host: " ++ canon.script_host ++ "\r\n") != null);
     // And the Host it carries is the one no origin may ever see.
     assert(std.mem.indexOf(u8, absolute_form_request, canon.overridden_host) != null);
 }
