@@ -1633,11 +1633,21 @@ external binaries. They and the speed gates run at merge.
       scenario deletes its excuse.
   - **Scripted scenarios** end a run at a chosen virtual instant, which
     asserts *when* something happened, not only *that* it did.
+  - **Reach in lines.** The census sees counters and op kinds, which are
+    points. `zig build coverage` also reports the sweep's line coverage
+    on its own, and `scripts/sim_gap.zig` lists the serving-path
+    functions only unit tests reach. Each is a branch no seed takes or a
+    feature no seed turns on. The report does not gate; a gap in it
+    should either be named in the list below or be a scenario to widen.
   - **Not swept, covered by directed tests and the live gate instead:**
-    HTTP/2 to origins, HTTPS clusters, SNI routing and certificate
-    selection, RSA, mutual TLS, gRPC deadlines, and clusters that follow
-    names — whose resolver runs under `SimIo` against scripted
-    nameservers and the datagram adversary in `dns/resolver_test.zig`.
+    - HTTP/2 to origins, HTTPS clusters, SNI routing and certificate
+      selection, RSA, mutual TLS, and gRPC deadlines;
+    - trailers, in every protocol: no script or origin sends one;
+    - IPv6: every address a seed uses is IPv4, so the TCP6 forms of the
+      PROXY header are never written;
+    - clusters that follow names, whose resolver runs under `SimIo`
+      against scripted nameservers and the datagram adversary in
+      `dns/resolver_test.zig`.
 - **Fuzzing.** Twenty-one `std.testing.fuzz` targets cover every parser
   edge:
   - the HTTP/1.1 head and chunked parsers, and the render;
@@ -1730,7 +1740,8 @@ external binaries. They and the speed gates run at merge.
   - bounded loops;
   - functions of at most 70 lines;
   - no file paths that collide by case.
-- **Coverage** (kcov) runs as its own CI job.
+- **Coverage** (kcov) runs as its own CI job: the unit tests and the
+  sweep merged, the sweep alone, and the gap between them.
 
 ## 10. Module map
 
@@ -1822,6 +1833,7 @@ sim/                    the simulator: Harness, L4 and L7 populations, oracles
 smoke/                  the live gate and the h2spec and h3spec harnesses
 bench/                  zrk loopback harness, profile, micro benches
 scripts/lint.zig        the build-time lint
+scripts/sim_gap.zig     what only unit tests reach (zig build coverage)
 tools/schema.zig        the schema emitter's entry point
 ```
 
