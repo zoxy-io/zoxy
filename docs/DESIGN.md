@@ -1631,7 +1631,9 @@ external binaries. They and the speed gates run at merge.
     - L7 request scripts;
     - h2c clients, including flooders, and on a seed whose cluster speaks
       HTTP/2, gRPC calls its origin never answers, left to their
-      `grpc-timeout`;
+      `grpc-timeout`; a third throttle their streams to a five-octet
+      window, granting credit only once the first DATA is back, and a
+      third lower their HPACK table, to nothing or below the default;
     - TLS clients, including resumers across key rotation, each naming
       one of the listener's certificates exactly or under a wildcard, in
       any case, a name the wildcard does not cover, an unknown name, or
@@ -1671,6 +1673,9 @@ external binaries. They and the speed gates run at merge.
     - no origin receives a malformed byte;
     - a forwarded-for chain holds only the hops a script claimed and,
       last, the observed client, written bare in either family;
+    - an HTTP/2 stream carries no more DATA before its client granted
+      credit than the window it advertised, and a client that lowered its
+      HPACK table hears a first field block that opens with the resize;
     - a route or filter rule takes a request only when every predicate
       holds: a decoy rule pairs the root prefix with one predicate no
       request meets (a client prefix, a method, a host, a header value or
@@ -1707,8 +1712,9 @@ external binaries. They and the speed gates run at merge.
     counter and every seam op kind. Each client population (HTTP/1.1,
     HTTP/2, HTTP/3) must also hear an origin's trailer section and have
     a request that ended with one answered, and an IPv6 client must be
-    announced to an origin and forwarded to one, and every certificate of
-    a listener that holds several must be chosen by a name.
+    announced to an origin and forwarded to one, every certificate of
+    a listener that holds several must be chosen by a name, and some
+    HTTP/2 send must stop at a client's window and some resize be heard.
     - Exemptions are named, each with its reason.
     - An exemption that *does* fire fails the census too, so widening a
       scenario deletes its excuse.

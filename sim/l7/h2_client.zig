@@ -83,6 +83,12 @@ pub const ClientError = error{
     /// A gRPC call answered with a 200 that is not its deadline's
     /// Trailers-Only one (§8).
     GrpcDeadlineMissed,
+    /// More DATA on a stream, before this client granted any credit,
+    /// than the initial window it advertised (RFC 9113 §6.9.1).
+    FlowControlViolated,
+    /// A client that lowered its HPACK table (RFC 7541 §4.2) heard a
+    /// first field block that did not open with the size update.
+    TableResizeMissed,
     /// A stream answered past the last stream a GOAWAY named. RFC 9113
     /// §6.8: the server did not act on streams past that one, so none of
     /// them may carry a status. Every seed holds this. A drain, the idle
@@ -108,6 +114,30 @@ pub const Mode = enum {
         .ignored,     .empty_data, .continuation, .field_block,
     };
 };
+
+/// What an exchange client asks of its connection in its opening
+/// SETTINGS (RFC 9113 §6.5.2), beside the streams it opens. A throttled
+/// client advertises a stream window of `throttle_window` octets and
+/// grants credit, per stream and for the connection, only once the first
+/// DATA frame is back, so the server sends to the window and waits. One
+/// that lowers its HPACK table owes the server's encoder a resize.
+pub const Tuning = struct {
+    throttle_window: ?u32 = null,
+    header_table_size: ?u32 = null,
+
+    pub fn tuned(tuning: Tuning) bool {
+        return tuning.throttle_window != null or tuning.header_table_size != null;
+    }
+};
+
+/// What a throttled client grants each stream, and the connection, once
+/// credit is due: past any answer a stream here can carry.
+const credit_increment: u32 = 1 << 16;
+/// RFC 9113 §6.5.2's identifiers for the two settings a tuning names.
+const setting_header_table_size: u16 = 0x1;
+const setting_initial_window_size: u16 = 0x4;
+/// Both settings, six octets each: the opening SETTINGS' payload at most.
+const settings_bytes_max: u32 = 2 * 6;
 
 /// What an exchange's stream asks (#373): `get`'s GET, a POST whose
 /// body the origin checks octet by octet, its length declared or not, or
@@ -247,8 +277,15 @@ pub fn Client(comptime IoType: type) type {
         request_len: u32 = 0,
         sent_len: u32 = 0,
         /// How far the client may send: all of `request`, but for Rapid
-        /// Reset only up to the round whose PONG it waits on.
+        /// Reset only up to the round whose PONG it waits on, and for a
+        /// throttled exchange only up to its held-back credit.
         send_limit: u32 = 0,
+        tuning: Tuning = .{},
+        /// Where a throttled exchange's credit starts in `request`.
+        credit_start: u32 = 0,
+        /// How much had been received when the credit was let go: every
+        /// DATA octet before it was sent on the initial window alone.
+        received_before_credit: ?u32 = null,
         round_ends: [rounds_max]u32 = undefined,
         receive_buffer: [receive_bytes_max]u8 = undefined,
         received_len: u32 = 0,
@@ -279,9 +316,11 @@ pub fn Client(comptime IoType: type) type {
         comptime {
             // The preface, its SETTINGS, and every round.
             assert(64 + rounds_max * round_bytes_max <= request_bytes_max);
-            // Or every stream's head and body, each frame's header too.
+            // Or every stream's head and body, each frame's header too, with
+            // a tuned SETTINGS' entries and a throttled exchange's credit.
             const stream_bytes_max = head_bytes_max + body_bytes_max + body_frames_max * 9 + trailers_bytes_max;
-            assert(64 + @as(u32, streams_max) * stream_bytes_max <= request_bytes_max);
+            const credit_bytes_max = (@as(u32, streams_max) + 1) * 13;
+            assert(64 + settings_bytes_max + credit_bytes_max + @as(u32, streams_max) * stream_bytes_max <= request_bytes_max);
             // Every body inside the default connection window (RFC 9113
             // §6.9.2), which this client never sees grow.
             assert(@as(u32, streams_max) * body_bytes_max <= (1 << 16) - 1);
@@ -317,9 +356,13 @@ pub fn Client(comptime IoType: type) type {
             salt: u8,
             clean: bool,
             mode: Mode,
+            tuning: Tuning,
         ) void {
             assert(plans.len >= 1);
             assert(plans.len <= streams_max);
+            // A flood's SETTINGS count against the SETTINGS budget as sent.
+            assert(mode == .exchange or !tuning.tuned());
+            if (tuning.throttle_window) |window| assert(window >= 1);
             client.io = io;
             client.address = address;
             client.streams = @intCast(plans.len);
@@ -327,17 +370,53 @@ pub fn Client(comptime IoType: type) type {
             client.salt = salt;
             client.clean = clean;
             client.mode = mode;
+            client.tuning = tuning;
+            client.received_before_credit = null;
             var len: u32 = 0;
             append(&client.request, &len, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
-            writeFrame(&client.request, &len, frame_settings, 0, 0, "");
+            var settings: [settings_bytes_max]u8 = undefined;
+            writeFrame(&client.request, &len, frame_settings, 0, 0, settingsPayload(tuning, &settings));
             switch (mode) {
                 .exchange => client.writeExchange(&len),
                 .rapid_reset => client.writeRounds(&len),
                 else => writeFlood(&client.request, &len, mode),
             }
+            client.credit_start = len;
+            if (tuning.throttle_window != null) client.writeCredit(&len);
             client.request_len = len;
-            client.send_limit = if (mode == .rapid_reset) client.round_ends[0] else len;
+            client.send_limit = if (mode == .rapid_reset) client.round_ends[0] else client.credit_start;
             assert(client.send_limit <= client.request_len);
+        }
+
+        /// The opening SETTINGS' entries a tuning asks for, six octets each.
+        fn settingsPayload(tuning: Tuning, out: *[settings_bytes_max]u8) []const u8 {
+            var len: usize = 0;
+            if (tuning.header_table_size) |size| {
+                std.mem.writeInt(u16, out[len..][0..2], setting_header_table_size, .big);
+                std.mem.writeInt(u32, out[len + 2 ..][0..4], size, .big);
+                len += 6;
+            }
+            if (tuning.throttle_window) |window| {
+                std.mem.writeInt(u16, out[len..][0..2], setting_initial_window_size, .big);
+                std.mem.writeInt(u32, out[len + 2 ..][0..4], window, .big);
+                len += 6;
+            }
+            assert(len % 6 == 0);
+            assert(len <= out.len);
+            return out[0..len];
+        }
+
+        /// A WINDOW_UPDATE for every stream this client opened, and one for
+        /// the connection: what a throttled exchange holds back.
+        fn writeCredit(client: *Self, len: *u32) void {
+            assert(client.mode == .exchange);
+            var increment: [4]u8 = undefined;
+            std.mem.writeInt(u32, &increment, credit_increment, .big);
+            for (0..client.streams) |index| {
+                writeFrame(&client.request, len, frame_window_update, 0, streamId(@intCast(index)), &increment);
+            }
+            writeFrame(&client.request, len, frame_window_update, 0, 0, &increment);
+            assert(len.* - client.credit_start == (@as(u32, client.streams) + 1) * 13);
         }
 
         pub fn begin(client: *Self) void {
@@ -395,9 +474,12 @@ pub fn Client(comptime IoType: type) type {
             const bytes = client.receive_buffer[0..client.received_len];
             switch (client.mode) {
                 // Every stream ended: the client is done, and closes.
-                .exchange => if (allEnded(bytes, client.streams)) {
-                    client.satisfied = true;
-                    return client.settleIfTerminal();
+                .exchange => {
+                    if (allEnded(bytes, client.streams)) {
+                        client.satisfied = true;
+                        return client.settleIfTerminal();
+                    }
+                    if (client.send_limit < client.request_len and sawData(bytes)) client.releaseCredit();
                 },
                 .rapid_reset => if (client.nextRound(@min(countPongs(bytes), rounds_max))) {
                     client.satisfied = true;
@@ -407,6 +489,30 @@ pub fn Client(comptime IoType: type) type {
                 else => {},
             }
             client.armRecv();
+        }
+
+        /// A throttled exchange's first DATA is back: the server has met
+        /// the window, so the credit goes out now.
+        fn releaseCredit(client: *Self) void {
+            assert(client.tuning.throttle_window != null);
+            assert(client.received_before_credit == null);
+            client.received_before_credit = client.received_len;
+            client.send_limit = client.request_len;
+            if (!client.send_pending and client.sent_len < client.send_limit) client.armSend();
+        }
+
+        /// Whether any whole DATA frame is among `bytes`.
+        fn sawData(bytes: []const u8) bool {
+            var offset: usize = 0;
+            var frames: u32 = 0;
+            while (bytes.len - offset >= 9) : (frames += 1) {
+                assert(frames < receive_bytes_max / 9 + 1);
+                const length = std.mem.readInt(u24, bytes[offset..][0..3], .big);
+                if (bytes.len - offset - 9 < length) return false;
+                if (bytes[offset + 3] == frame_data) return true;
+                offset += 9 + length;
+            }
+            return false;
         }
 
         /// Rapid Reset's next round, once `pongs` rounds are answered.
@@ -516,6 +622,8 @@ pub fn Client(comptime IoType: type) type {
             var answers: [streams_max]Answer = @splat(.{});
             const plans = client.plans[0..client.streams];
             const goaway_last = try readAnswers(client.receive_buffer[0..client.received_len], plans, &answers);
+            _ = try client.windowMet();
+            _ = try client.tableResized();
             for (answers[0..client.streams], plans, 0..) |*answer, plan, index| {
                 const allowed = scripts.spec(plan.scriptOf()).allowed_statuses;
                 if (answer.status != 0 and std.mem.indexOfScalar(u16, allowed, answer.status) == null) {
@@ -560,6 +668,112 @@ pub fn Client(comptime IoType: type) type {
             if (answer.status != 200) return;
             if (answer.grpc_status != @as(?u8, 4)) return error.GrpcDeadlineMissed;
             if (answer.body_len != 0) return error.GrpcDeadlineMissed;
+        }
+
+        /// A throttled exchange's oracle: no stream carried more DATA before
+        /// the client granted credit than the window it advertised. True
+        /// when some stream met the window exactly, the server's send
+        /// having stopped at it — the census's proof the wait ran.
+        pub fn windowMet(client: *const Self) ClientError!bool {
+            const window = client.tuning.throttle_window orelse return false;
+            const seen = client.received_before_credit orelse client.received_len;
+            assert(window >= 1);
+            assert(seen <= client.received_len);
+            const bytes = client.receive_buffer[0..seen];
+            var sent: [streams_max]u32 = @splat(0);
+            var offset: usize = 0;
+            var frames: u32 = 0;
+            while (bytes.len - offset >= 9) : (frames += 1) {
+                assert(frames < receive_bytes_max / 9 + 1);
+                const header = bytes[offset..][0..9];
+                const length = std.mem.readInt(u24, header[0..3], .big);
+                const id = std.mem.readInt(u32, header[5..9], .big) & 0x7fff_ffff;
+                if (bytes.len - offset - 9 < length) break;
+                offset += 9 + length;
+                if (header[3] != frame_data) continue;
+                // `readAnswers` refuses DATA on a stream not opened here.
+                if (id == 0 or id % 2 == 0 or (id - 1) / 2 >= client.streams) continue;
+                sent[(id - 1) / 2] += length;
+            }
+            var met = false;
+            for (sent[0..client.streams]) |octets| {
+                if (octets > window) return error.FlowControlViolated;
+                met = met or octets == window;
+            }
+            return met;
+        }
+
+        /// A client that lowered its HPACK table heard the server's first
+        /// field block open with a size update (RFC 7541 §6.3) no larger
+        /// than it asked. True when it did, for the census.
+        pub fn tableResized(client: *const Self) ClientError!bool {
+            const size = client.tuning.header_table_size orelse return false;
+            const bytes = client.receive_buffer[0..client.received_len];
+            var offset: usize = 0;
+            var frames: u32 = 0;
+            while (bytes.len - offset >= 9) : (frames += 1) {
+                assert(frames < receive_bytes_max / 9 + 1);
+                const length = std.mem.readInt(u24, bytes[offset..][0..3], .big);
+                if (bytes.len - offset - 9 < length) return false;
+                const header = bytes[offset..][0..9];
+                const payload = bytes[offset + 9 ..][0..length];
+                offset += 9 + length;
+                if (header[3] != frame_headers) continue;
+                const block = fieldBlock(header[4], payload) orelse return error.FieldsCorrupted;
+                if (block.len == 0 or block[0] & 0xe0 != 0x20) return error.TableResizeMissed;
+                const value = hpackInteger(block, 5) orelse return error.FieldsCorrupted;
+                if (value > size) return error.TableResizeMissed;
+                return true;
+            }
+            return false;
+        }
+
+        /// A HEADERS payload's field block, past its padding and priority.
+        fn fieldBlock(flags: u8, payload: []const u8) ?[]const u8 {
+            const padded = flags & 0x8 != 0;
+            const prioritized = flags & 0x20 != 0;
+            var start: usize = 0;
+            var pad: usize = 0;
+            if (padded) {
+                if (payload.len < 1) return null;
+                pad = payload[0];
+                start = 1;
+            }
+            if (prioritized) start += 5;
+            if (start + pad > payload.len) return null;
+            const block = payload[start .. payload.len - pad];
+            assert(block.len <= payload.len);
+            return block;
+        }
+
+        /// RFC 7541 §5.1's integer, `prefix` bits into `bytes[0]`.
+        fn hpackInteger(bytes: []const u8, comptime prefix: u3) ?u32 {
+            assert(bytes.len >= 1);
+            const mask: u8 = (1 << prefix) - 1;
+            var value: u32 = bytes[0] & mask;
+            if (value < mask) return value;
+            var shift: u5 = 0;
+            for (bytes[1..@min(bytes.len, 5)]) |octet| {
+                value += @as(u32, octet & 0x7f) << shift;
+                if (octet & 0x80 == 0) return value;
+                shift += 7;
+            }
+            return null;
+        }
+
+        /// What a tuned exchange proved, for the census: a stream filled to
+        /// its window, and the HPACK resize heard. On `trailersHeard`'s
+        /// terms: run only after `verify` passed.
+        pub fn tuningHeard(client: *const Self) struct { window_met: bool, resized: bool } {
+            assert(client.streams >= 1);
+            if (client.mode != .exchange) return .{ .window_met = false, .resized = false };
+            const window_met = client.windowMet() catch |err| {
+                std.debug.panic("tuningHeard after a failed verify: {s}", .{@errorName(err)});
+            };
+            const resized = client.tableResized() catch |err| {
+                std.debug.panic("tuningHeard after a failed verify: {s}", .{@errorName(err)});
+            };
+            return .{ .window_met = window_met, .resized = resized };
         }
 
         /// Streams that heard a gRPC call's deadline answered (§8), for the
