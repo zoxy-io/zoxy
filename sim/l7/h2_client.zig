@@ -458,9 +458,11 @@ pub fn Client(comptime IoType: type) type {
         }
 
         /// Streams whose trailer section reached this client, for the
-        /// census (§9). Read only once `verify` has passed: it walks the
-        /// very bytes `verify` walked, so a failure here is a caller that
-        /// broke that contract, and it says so rather than count.
+        /// census (§9). Read only once `verify` has judged this client (the
+        /// census skips a seed whose drain gave up, which judges none): it
+        /// walks the very bytes `verify` walked, so a failure here is a
+        /// caller that broke that contract, and it says so rather than
+        /// count.
         pub fn trailersHeard(client: *const Self) u32 {
             assert(client.streams >= 1);
             if (client.mode != .exchange) return 0;
@@ -477,7 +479,7 @@ pub fn Client(comptime IoType: type) type {
         }
 
         /// Streams that ended their half with a trailer section and were
-        /// answered whole, for the census (§9); read once `verify` passed.
+        /// answered whole, for the census (§9); on `trailersHeard`'s terms.
         pub fn requestTrailersAnswered(client: *const Self) u32 {
             assert(client.streams >= 1);
             if (client.mode != .exchange) return 0;

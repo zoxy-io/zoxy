@@ -383,12 +383,14 @@ pub fn Client(comptime IoType: type) type {
         }
 
         /// Responses whose trailer section reached this client whole, for
-        /// the census (§9); read once `verify` has passed.
+        /// the census (§9); read once `verify` has judged this client (the
+        /// census skips a seed whose drain gave up, which judges none).
         pub fn trailersHeard(client: *const Self) u32 {
             assert(client.received_len <= client.receive_buffer.len);
             const bytes = client.receive_buffer[0..client.received_len];
             const walk = walkResponses(bytes, scripts.spec(client.script), .{ .sticky = client.sticky });
             assert(walk.violation == null);
+            assert(walk.trailers_count <= walk.complete_count);
             return walk.trailers_count;
         }
 

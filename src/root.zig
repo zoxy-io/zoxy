@@ -62,6 +62,10 @@ pub const http = struct {
     /// one past each.
     pub const h2 = struct {
         pub const ResponseReader = @import("http/h2/ResponseReader.zig");
+        /// An HTTP/2 origin, h2c or behind TLS, answering a scripted head
+        /// and body (#275): the sweep's origin for an HTTP/2 cluster.
+        pub const TestOriginSized = @import("http/h2/TestOrigin.zig").TestOriginSized;
+        pub const Pair = @import("http/h2/TestOrigin.zig").Pair;
         pub const budgets = struct {
             const Session = @import("http/h2/Session.zig");
             pub const Calm = Session.Calm;

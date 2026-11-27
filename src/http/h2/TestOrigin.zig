@@ -20,7 +20,17 @@ const assert = std.debug.assert;
 /// A field as a scenario writes it.
 pub const Pair = [2][]const u8;
 
+/// Four connections: what a directed scenario dials.
 pub fn TestOrigin(comptime IoType: type) type {
+    return TestOriginSized(IoType, 4);
+}
+
+/// `TestOrigin` holding `conns_max` connections at once — a sweep whose
+/// proxy redials under an adversary needs more than a scenario does — and
+/// reusing a slot once its connection is closed and its socket released.
+/// A dial past them all is closed at once and counted (`refused`).
+pub fn TestOriginSized(comptime IoType: type, comptime conns_max_value: u32) type {
+    comptime assert(conns_max_value >= 1);
     return struct {
         io: *IoType = undefined,
         listener: IoType.Listener = undefined,
@@ -28,6 +38,10 @@ pub fn TestOrigin(comptime IoType: type) type {
         listening: bool = false,
         conns: [conns_max]Conn = @splat(.{}),
         accepted_count: u32 = 0,
+        /// Slots in use or ever used, at most `conns_max`.
+        slots_used: u32 = 0,
+        /// Dials closed at once because every slot was still busy.
+        refused: u32 = 0,
 
         // -- the script --
         status: []const u8 = "200",
@@ -67,7 +81,7 @@ pub fn TestOrigin(comptime IoType: type) type {
         last_body_len: u64 = 0,
 
         const Self = @This();
-        pub const conns_max: u32 = 4;
+        pub const conns_max: u32 = conns_max_value;
         const streams_max: u32 = 16;
         const layout: Session.Layout = .{ .header_list_size_max = 8192, .concurrent_streams_max = streams_max };
 
@@ -109,6 +123,8 @@ pub fn TestOrigin(comptime IoType: type) type {
             receiving: bool = false,
             sending: u32 = 0,
             closed: bool = false,
+            /// The socket is released: `closed` and no op still out on it.
+            socket_closed: bool = false,
             jobs: [streams_max]Job = @splat(.{}),
             tls: ?*TestTlsServer = null,
 
@@ -269,7 +285,7 @@ pub fn TestOrigin(comptime IoType: type) type {
 
             fn onSend(conn: *Conn, result: Io.SendError!u32) void {
                 conn.sending = 0;
-                if (conn.closed) return;
+                if (conn.closed) return conn.releaseIfSettled();
                 const sent = result catch return conn.close();
                 if (conn.tls) |tls| {
                     const plain = tls.sent(sent);
@@ -290,7 +306,7 @@ pub fn TestOrigin(comptime IoType: type) type {
 
             fn onRecv(conn: *Conn, result: Io.RecvError!u32) void {
                 conn.receiving = false;
-                if (conn.closed) return;
+                if (conn.closed) return conn.releaseIfSettled();
                 const received = result catch return conn.close();
                 if (conn.tls) |tls| {
                     tls.received(received) catch return conn.tlsFailed();
@@ -305,11 +321,20 @@ pub fn TestOrigin(comptime IoType: type) type {
                 conn.closed = true;
                 if (conn.tls) |tls| tls.finish();
                 // An op still out holds the socket; it delivers into a
-                // closed conn and is dropped.
+                // closed conn, is dropped, and the last one releases it.
                 if (conn.receiving or conn.sending != 0) {
                     conn.origin.io.shutdown(conn.socket, .both);
                     return;
                 }
+                conn.releaseIfSettled();
+            }
+
+            /// Close the socket of a closed conn once no op is out on it.
+            fn releaseIfSettled(conn: *Conn) void {
+                assert(conn.closed);
+                if (conn.receiving or conn.sending != 0) return;
+                if (conn.socket_closed) return;
+                conn.socket_closed = true;
                 conn.origin.io.closeNow(conn.socket);
             }
         };
@@ -340,21 +365,41 @@ pub fn TestOrigin(comptime IoType: type) type {
             origin.io.accept(origin.listener, &origin.accept_completion, Self, origin, onAccept);
         }
 
+        /// A slot for the next connection: a fresh one while any is left,
+        /// else one whose connection is closed and socket released.
+        fn acquireSlot(origin: *Self) ?usize {
+            assert(origin.slots_used <= conns_max);
+            if (origin.slots_used < conns_max) {
+                origin.slots_used += 1;
+                return origin.slots_used - 1;
+            }
+            for (&origin.conns, 0..) |*conn, index| {
+                if (conn.closed and conn.socket_closed) return index;
+            }
+            return null;
+        }
+
         fn onAccept(origin: *Self, result: Io.AcceptError!IoType.Socket) void {
             const socket = result catch return;
-            assert(origin.accepted_count < conns_max);
-            const conn = &origin.conns[origin.accepted_count];
+            const index = origin.acquireSlot() orelse {
+                origin.refused += 1;
+                origin.io.closeNow(socket);
+                return origin.armAccept();
+            };
+            assert(index < conns_max);
+            const conn = &origin.conns[index];
             origin.accepted_count += 1;
             const session = conn.session;
             const buffers = conn.buffers;
             conn.* = .{ .origin = origin, .socket = socket, .session = session, .buffers = buffers };
             if (origin.tls) {
-                const tls = &origin.tls_servers[origin.accepted_count - 1];
+                const tls = &origin.tls_servers[index];
                 var key_share: [48]u8 = @splat(0x93);
-                key_share[47] = @intCast(origin.accepted_count);
+                key_share[47] = @truncate(origin.accepted_count);
                 tls.start(origin.tls_alpn, key_share) catch {
                     origin.tls_failures += 1;
                     conn.closed = true;
+                    conn.socket_closed = true;
                     origin.io.closeNow(socket);
                     return origin.armAccept();
                 };
@@ -377,10 +422,12 @@ pub fn TestOrigin(comptime IoType: type) type {
         /// Close what is still open, so a scenario's socket accounting is
         /// exact.
         pub fn closeRemaining(origin: *Self) void {
-            for (origin.conns[0..origin.accepted_count]) |*conn| {
+            for (origin.conns[0..origin.slots_used]) |*conn| {
                 if (conn.tls) |tls| tls.finish();
-                if (conn.closed) continue;
                 conn.closed = true;
+                // The loop has stopped: an op still out will never land.
+                if (conn.socket_closed) continue;
+                conn.socket_closed = true;
                 origin.io.closeNow(conn.socket);
             }
         }
