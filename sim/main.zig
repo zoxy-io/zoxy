@@ -626,16 +626,11 @@ const uncovered = [_]Uncovered{
             "live gate counts it against a real one",
     },
     .{
-        .name = "admin_served",
-        .why = .unreached,
-        .reason = "the sweep configures no admin listener; " ++
-            "src/admin_test.zig covers the scrape, and the Tier-0.5 live " ++
-            "gate reads its counters through one",
-    },
-    .{
         .name = "admin_reaped",
         .why = .unreached,
-        .reason = "the sweep configures no admin listener; " ++
+        .reason = "structural, as tunnels_drained: the scrape deadline " ++
+            "(`admin_scrape_deadline_ms`, 5 s) outlasts a whole 2 s scenario, " ++
+            "and the scenario's drain tears a held scrape down first. " ++
             "src/admin_test.zig covers the scrape deadline",
     },
     .{
@@ -700,18 +695,10 @@ comptime {
 }
 
 /// The §4 seam ops no scenario delivers, on the same both-ways terms as
-/// `uncovered`. One entry today, and it is a finding rather than a
-/// footnote: the whole asynchronous close path is unreached by 4096
-/// seeds.
-const uncovered_ops = [_]struct { kind: SimIo.OpKind, reason: []const u8 }{
-    .{
-        .kind = .close,
-        .reason = "src/admin.zig is the only asynchronous close in the tree — " ++
-            "every serving path closes synchronously via closeNow — and the " ++
-            "sweep configures no admin listener; src/admin_test.zig covers it, " ++
-            "and the Tier-0.5 live gate delivers real ones through its scrapes",
-    },
-};
+/// `uncovered`. Empty since the admin scrapers (§8) reached the one
+/// asynchronous close in the tree; an op added to the seam that no
+/// scenario delivers is entered here with what covers it instead.
+const uncovered_ops = [_]struct { kind: SimIo.OpKind, reason: []const u8 }{};
 
 comptime {
     // The twin of `uncovered`'s validation: an entry naming `.none`
