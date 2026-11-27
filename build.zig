@@ -263,15 +263,29 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // The `coverage` step's sim gap report (§9). Built for the host and
+    // ReleaseSafe for the lint's reason: it scans every line of src/ and
+    // megabytes of kcov XML, and its asserts are the point.
+    const sim_gap_exe = b.addExecutable(.{
+        .name = "zoxy-sim-gap",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/sim_gap.zig"),
+            .target = b.graph.host,
+            .optimize = .safe,
+        }),
+    });
+
     const module_tests = b.addRunArtifact(b.addTest(.{ .root_module = zoxy_module }));
     const json_tests = b.addRunArtifact(b.addTest(.{ .root_module = json_module }));
     const exe_tests = b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module }));
     const lint_tests = b.addRunArtifact(b.addTest(.{ .root_module = lint_exe.root_module }));
+    const sim_gap_tests = b.addRunArtifact(b.addTest(.{ .root_module = sim_gap_exe.root_module }));
     const test_step = b.step("test", "Run unit tests (--fuzz adds the fuzz gate)");
     test_step.dependOn(&module_tests.step);
     test_step.dependOn(&json_tests.step);
     test_step.dependOn(&exe_tests.step);
     test_step.dependOn(&lint_tests.step);
+    test_step.dependOn(&sim_gap_tests.step);
 
     // The fixed libcrypto heap (§4, §5): its own step, and the one TLS
     // test that cannot ride the main test binary. The allocation hooks
@@ -648,6 +662,9 @@ pub fn build(b: *std.Build) void {
     // compiled here.
     ci_step.dependOn(&h2spec_exe.step);
     ci_step.dependOn(&h3spec_exe.step);
+    // And the sim gap report's, which only `coverage` runs, on Linux:
+    // compiled here so a Mac-only change cannot break it unseen.
+    ci_step.dependOn(&sim_gap_exe.step);
 
     // Line coverage via kcov (Linux-only, in the dev shell): the unit-test
     // binary plus a simulator sweep, merged — the simulator reaches error
@@ -702,11 +719,15 @@ pub fn build(b: *std.Build) void {
     const json_tests_cov = kcov_json_tests.addOutputDirectoryArg("cov-json-tests");
     kcov_json_tests.addArtifactArg(cov_json_tests);
 
+    // No arguments: the sweep `zig build sim` runs, census included, so
+    // the lines it reports are the reach `ci` gates on. kcov drops each
+    // breakpoint at its first hit, so a seed past the first few costs
+    // little more than it does uninstrumented, and a shorter sweep would
+    // save seconds while reporting less reach than `ci` actually has.
     const kcov_sim = b.addSystemCommand(&.{"kcov"});
     kcov_sim.addDirectoryArg2(src_root, include_arg);
     const sim_cov = kcov_sim.addOutputDirectoryArg("cov-sim");
     kcov_sim.addArtifactArg(cov_sim);
-    kcov_sim.addArgs(&.{ "1", "150" });
 
     const kcov_merge = b.addSystemCommand(&.{ "kcov", "--merge" });
     const merged_cov = kcov_merge.addOutputDirectoryArg("cov-merged");
@@ -733,11 +754,32 @@ pub fn build(b: *std.Build) void {
     });
     install_cov.step.dependOn(&patch_cov.step);
 
+    // The sweep's own report beside the merged one, and the gap between
+    // them (§9). The merged report reads a line one unit test runs as
+    // covered whichever binary ran it, so only the two apart say what the
+    // sweep reaches. The install skips kcov's per-binary symlink; the
+    // index links the hashed directory it keeps.
+    const install_sim_cov = b.addInstallDirectory(.{
+        .source_dir = sim_cov,
+        .install_dir = .{ .custom = "coverage" },
+        .install_subdir = "sim",
+    });
+    const sim_gap_run = b.addRunArtifact(sim_gap_exe);
+    sim_gap_run.addDirectoryArg(src_root);
+    sim_gap_run.addFileArg(sim_cov.path(b, "coverage-sim/cobertura.xml"));
+    sim_gap_run.addFileArg(tests_cov.path(b, "coverage-tests/cobertura.xml"));
+    sim_gap_run.addFileArg(json_tests_cov.path(b, "coverage-json-tests/cobertura.xml"));
+    const sim_gap_report = sim_gap_run.captureStdOut(.{ .basename = "sim-gap.txt" });
+    const install_sim_gap = b.addInstallFile(sim_gap_report, "coverage/sim-gap.txt");
+
     const cov_step = b.step(
         "coverage",
-        "Line coverage via kcov (Linux): unit tests + sim, merged to zig-out/coverage",
+        "Line coverage via kcov (Linux): unit tests + sim, merged to zig-out/coverage; " ++
+            "the sim alone in coverage/sim, what only the tests reach in coverage/sim-gap.txt",
     );
     cov_step.dependOn(&install_cov.step);
+    cov_step.dependOn(&install_sim_cov.step);
+    cov_step.dependOn(&install_sim_gap.step);
 }
 
 /// Which build this binary is, beyond its release version.
