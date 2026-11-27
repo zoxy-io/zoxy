@@ -1623,7 +1623,9 @@ external binaries. They and the speed gates run at merge.
     - an http cluster speaking HTTP/2 to its origin on a quarter of
       seeds, h2c or over TLS, or HTTP/1.1 over TLS on an eighth, answered
       by a scripted origin with the canonical sized 200 every client
-      already judges.
+      already judges; where an HTTP/2 cluster is checked by request, the
+      check is gRPC's health call over the origin pool, which the origin
+      answers SERVING, or NOT_SERVING on the quarter drawn to fail.
   - **Who connects:**
     - L4 echo clients, which on a listener that routes by SNI open with
       a ClientHello naming the route, another name, or none, or with
@@ -1673,6 +1675,9 @@ external binaries. They and the speed gates run at merge.
     - no origin receives a malformed byte;
     - a forwarded-for chain holds only the hops a script claimed and,
       last, the observed client, written bare in either family;
+    - a gRPC health probe passes only on SERVING: on a NOT_SERVING seed
+      every call the origin answered failed its probe, but for one per
+      endpoint the drain cut, and on a clean SERVING seed none failed;
     - an HTTP/2 stream carries no more DATA before its client granted
       credit than the window it advertised, and a client that lowered its
       HPACK table hears a first field block that opens with the resize;

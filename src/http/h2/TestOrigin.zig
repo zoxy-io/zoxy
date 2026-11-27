@@ -20,6 +20,33 @@ const assert = std.debug.assert;
 /// A field as a scenario writes it.
 pub const Pair = [2][]const u8;
 
+/// One scripted answer: a head, a body, and a trailer section.
+pub const Answer = struct {
+    status: []const u8,
+    headers: []const Pair = &.{},
+    body: []const u8 = "",
+    trailers: []const Pair = &.{},
+};
+
+/// The path a `grpc` health check calls (§7).
+pub const health_path = "/grpc.health.v1.Health/Check";
+
+/// gRPC's answers to it (`grpc.health.v1`): a `HealthCheckResponse` whose
+/// field 1 (`status`) is SERVING (1) or NOT_SERVING (2), behind its frame
+/// prefix, ended by `grpc-status: 0` — the call succeeded either way.
+pub const grpc_serving: Answer = grpcHealth("\x00\x00\x00\x00\x02\x08\x01");
+pub const grpc_not_serving: Answer = grpcHealth("\x00\x00\x00\x00\x02\x08\x02");
+
+fn grpcHealth(comptime message: []const u8) Answer {
+    comptime assert(message.len == 7);
+    return .{
+        .status = "200",
+        .headers = &.{.{ "content-type", "application/grpc" }},
+        .body = message,
+        .trailers = &.{.{ "grpc-status", "0" }},
+    };
+}
+
 /// Four connections: what a directed scenario dials.
 pub fn TestOrigin(comptime IoType: type) type {
     return TestOriginSized(IoType, 4);
@@ -73,10 +100,16 @@ pub fn TestOriginSized(comptime IoType: type, comptime conns_max_value: u32) typ
         /// Refuse every stream past the first with GOAWAY naming it, the
         /// shape of an origin draining under a client.
         goaway_after_first: bool = false,
+        /// What a call to `health_path` is answered with, in the script's
+        /// place: a sweep's origin serves traffic and its prober alike.
+        /// Null answers it with the script.
+        health: ?Answer = null,
 
         // -- what it heard --
         requests: u32 = 0,
         answered: u32 = 0,
+        /// Health calls answered whole with `health`.
+        health_answered: u32 = 0,
         /// The last request's pseudo-headers and a few fields, as received.
         last_method: Text = .{},
         last_path: Text = .{},
@@ -120,6 +153,8 @@ pub fn TestOriginSized(comptime IoType: type, comptime conns_max_value: u32) typ
             body_offset: usize = 0,
             /// Its path is under `mute_path_prefix`: it is never answered.
             muted: bool = false,
+            /// A health call, answered with `health`.
+            health: bool = false,
         };
 
         pub const Conn = struct {
@@ -204,8 +239,8 @@ pub fn TestOriginSized(comptime IoType: type, comptime conns_max_value: u32) typ
                     origin.requests_dropped += 1;
                     return;
                 };
-                job.* = .{ .stream = request.stream, .muted = origin.mutes(request) };
-                if (origin.answer_at_head and !origin.mute and !job.muted) {
+                job.* = .{ .stream = request.stream, .muted = origin.mutes(request), .health = origin.asksHealth(request) };
+                if (origin.answer_at_head and !origin.mute and !job.muted and !job.health) {
                     job.started = true;
                     conn.push(job);
                 }
@@ -229,19 +264,28 @@ pub fn TestOriginSized(comptime IoType: type, comptime conns_max_value: u32) typ
                 return null;
             }
 
-            /// As much of the scripted answer as the session takes.
+            /// As much of the job's answer as the session takes.
             fn push(conn: *Conn, job: *Job) void {
                 const origin = conn.origin;
                 assert(job.stream != 0);
                 if (!job.started) return;
+                assert(!job.health or origin.health != null);
+                const answer: Answer = if (job.health) origin.health.? else .{
+                    .status = origin.status,
+                    .headers = origin.headers,
+                    .body = origin.body,
+                    .trailers = origin.trailers,
+                };
                 var fields: [32]hpack.Field = undefined;
-                // A bidirectional answer ends only after the request has.
-                const holds = origin.answer_at_head and !job.request_ended;
+                // A bidirectional answer ends only after the request has;
+                // a health call is answered as gRPC answers one, whole.
+                const holds = origin.answer_at_head and !job.request_ended and !job.health;
+                const stalls = origin.stall_after_body and !job.health;
                 if (!job.head_sent) {
-                    fields[0] = .{ .name = ":status", .value = origin.status };
-                    for (origin.headers, 1..) |pair, index| fields[index] = .{ .name = pair[0], .value = pair[1] };
-                    const head = fields[0 .. origin.headers.len + 1];
-                    const ends = origin.body.len == 0 and origin.trailers.len == 0 and !holds;
+                    fields[0] = .{ .name = ":status", .value = answer.status };
+                    for (answer.headers, 1..) |pair, index| fields[index] = .{ .name = pair[0], .value = pair[1] };
+                    const head = fields[0 .. answer.headers.len + 1];
+                    const ends = answer.body.len == 0 and answer.trailers.len == 0 and !holds;
                     switch (conn.session.sendHead(job.stream, head, ends)) {
                         .staged => job.head_sent = true,
                         .blocked => return,
@@ -249,22 +293,22 @@ pub fn TestOriginSized(comptime IoType: type, comptime conns_max_value: u32) typ
                     }
                     if (ends) return conn.finished(job);
                 }
-                if (job.body_offset < origin.body.len) {
-                    const ends = origin.trailers.len == 0 and !origin.stall_after_body and !holds;
-                    const sent = conn.session.sendData(job.stream, origin.body[job.body_offset..], ends);
+                if (job.body_offset < answer.body.len) {
+                    const ends = answer.trailers.len == 0 and !stalls and !holds;
+                    const sent = conn.session.sendData(job.stream, answer.body[job.body_offset..], ends);
                     job.body_offset += sent.taken;
-                    if (job.body_offset < origin.body.len) return;
+                    if (job.body_offset < answer.body.len) return;
                     if (sent.ended) return conn.finished(job);
                 }
-                if (origin.stall_after_body or holds) return;
-                if (origin.trailers.len == 0) {
+                if (stalls or holds) return;
+                if (answer.trailers.len == 0) {
                     // A body-less answer whose head did not end the stream.
                     const sent = conn.session.sendData(job.stream, &.{}, true);
                     if (sent.ended) conn.finished(job);
                     return;
                 }
-                for (origin.trailers, 0..) |pair, index| fields[index] = .{ .name = pair[0], .value = pair[1] };
-                switch (conn.session.sendTrailers(job.stream, fields[0..origin.trailers.len])) {
+                for (answer.trailers, 0..) |pair, index| fields[index] = .{ .name = pair[0], .value = pair[1] };
+                switch (conn.session.sendTrailers(job.stream, fields[0..answer.trailers.len])) {
                     .staged => conn.finished(job),
                     .blocked => {},
                     .refused => unreachable,
@@ -273,6 +317,8 @@ pub fn TestOriginSized(comptime IoType: type, comptime conns_max_value: u32) typ
 
             fn finished(conn: *Conn, job: *Job) void {
                 conn.origin.answered += 1;
+                if (job.health) conn.origin.health_answered += 1;
+                assert(conn.origin.health_answered <= conn.origin.answered);
                 job.* = .{};
             }
 
@@ -375,6 +421,17 @@ pub fn TestOriginSized(comptime IoType: type, comptime conns_max_value: u32) typ
 
         fn armAccept(origin: *Self) void {
             origin.io.accept(origin.listener, &origin.accept_completion, Self, origin, onAccept);
+        }
+
+        /// Whether `request` is a health call this origin answers as one.
+        fn asksHealth(origin: *const Self, request: *const Session.Step.Request) bool {
+            if (origin.health == null) return false;
+            for (request.fields) |*field| {
+                if (!std.mem.eql(u8, field.name, ":path")) continue;
+                return std.mem.eql(u8, field.value, health_path);
+            }
+            assert(request.fields.len >= 1);
+            return false;
         }
 
         /// Whether `request`'s path is one this origin leaves unanswered.

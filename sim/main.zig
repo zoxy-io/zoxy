@@ -284,8 +284,10 @@ const uncovered = [_]Uncovered{
     .{
         .name = "health_probes_skipped",
         .why = .unreached,
-        .reason = "the sweep's HTTP/2 clusters are checked by dial, since their scripted origin " ++
-            "answers no gRPC health call; http_proxy_test's grpc probe scenarios fill the pool",
+        .reason = "the sweep's HTTP/2 clusters have one endpoint, since only a retry budget adds a " ++
+            "second and HTTP/2 takes none, and their gRPC probe rides that endpoint's connection or " ++
+            "dials one in the room the loader's default pool leaves, two per endpoint; " ++
+            "http_proxy_test's grpc probe scenarios fill the pool",
     },
     .{
         .name = "upstream_tls_failed",
@@ -716,6 +718,9 @@ const Census = struct {
     /// HPACK table and heard the encoder's resize (RFC 7541 §4.2).
     h2_windows_met: u64 = 0,
     h2_table_resizes: u64 = 0,
+    /// gRPC health calls an HTTP/2 origin answered (§7): SERVING, then
+    /// NOT_SERVING.
+    grpc_health_answered: [2]u64 = @splat(0),
 
     const Population = enum(u8) {
         http1,
@@ -825,6 +830,11 @@ const Census = struct {
             std.debug.print("sim census: no HTTP/2 client heard its HPACK table resized\n", .{});
             return false;
         }
+        for (census.grpc_health_answered, [_][]const u8{ "SERVING", "NOT_SERVING" }) |answered, said| {
+            if (answered >= 1) continue;
+            std.debug.print("sim census: no HTTP/2 origin answered a gRPC health call {s} (§7)\n", .{said});
+            return false;
+        }
         return true;
     }
 
@@ -861,6 +871,10 @@ const Census = struct {
             census.h2_table_resizes += @intFromBool(tuning.resized);
         }
         for (requests_before, census.request_trailers) |earlier, now| assert(now >= earlier);
+        if (harness.grpc_health) |*answer| {
+            const index: usize = if (Harness.grpcHealthServing(answer)) 0 else 1;
+            census.grpc_health_answered[index] += harness.h2_origin.health_answered;
+        }
     }
 
     /// Every population must hear a trailer section somewhere in the
