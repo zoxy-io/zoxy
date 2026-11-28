@@ -728,6 +728,11 @@ const Census = struct {
     /// Streams answered whole over HTTP/2 on a terminating TLS listener
     /// (#271): what proves the sweep drives `h2` over TLS at all.
     h2_tls_streams: u64 = 0,
+    /// HTTP/2 streams the build's handler answered whole (#434), GET then
+    /// POST.
+    h2_handler_answered: [2]u64 = @splat(0),
+    /// HTTP/2 cookies an origin read joined into one line (§8.2.3).
+    cookies_joined: u64 = 0,
     /// Each RFC 9113 violation's owed answer heard (`H2Mode.violations`).
     h2_violations_answered: [l7.H2Mode.violations.len]u64 = @splat(0),
     /// gRPC health calls an HTTP/2 origin answered (§7): SERVING, then
@@ -796,6 +801,7 @@ const Census = struct {
         }
         const forwarded_before = census.forwarded_ip6_verified;
         census.forwarded_ip6_verified += harness.origin_http.forwarded_ip6_verified;
+        census.cookies_joined += harness.origin_http.cookies_joined;
         assert(census.forwarded_ip6_verified >= forwarded_before);
     }
 
@@ -840,6 +846,15 @@ const Census = struct {
         }
         if (census.h2_table_resizes == 0) {
             std.debug.print("sim census: no HTTP/2 client heard its HPACK table resized\n", .{});
+            return false;
+        }
+        if (census.cookies_joined == 0) {
+            std.debug.print("sim census: no origin read an HTTP/2 client's split cookie joined\n", .{});
+            return false;
+        }
+        for (census.h2_handler_answered, [_][]const u8{ "GET", "POST" }) |answered, method| {
+            if (answered >= 1) continue;
+            std.debug.print("sim census: no HTTP/2 {s} was answered by the handler (#434)\n", .{method});
             return false;
         }
         for (census.h2_violations_answered, l7.H2Mode.violations) |answered, mode| {
@@ -887,6 +902,9 @@ const Census = struct {
         }
         for (harness.h2_clients[0..harness.h2_count]) |*client| {
             census.grpc_deadlines_heard += client.grpcDeadlinesHeard();
+            const handled = client.handlerAnswered();
+            census.h2_handler_answered[0] += handled[0];
+            census.h2_handler_answered[1] += handled[1];
             if (client.violationAnswered()) |mode| {
                 const index = std.mem.indexOfScalar(l7.H2Mode, &l7.H2Mode.violations, mode).?;
                 census.h2_violations_answered[index] += 1;

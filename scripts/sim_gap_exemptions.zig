@@ -79,10 +79,10 @@ const h2_peer = "an HTTP/2 peer breaking RFC 9113, or using a part of it the swe
     "a SETTINGS change once streams are open, a peer's push of credit: the sweep's clients and " ++
     "origins speak HTTP/2 plainly and its adversary acts on delivery, never on frames; " ++
     "src/http/h2's tests and h2spec drive it";
-const h2_request = "an HTTP/2 request the sweep's clients never make — to the build's handler " ++
-    "route, with split cookies, refused before its head maps, or an asterisk or origin form; " ++
-    "they ask `get`'s, `consult_get`'s and POST paths; http_proxy_test.zig and downgrade's " ++
-    "tests drive it";
+const h2_request = "an HTTP/2 request the sweep's clients never make — refused before its head " ++
+    "maps, an asterisk-form OPTIONS, or a `:path` in neither form §8.3.1 allows; they ask " ++
+    "`get`'s, `consult_get`'s, the handler's and POST paths, all origin-form; " ++
+    "http_proxy_test.zig and downgrade's tests drive it";
 const h2_tls = "HTTP/2 over a terminating TLS listener (ALPN `h2`): the sweep's TLS clients speak " ++
     "HTTP/1.1 and its HTTP/2 clients h2c, and a listener offered `h2` alone refuses it (#271); " ++
     "server_test.zig's h2 TLS scenarios drive it";
@@ -362,11 +362,8 @@ pub const exemptions = [_]Exemption{
     .{ .path = "http/h2/downgrade.zig", .owner = "requestHead", .lines = 1, .reason = h2_request },
     .{ .path = "http/h2/downgrade.zig", .owner = "string", .lines = 4, .reason = test_support },
     .{ .path = "http/h2/downgrade.zig", .owner = "validated", .lines = 5, .reason = test_support },
-    .{ .path = "http/h2/downgrade.zig", .owner = "writeCookie", .lines = 13, .reason = h2_request },
-    .{ .path = "http/h2/downgrade.zig", .owner = "writeFields", .lines = 2, .reason = h2_request },
     .{ .path = "http/h2/exchange.zig", .owner = "bytesFor", .lines = 1, .reason = h2_request },
     .{ .path = "http/h2/exchange.zig", .owner = "init", .lines = 1, .reason = h2_request },
-    .{ .path = "http/h2/exchange.zig", .owner = "onData", .lines = 2, .reason = h2_request },
     .{ .path = "http/h2/exchange.zig", .owner = "requestWindow", .lines = 1, .reason = h2_request },
     .{ .path = "http/h2/origin.zig", .owner = "framingFor", .lines = 1, .reason = origin_answer },
     .{ .path = "http/h2/origin.zig", .owner = "noBody", .lines = 6, .reason = origin_answer },
@@ -435,7 +432,6 @@ pub const exemptions = [_]Exemption{
     .{ .path = "http/proxy.zig", .owner = "appendInboundChain", .lines = 1, .reason = rare },
     .{ .path = "http/proxy.zig", .owner = "armRequestDeadline", .lines = 1, .reason = rare },
     .{ .path = "http/proxy.zig", .owner = "attachOrigin", .lines = 1, .reason = rare },
-    .{ .path = "http/proxy.zig", .owner = "beginH2Handler", .lines = 11, .reason = h2_request },
     .{ .path = "http/proxy.zig", .owner = "beginHandler", .lines = 1, .reason = head_shape },
     .{ .path = "http/proxy.zig", .owner = "callHandler", .lines = 1, .reason = rare },
     .{ .path = "http/proxy.zig", .owner = "clientAddressOf", .lines = 1, .reason = unix },
@@ -460,7 +456,6 @@ pub const exemptions = [_]Exemption{
     .{ .path = "http/proxy.zig", .owner = "planForwarded", .lines = 1, .reason = rare },
     .{ .path = "http/proxy.zig", .owner = "planMaxForwards", .lines = 1, .reason = kcov_line_x86 },
     .{ .path = "http/proxy.zig", .owner = "readMoreHead", .lines = 1, .reason = rare },
-    .{ .path = "http/proxy.zig", .owner = "readsHandlerBody", .lines = 1, .reason = h2_request },
     .{ .path = "http/proxy.zig", .owner = "refuseH2Request", .lines = 6, .reason = h2_request },
     .{ .path = "http/proxy.zig", .owner = "refusedByPolicies", .lines = 1, .reason = extension },
     .{ .path = "http/proxy.zig", .owner = "replayEligible", .lines = 2, .reason = rare },
@@ -469,7 +464,6 @@ pub const exemptions = [_]Exemption{
     .{ .path = "http/proxy.zig", .owner = "routeOf", .lines = 1, .reason = rare },
     .{ .path = "http/proxy.zig", .owner = "sendResponseExcess", .lines = 6, .reason = origin_answer },
     .{ .path = "http/proxy.zig", .owner = "start", .lines = 2, .reason = census },
-    .{ .path = "http/proxy.zig", .owner = "takeHandlerData", .lines = 11, .reason = h2_request },
     .{ .path = "http/proxy.zig", .owner = "targetViews", .lines = 2, .reason = head_shape },
     .{ .path = "http/render.zig", .owner = "append", .lines = 1, .reason = kcov_line_x86 },
     .{ .path = "http/render.zig", .owner = "appendEndToEndHeaders", .lines = 1, .reason = head_shape },
