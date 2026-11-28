@@ -1622,10 +1622,17 @@ external binaries. They and the speed gates run at merge.
       the wrong ID first — under the datagram adversary;
     - an http cluster speaking HTTP/2 to its origin on a quarter of
       seeds, h2c or over TLS, or HTTP/1.1 over TLS on an eighth, answered
-      by a scripted origin with the canonical sized 200 every client
-      already judges; where an HTTP/2 cluster is checked by request, the
-      check is gRPC's health call over the origin pool, which the origin
-      answers SERVING, or NOT_SERVING on the quarter drawn to fail.
+      by a scripted origin in the shapes every client already judges. The
+      HTTPS origin answers the canonical sized 200. The HTTP/2 origin
+      draws each answer, on clean seeds too, from the sized 200, the
+      chunked one sent with no length (which the proxy frames chunked
+      again for HTTP/1.1), that with a trailer section, and the sized
+      200 behind an interim `100`; on a seed whose HTTP/1.1 origin
+      would prefix an interim `100`, every answer is the interim one.
+      Where an HTTP/2 cluster is
+      checked by request, the check is gRPC's health call over the
+      origin pool, which the origin answers SERVING, or NOT_SERVING on
+      the quarter drawn to fail.
   - **Who connects:**
     - L4 echo clients, which on a listener that routes by SNI open with
       a ClientHello naming the route, another name, or none, or with
@@ -1740,9 +1747,9 @@ external binaries. They and the speed gates run at merge.
     a listener that holds several must be chosen by a name, and some
     HTTP/2 send must stop at a client's window and some resize be heard,
     some stream must be answered over HTTP/2 on a TLS listener, every
-    kind of HTTP/2 violation must hear its owed answer, the handler must
-    answer an HTTP/2 GET and POST, and some split cookie must arrive
-    joined.
+    kind of HTTP/2 violation must hear its owed answer, the HTTP/2 origin
+    must answer in each of its shapes, the handler must answer an HTTP/2
+    GET and POST, and some split cookie must arrive joined.
     - Exemptions are named, each with its reason.
     - An exemption that *does* fire fails the census too, so widening a
       scenario deletes its excuse.

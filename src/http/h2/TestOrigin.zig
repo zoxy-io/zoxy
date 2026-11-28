@@ -20,12 +20,24 @@ const assert = std.debug.assert;
 /// A field as a scenario writes it.
 pub const Pair = [2][]const u8;
 
-/// One scripted answer: a head, a body, and a trailer section.
+/// One scripted answer: a head, a body, and a trailer section — and, when
+/// `interim` names a 1xx status, an informational head before them all.
 pub const Answer = struct {
     status: []const u8,
     headers: []const Pair = &.{},
     body: []const u8 = "",
     trailers: []const Pair = &.{},
+    interim: []const u8 = "",
+};
+
+/// Chooses each request's answer in the script's place, and hears when
+/// one is staged whole: a sweep's origin answers in more than one shape,
+/// and counts which it gave. Neither a health call nor a muted one asks.
+pub const Picker = struct {
+    context: *anyopaque,
+    /// The answer for the next request; null answers it with the script.
+    pick: *const fn (context: *anyopaque) ?*const Answer,
+    answered: *const fn (context: *anyopaque, answer: *const Answer) void,
 };
 
 /// The path a `grpc` health check calls (§7).
@@ -104,6 +116,9 @@ pub fn TestOriginSized(comptime IoType: type, comptime conns_max_value: u32) typ
         /// place: a sweep's origin serves traffic and its prober alike.
         /// Null answers it with the script.
         health: ?Answer = null,
+        /// Chooses each request's answer; null answers every one with the
+        /// script.
+        picker: ?Picker = null,
 
         // -- what it heard --
         requests: u32 = 0,
@@ -155,6 +170,10 @@ pub fn TestOriginSized(comptime IoType: type, comptime conns_max_value: u32) typ
             muted: bool = false,
             /// A health call, answered with `health`.
             health: bool = false,
+            /// What `picker` chose for it; null is the script.
+            picked: ?*const Answer = null,
+            /// The answer's informational head is staged.
+            interim_sent: bool = false,
         };
 
         pub const Conn = struct {
@@ -240,6 +259,9 @@ pub fn TestOriginSized(comptime IoType: type, comptime conns_max_value: u32) typ
                     return;
                 };
                 job.* = .{ .stream = request.stream, .muted = origin.mutes(request), .health = origin.asksHealth(request) };
+                if (origin.picker) |picker| {
+                    if (!job.muted and !job.health) job.picked = picker.pick(picker.context);
+                }
                 if (origin.answer_at_head and !origin.mute and !job.muted and !job.health) {
                     job.started = true;
                     conn.push(job);
@@ -270,12 +292,14 @@ pub fn TestOriginSized(comptime IoType: type, comptime conns_max_value: u32) typ
                 assert(job.stream != 0);
                 if (!job.started) return;
                 assert(!job.health or origin.health != null);
-                const answer: Answer = if (job.health) origin.health.? else .{
+                assert(!job.health or job.picked == null);
+                const answer: Answer = if (job.health) origin.health.? else if (job.picked) |picked| picked.* else .{
                     .status = origin.status,
                     .headers = origin.headers,
                     .body = origin.body,
                     .trailers = origin.trailers,
                 };
+                if (!conn.sendInterim(job, &answer)) return;
                 var fields: [32]hpack.Field = undefined;
                 // A bidirectional answer ends only after the request has;
                 // a health call is answered as gRPC answers one, whole.
@@ -315,10 +339,31 @@ pub fn TestOriginSized(comptime IoType: type, comptime conns_max_value: u32) typ
                 }
             }
 
+            /// The answer's informational head, ahead of the rest, once: false
+            /// while the session has no room for it.
+            fn sendInterim(conn: *Conn, job: *Job, answer: *const Answer) bool {
+                if (answer.interim.len == 0 or job.interim_sent) return true;
+                // RFC 9110 §15.2: a three-digit status in the 1xx class.
+                assert(answer.interim.len == 3 and answer.interim[0] == '1');
+                const fields = [_]hpack.Field{.{ .name = ":status", .value = answer.interim }};
+                switch (conn.session.sendHead(job.stream, &fields, false)) {
+                    .staged => job.interim_sent = true,
+                    .blocked => return false,
+                    .refused => unreachable, // The scenario's own script.
+                }
+                assert(job.interim_sent);
+                return true;
+            }
+
             fn finished(conn: *Conn, job: *Job) void {
                 conn.origin.answered += 1;
                 if (job.health) conn.origin.health_answered += 1;
                 assert(conn.origin.health_answered <= conn.origin.answered);
+                assert(job.picked == null or conn.origin.picker != null);
+                if (job.picked) |picked| {
+                    const picker = conn.origin.picker.?;
+                    picker.answered(picker.context, picked);
+                }
                 job.* = .{};
             }
 

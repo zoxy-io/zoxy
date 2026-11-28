@@ -733,6 +733,8 @@ const Census = struct {
     h2_handler_answered: [2]u64 = @splat(0),
     /// HTTP/2 cookies an origin read joined into one line (§8.2.3).
     cookies_joined: u64 = 0,
+    /// Answers the HTTP/2 origin staged whole, by shape.
+    h2_origin_shapes: [std.enums.values(Harness.H2OriginShape).len]u64 = @splat(0),
     /// Each RFC 9113 violation's owed answer heard (`H2Mode.violations`).
     h2_violations_answered: [l7.H2Mode.violations.len]u64 = @splat(0),
     /// gRPC health calls an HTTP/2 origin answered (§7): SERVING, then
@@ -802,6 +804,7 @@ const Census = struct {
         const forwarded_before = census.forwarded_ip6_verified;
         census.forwarded_ip6_verified += harness.origin_http.forwarded_ip6_verified;
         census.cookies_joined += harness.origin_http.cookies_joined;
+        for (&census.h2_origin_shapes, harness.h2_shapes_answered) |*total, answered| total.* += answered;
         assert(census.forwarded_ip6_verified >= forwarded_before);
     }
 
@@ -846,6 +849,12 @@ const Census = struct {
         }
         if (census.h2_table_resizes == 0) {
             std.debug.print("sim census: no HTTP/2 client heard its HPACK table resized\n", .{});
+            return false;
+        }
+        for (census.h2_origin_shapes, 0..) |answered, index| {
+            if (answered >= 1) continue;
+            const shape: Harness.H2OriginShape = @fromBackingInt(@intCast(index));
+            std.debug.print("sim census: the HTTP/2 origin never answered {s}\n", .{@tagName(shape)});
             return false;
         }
         if (census.cookies_joined == 0) {

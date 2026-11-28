@@ -90,10 +90,10 @@ const h2_origin_tls = "TLS to an HTTP/2 origin failing: the sweep's h2 origin se
     "cluster trusts over a byte-faithful TCP adversary; http_proxy_test.zig's h2 origin " ++
     "scenarios refuse a chain";
 const origin_answer = "an origin answer the sweep's scripted origins never give — bytes past a " ++
-    "declared length, an HTTP/2 answer with no length that is re-framed chunked, a `101` to a " ++
-    "request that asked no upgrade, a malformed head under a " ++
-    "borrowed scratch, an HTTP/2 origin's trailers, interim or 204 head, nominated `te`, or " ++
-    "asterisk target: they answer the canonical sized 200; http_proxy_test.zig drives it";
+    "declared length, a `101` to a request that asked no upgrade, a malformed head under a " ++
+    "borrowed scratch, an HTTP/2 origin's 204 or HEAD answer, nominated `te`, or asterisk " ++
+    "target: they answer the canonical sized, chunked and trailered 200s, the HTTP/2 one " ++
+    "behind an interim too; http_proxy_test.zig drives it";
 const grpc_service = "a `grpc` check naming a service: the sweep's ask about the server as a " ++
     "whole (`service = \"\"`); origin_pool's tests compose a named one";
 const grpc_timeout = "a `grpc-timeout` in hours, minutes or seconds, or a gRPC content type with " ++
@@ -365,22 +365,16 @@ pub const exemptions = [_]Exemption{
     .{ .path = "http/h2/exchange.zig", .owner = "bytesFor", .lines = 1, .reason = h2_request },
     .{ .path = "http/h2/exchange.zig", .owner = "init", .lines = 1, .reason = h2_request },
     .{ .path = "http/h2/exchange.zig", .owner = "requestWindow", .lines = 1, .reason = h2_request },
-    .{ .path = "http/h2/origin.zig", .owner = "framingFor", .lines = 1, .reason = origin_answer },
     .{ .path = "http/h2/origin.zig", .owner = "noBody", .lines = 6, .reason = origin_answer },
     .{ .path = "http/h2/origin.zig", .owner = "nominated", .lines = 7, .reason = origin_answer },
     .{ .path = "http/h2/origin.zig", .owner = "path", .lines = 10, .reason = origin_answer },
     .{ .path = "http/h2/origin.zig", .owner = "request", .lines = 2, .reason = test_support },
     .{ .path = "http/h2/origin.zig", .owner = "requestCarries", .lines = 2, .reason = origin_answer },
-    .{ .path = "http/h2/origin.zig", .owner = "responseHead", .lines = 2, .reason = origin_answer },
-    .{ .path = "http/h2/origin.zig", .owner = "trailerSection", .lines = 14, .reason = origin_answer },
     .{ .path = "http/h2/origin_pool.zig", .owner = "compose", .lines = 2, .reason = grpc_service },
-    .{ .path = "http/h2/origin_pool.zig", .owner = "copyOut", .lines = 5, .reason = origin_answer },
     .{ .path = "http/h2/origin_pool.zig", .owner = "copyPayload", .lines = 6, .reason = origin_answer_part },
     .{ .path = "http/h2/origin_pool.zig", .owner = "drive", .lines = 2, .reason = rare },
     .{ .path = "http/h2/origin_pool.zig", .owner = "nextOf", .lines = 1, .reason = rare },
     .{ .path = "http/h2/origin_pool.zig", .owner = "onConnect", .lines = 1, .reason = rare },
-    .{ .path = "http/h2/origin_pool.zig", .owner = "onTrailers", .lines = 6, .reason = origin_answer },
-    .{ .path = "http/h2/origin_pool.zig", .owner = "stageEnd", .lines = 3, .reason = origin_answer },
     .{ .path = "http/h2/origin_pool.zig", .owner = "stepEvents", .lines = 2, .reason = rare },
     .{ .path = "http/h2/origin_pool.zig", .owner = "streamWindow", .lines = 1, .reason = kcov_line },
     .{ .path = "http/h2/origin_pool.zig", .owner = "tlsFailed", .lines = 5, .reason = h2_origin_tls },

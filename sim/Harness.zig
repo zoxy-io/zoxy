@@ -319,6 +319,11 @@ h2_violation_prng: std.Random.DefaultPrng,
 /// #434 over HTTP/2: which h2c streams ask the build's handler route
 /// rather than the origin. Its own stream, so the plans draw as they did.
 h2_handler_prng: std.Random.DefaultPrng,
+/// Which shape the HTTP/2 origin answers each request in, drawn per
+/// request on clean seeds too (`pickH2Answer`), and how many of each it
+/// staged whole.
+h2_shape_prng: std.Random.DefaultPrng,
+h2_shapes_answered: [h2_origin_shapes.len]u32,
 quic_http: bool,
 quic_connections: u32,
 h3_prng: std.Random.DefaultPrng,
@@ -2692,6 +2697,8 @@ fn drawHttpProtocol(harness: *Harness, seed: u64) void {
     harness.h2_tuning_prng = std.Random.DefaultPrng.init(seed ^ 0x0009_0113_0009_0113);
     harness.h2_violation_prng = std.Random.DefaultPrng.init(seed ^ 0x9113_0005_9113_0005);
     harness.h2_handler_prng = std.Random.DefaultPrng.init(seed ^ 0x0434_0002_0434_0002);
+    harness.h2_shape_prng = std.Random.DefaultPrng.init(seed ^ 0x9113_0008_9113_0008);
+    harness.h2_shapes_answered = @splat(0);
     var protocol_prng = std.Random.DefaultPrng.init(seed ^ 0x0275_0275_0275_0275);
     const random = protocol_prng.random();
     const roll = random.uintLessThan(u8, 8);
@@ -2715,6 +2722,62 @@ const h2_origin_headers = [_]zoxy.http.h2.Pair{
     .{ "content-length", "32" },
     .{ l7.canon.log_response_header, l7.canon.log_response_value },
 };
+
+/// The shapes the HTTP/2 origin answers in: the HTTP/1.1 origin's
+/// well-formed ones (`l7.OriginMode`), in HTTP/2's terms, so every client
+/// judges them by the same octets. With no length, the proxy frames the
+/// answer chunked for HTTP/1.1 (`h2/origin.zig`), one chunk per DATA
+/// frame, and the origin sends one. A trailer section closes the chunked
+/// stream for HTTP/1.1, and goes on as trailing HEADERS for HTTP/2 and
+/// HTTP/3. An interim `100` comes ahead of the sized answer (#232).
+pub const H2OriginShape = enum(u8) { sized, chunked, chunked_trailers, interim_then_sized };
+const h2_origin_shapes = [_]zoxy.http.h2.Answer{
+    .{ .status = "200", .headers = &h2_origin_headers, .body = l7.canon.sized_body },
+    .{ .status = "200", .body = l7.h2_canonical_chunked_body },
+    .{
+        .status = "200",
+        .headers = &.{
+            .{ "trailer", l7.canon.response_trailer_name },
+            .{ l7.canon.response_trailer_owed_header, "1" },
+        },
+        .body = l7.h2_canonical_chunked_body,
+        .trailers = &.{.{ l7.canon.response_trailer_name, l7.canon.response_trailer_value }},
+    },
+    .{ .status = "200", .headers = &h2_origin_headers, .body = l7.canon.sized_body, .interim = "100" },
+};
+
+comptime {
+    assert(h2_origin_shapes.len == std.enums.values(H2OriginShape).len);
+    assert(h2_origin_shapes[@backingInt(H2OriginShape.chunked_trailers)].trailers.len == 1);
+}
+
+/// Each request's shape: behind an interim on an interim seed, as the
+/// HTTP/1.1 origin answers there (`pickHttpOriginMode`), and drawn
+/// otherwise — on clean seeds too. Every shape is well-formed, and only
+/// a clean seed's golden oracle demands the whole answer: off one, a
+/// chunk the proxy framed wrong is refused by its own scanner, and the
+/// cut that leaves passes as the adversary's.
+fn pickH2Answer(context: *anyopaque) ?*const zoxy.http.h2.Answer {
+    const harness: *Harness = @ptrCast(@alignCast(context));
+    const shape: H2OriginShape = if (harness.interim_http)
+        .interim_then_sized
+    else
+        harness.h2_shape_prng.random().enumValue(H2OriginShape);
+    assert(!harness.interim_http or shape == .interim_then_sized);
+    assert(@backingInt(shape) < h2_origin_shapes.len);
+    return &h2_origin_shapes[@backingInt(shape)];
+}
+
+fn countH2Answer(context: *anyopaque, answer: *const zoxy.http.h2.Answer) void {
+    const harness: *Harness = @ptrCast(@alignCast(context));
+    var matched: u32 = 0;
+    for (&h2_origin_shapes, &harness.h2_shapes_answered) |*shape, *count| {
+        if (shape != answer) continue;
+        count.* += 1;
+        matched += 1;
+    }
+    assert(matched == 1);
+}
 
 /// The http listeners' request policies: the listener's own, then the
 /// #437 consult — except where the http cluster speaks HTTP/2 (#275) or
@@ -3230,6 +3293,7 @@ fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: st
         // §8: a gRPC call is left to its deadline.
         .mute_path_prefix = l7.canon.grpc_mute_prefix,
         .health = harness.grpc_health,
+        .picker = .{ .context = harness, .pick = pickH2Answer, .answered = countH2Answer },
     };
     // One of the two answers at the http endpoint's address — the address
     // the #178 pinned tag is minted from, so a sticky cookie names the same
