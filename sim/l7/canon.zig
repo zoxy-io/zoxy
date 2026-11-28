@@ -83,7 +83,9 @@ pub const sized_head = "HTTP/1.1 200 OK\r\nContent-Length: 32\r\n" ++
     log_response_header ++ ": " ++ log_response_value ++ "\r\n" ++
     hop_by_hop_lines ++ "\r\n";
 pub const sized_response = sized_head ++ sized_body;
-pub const chunked_wire = "10\r\nchunked-body-16b\r\n0\r\n\r\n";
+/// The payload both chunked origins answer, whatever chunks carry it.
+pub const chunked_body = "chunked-body-16b";
+pub const chunked_wire = "10\r\n" ++ chunked_body ++ "\r\n0\r\n\r\n";
 pub const chunked_head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
 pub const chunked_response = chunked_head ++ chunked_wire;
 /// The one trailer field (§7) the trailing origin ends its chunked 200
@@ -93,8 +95,10 @@ pub const chunked_response = chunked_head ++ chunked_wire;
 /// rather than searching it.
 pub const response_trailer_name = "x-sim-trailer";
 pub const response_trailer_value = "sim-trailer-1";
-pub const chunked_trailers_wire = "10\r\nchunked-body-16b\r\n0\r\n" ++
-    response_trailer_name ++ ": " ++ response_trailer_value ++ "\r\n\r\n";
+/// The section after the trailing origin's last chunk, its one field and
+/// the closing CRLF.
+pub const chunked_trailer_section = response_trailer_name ++ ": " ++ response_trailer_value ++ "\r\n\r\n";
+pub const chunked_trailers_wire = "10\r\n" ++ chunked_body ++ "\r\n0\r\n" ++ chunked_trailer_section;
 /// What the trailing origin's head says, so every client knows a section
 /// is owed and can demand it on a whole answer — a proxy that dropped one
 /// would otherwise pass as the plain chunked origin. `Trailer` announces it
@@ -106,10 +110,6 @@ pub const chunked_trailers_head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked
     "Trailer: " ++ response_trailer_name ++ "\r\n" ++
     response_trailer_owed_header ++ ": 1\r\n\r\n";
 pub const chunked_trailers_response = chunked_trailers_head ++ chunked_trailers_wire;
-/// Where the two chunked wires part: every octet before the last chunk's
-/// terminating CRLF is shared, so a client knows which one it is reading
-/// from the first octet after them.
-pub const chunked_shared_bytes: u32 = chunked_wire.len - 2;
 
 /// A gRPC call the sweep's HTTP/2 origin never answers (§8): its path is
 /// under the origin's muted prefix, and its `grpc-timeout` short, so the
@@ -293,12 +293,9 @@ comptime {
     // for being unknown rather than for being nominated.
     assert(std.mem.indexOf(u8, sized_head, "keep-alive, " ++ hop_nominated_header) != null);
     assert(chunked_wire[0] == '1' and chunked_wire[1] == '0');
-    assert(chunked_wire.len == 4 + 16 + 2 + 5);
-    // The clients tell the two chunked wires apart by one octet, so the
-    // octets before it must be the same and that octet must differ.
-    assert(std.mem.eql(u8, chunked_wire[0..chunked_shared_bytes], chunked_trailers_wire[0..chunked_shared_bytes]));
-    assert(chunked_wire[chunked_shared_bytes] == '\r');
-    assert(chunked_trailers_wire[chunked_shared_bytes] != '\r');
+    assert(chunked_wire.len == 4 + chunked_body.len + 2 + 5);
+    // A section that opened with CR would read as no section at all.
+    assert(chunked_trailer_section[0] != '\r');
     assert(oversize_head.len == 8190);
     // The handshake answer must carry both halves of the pair, or the
     // scenario would pass while proving nothing about the exemption.

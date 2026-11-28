@@ -1631,11 +1631,11 @@ external binaries. They and the speed gates run at merge.
       would prefix an interim `100`, every answer is the interim one.
       Off clean seeds it also misbehaves within RFC 9113: it refuses a
       stream unprocessed (REFUSED_STREAM), breaks off half way through
-      the sized body (INTERNAL_ERROR), or answers and then drains its
-      connection (GOAWAY), refusing the streams after. Where an HTTP/2
-      cluster is checked by request, the check is gRPC's health call
-      over the origin pool, which the origin answers SERVING, or
-      NOT_SERVING on the quarter drawn to fail.
+      the sized or the chunked body (INTERNAL_ERROR), or answers and
+      then drains its connection (GOAWAY), refusing the streams after.
+      Where an HTTP/2 cluster is checked by request, the check is gRPC's
+      health call over the origin pool, which the origin answers
+      SERVING, or NOT_SERVING on the quarter drawn to fail.
   - **Who connects:**
     - L4 echo clients, which on a listener that routes by SNI open with
       a ClientHello naming the route, another name, or none, or with
@@ -1705,6 +1705,12 @@ external binaries. They and the speed gates run at merge.
       each 200 it gave reaches its client behind one, over HTTP/1.1,
       HTTP/2 and HTTP/3 alike: §7 relays a `1xx`, and an interim comes
       before the final head on the wire, so no cut excuses its absence;
+    - a chunked 200 is judged by what it carries, not how it is framed:
+      the proxy chunks an HTTP/2 origin's answer one DATA run at a time,
+      so an HTTP/1.1 client decodes the sizes, and the payload must be a
+      prefix of the canonical body, whole once the last chunk says the
+      end, with exactly the trailer section its head owed, or none where
+      it owed none;
     - an HTTP/2 violator hears only the answer RFC 9113 owes it — the
       connection's GOAWAY with its code, or stream 1's reset with its code
       while the connection stays — and on a clean seed hears it;

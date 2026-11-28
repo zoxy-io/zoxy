@@ -601,7 +601,7 @@ pub fn Client(comptime IoType: type) type {
                     walk.violation = violation;
                     return walk;
                 }
-                if (recordComplete(&walk, &response, verdict.body_len)) |violation| {
+                if (recordComplete(&walk, &response, verdict)) |violation| {
                     walk.violation = violation;
                     return walk;
                 }
@@ -914,7 +914,11 @@ pub fn Client(comptime IoType: type) type {
         const BodyVerdict = struct {
             body_len: u32,
             violation: ?ClientError,
+            /// A chunked body ended with the trailing origin's section.
+            trailers: bool = false,
         };
+
+        const body_corrupted: BodyVerdict = .{ .body_len = 0, .violation = ClientError.ResponseBodyCorrupted };
 
         /// Null means the body is still incomplete (a legal partial
         /// tail); otherwise the verdict carries the wire length consumed
@@ -973,11 +977,7 @@ pub fn Client(comptime IoType: type) type {
                     if (response.status != 200 or page_body != null or entry.answered_here) {
                         return .{ .body_len = 0, .violation = ClientError.ResponseCorrupted };
                     }
-                    // Two origins answer chunked, one with a trailer
-                    // section (§7) the proxy relays verbatim; the octet
-                    // after the last chunk's line says which this is.
-                    const wire = chunkedWireOf(body);
-                    return prefixVerdict(body, wire, @intCast(wire.len));
+                    return chunkedVerdict(body);
                 },
                 .until_close => {
                     if (response.status != 200 or page_body != null or entry.answered_here) {
@@ -1008,20 +1008,19 @@ pub fn Client(comptime IoType: type) type {
 
         /// Counts one complete response into the walk — its status, its
         /// persistence, its trailer section — once every check of it has
-        /// passed but the trailer one, which needs the body's length.
-        fn recordComplete(walk: *Walk, response: *const parser.ResponseHead, body_len: u32) ?ClientError {
+        /// passed but the trailer one, which needs whether the body ended
+        /// with the section.
+        fn recordComplete(walk: *Walk, response: *const parser.ResponseHead, verdict: BodyVerdict) ?ClientError {
             assert(walk.complete_count < responses_max);
-            if (trailerViolation(response, body_len)) |violation| return violation;
+            assert(verdict.violation == null);
+            if (verdict.trailers) assert(response.framing == .chunked);
+            const body_len = verdict.body_len;
+            if (trailerViolation(response, verdict.trailers)) |violation| return violation;
             walk.statuses[walk.complete_count] = response.status;
             walk.keep_alives[walk.complete_count] = response.keep_alive;
             walk.complete_count += 1;
             walk.interims_pending = 0;
-            // Only the trailing wire is this long among chunked bodies, and
-            // `walkBody` passed it octet for octet. The framing is named
-            // because a sized body could share the length.
-            if (response.framing == .chunked and body_len == canon.chunked_trailers_wire.len) {
-                walk.trailers_count += 1;
-            }
+            if (verdict.trailers) walk.trailers_count += 1;
             walk.offset += response.head_len + body_len;
             assert(walk.trailers_count <= walk.complete_count);
             return null;
@@ -1030,29 +1029,96 @@ pub fn Client(comptime IoType: type) type {
         /// A whole chunked answer carries the trailer section its head owed,
         /// and only then (§7): the proxy relays the section, and the head's
         /// `Trailer` announcement with it, verbatim.
-        fn trailerViolation(response: *const parser.ResponseHead, body_len: u32) ?ClientError {
+        fn trailerViolation(response: *const parser.ResponseHead, heard: bool) ?ClientError {
             assert(response.status >= 100);
             if (response.framing != .chunked) return null;
             const owed = headerEquals(response.headers, canon.response_trailer_owed_header, "1");
             const announced = headerEquals(response.headers, "Trailer", canon.response_trailer_name);
-            const heard = body_len == canon.chunked_trailers_wire.len;
-            assert(body_len == canon.chunked_wire.len or heard);
             if (owed != heard) return ClientError.TrailersMismatched;
             if (owed != announced) return ClientError.TrailersMismatched;
             return null;
         }
 
-        /// The canonical chunked wire `body` is a prefix of, if any: the
-        /// two agree up to `chunked_shared_bytes`, so a body no longer than
-        /// that is judged against either, and one longer by the octet
-        /// where they part. An octet that is neither's is judged against
-        /// the trailing wire and fails it.
-        fn chunkedWireOf(body: []const u8) []const u8 {
-            assert(canon.chunked_shared_bytes < canon.chunked_wire.len);
-            assert(canon.chunked_shared_bytes < canon.chunked_trailers_wire.len);
-            if (body.len <= canon.chunked_shared_bytes) return canon.chunked_wire;
-            if (body[canon.chunked_shared_bytes] == '\r') return canon.chunked_wire;
-            return canon.chunked_trailers_wire;
+        /// A chunked canonical 200, decoded rather than matched: the proxy
+        /// frames an HTTP/2 origin's answer one chunk per DATA run, so the
+        /// chunk sizes are its own, and only the payload and the section
+        /// after the last chunk are the origin's. The payload must be a
+        /// prefix of the chunked body, and whole once the last chunk says
+        /// the end. Null while a legal answer is still arriving.
+        fn chunkedVerdict(body: []const u8) ?BodyVerdict {
+            const canonical = canon.chunked_body;
+            var at: usize = 0;
+            var payload: usize = 0;
+            // Every chunk but the last carries an octet of the body.
+            for (0..canonical.len + 1) |_| {
+                const size = switch (chunkSizeLine(body[at..])) {
+                    .partial => return null,
+                    .corrupt => return body_corrupted,
+                    .size => |line| line,
+                };
+                at += size.line_len;
+                assert(at <= body.len);
+                if (size.value == 0) return chunkedEnd(body, at, payload == canonical.len);
+                if (size.value > canonical.len - payload) return body_corrupted;
+                const have = @min(size.value, body.len - at);
+                if (!std.mem.eql(u8, body[at..][0..have], canonical[payload..][0..have])) return body_corrupted;
+                if (have < size.value) return null;
+                at += size.value;
+                payload += size.value;
+                const crlf = @min(2, body.len - at);
+                if (!std.mem.eql(u8, body[at..][0..crlf], "\r\n"[0..crlf])) return body_corrupted;
+                if (crlf < 2) return null;
+                at += 2;
+                assert(payload <= canonical.len);
+            }
+            return body_corrupted;
+        }
+
+        const ChunkSizeLine = union(enum) {
+            partial,
+            corrupt,
+            size: struct { value: usize, line_len: usize },
+        };
+
+        /// A chunk's size line, `HEX CRLF` with no extension — what both the
+        /// proxy and the chunked origins write.
+        fn chunkSizeLine(bytes: []const u8) ChunkSizeLine {
+            // The body's own length fits in this many hex digits.
+            const digits_max = 4;
+            comptime assert(canon.chunked_body.len < 1 << (4 * digits_max));
+            var value: usize = 0;
+            for (bytes, 0..) |octet, index| {
+                if (index > digits_max) return .corrupt;
+                if (octet == '\r') {
+                    if (index == 0) return .corrupt;
+                    if (index + 1 == bytes.len) return .partial;
+                    if (bytes[index + 1] != '\n') return .corrupt;
+                    assert(index >= 1 and index <= digits_max);
+                    return .{ .size = .{ .value = value, .line_len = index + 2 } };
+                }
+                const digit = std.fmt.charToDigit(octet, 16) catch return .corrupt;
+                value = value * 16 + digit;
+            }
+            assert(bytes.len <= digits_max + 1);
+            return .partial;
+        }
+
+        /// After the last chunk: no section, or the trailing origin's one
+        /// field (§7). A payload short of whole is a cut the proxy passed
+        /// off as an answer when it framed the end.
+        fn chunkedEnd(body: []const u8, at: usize, whole: bool) ?BodyVerdict {
+            assert(at <= body.len);
+            if (!whole) return body_corrupted;
+            const rest = body[at..];
+            const sections = [_][]const u8{ "\r\n", canon.chunked_trailer_section };
+            for (sections, [_]bool{ false, true }) |section, trailers| {
+                const have = @min(rest.len, section.len);
+                if (!std.mem.eql(u8, rest[0..have], section[0..have])) continue;
+                if (have < section.len) return null;
+                assert(at + section.len <= std.math.maxInt(u32));
+                return .{ .body_len = @intCast(at + section.len), .violation = null, .trailers = trailers };
+            }
+            return body_corrupted;
         }
 
         /// Verdict for a wire-exact canonical body: the received prefix
