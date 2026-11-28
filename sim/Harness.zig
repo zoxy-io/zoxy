@@ -43,6 +43,7 @@ const HttpOrigin = l7.HttpOrigin(SimIo);
 const HttpClient = l7.Client(SimIo);
 const H2Client = l7.H2Client(SimIo);
 const H3Client = l7.H3Client(SimIo);
+const VersionProbe = l7.VersionProbe(SimIo);
 const EchoClient = l4.Client(SimIo);
 const AdminScraper = admin.Scraper(SimIo);
 /// The HTTP/2 origin of a seed whose http cluster speaks it (#275): enough
@@ -278,6 +279,10 @@ h2_count: u8,
 /// listener's binding, on a seed whose terminating listener speaks http
 /// and drew one. Drawn from `h3_prng`, so no other draw of a seed moves.
 h3_clients: [h3_clients_max]H3Client,
+/// On half the seeds that speak HTTP/3, a datagram in a version the server
+/// does not speak, and the Version Negotiation it earns (RFC 9000 §6).
+version_probe: VersionProbe,
+version_probing: bool,
 h3_count: u8,
 /// The admin plane's population (§8): scrapers of the metrics listener,
 /// on a seed that binds one. From the arena, since each holds a whole
@@ -3692,6 +3697,8 @@ fn prepareH3Clients(harness: *Harness) void {
         client.on_ended = clientEndedHook;
         client.context = harness;
     }
+    harness.version_probing = harness.h3_count >= 1 and harness.h3_violation_prng.random().boolean();
+    assert(!harness.version_probing or harness.quic_http);
 }
 
 /// An eighth of GETs ask a bodiless path instead (`canon.bodiless_answers`:
@@ -3881,6 +3888,11 @@ pub fn startClients(harness: *Harness) void {
     }
     for (harness.h3_clients[0..harness.h3_count]) |*client| {
         client.begin();
+    }
+    if (harness.version_probing) {
+        harness.version_probe.start(&harness.io, tlsBindAddress()) catch |err| {
+            std.debug.panic("version probe bind: {s}", .{@errorName(err)});
+        };
     }
     harness.startTlsClients();
 }
@@ -4521,6 +4533,7 @@ fn endScenario(harness: *Harness) void {
     for (harness.h3_clients[0..harness.h3_count]) |*client| {
         client.cancelIfStuck();
     }
+    if (harness.version_probing) harness.version_probe.stop();
     for (harness.tls_clients_storage[0..harness.tls_clients_live]) |*client| {
         client.cancelIfStuck();
     }
@@ -4660,6 +4673,10 @@ pub fn verify(harness: *Harness) !void {
         try harness.verifyH3Certificate(client, index);
     }
     try harness.verifyH3ProtocolErrors();
+    if (harness.version_probing) {
+        const intact = harness.io.adversary.udp_corrupt_percent == 0;
+        try harness.version_probe.verify(harness.clean, intact);
+    }
     for (harness.admin_scrapers) |*scraper| try scraper.verify(&harness.server.counters);
     try harness.verifyTlsSessions();
     try harness.verifyClientRefusalCount();

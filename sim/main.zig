@@ -204,20 +204,6 @@ const uncovered = [_]Uncovered{
             "raise, and a pass polls it after every datagram; the rung exists so a queue that " ++
             "did overflow is read again rather than lost",
     },
-    .{
-        .name = "h3_version_negotiations",
-        .why = .must_stay_zero,
-        // A rate, not zero, and the soak is what proved it: "never" held
-        // at 4096 seeds and failed in run #143, 2 to 7 times per 500,000
-        // seeds a shard. One per 20,000 leaves several times that as
-        // headroom, and still sits orders of magnitude under a regression
-        // that answered the sweep's own v1 Initials, which would fire on
-        // nearly every seed with an HTTP/3 client.
-        .allowance = .{ .at_most_one_per = 20_000 },
-        .reason = "the sweep's clients speak QUIC v1; only the adversary corrupting a " ++
-            "datagram's version field, with the datagram still 1200 octets, reaches it, " ++
-            "and src/http/h3/server_test.zig sends one on purpose",
-    },
     // #481's resolver. A quarter of seeds' L4 cluster follows a name its
     // scripted nameservers answer, each by a drawn behaviour under the
     // datagram adversary, so every outcome of a query is reached; what is
@@ -724,6 +710,8 @@ const Census = struct {
     h2_violations_answered: [l7.H2Mode.violations.len]u64 = @splat(0),
     /// HTTP/3 violators that heard their owed answer, by kind.
     h3_violations_answered: [l7.H3Violation.violations.len]u64 = @splat(0),
+    /// Version Negotiations a probe heard and judged (RFC 9000 §6).
+    version_negotiations_heard: u64 = 0,
     /// gRPC health calls an HTTP/2 origin answered (§7): SERVING, then
     /// NOT_SERVING.
     grpc_health_answered: [2]u64 = @splat(0),
@@ -853,6 +841,10 @@ const Census = struct {
             std.debug.print("sim census: no HTTP/2 {s} was answered by the handler (#434)\n", .{method});
             return false;
         }
+        if (census.version_negotiations_heard == 0) {
+            std.debug.print("sim census: no probe heard a Version Negotiation\n", .{});
+            return false;
+        }
         for (census.h3_violations_answered, l7.H3Violation.violations) |answered, violation| {
             if (answered >= 1) continue;
             std.debug.print("sim census: no HTTP/3 {s} heard its owed answer\n", .{@tagName(violation)});
@@ -898,6 +890,7 @@ const Census = struct {
             census.interims_heard[@backingInt(Population.http3)] += client.interimsHeard();
             census.addBodiless(.http3, client.bodilessHeard());
             if (client.violationAnswered()) |violation| {
+                assert(violation != .none);
                 for (l7.H3Violation.violations, &census.h3_violations_answered) |candidate, *answered| {
                     if (candidate == violation) answered.* += 1;
                 }
@@ -927,6 +920,7 @@ const Census = struct {
         }
         for (requests_before, census.request_trailers) |earlier, now| assert(now >= earlier);
         census.h2_tls_streams += harness.tls_h2_streams;
+        census.version_negotiations_heard += @intFromBool(harness.version_probing and harness.version_probe.answered());
         if (harness.grpc_health) |*answer| {
             const index: usize = if (Harness.grpcHealthServing(answer)) 0 else 1;
             census.grpc_health_answered[index] += harness.h2_origin.health_answered;
