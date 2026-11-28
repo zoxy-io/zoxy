@@ -2742,12 +2742,17 @@ fn drawHello(harness: *Harness, l4_index: u8, silent: bool, token: *[l4.token_by
 }
 
 /// What the peek must have counted (#298), from what each client opened
-/// with: never more than that on any seed — a client cut before its hello
-/// is read is counted by nothing — and exactly that on a clean seed whose
-/// listener reads no PROXY header, which could close a client first.
+/// with: never more than that on any seed, and exactly that on a clean
+/// seed whose listener reads no PROXY header, which could close a client
+/// first. But one: a client that hangs up before its hello is whole —
+/// silent, or cut mid-hello by the adversary — is counted invalid, the
+/// verdict bytes that are no hello get, so on any seed an invalid count
+/// may take every client no other verdict did.
 fn verifySniCounters(harness: *const Harness) !void {
     const counters = &harness.server.counters;
     const names = [_][]const u8{ "l4_sni_routed", "l4_sni_absent", "l4_sni_no_route", "l4_sni_invalid" };
+    const invalid_index = 3;
+    comptime assert(std.mem.eql(u8, names[invalid_index], "l4_sni_invalid"));
     if (!harness.l4_sni) {
         // No listener routes by name on this seed, so no verdict is taken.
         inline for (names) |name| assert(counters.get(name) == 0);
@@ -2770,11 +2775,15 @@ fn verifySniCounters(harness: *const Harness) !void {
         }
     }
     const exact = harness.clean and harness.proxy_protocol_l4 == null;
-    inline for (names, owed) |name, expected| {
+    var verdicts: u64 = 0;
+    inline for (names, owed, 0..) |name, expected, index| {
         const counted = counters.get(name);
-        if (counted > expected) return error.L4SniMiscounted;
+        verdicts += counted;
+        // Invalid is bounded below, by every client at once.
+        if (index != invalid_index and counted > expected) return error.L4SniMiscounted;
         if (exact and counted != expected) return error.L4SniMiscounted;
     }
+    if (verdicts > harness.l4_count) return error.L4SniMiscounted;
     // One verdict a client at most; and a table with an any-name route
     // leaves no name unrouted.
     assert(owed[0] + owed[1] + owed[2] + owed[3] <= harness.l4_count);
@@ -4330,19 +4339,27 @@ fn verifyGrpcHealth(harness: *const Harness) !void {
     if (harness.clean and failed != 0) return error.GrpcHealthServingFailed;
 }
 
-/// #481: what the L4 cluster serves, when it follows a name, is never more
-/// than the nameservers could make it — the origin and the next host in
-/// address order, `addresses_max` of an answer cut to two — and never an
-/// address a reply under the wrong ID named.
+/// #481: what the L4 cluster serves, when it follows a name and the
+/// datagram adversary flips no octet, is never more than the nameservers
+/// could make it: the origin and the next host in address order, an
+/// answer cut to two, and never an address a reply under the wrong ID
+/// named. A flipped octet is a reply plain DNS has no way to refuse — an
+/// address changed in flight (seed 13653), or a second query's answer let
+/// through (39735) — so a corrupting seed's set is bounded by the
+/// cluster's slots alone, which the endpoint table holds it to.
 fn verifyDnsSet(harness: *const Harness) !void {
     if (!harness.dns_l4) return;
     const cluster = &harness.server.config.clusters[l4_cluster_index];
     assert(std.mem.eql(u8, cluster.name, l4_cluster_name));
     const slots = cluster.slots orelse return error.DnsClusterWithoutSlots;
+    const intact = harness.io.adversary.udp_corrupt_percent == 0;
     var live: u32 = 0;
     for (slots.states, slots.addresses) |state, *address| {
         if (state != .live) continue;
         live += 1;
+        // A reply's address is an IP whatever was flipped in it.
+        if (address.* == .unix) return error.DnsSetWrong;
+        if (!intact) continue;
         const ip = switch (address.*) {
             .ip => |*ip| ip,
             .unix => return error.DnsSetWrong,
@@ -4355,7 +4372,8 @@ fn verifyDnsSet(harness: *const Harness) !void {
         } else false;
         if (!allowed) return error.DnsSetWrong;
     }
-    if (live > 2) return error.DnsSetWrong;
+    if (intact and live > 2) return error.DnsSetWrong;
+    assert(live <= slots.states.len);
 }
 
 /// #304: every refusal the client CA made was owed — the counter never

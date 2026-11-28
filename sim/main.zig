@@ -291,9 +291,15 @@ const uncovered = [_]Uncovered{
     },
     .{
         .name = "upstream_tls_failed",
-        .why = .unreached,
+        .why = .must_stay_zero,
+        // A rate: twice in seeds 1..65536 and never in the gate's range.
+        // One per 10k sits at three times that and orders of magnitude
+        // under a regression, which would fail most HTTPS seeds' dials.
+        .allowance = .{ .at_most_one_per = 10_000 },
         .reason = "the sweep's HTTPS origin (#296) serves the chain its cluster trusts, and the " ++
-            "adversary never corrupts a byte; the https origin scenarios refuse a misnamed chain",
+            "TCP adversary never corrupts a byte, so the one failure left is a hangup " ++
+            "mid-handshake, which its resets reach about once per 30k seeds; the https " ++
+            "origin scenarios refuse a misnamed chain",
     },
     .{
         .name = "l7_shed_upstream_tls",

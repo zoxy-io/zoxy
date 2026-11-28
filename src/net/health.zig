@@ -235,6 +235,10 @@ pub fn Checker(comptime runtime: Runtime) type {
             /// what keeps the serialized drain from re-canceling an op whose
             /// terminal delivery is still in flight.
             canceled: Armed,
+            /// The instant the deadline's cancel went out, once it has: a
+            /// fire in that same instant is a tie, not a late cancel
+            /// (`onProbeDeadline`).
+            deadline_canceled_ns: ?u64,
             op_connect: IoType.Completion,
             /// The http probe's two data legs. They never co-arm — the
             /// request goes out in full before a byte is read — so one
@@ -290,6 +294,7 @@ pub fn Checker(comptime runtime: Runtime) type {
                 probe.response_len = 0;
                 probe.armed = .{};
                 probe.canceled = .{};
+                probe.deadline_canceled_ns = null;
                 probe.op_connect = .{};
                 probe.op_send = .{};
                 probe.op_recv = .{};
@@ -339,6 +344,7 @@ pub fn Checker(comptime runtime: Runtime) type {
                     server.counters.increment("health_probes_concurrent");
                 }
                 probe.canceled = .{};
+                probe.deadline_canceled_ns = null;
                 // One budget covers the whole probe (§7) — the dial alone for
                 // a tcp check, dial + request + response for an http one —
                 // because what an operator cares about is how long an
@@ -734,7 +740,7 @@ pub fn Checker(comptime runtime: Runtime) type {
                         // or a mute origin releases the prober (§5).
                         probe.pending_verdict = .fail;
                         probe.endArmedLeg();
-                    } else {
+                    } else if (probe.deadline_canceled_ns != checker.server.io.nowNs()) {
                         // The fire raced its own cancel (a legal §4 race): the
                         // outcome is decided, this delivery is op accounting
                         // only. Counted because "rare race" and "the cancel is
@@ -745,6 +751,13 @@ pub fn Checker(comptime runtime: Runtime) type {
                         // reported the right verdict.
                         checker.server.counters.increment("health_probe_deadline_raced");
                     }
+                    // Else a tie: the verdict landed in the very instant the
+                    // budget ran out, and the cancel went out with it — a
+                    // `grpc` probe whose pool dial times out at the cluster's
+                    // connect budget, which is the check's default
+                    // `timeout_ms`, meets one on every black-holed endpoint.
+                    // No budget was burned, so it is not the race this
+                    // counts, and counting it would read as #130.
                 } else |err| {
                     assert(err == error.Canceled);
                     assert(probe.pending_verdict != .none);
@@ -848,6 +861,12 @@ pub fn Checker(comptime runtime: Runtime) type {
                 assert(!probe.armed.cancel);
                 probe.armed.cancel = true;
                 probe.canceled.deadline = true;
+                // `settle` may cancel again when the first cancel's own
+                // completion lands before the timer's: the first instant is
+                // when the budget stopped mattering.
+                const now_ns = probe.checker.server.io.nowNs();
+                if (probe.deadline_canceled_ns == null) probe.deadline_canceled_ns = now_ns;
+                assert(probe.deadline_canceled_ns.? <= now_ns);
                 probe.checker.server.io.timerCancel(
                     &probe.op_deadline,
                     &probe.op_cancel,
