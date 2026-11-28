@@ -288,7 +288,7 @@ pub const canonical_bodies = [_][]const u8{
 };
 
 /// The chunked body's payload, which both chunked origins answer.
-pub const canonical_chunked_body = "chunked-body-16b";
+pub const canonical_chunked_body = canon.chunked_body;
 
 comptime {
     assert(std.mem.indexOf(u8, canon.chunked_wire, canonical_chunked_body) != null);

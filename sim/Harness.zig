@@ -2734,9 +2734,9 @@ const h2_origin_headers = [_]zoxy.http.h2.Pair{
 ///
 /// Past those, off clean seeds only, an origin that misbehaves within RFC
 /// 9113: one that refuses the stream unprocessed (REFUSED_STREAM, §8.7),
-/// one that breaks off half way through the sized body (INTERNAL_ERROR),
-/// and one that answers and then drains its connection (GOAWAY, §6.8),
-/// refusing every later stream on it. What the clients may hear of those
+/// one that breaks off half way through the sized or the chunked body
+/// (INTERNAL_ERROR), and one that answers and then drains its connection
+/// (GOAWAY, §6.8), refusing every later stream on it. What the clients may hear of those
 /// is what an adversary's cut leaves, or a replay's whole answer, or a
 /// 502 — never a whole answer that is wrong.
 pub const H2OriginShape = enum(u8) {
@@ -2746,6 +2746,7 @@ pub const H2OriginShape = enum(u8) {
     interim_then_sized,
     refused,
     reset_mid_body,
+    reset_mid_chunked,
     draining,
 };
 /// The shapes a clean seed draws: the first four.
@@ -2764,15 +2765,19 @@ const h2_origin_shapes = [_]zoxy.http.h2.Answer{
     },
     .{ .status = "200", .headers = &h2_origin_headers, .body = l7.canon.sized_body, .interim = "100" },
     .{ .status = "200", .refuse = true },
-    // Sized, not chunked: the proxy frames each DATA run as its own chunk,
-    // so a chunked answer cut short is legal octets that no canonical wire
-    // starts with, and the HTTP/1.1 client judges the wire octet for octet.
-    // A proxy that took the reset for the end still shows: an HTTP/2 or
-    // HTTP/3 client would hear the stream end short of its length.
+    // A proxy that took the reset for the end shows on either: an HTTP/2
+    // or HTTP/3 client hears the sized stream end short of its length, and
+    // with no length a proxy would close the chunked one around a short
+    // payload, which the HTTP/1.1 client decodes and refuses.
     .{
         .status = "200",
         .headers = &h2_origin_headers,
         .body = l7.canon.sized_body[0 .. l7.canon.sized_body.len / 2],
+        .reset_after = .internal_error,
+    },
+    .{
+        .status = "200",
+        .body = l7.canon.chunked_body[0 .. l7.canon.chunked_body.len / 2],
         .reset_after = .internal_error,
     },
     .{ .status = "200", .headers = &h2_origin_headers, .body = l7.canon.sized_body, .goaway = true },
