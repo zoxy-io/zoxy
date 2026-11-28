@@ -90,7 +90,10 @@ const h3_clients_max: u8 = 2;
 /// nightly seeds (448156674, 449268806, 450273021) engage relay pressure
 /// on a clean seed, so their `keepalive_pair` met a pressure-announced
 /// close beside four HTTP/2 clients.
-const exchanges_max: u32 = @as(u32, clients_max) * H2Client.streams_max + tls_client_slots +
+/// A TLS slot that speaks HTTP/2 (`tls_h2`) opens its exchange's streams
+/// as an h2c client does, so each slot counts as that many.
+const exchanges_max: u32 = @as(u32, clients_max) * H2Client.streams_max +
+    @as(u32, tls_client_slots) * H2Client.streams_max +
     @as(u32, h3_clients_max) * H3Client.streams_max;
 /// Every pool's capacity on a clean seed, sized so its §8 pressure
 /// watermark sits above `exchanges_max`: a golden outcome must never meet
@@ -348,6 +351,17 @@ tls_scripts: [tls_client_slots]l7.Script,
 /// same two places: `startTlsClient` to make the offer, and
 /// `verifyTlsSessions` to hold the outcome to what the listener implies.
 tls_alpn_offers: [tls_client_slots]TlsAlpnOffer,
+/// HTTP/2 over the terminating listener (#271, §7): on a seed whose http
+/// listener speaks HTTP/2 and whose terminator is http, half have it offer
+/// `h2` after HTTP/1.1. A slot that offers `h2` alone is then served
+/// HTTP/2 over its session, by an exchange `tls_h2_clients` writes and
+/// judges, where any other offer is still answered HTTP/1.1. Its own
+/// stream, so no other draw moves.
+tls_h2: bool,
+tls_h2_prng: std.Random.DefaultPrng,
+tls_h2_clients: [tls_client_slots]H2Client,
+/// Streams the HTTP/2 TLS slots heard answered whole, for the census.
+tls_h2_streams: u32,
 tls_credentials: [3]?zoxy.tls.Credentials,
 /// #297: on a seed that draws it, the terminating listener holds two more
 /// certificates beside its default — a P-384 one and a second P-256 one —
@@ -1288,6 +1302,76 @@ fn deriveUpgrades(harness: *Harness, random: std.Random) void {
     assert(harness.tunnels <= clients_max);
 }
 
+/// Whether the terminating listener speaks HTTP/2 too (`tls_h2`), and the
+/// room its sessions need. An `h2` TLS session takes an HTTP/2 session
+/// slot as an h2c one does, so a seed with room for every h2c client's
+/// streams gets room for every TLS slot's as well; a starved one keeps
+/// its starved pools, which are its coverage.
+fn deriveTlsH2(harness: *Harness) void {
+    harness.tls_h2_streams = 0;
+    const drawn = harness.tls_h2_prng.random().boolean();
+    harness.tls_h2 = drawn and harness.tls_protocol == .http and harness.h2c_http and harness.tls_clients >= 1;
+    if (!harness.tls_h2) return;
+    if (harness.h2_connections < clients_max) return; // Starved.
+    harness.h2_connections += tls_client_slots;
+    harness.stream_slots += @as(u32, tls_client_slots) * H2Client.streams_max;
+    assert(harness.stream_slots <= SimIo.stream_slots_max);
+}
+
+/// Whether TLS slot `index` is served HTTP/2 (`tls_h2`): it offers `h2`
+/// alone, on a listener that now speaks it.
+fn slotSpeaksH2(harness: *const Harness, index: usize) bool {
+    assert(index < tls_client_slots);
+    return harness.tls_h2 and harness.tls_alpn_offers[index] == .h2_only;
+}
+
+/// The exchange an HTTP/2 TLS slot sends: `drawH2Plan`'s streams, their
+/// bodies held so the whole flight is one TLS record (`sendApplicationData`
+/// seals one at a time), from `tls_h2_prng`. No pacing — a throttle's held
+/// credit, a flood — since the session sends the flight in one write.
+fn prepareTlsH2Client(harness: *Harness, index: u8) void {
+    assert(harness.slotSpeaksH2(index));
+    const random = harness.tls_h2_prng.random();
+    const client = &harness.tls_h2_clients[index];
+    client.* = .{};
+    const streams = 1 + random.uintLessThan(u8, H2Client.streams_max);
+    var plans: [H2Client.streams_max]l7.H2Plan = @splat(.{});
+    for (plans[0..streams]) |*plan| {
+        plan.* = drawH2Plan(random, random);
+        if (!plan.carriesBody()) continue;
+        plan.body_len = @min(plan.body_len, tls_h2_body_bytes_max);
+        plan.frames = @intCast(@min(@as(u32, plan.frames), plan.body_len));
+        assert(plan.frames >= 1);
+    }
+    // Salts past every h2c client's, so no two bodies on the origin match.
+    const salt: u8 = clients_max + index;
+    client.prepare(&harness.io, tlsBindAddress(), plans[0..streams], salt, harness.clean, .exchange, .{});
+    assert(client.flight().len <= zoxy.constants.tls_record_plaintext_bytes_max);
+}
+
+/// An HTTP/2 TLS slot's verdict: what came back over the session is
+/// judged as an h2c client's socket would be — every frame whole, each
+/// stream answered at most once with a status its script allows and a
+/// canonical body, and on a clean seed every stream a whole `200` — by the
+/// client that wrote the exchange. True when the session heard any of it.
+fn verifyTlsH2(harness: *Harness, client: *const TlsClient, index: usize, back: []const u8) !bool {
+    assert(harness.slotSpeaksH2(index));
+    const exchange = &harness.tls_h2_clients[index];
+    exchange.adoptTranscript(back);
+    try exchange.verify();
+    if (back.len >= 1 and client.handshake_done) {
+        // Answered over HTTP/2, so `h2` was what the listener chose.
+        const selected = client.alpnSelected() orelse return error.TlsAlpnSelectionDiverged;
+        if (!std.mem.eql(u8, selected, "h2")) return error.TlsAlpnSelectionDiverged;
+    }
+    harness.tls_h2_streams += exchange.streamsAnswered();
+    return back.len >= 1;
+}
+
+/// An HTTP/2 TLS slot's largest POST body: four of them, their heads and
+/// the preface well inside one record.
+const tls_h2_body_bytes_max: u32 = 1024;
+
 fn deriveHttp2(harness: *Harness, random: std.Random) void {
     if (random.uintLessThan(u8, 4) == 0) {
         harness.h2c_http = false;
@@ -1600,6 +1684,7 @@ fn deriveTerminatingDraws(harness: *Harness, random: std.Random) void {
     for (&harness.tls_alpn_offers) |*offer| {
         offer.* = random.enumValue(TlsAlpnOffer);
     }
+    harness.deriveTlsH2();
     assert(harness.listeners_count <= harness.listener_options.len);
     assert(harness.tls_clients >= 1 or !harness.clock_jump_wanted);
 }
@@ -2365,6 +2450,10 @@ fn terminatingListener(harness: *Harness) zoxy.Options.Listener {
             .{ .ca_pem = zoxy.tls.testdata.client_ca_pem, .verify = client_verify }
         else
             null,
+        // HTTP/1.1 first: zssl picks by the listener's order (RFC 7301
+        // §3.2 leaves it to the server), so a slot offering both keeps its
+        // HTTP/1.1 script, and only one offering `h2` alone meets HTTP/2.
+        .alpn = if (harness.tls_h2) &.{ .http_1_1, .h2 } else null,
     } else null;
     return .{
         .bind = .{ .ip = tlsBindAddress() },
@@ -2592,6 +2681,7 @@ const admin_address: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 
 /// already judges.
 fn drawHttpProtocol(harness: *Harness, seed: u64) void {
     harness.grpc_prng = std.Random.DefaultPrng.init(seed ^ 0x0004_0004_0004_0004);
+    harness.tls_h2_prng = std.Random.DefaultPrng.init(seed ^ 0x0271_0002_0271_0002);
     harness.h2_tuning_prng = std.Random.DefaultPrng.init(seed ^ 0x0009_0113_0009_0113);
     var protocol_prng = std.Random.DefaultPrng.init(seed ^ 0x0275_0275_0275_0275);
     const random = protocol_prng.random();
@@ -3604,6 +3694,7 @@ fn startTlsClient(
     // as `terminating_pair`), and one whose response is a static, a
     // redirect, a rejection or an un-stamped 200 cannot — a single spec
     // could not describe both halves of that pair.
+    if (harness.slotSpeaksH2(index)) return harness.startTlsH2Client(index, seeds, resume_with);
     const entry = l7.scripts.spec(harness.tls_scripts[index]);
     const pairs = harness.tls_protocol == .http and entry.routed_canonical;
     client.start(&harness.io, Harness.tlsBindAddress(), .{
@@ -3657,6 +3748,37 @@ fn startTlsClient(
     // previous occupant captured must not survive into the next one, and
     // on the resuming slot that is the difference between offering the
     // issuer's ticket and offering its own.
+    assert(client.capturedTicket() == null);
+    client.on_end = tlsClientEndedHook;
+    client.on_end_context = harness;
+}
+
+/// An HTTP/2 TLS slot (`slotSpeaksH2`): the session sends its exchange's
+/// whole flight once up, and ends — closing in protocol — when every
+/// stream has, as `tls_h2_clients` judges what came back.
+fn startTlsH2Client(
+    harness: *Harness,
+    index: u8,
+    seeds: *const [3][32]u8,
+    resume_with: ?*const zoxy.tls.SessionTicket,
+) void {
+    harness.prepareTlsH2Client(index);
+    const exchange = &harness.tls_h2_clients[index];
+    const client = &harness.tls_clients_storage[index];
+    client.start(&harness.io, Harness.tlsBindAddress(), .{
+        .host_name = harness.tls_names[index],
+        .scheme_offer = harness.tls_scheme_offers[index],
+        .client_credentials = harness.clientIdentity(index),
+        .resume_with = resume_with,
+        .alpn = harness.tls_alpn_offers[index].protocols(),
+        .app_data = exchange.flight(),
+        .exchange_end = .judged,
+        .judge = .{ .context = exchange, .complete = H2Client.judgeComplete },
+        .close_after_echo = true,
+        .x25519_seed = seeds[0],
+        .p256_seed = seeds[1],
+        .random = seeds[2],
+    }) catch unreachable; // Seeded keypairs; the inputs are ours.
     assert(client.capturedTicket() == null);
     client.on_end = tlsClientEndedHook;
     client.on_end_context = harness;
@@ -4525,6 +4647,7 @@ fn verifyTlsSlot(harness: *Harness, client: *const TlsClient, index: usize, refu
     }
     if (try harness.verifyTlsSchemes(client, index, back)) return false;
     if (try harness.verifyClientCertificate(client, index, back)) return false;
+    if (harness.slotSpeaksH2(index)) return harness.verifyTlsH2(client, index, back);
     if (harness.tls_protocol == .http) {
         // What this slot drew, and the same pairing rule
         // `startTlsClient` sent it under: a `routed_canonical` script
@@ -4595,7 +4718,22 @@ fn verifyTlsAlpn(
 ) !bool {
     assert(index < harness.tls_alpn_offers.len);
     const offer = harness.tls_alpn_offers[index];
-    const refusable = harness.tls_protocol == .http and offer == .h2_only;
+    if (harness.slotSpeaksH2(index) and !harness.clean) {
+        // Served HTTP/2 when a session is free, and otherwise offered the
+        // list less `h2` (`alpn_fallback`, #275), which an `h2`-only offer
+        // cannot meet. Possible whether or not the alert landed: the
+        // adversary can cut the socket between the refusal and its alert.
+        refusals.possible += 1;
+        if (client.refusedForAlpn()) {
+            refusals.heard += 1;
+            if (back.len != 0 or client.handshake_done) return error.TlsAlpnRefusalServed;
+            return true;
+        }
+    }
+    // A clean seed has a session for every `h2` slot, so it is never
+    // refused there: the check below fails it as any wrong refusal.
+    // Refused unless the listener speaks HTTP/2 too, which serves it.
+    const refusable = harness.tls_protocol == .http and offer == .h2_only and !harness.tls_h2;
     if (refusable) {
         refusals.possible += 1;
         if (client.refusedForAlpn()) refusals.heard += 1;
@@ -4614,7 +4752,7 @@ fn verifyTlsAlpn(
         // on an `http` terminator to any client that offered it, and
         // nothing from an `l4` one, which names no protocol.
         const expected: ?[]const u8 = switch (harness.tls_protocol) {
-            .http => if (offer == .none) null else "http/1.1",
+            .http => if (offer == .none) null else if (harness.slotSpeaksH2(index)) "h2" else "http/1.1",
             .l4 => null,
         };
         const selected = client.alpnSelected();
