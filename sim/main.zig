@@ -698,7 +698,7 @@ const Census = struct {
             // owed its failed handshake, by the harness's own draw — held
             // against the allowance below only past what was owed.
             const excused = if (comptime std.mem.eql(u8, name, "tls_handshake_failed"))
-                @min(counted, harness.tls_scheme_refusals + harness.tls_corrupt_handshakes_owed)
+                @min(counted, harness.tls_scheme_refusals + harness.tls_corrupt_handshakes_owed + harness.tls_unnamed_refusals)
             else
                 0;
             census.totals[index] += counted - excused;

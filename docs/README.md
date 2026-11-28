@@ -1027,7 +1027,10 @@ client offering only `h2` to a listener that offers only `http/1.1`), the
 handshake fails with the `no_application_protocol` alert and
 `zoxy_tls_alpn_refused` counts it. The client is never handed an HTTP/1.1
 session it would then speak HTTP/2 into. A client that offers no ALPN is
-unaffected. Unknown names, an empty list and a repeated name are refused
+unaffected, except on a listener offering `h2` alone: HTTP/2 over TLS is
+reached only through ALPN, and such a listener speaks nothing else, so it
+closes the connection without an alert and `zoxy_tls_handshake_failed`
+counts it. Unknown names, an empty list and a repeated name are refused
 at load. An `l4` listener never parses the bytes it relays, so it offers
 nothing and refuses the `alpn` key.
 

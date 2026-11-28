@@ -893,7 +893,8 @@ pub fn sendClose(engine: *Engine) !void {
 }
 
 /// The application protocol this session negotiated, or null when none
-/// was: the client offered no ALPN, or the listener advertises none (an
+/// was: the client offered no ALPN — served only where the listener offers
+/// HTTP/1.1 (`refusesUnnamedClient`) — or the listener advertises none (an
 /// `l4` one). Valid from the moment the ClientHello is answered.
 pub fn alpnSelected(engine: *const Engine) ?alpn.Protocol {
     // QUIC's one protocol is h3, which no TCP offer may name (#449).
@@ -970,6 +971,21 @@ pub fn refuseCorruptRecord(engine: *Engine) bool {
     if (!engine.stageRecordAlert()) return false;
     engine.refused = true;
     return true;
+}
+
+/// A listener offering `h2` alone speaks nothing a client that named no
+/// protocol could use (§4): HTTP/2 over TLS is reached through ALPN alone
+/// (RFC 9113 §3.2), and the HTTP/1.1 such a client is assumed to speak is
+/// not on its list. Asked at the server's answer to the hello — the real
+/// one, not a HelloRetryRequest, after which a second hello is answered
+/// afresh — so a refusal stages no ServerHello at all. No alert fits:
+/// RFC 7301's `no_application_protocol` is for an offer with no overlap.
+fn refusesUnnamedClient(engine: *const Engine) bool {
+    if (engine.isConnected()) return false;
+    if (engine.hs.state == .awaiting_retry_client_hello) return false;
+    if (engine.hs.alpnSelected() != null) return false;
+    assert(engine.quic_transport_parameters_len == 0 or !alpn.namesH2(engine.handshake_alpn));
+    return alpn.namesH2(engine.handshake_alpn) and alpn.withoutH2(engine.handshake_alpn).len == 0;
 }
 
 /// The verified client's names (#432), or null with no verified client.
@@ -1116,6 +1132,7 @@ fn pump(engine: *Engine, sink: *const Sink) !void {
                 // afterwards.
                 .send => |wire| {
                     assert(wire.len > 0);
+                    if (engine.refusesUnnamedClient()) return error.ApplicationProtocolUnnamed;
                     engine.stage(wire);
                 },
                 .application_data => |bytes| {

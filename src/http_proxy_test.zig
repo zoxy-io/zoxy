@@ -3617,6 +3617,37 @@ test "h2: a listener offering h2 alone sheds at accept when no session is free" 
     try bed.expectDrained();
 }
 
+test "h2: a listener offering h2 alone refuses a client that names no protocol (§4)" {
+    // HTTP/2 over TLS is reached through ALPN alone (RFC 9113 §3.2), and
+    // the HTTP/1.1 a client naming nothing is assumed to speak is not on
+    // this listener's list. So it is refused at the hello, before a
+    // ServerHello is staged, and counted as the failed handshake it is —
+    // with no alert, `no_application_protocol` being for an offer with no
+    // overlap — and the session reserved at admission goes back.
+    var options = h2TlsBedOptions(67);
+    options.alpn = &.{"h2"};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    var client: TlsClient = undefined;
+    var wind_down: TlsWindDownAll = .{ .bed = &bed, .clients = 1 };
+    try client.start(&bed.sim_io, Http1Bed.bindAddress(), .{
+        .host_name = fixture_host_name,
+        .app_data = "GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+    });
+    wind_down.attach(&client);
+    try bed.sim_io.run();
+
+    try std.testing.expect(!client.handshake_done);
+    try std.testing.expectEqual(@as(?u8, null), client.peerAlert());
+    try std.testing.expectEqual(@as(u32, 0), client.app_received_len);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("tls_handshake_failed"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("tls_alpn_refused"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("tls_handshakes_completed"));
+    try bed.expectDrained();
+}
+
 test "h2: a client refused in ALPN on an h2 listener leaves no session held" {
     // The reservation is made at admission, before the client has named
     // anything; a client naming only what the listener does not speak is
