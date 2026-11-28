@@ -120,7 +120,8 @@ pub fn TestOriginSized(comptime IoType: type, comptime conns_max_value: u32) typ
         tls_servers: []TestTlsServer = &.{},
         /// Handshakes that failed on this side.
         tls_failures: u32 = 0,
-        /// Refuse every stream past the first with GOAWAY naming it, the
+        /// GOAWAY once, after the origin's first request, naming that
+        /// stream: every later stream on the connection is refused, the
         /// shape of an origin draining under a client.
         goaway_after_first: bool = false,
         /// What a call to `health_path` is answered with, in the script's

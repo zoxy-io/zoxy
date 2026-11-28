@@ -1617,9 +1617,12 @@ external binaries. They and the speed gates run at merge.
     - on adversarial seeds with at least two upstream slots, pools
       narrower than those slots, each on a third of the seeds it applies
       to — an HTTP/2 cluster's origin streams, an HTTPS cluster's
-      sessions — so their own rungs of §8's ladder shed, as a 503 every
-      script allows there; an HTTP/2 cluster's origin connections held to
-      one on another third;
+      sessions, held to one, and, where nothing else is narrowed, the
+      upstream heads — so their own rungs of §8's ladder shed, as a 503
+      every script allows there. An HTTP/2 cluster's origin connections
+      are held to one on another third, and its origin goes away once,
+      after its first request, so a refused stream's replay finds the
+      only connection slot still held;
     - resets at every point in an exchange;
     - misbehaving origins;
     - an IPv6 peer for every stream client on a third of seeds, and
@@ -1670,7 +1673,10 @@ external binaries. They and the speed gates run at merge.
       listener speaks HTTP/2 and whose terminator is http, the terminator
       offers `h2` after HTTP/1.1, and a slot offering `h2` alone runs an
       HTTP/2 exchange over its session, refused only when no session is
-      free;
+      free. On half of those the terminator offers `h2` alone instead: a
+      slot offering `h2` first is served it, one offering HTTP/1.1 alone is
+      refused, one offering nothing is answered HTTP/1.1, and an admission
+      with no session free sheds before its handshake;
     - HTTP/3 clients, which name a certificate the same way, and a fifth
       of which break the rules once, on their first stream: an uppercase
       field name (RFC 9114 §4.2), a field section that cannot decode

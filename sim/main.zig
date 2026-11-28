@@ -246,7 +246,12 @@ const uncovered = [_]Uncovered{
     },
     .{
         .name = "health_probes_skipped",
-        .why = .unreached,
+        .why = .must_stay_zero,
+        // A rate, since one origin connection (`narrowPools`) made it
+        // reachable: twice in seeds 1..32768 and never in the gate's
+        // range. One per 5k sits at three times that, and a probe that
+        // skipped whenever it could dial would fail most HTTP/2 seeds.
+        .allowance = .{ .at_most_one_per = 5_000 },
         .reason = "the sweep's HTTP/2 clusters have one endpoint, since only a retry budget adds a " ++
             "second and HTTP/2 takes none, and their gRPC probe rides that endpoint's connection or " ++
             "dials one in the room the pool leaves, so it is skipped only when the one connection " ++
@@ -264,15 +269,6 @@ const uncovered = [_]Uncovered{
             "TCP adversary never corrupts a byte, so the one failure left is a hangup " ++
             "mid-handshake, which its resets reach about once per 30k seeds; the https " ++
             "origin scenarios refuse a misnamed chain",
-    },
-    .{
-        .name = "l7_shed_h2_origin_connections",
-        .why = .unreached,
-        .reason = "has not fired in the gate's range: a third of adversarial HTTP/2 seeds hold " ++
-            "one origin connection, which multiplexes every admitted request, and the sim " ++
-            "origin's GOAWAYs rarely overlap a new admission — the rung is reachable, a " ++
-            "going-away connection still holding the only slot; http_proxy_test's h2 origin " ++
-            "scenarios starve the pool",
     },
     .{
         .name = "health_probe_deadline_raced",
@@ -430,13 +426,6 @@ const uncovered = [_]Uncovered{
             "listener lacks, and one at the route phase",
     },
     .{
-        .name = "shed_h2_sessions",
-        .why = .unreached,
-        .reason = "the simulator's terminating listener offers http/1.1 alone, and only " ++
-            "a listener offering h2 alone sheds at accept; " ++
-            "src/http_proxy_test.zig drives one directly",
-    },
-    .{
         .name = "tunnels_drained",
         .why = .unreached,
         .reason = "structural rather than a gap in ambition: the production " ++
@@ -446,15 +435,6 @@ const uncovered = [_]Uncovered{
             "tunnel dies with its client rather than at the bound. " ++
             "src/http_proxy_test.zig drains a live tunnel under a zero " ++
             "drain_deadline_ms directly, and asserts the loop reached idle",
-    },
-    .{
-        .name = "l7_shed_upstream_head_buffers",
-        .why = .unreached,
-        .reason = "same shadow as l7_shed_upstream_slots: the relay rung " ++
-            "answers first on every pool-starved seed, and reaching this " ++
-            "one besides needs two concurrent renders, which upstream_slots " ++
-            "= 1 rules out; src/http_proxy_test.zig exhausts the upstream " ++
-            "head pool directly",
     },
     .{
         .name = "l7_response_excess_sent",
