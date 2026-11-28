@@ -298,6 +298,11 @@ listener parses it.
     listener refuses the key.
   - A client with no protocol in common gets `no_application_protocol`,
     counted in `tls_alpn_refused`.
+  - A listener offering `h2` alone refuses a client that names no
+    protocol: HTTP/2 over TLS is reached through ALPN alone (RFC 9113
+    §3.2), and the HTTP/1.1 such a client is assumed to speak is not on
+    the list. It is refused at the hello, with no ServerHello sent and
+    no alert fitting, and counted in `tls_handshake_failed`.
 - **Resumption keeps no table.**
   - The PSK is sealed into the ticket itself (AES-256-GCM) under one of
     two rotating keys. The proxy keeps 64 bytes of keys, whatever the
@@ -1691,8 +1696,8 @@ external binaries. They and the speed gates run at merge.
       HTTP/2 exchange over its session, refused only when no session is
       free. On half of those the terminator offers `h2` alone instead: a
       slot offering `h2` first is served it, one offering HTTP/1.1 alone is
-      refused, one offering nothing is answered HTTP/1.1, and an admission
-      with no session free sheds before its handshake. A sixteenth of the
+      refused, one offering nothing is refused at its hello, and an
+      admission with no session free sheds before its handshake. A sixteenth of the
       slots owed no refusal send the flight carrying their Finished with
       its last tag octet flipped, and a sixteenth their first application
       record, each owed `bad_record_mac` and nothing back;

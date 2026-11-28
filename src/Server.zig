@@ -4420,7 +4420,9 @@ pub fn Server(comptime runtime: Runtime) type {
             assert(conn.tls_session_up); // The pump counted it on the way here.
             // What the session negotiated (#271): HTTP/2 (#275), or
             // HTTP/1.1 — chosen, or assumed by a client that offered no
-            // ALPN. An `l4` listener offers none, so negotiates nothing.
+            // ALPN, on a listener that offers HTTP/1.1; one offering `h2`
+            // alone refused it in the handshake (`refusesUnnamedClient`).
+            // An `l4` listener offers none, so negotiates nothing.
             const selected = conn.tls.?.alpnSelected();
             if (conn.protocol == .l4) assert(selected == null);
             if (selected == .h2) {

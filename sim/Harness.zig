@@ -386,13 +386,18 @@ tls_bad_record_macs_heard: [2]u32,
 /// Handshakes corrupted slots failed on purpose: excused from
 /// `tls_handshake_failed`'s allowance as #411's refusals are.
 tls_corrupt_handshakes_owed: u32,
+/// Slots a listener offering `h2` alone refused for naming no protocol
+/// (§4, `verifyTlsUnnamed`): failed handshakes owed the same way. Exact
+/// on a clean seed; an upper bound on an adversarial one, where an
+/// admission shed leaves a client looking the same and fails nothing.
+tls_unnamed_refusals: u32,
 /// HTTP/2 over the terminating listener (#271, §7): on a seed whose http
 /// listener speaks HTTP/2 and whose terminator is http, half have it offer
 /// `h2` — after HTTP/1.1, or on half of those alone (`tls_h2_only`). A
 /// slot the listener serves `h2` (`slotSpeaksH2`) runs HTTP/2 over its
 /// session, by an exchange `tls_h2_clients` writes and judges; any other
-/// offer it meets is answered HTTP/1.1. Its own stream, so no other draw
-/// moves.
+/// offer it meets is answered HTTP/1.1, bar what `tls_h2_only` refuses.
+/// Its own stream, so no other draw moves.
 tls_h2: bool,
 /// On half the seeds whose terminator speaks HTTP/2, it offers `h2` alone:
 /// no HTTP/1.1 to fall back to, so an admission with no HTTP/2 session
@@ -1381,10 +1386,39 @@ fn alpnRefusable(harness: *const Harness, index: usize) bool {
 }
 
 /// Whether slot `index` can be refused for its offer at all: refusable,
-/// or, off a clean seed, an `h2` slot no session was free for.
+/// unnamed on a listener offering `h2` alone, or, off a clean seed, an
+/// `h2` slot no session was free for.
 fn alpnRefusalPossible(harness: *const Harness, index: usize) bool {
     assert(index < tls_client_slots);
+    if (harness.alpnUnnamedRefused(index)) return true;
     return harness.alpnRefusable(index) or (harness.slotSpeaksH2(index) and !harness.clean);
+}
+
+/// Whether slot `index` names no protocol to a listener offering `h2`
+/// alone, which refuses it (§4): HTTP/2 over TLS is reached through ALPN
+/// alone (RFC 9113 §3.2), and the HTTP/1.1 it would be assumed to speak is
+/// not on the list.
+fn alpnUnnamedRefused(harness: *const Harness, index: usize) bool {
+    assert(index < tls_client_slots);
+    assert(!harness.tls_h2_only or harness.tls_protocol == .http);
+    return harness.tls_h2_only and harness.tls_alpn_offers[index] == .none;
+}
+
+/// The refusal `alpnUnnamedRefused` owes: a bare teardown at the hello, so
+/// no session, nothing back and no alert, and one failed handshake owed
+/// — unless the slot's schemes refused it first, which #411's count holds.
+/// True when the slot was one, and so is accounted for here.
+fn verifyTlsUnnamed(harness: *Harness, client: *const TlsClient, index: usize, back: []const u8) !bool {
+    if (!harness.alpnUnnamedRefused(index)) return false;
+    assert(harness.tls_corruptions[index] == .none);
+    if (back.len != 0 or client.handshake_done) return error.TlsUnnamedServed;
+    if (client.peerAlert() != null) return error.TlsUnnamedAlerted;
+    if (!client.helloSent()) return true;
+    const scheme_refused = harness.schemeRefusable(index);
+    if (scheme_refused) harness.noteSchemeRefusal(client);
+    if (!scheme_refused) harness.tls_unnamed_refusals += 1;
+    assert(harness.tls_unnamed_refusals <= tls_client_slots);
+    return true;
 }
 
 /// Whether TLS slot `index` is served HTTP/2 (`tls_h2`): it offers `h2`
@@ -3333,6 +3367,7 @@ fn drawTlsCorruptions(harness: *Harness, seed: u64) void {
     const random = corruption_prng.random();
     harness.tls_bad_record_macs_heard = @splat(0);
     harness.tls_corrupt_handshakes_owed = 0;
+    harness.tls_unnamed_refusals = 0;
     for (&harness.tls_corruptions) |*corruption| {
         corruption.* = switch (random.uintLessThan(u8, 16)) {
             0 => .finished,
@@ -3393,7 +3428,8 @@ fn verifyTlsCorruptions(harness: *Harness) !void {
     assert(harness.tls_corrupt_handshakes_owed <= harness.tls_clients_live);
     if (!harness.clean) return;
     const failed = harness.server.counters.get("tls_handshake_failed");
-    if (failed < harness.tls_scheme_refusals + harness.tls_corrupt_handshakes_owed) return error.TlsCorruptionsDiverged;
+    const owed = harness.tls_scheme_refusals + harness.tls_corrupt_handshakes_owed + harness.tls_unnamed_refusals;
+    if (failed < owed) return error.TlsCorruptionsDiverged;
 }
 
 /// The terminating listener's choices, as `App` builds them: the default
@@ -5083,6 +5119,7 @@ fn verifyTlsSlot(harness: *Harness, client: *const TlsClient, index: usize, refu
     try harness.verifyTlsCertificate(client, index);
     const back = client.app_received[0..client.app_received_len];
     if (try harness.verifyTlsCorruption(client, index, back)) return false;
+    if (try harness.verifyTlsUnnamed(client, index, back)) return false;
     if (try harness.verifyTlsAlpn(client, index, back, refusals)) {
         // Refusable on both counts, a slot is refused for its offer:
         // zssl picks a scheme before it reads ALPN. Unless it resumed,
