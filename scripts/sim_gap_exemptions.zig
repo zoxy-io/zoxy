@@ -74,10 +74,10 @@ const comptime_only = "compile-time arithmetic: run by `comptime` asserts and st
 const test_support = "test support beside the code it serves — a fixture, a builder, a fuzz source, " ++
     "a test address or peer — that the caller count takes for serving code by a name it shares";
 
-const h2_peer = "an HTTP/2 peer breaking RFC 9113, or using a part of it the sweep's never do — a " ++
-    "stream or connection error, a GOAWAY or RST_STREAM it sends, a header block past one frame, " ++
-    "a SETTINGS change once streams are open, a peer's push of credit: the sweep's clients and " ++
-    "origins speak HTTP/2 plainly and its adversary acts on delivery, never on frames; " ++
+const h2_peer = "an HTTP/2 peer doing what the sweep's never do — a header block past one " ++
+    "frame, a SETTINGS change once streams are open, a peer's push of credit, a stream or " ++
+    "connection error other than the seven its violators and the floods commit: its origin " ++
+    "refuses, resets and drains, but its adversary acts on delivery, never on frames; " ++
     "src/http/h2's tests and h2spec drive it";
 const h2_request = "an HTTP/2 request the sweep's clients never make — refused before its head " ++
     "maps, an asterisk-form OPTIONS, or a `:path` in neither form §8.3.1 allows; they ask " ++
@@ -339,13 +339,11 @@ pub const exemptions = [_]Exemption{
     .{ .path = "http/h2/Session.zig", .owner = "framesFor", .lines = 1, .reason = rare },
     .{ .path = "http/h2/Session.zig", .owner = "handleData", .lines = 6, .reason = h2_peer },
     .{ .path = "http/h2/Session.zig", .owner = "handleFrame", .lines = 3, .reason = h2_peer },
-    .{ .path = "http/h2/Session.zig", .owner = "handleGoaway", .lines = 4, .reason = h2_peer },
     .{ .path = "http/h2/Session.zig", .owner = "handleResponseBlock", .lines = 2, .reason = rare },
     .{ .path = "http/h2/Session.zig", .owner = "handleSettings", .lines = 3, .reason = h2_peer },
     .{ .path = "http/h2/Session.zig", .owner = "handleTrailers", .lines = 1, .reason = h2_peer },
     .{ .path = "http/h2/Session.zig", .owner = "inputDrained", .lines = 2, .reason = h2_peer },
     .{ .path = "http/h2/Session.zig", .owner = "openStream", .lines = 2, .reason = rare },
-    .{ .path = "http/h2/Session.zig", .owner = "refuseNext", .lines = 14, .reason = h2_peer },
     .{ .path = "http/h2/Session.zig", .owner = "retunePeerWindows", .lines = 2, .reason = h2_peer },
     .{ .path = "http/h2/Session.zig", .owner = "selfDependent", .lines = 1, .reason = h2_peer },
     .{ .path = "http/h2/Session.zig", .owner = "sendFields", .lines = 1, .reason = h2_peer },
@@ -371,7 +369,6 @@ pub const exemptions = [_]Exemption{
     .{ .path = "http/h2/origin.zig", .owner = "request", .lines = 2, .reason = test_support },
     .{ .path = "http/h2/origin.zig", .owner = "requestCarries", .lines = 2, .reason = origin_answer },
     .{ .path = "http/h2/origin_pool.zig", .owner = "compose", .lines = 2, .reason = grpc_service },
-    .{ .path = "http/h2/origin_pool.zig", .owner = "copyPayload", .lines = 6, .reason = origin_answer_part },
     .{ .path = "http/h2/origin_pool.zig", .owner = "drive", .lines = 2, .reason = rare },
     .{ .path = "http/h2/origin_pool.zig", .owner = "nextOf", .lines = 1, .reason = rare },
     .{ .path = "http/h2/origin_pool.zig", .owner = "onConnect", .lines = 1, .reason = rare },

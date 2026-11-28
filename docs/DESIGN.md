@@ -1629,10 +1629,13 @@ external binaries. They and the speed gates run at merge.
       again for HTTP/1.1), that with a trailer section, and the sized
       200 behind an interim `100`; on a seed whose HTTP/1.1 origin
       would prefix an interim `100`, every answer is the interim one.
-      Where an HTTP/2 cluster is
-      checked by request, the check is gRPC's health call over the
-      origin pool, which the origin answers SERVING, or NOT_SERVING on
-      the quarter drawn to fail.
+      Off clean seeds it also misbehaves within RFC 9113: it refuses a
+      stream unprocessed (REFUSED_STREAM), breaks off half way through
+      the sized body (INTERNAL_ERROR), or answers and then drains its
+      connection (GOAWAY), refusing the streams after. Where an HTTP/2
+      cluster is checked by request, the check is gRPC's health call
+      over the origin pool, which the origin answers SERVING, or
+      NOT_SERVING on the quarter drawn to fail.
   - **Who connects:**
     - L4 echo clients, which on a listener that routes by SNI open with
       a ClientHello naming the route, another name, or none, or with

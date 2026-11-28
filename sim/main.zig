@@ -250,19 +250,14 @@ const uncovered = [_]Uncovered{
             "of seeds 1..4096 does; src/dns/resolver_test.zig refuses one",
     },
     // §7 HTTP/2 to the origin (#275). A third of seeds' http cluster
-    // speaks it, h2c or over TLS, to `TestOrigin` answering the canonical
-    // sized 200, so the pool dials, idles and fails to dial under the
-    // adversary. What that origin never does is misbehave at the HTTP/2
-    // layer, and these are the counters only that reaches; the leg's
-    // refusals run under `SimIo` in `src/http_proxy_test.zig`'s `h2 origin:`
-    // scenarios, and `client_session_test.zig` drives the session's client
-    // role frame by frame.
-    .{
-        .name = "h2_origin_streams_reset",
-        .why = .unreached,
-        .reason = "the sweep's HTTP/2 origin answers every stream it is sent; " ++
-            "client_session_test covers the reset and GOAWAY refusals",
-    },
+    // speaks it, h2c or over TLS, to `TestOrigin`, which off clean seeds
+    // also refuses streams, breaks off mid-answer and drains — so its
+    // resets and GOAWAY refusals are swept. What that origin never sends
+    // is an answer the mapping refuses, and these are the counters only
+    // that reaches; the leg's refusals run under `SimIo` in
+    // `src/http_proxy_test.zig`'s `h2 origin:` scenarios, and
+    // `client_session_test.zig` drives the session's client role frame by
+    // frame.
     .{
         .name = "h2_origin_refused_heads",
         .why = .unreached,
