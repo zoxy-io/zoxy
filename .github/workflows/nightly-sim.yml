@@ -37,11 +37,11 @@ on:
       seeds:
         description: "Seeds per shard"
         required: false
-        default: "500000"
+        default: "200000"
       shards:
         description: "Parallel shards (block = shards x seeds)"
         required: false
-        default: "8"
+        default: "20"
       start_seed:
         description: "First seed (blank = continue the nightly range)"
         required: false
@@ -81,8 +81,8 @@ jobs:
       - name: Compute seed range
         id: range
         env:
-          SEEDS: ${{ inputs.seeds || '500000' }}
-          SHARDS: ${{ inputs.shards || '8' }}
+          SEEDS: ${{ inputs.seeds || '200000' }}
+          SHARDS: ${{ inputs.shards || '20' }}
           START_OVERRIDE: ${{ inputs.start_seed }}
           RUN_NUMBER: ${{ github.run_number }}
           # The tiling epoch: run EPOCH_RUN sweeps the block starting at
@@ -170,6 +170,18 @@ jobs:
     # shard, and run #140's four were all cancelled at the cap. So the
     # night is 8 shards of 500k: the same 4M block, so the tiling is
     # unchanged, at 40 to 50 min a shard.
+    #
+    # And dearer again by run #158 (2026-11-28). The sim work 1.3.1 and
+    # 1.3.2 shipped — HTTP/2 and HTTPS to the origins, the shed rungs,
+    # clients that break RFC 9113 and 9114 — doubled a seed's cost (20,000
+    # seeds on the dev box: 51 s at 1.3.0, 109 s after), and shared runners
+    # differ by more than that: #158's shards swept 52 to 126 seeds/s,
+    # where #156's had swept up to 272. Seven of #158's eight were
+    # cancelled at the cap. So the night is 20 shards of 200k — the same 4M
+    # block again — at 26 to 64 min a shard on #158's runners. Twenty is
+    # the free plan's concurrent-job limit: a wider split would queue
+    # rather than run, so the next time seeds grow dearer the block must
+    # shrink, and the epoch in `plan` move with it.
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
