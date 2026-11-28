@@ -1654,8 +1654,13 @@ external binaries. They and the speed gates run at merge.
       the wrong ID first — under the datagram adversary;
     - an http cluster speaking HTTP/2 to its origin on a quarter of
       seeds, h2c or over TLS, or HTTP/1.1 over TLS on an eighth, answered
-      by a scripted origin in the shapes every client already judges. The
-      HTTPS origin answers the canonical sized 200. The HTTP/2 origin
+      by a scripted origin in the shapes every client already judges. On
+      an eighth of the adversarial seeds whose origin speaks TLS, the
+      cluster names it under a name its leaf does not cover: every
+      handshake fails verification, each request is answered 502 (or
+      shed), and the origin, which could not prove whose it was, receives
+      no request.
+      The HTTPS origin answers the canonical sized 200. The HTTP/2 origin
       draws each answer, on clean seeds too, from the sized 200, the
       chunked one sent with no length (which the proxy frames chunked
       again for HTTP/1.1), that with a trailer section, and the sized
