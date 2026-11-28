@@ -1729,13 +1729,18 @@ external binaries. They and the speed gates run at merge.
     points. `zig build coverage` also reports the sweep's line coverage
     on its own, and `scripts/sim_gap.zig` lists the serving-path
     functions only unit tests reach. Each is a branch no seed takes or a
-    feature no seed turns on. What the sweep cannot reach by construction
-    is set apart with its reason: a loader line that refuses a config,
-    a function only startup code names, and a table of named functions
-    (the serving watchdog). A table entry the sweep reaches any line of,
-    or that excuses no gap, is stale and fails the report. The rest does
-    not gate; a gap in it should be a scenario to widen, or an exemption
-    that says what covers it instead.
+    feature no seed turns on. Every such line is either swept or set
+    apart with its reason (#487): a loader line that refuses a config, a
+    function only startup code names, and `scripts/sim_gap_exemptions.zig`,
+    which names each remaining function with the most lines it may
+    excuse and a reason. A reason says what keeps the sweep away and what
+    reaches the lines instead, much as a census exemption does. The report
+    fails on a gap nothing explains, and on an excused function whose gap
+    outgrew its entry, so a new gap is judged rather than absorbed. An
+    entry whose function the sweep reaches whole is named for deletion.
+    The bound is a ceiling because kcov attributes lines differently
+    across architectures; the entries hold the larger of arm64's and
+    CI's x86_64 count.
 - **Fuzzing.** Twenty-one `std.testing.fuzz` targets cover every parser
   edge:
   - the HTTP/1.1 head and chunked parsers, and the render;

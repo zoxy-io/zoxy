@@ -16,12 +16,20 @@
 //! - test-helper: never compiled into the sim, and nothing outside tests and
 //!   fuzz targets names it — not a gap at all, so set aside.
 //!
-//! A gap the sweep cannot reach by construction is set apart with its
-//! reason, as the census exempts a counter: a loader line that refuses a
-//! config (the sim builds only configs zoxy accepts), a function only
-//! startup code names, and the functions `exemptions` names. An exemption
-//! that matches no gap is stale, and fails the report — widening a scenario
-//! deletes its excuse.
+//! A gap the sweep does not reach is set apart with its reason, as the
+//! census exempts a counter: a loader line that refuses a config (the sim
+//! builds only configs zoxy accepts), a function only startup code names,
+//! and the functions `sim_gap_exemptions.zig` names, each with the most
+//! lines it may excuse. The report fails on a serving-path gap nothing
+//! explains, and on an excused function whose gap outgrew its entry — a
+//! change that opens a new gap is judged, not absorbed. An entry whose
+//! function the sweep now reaches whole is named for deletion. The bound
+//! is a ceiling rather than an exact count because kcov attributes lines
+//! differently across architectures and toolchains: the entries hold the
+//! larger of what arm64 and CI's x86_64 report.
+//!
+//! Each failure is written to stderr as well as the report, so a run whose
+//! report a failing build step does not install still says what failed.
 //!
 //! The last split is a heuristic. Callers are found by name across src/,
 //! so two functions that share a name read as calling each other. That errs
@@ -73,30 +81,9 @@ const placements = [_]Placement{
     },
 };
 
-/// A serving-path function the sweep does not reach by design, and why.
-/// Its gap lines are set apart under the reason. An entry is stale — and
-/// fails the report — when its function has no gap left, or when the sweep
-/// reaches any line of it: a design that keeps the sweep out keeps it out
-/// of the whole function.
-const Exemption = struct {
-    path: []const u8,
-    owner: []const u8,
-    reason: []const u8,
-};
-
-const exemptions = [_]Exemption{
-    .{
-        .path = "Server.zig",
-        .owner = "armLoopWatchdog",
-        .reason = "the serving watchdog is off for the sweep (`loop_watchdog_ms = null`): a tick every " ++
-            "second of virtual time would move every schedule; server_test.zig provokes it",
-    },
-    .{
-        .path = "Server.zig",
-        .owner = "onLoopWatchdogTick",
-        .reason = "the serving watchdog is off for the sweep (`loop_watchdog_ms = null`); server_test.zig provokes it",
-    },
-};
+const exemption_table = @import("sim_gap_exemptions.zig");
+const Exemption = exemption_table.Exemption;
+const exemptions = exemption_table.exemptions;
 
 /// The file whose refusals are the loader's: a line of it that does no
 /// more than return an error refuses a config, and the sim builds only
@@ -143,10 +130,9 @@ const Tree = struct {
     /// The same count over serving-path files alone.
     serving_callers: std.StringHashMapUnmanaged(u32) = .empty,
     harness_seen: [harness_paths.len]bool = @splat(false),
-    /// Which `exemptions` matched a gap: one that matched none is stale.
-    exemptions_seen: [exemptions.len]bool = @splat(false),
-    /// Which matched a function the sweep reaches part of: stale too.
-    exemptions_reached: [exemptions.len]bool = @splat(false),
+    /// The gap lines each of `exemptions` matched: an entry is stale
+    /// unless it matched exactly the count it names.
+    exemptions_matched: [exemptions.len]u32 = @splat(0),
 };
 
 const Kind = enum(u8) { executed_never, unreferenced, test_helper, exempt };
@@ -226,18 +212,44 @@ pub fn main(init: std.process.Init) !u8 {
     var file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
     try writeReport(&file_writer.interface, rows);
     try file_writer.interface.flush();
-    return if (exemptionsHold(&tree)) 0 else 1;
+    const explained = everyGapExplained(rows);
+    return if (exemptionsHold(&tree) and explained) 0 else 1;
+}
+
+/// Every serving-path gap is swept or set apart (#487): one that is
+/// neither is a scenario to widen or an exemption to write.
+fn everyGapExplained(rows: []const Row) bool {
+    assert(rows.len >= 1);
+    var explained = true;
+    for (rows) |*row| {
+        if (row.source.bucket != .serving) continue;
+        for (row.groups) |*group| {
+            assert(group.numbers.items.len >= 1);
+            if (group.kind != .executed_never and group.kind != .unreferenced) continue;
+            std.debug.print("sim_gap: unexplained {s}:{s} ({t}, {d} line(s)): sweep it or exempt it\n", .{
+                row.source.path, group.owner, group.kind, group.numbers.items.len,
+            });
+            explained = false;
+        }
+    }
+    return explained;
 }
 
 /// Every exemption must still excuse a gap: one whose function the sweep
 /// now reaches, or that no longer exists, would read as though it did.
 fn exemptionsHold(tree: *const Tree) bool {
     var holds = true;
-    for (exemptions, tree.exemptions_seen, tree.exemptions_reached) |exemption, seen, reached| {
+    for (exemptions, tree.exemptions_matched) |exemption, matched| {
         assert(exemption.reason.len >= 1);
-        if (seen and !reached) continue;
-        const why = if (seen) "the sweep reaches part of it" else "it excuses no gap";
-        std.debug.print("sim_gap: exemption {s}:{s} is stale, {s}\n", .{ exemption.path, exemption.owner, why });
+        assert(exemption.lines >= 1);
+        if (matched == 0) {
+            std.debug.print("sim_gap: exemption {s}:{s} excuses nothing here: delete it if no " ++
+                "architecture's report needs it\n", .{ exemption.path, exemption.owner });
+            continue;
+        }
+        if (matched <= exemption.lines) continue;
+        std.debug.print("sim_gap: exemption {s}:{s} allows {d} line(s) and the gap holds {d}: " ++
+            "judge the new ones\n", .{ exemption.path, exemption.owner, exemption.lines, matched });
         holds = false;
     }
     return holds;
@@ -544,26 +556,17 @@ fn judge(tree: *Tree, source: *const Source, group: *Group) void {
     // set apart whole by their placement.
     if (source.bucket != .serving) return;
     if (group.refusal) return exempt(group, refusal_reason);
-    for (exemptions, &tree.exemptions_seen, &tree.exemptions_reached) |exemption, *seen, *reached| {
+    for (exemptions, &tree.exemptions_matched) |exemption, *matched| {
         if (!std.mem.eql(u8, exemption.path, source.path)) continue;
         if (!std.mem.eql(u8, exemption.owner, group.owner)) continue;
-        seen.* = true;
-        reached.* = reached.* or ownerReached(source, group.owner);
+        assert(matched.* == 0); // One group per owner past its refusals.
+        matched.* = @intCast(group.numbers.items.len);
         return exempt(group, exemption.reason);
     }
     if (group.kind == .unreferenced and (tree.serving_callers.get(group.owner) orelse 0) == 0) {
         assert((tree.callers.get(group.owner) orelse 0) >= 1);
         return exempt(group, startup_reason);
     }
-}
-
-/// Whether the sweep runs any line `owner` holds.
-fn ownerReached(source: *const Source, owner: []const u8) bool {
-    assert(source.marks.len == source.owners.len);
-    for (source.marks, source.owners) |mark, line_owner| {
-        if (mark.sim_hit and std.mem.eql(u8, line_owner, owner)) return true;
-    }
-    return false;
 }
 
 fn exempt(group: *Group, reason: []const u8) void {
@@ -574,13 +577,16 @@ fn exempt(group: *Group, reason: []const u8) void {
 }
 
 /// A loader line that does no more than refuse: `return error.X;`, alone
-/// or after its condition.
+/// or after its condition, or a switch arm whose value is that refusal
+/// (`.unix => return error.X,`, `error.A => return error.B,`).
 fn isRefusal(line: []const u8) bool {
     const code = std.mem.trim(u8, line, " \r");
     assert(code.len <= line.len);
     if (std.mem.startsWith(u8, code, "return error.")) return true;
-    if (!std.mem.startsWith(u8, code, "if (")) return false;
-    return std.mem.indexOf(u8, code, ") return error.") != null;
+    if (std.mem.startsWith(u8, code, "if (")) return std.mem.indexOf(u8, code, ") return error.") != null;
+    const arm = std.mem.indexOf(u8, code, " => return error.") orelse return false;
+    // The arm's own value, and nothing after it but its comma.
+    return std.mem.endsWith(u8, code, ",") and std.mem.indexOfScalar(u8, code[arm..], '(') == null;
 }
 
 /// The group for `owner` (its refusals apart), opened on its first gap
@@ -903,6 +909,9 @@ test "isRefusal: a loader line that only returns an error" {
     try std.testing.expect(!isRefusal("    const value = try resolveThing(arena) orelse return error.X;"));
     try std.testing.expect(!isRefusal("    if (x) {"));
     try std.testing.expect(!isRefusal("    errdefer arena.free(x);"));
+    try std.testing.expect(isRefusal("        .unix => return error.ListenerQuicBindNotIp,"));
+    try std.testing.expect(isRefusal("    error.AnchorsInvalid, error.AnchorsTooMany => return error.ClusterTlsCaInvalid,"));
+    try std.testing.expect(!isRefusal("    .ip => |ip| return error.X(ip),"));
 }
 
 test "codeEnd: a comment ends the code, a URL in a literal does not" {
