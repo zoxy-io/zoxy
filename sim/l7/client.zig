@@ -35,6 +35,10 @@ pub const ClientError = error{
     /// owed: missing where `x-sim-trailer-owed` says one is coming,
     /// present where it does not, or a `Trailer` announcement not relayed.
     TrailersMismatched,
+    /// An origin's 200 reached the client with none of the interim `100`s
+    /// its seed's origin prefixes to every answer (#232): §7 relays a
+    /// `1xx`, and a proxy that dropped it answers with the rest intact.
+    InterimUnrelayed,
     /// Received bytes that no legal transcript starts with.
     ResponseCorrupted,
     /// A complete response carried a status outside the script's set.
@@ -104,6 +108,9 @@ pub const Connection = struct {
     /// The client reached the proxy over a listener that terminates TLS,
     /// so that stamp owes `Secure` (#125).
     terminated: bool = false,
+    /// The seed's origin prefixes an interim `100` to every answer (#232),
+    /// so every 200 it gave arrives behind one: §7 relays a `1xx`.
+    interim_owed: bool = false,
 };
 
 pub fn Client(comptime IoType: type) type {
@@ -125,6 +132,8 @@ pub fn Client(comptime IoType: type) type {
         /// The seed drew the #178 cookie-keyed http cluster, so the
         /// stamp oracle runs over every parsed response head.
         sticky: bool = false,
+        /// Set by the harness after `prepare` (`Connection.interim_owed`).
+        interim_owed: bool = false,
         connect_completion: IoType.Completion = .{},
         connect_cancel_completion: IoType.Completion = .{},
         recv_completion: IoType.Completion = .{},
@@ -282,7 +291,7 @@ pub fn Client(comptime IoType: type) type {
             const walk = walkResponses(
                 client.receive_buffer[0..client.received_len],
                 scripts.spec(client.script),
-                .{ .sticky = client.sticky },
+                client.connectionFacts(),
             );
             client.maybeSendSecondRequest(&walk);
             if (walk.violation == null and walk.complete_count >= responsesTarget(client.script, &walk)) {
@@ -382,13 +391,31 @@ pub fn Client(comptime IoType: type) type {
             }
         }
 
+        /// What the walk is told of this client's connection.
+        fn connectionFacts(client: *const Self) Connection {
+            assert(client.received_len <= client.receive_buffer.len);
+            return .{ .sticky = client.sticky, .interim_owed = client.interim_owed };
+        }
+
+        /// Interim heads walked, on a seed that owed them, for the census;
+        /// read once `verify` has passed. Heads rather than answers, as
+        /// HTTP/1.1 relays them, where the HTTP/2 and HTTP/3 clients count
+        /// the 200s that came behind one; the census asks only for one.
+        pub fn interimsHeard(client: *const Self) u32 {
+            if (!client.interim_owed) return 0;
+            const bytes = client.receive_buffer[0..client.received_len];
+            const walk = walkResponses(bytes, scripts.spec(client.script), client.connectionFacts());
+            assert(walk.violation == null);
+            return walk.interim_count;
+        }
+
         /// Responses whose trailer section reached this client whole, for
         /// the census (§9); read once `verify` has judged this client (the
         /// census skips a seed whose drain gave up, which judges none).
         pub fn trailersHeard(client: *const Self) u32 {
             assert(client.received_len <= client.receive_buffer.len);
             const bytes = client.receive_buffer[0..client.received_len];
-            const walk = walkResponses(bytes, scripts.spec(client.script), .{ .sticky = client.sticky });
+            const walk = walkResponses(bytes, scripts.spec(client.script), client.connectionFacts());
             assert(walk.violation == null);
             assert(walk.trailers_count <= walk.complete_count);
             return walk.trailers_count;
@@ -404,7 +431,7 @@ pub fn Client(comptime IoType: type) type {
             if (client.overrun) return ClientError.ResponseOverrun;
             const bytes = client.receive_buffer[0..client.received_len];
             const entry = scripts.spec(client.script);
-            const walk = walkResponses(bytes, entry, .{ .sticky = client.sticky });
+            const walk = walkResponses(bytes, entry, client.connectionFacts());
             if (walk.violation) |violation| return violation;
             assert(walk.offset <= client.received_len);
             if (client.clean) {
@@ -441,6 +468,9 @@ pub fn Client(comptime IoType: type) type {
             /// `complete_count` because they are not responses — an
             /// exchange that carried three of them still answered once.
             interim_count: u8,
+            /// Interims relayed since the last complete response: on a seed
+            /// that owes them, the origin's next 200 needs one.
+            interims_pending: u8,
             offset: u32,
             statuses: [responses_max]u16,
             /// Per-response persistence verdicts (§7): version defaults
@@ -458,6 +488,7 @@ pub fn Client(comptime IoType: type) type {
             pub const empty: Walk = .{
                 .complete_count = 0,
                 .interim_count = 0,
+                .interims_pending = 0,
                 .offset = 0,
                 .statuses = @splat(0),
                 .keep_alives = @splat(false),
@@ -551,30 +582,11 @@ pub fn Client(comptime IoType: type) type {
                 // leave that transcript looking like no response at all.
                 if (response.status >= 100 and response.status < 200 and response.status != 101) {
                     walk.interim_count +|= 1;
+                    walk.interims_pending +|= 1;
                     walk.offset += response.head_len;
                     continue;
                 }
-                if (std.mem.indexOfScalar(u16, entry.allowed_statuses, response.status) == null) {
-                    walk.violation = ClientError.ResponseStatusUnexpected;
-                    return walk;
-                }
-                if (responseEditViolation(entry, &response)) |violation| {
-                    walk.violation = violation;
-                    return walk;
-                }
-                if (dateViolation(entry, &response)) |violation| {
-                    walk.violation = violation;
-                    return walk;
-                }
-                if (hopByHopViolation(&response)) |violation| {
-                    walk.violation = violation;
-                    return walk;
-                }
-                if (stickyViolation(connection, entry, &response)) |violation| {
-                    walk.violation = violation;
-                    return walk;
-                }
-                if (checkStatusHeaders(response, entry)) |violation| {
+                if (headViolation(connection, entry, &response)) |violation| {
                     walk.violation = violation;
                     return walk;
                 }
@@ -585,6 +597,10 @@ pub fn Client(comptime IoType: type) type {
                     return walk;
                 }
                 assert(verdict.body_len <= body.len);
+                if (interimViolation(connection, entry, &walk, response.status)) |violation| {
+                    walk.violation = violation;
+                    return walk;
+                }
                 if (recordComplete(&walk, &response, verdict.body_len)) |violation| {
                     walk.violation = violation;
                     return walk;
@@ -819,6 +835,46 @@ pub fn Client(comptime IoType: type) type {
             return std.mem.eql(u8, tail[0..check_len], anchor[0..check_len]);
         }
 
+        /// What a final response's head owes before its body is walked: a
+        /// status the script allows, the edits and stamps the harness
+        /// configures, no hop-by-hop field, and the fields its status
+        /// carries. The first it fails, or null.
+        fn headViolation(connection: Connection, entry: Spec, response: *const parser.ResponseHead) ?ClientError {
+            assert(response.status >= 100);
+            assert(entry.allowed_statuses.len >= 1);
+            if (std.mem.indexOfScalar(u16, entry.allowed_statuses, response.status) == null) {
+                return ClientError.ResponseStatusUnexpected;
+            }
+            if (responseEditViolation(entry, response)) |violation| return violation;
+            if (dateViolation(entry, response)) |violation| return violation;
+            if (hopByHopViolation(response)) |violation| return violation;
+            if (stickyViolation(connection, entry, response)) |violation| return violation;
+            return checkStatusHeaders(response.*, entry);
+        }
+
+        /// Whether a `status` answer to `entry` is the origin's: a 200 that
+        /// is not a configured page's, the final recipient's own (#240), or
+        /// the handler's (#434). Its statics and refusals are the proxy's.
+        fn originAnswered(entry: Spec, status: u16) bool {
+            assert(status >= 100);
+            if (status != 200) return false;
+            // A handler's 200 is a page's too: `pageBodyFor` names its body.
+            if (pageBodyFor(entry, status) != null) return false;
+            assert(entry.handler_body == null);
+            return !entry.answered_here;
+        }
+
+        /// An origin's 200 on a connection owed an interim (#232), with none
+        /// walked since the last complete response: §7 relays a `1xx`, and
+        /// one precedes the final head on the wire, so no cut excuses it.
+        fn interimViolation(connection: Connection, entry: Spec, walk: *const Walk, status: u16) ?ClientError {
+            assert(walk.interims_pending <= walk.interim_count);
+            if (!connection.interim_owed) return null;
+            if (!originAnswered(entry, status)) return null;
+            if (walk.interims_pending >= 1) return null;
+            return ClientError.InterimUnrelayed;
+        }
+
         /// The #159 body a configured page carries for this (script,
         /// status), or null when the response is not one. Two pages are
         /// configured by the harness: `403` — the status a filter
@@ -959,6 +1015,7 @@ pub fn Client(comptime IoType: type) type {
             walk.statuses[walk.complete_count] = response.status;
             walk.keep_alives[walk.complete_count] = response.keep_alive;
             walk.complete_count += 1;
+            walk.interims_pending = 0;
             // Only the trailing wire is this long among chunked bodies, and
             // `walkBody` passed it octet for octet. The framing is named
             // because a sized body could share the length.

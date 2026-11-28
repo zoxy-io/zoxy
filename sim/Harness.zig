@@ -1358,6 +1358,7 @@ fn prepareTlsH2Client(harness: *Harness, index: u8) void {
     // Salts past every h2c client's, so no two bodies on the origin match.
     const salt: u8 = clients_max + index;
     client.prepare(&harness.io, tlsBindAddress(), plans[0..streams], salt, harness.clean, .exchange, .{});
+    client.interim_owed = harness.interimOwed();
     assert(client.flight().len <= zoxy.constants.tls_record_plaintext_bytes_max);
 }
 
@@ -3404,6 +3405,7 @@ fn prepareH2Client(harness: *Harness, random: std.Random) void {
         plan.trailers = false;
     }
     client.prepare(&harness.io, httpBindAddress(), plans[0..streams], salt, harness.clean, mode, harness.drawH2Tuning(mode));
+    client.interim_owed = harness.interimOwed();
     client.on_ended = clientEndedHook;
     client.context = harness;
 }
@@ -3533,6 +3535,7 @@ fn populateClients(harness: *Harness, random: std.Random) void {
                 harness.upgrades_http,
                 harness.sticky_http,
             );
+            client.interim_owed = harness.interimOwed();
             client.on_ended = clientEndedHook;
             client.context = harness;
         } else {
@@ -3586,6 +3589,7 @@ fn prepareH3Clients(harness: *Harness) void {
         // enough to make sure of it.
         seed[32] |= 1;
         client.prepare(&harness.io, tlsBindAddress(), plans[0..streams], @intCast(index), harness.clean, seed, harness.h3_names[index]);
+        client.interim_owed = harness.interimOwed();
         client.on_ended = clientEndedHook;
         client.context = harness;
     }
@@ -4772,7 +4776,7 @@ fn verifyTlsSlot(harness: *Harness, client: *const TlsClient, index: usize, refu
         const walk = HttpClient.walkResponses(
             back,
             entry,
-            .{ .sticky = harness.sticky_http, .terminated = true },
+            .{ .sticky = harness.sticky_http, .terminated = true, .interim_owed = harness.interimOwed() },
         );
         if (walk.violation) |violation| return violation;
         // #204: never more answers than questions. The framing rule
@@ -5324,6 +5328,16 @@ fn clientEndedHook(context: ?*anyopaque) void {
 fn pickOriginMode(context: ?*anyopaque) zoxy.testing.Mode {
     const harness: *Harness = @ptrCast(@alignCast(context.?));
     return harness.scenario_prng.random().enumValue(zoxy.testing.Mode);
+}
+
+/// Whether every answer the http cluster's origin gives comes behind an
+/// interim `100` (#232): an interim seed's, where that origin is the
+/// HTTP/1.1 one (`pickHttpOriginMode`) or the HTTP/2 one (`pickH2Answer`).
+/// The HTTPS origin prefixes none.
+fn interimOwed(harness: *const Harness) bool {
+    assert(harness.http_protocol.http2() == (harness.http_protocol != .http1));
+    const prefixes = harness.http_protocol.http2() or !harness.http_tls;
+    return harness.interim_http and prefixes;
 }
 
 /// Per-accept HTTP-origin misbehavior, drawn like the L4 origin's. Clean

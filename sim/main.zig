@@ -698,6 +698,9 @@ const Census = struct {
     /// counter says a trailer went through, so the census asks the
     /// clients whose oracles judged one.
     trailers_heard: [Population.count]u64 = @splat(0),
+    /// Interim heads owed and heard before an origin's 200 (#232), by
+    /// population.
+    interims_heard: [Population.count]u64 = @splat(0),
     /// Requests that ended with a trailer section and were answered, by
     /// population: HTTP/1.1's are the sections an origin read exactly as
     /// their head owed them (its relay, reached); HTTP/2's and HTTP/3's
@@ -893,12 +896,15 @@ const Census = struct {
         const before = census.trailers_heard;
         for (harness.l7_clients[0..harness.l7_count]) |*client| {
             census.trailers_heard[@backingInt(Population.http1)] += client.trailersHeard();
+            census.interims_heard[@backingInt(Population.http1)] += client.interimsHeard();
         }
         for (harness.h2_clients[0..harness.h2_count]) |*client| {
             census.trailers_heard[@backingInt(Population.http2)] += client.trailersHeard();
+            census.interims_heard[@backingInt(Population.http2)] += client.interimsHeard();
         }
         for (harness.h3_clients[0..harness.h3_count]) |*client| {
             census.trailers_heard[@backingInt(Population.http3)] += client.trailersHeard();
+            census.interims_heard[@backingInt(Population.http3)] += client.interimsHeard();
         }
         for (before, census.trailers_heard) |earlier, now| assert(now >= earlier);
         const requests_before = census.request_trailers;
@@ -944,6 +950,11 @@ const Census = struct {
             );
             held = false;
         }
+        for (std.enums.values(Population), census.interims_heard) |population, heard| {
+            if (heard >= 1) continue;
+            std.debug.print("sim census: no {s} client heard the interim an interim seed owes it (#232)\n", .{@tagName(population)});
+            held = false;
+        }
         for (std.enums.values(Population), census.request_trailers) |population, answered| {
             if (answered >= 1) continue;
             std.debug.print(
@@ -954,6 +965,7 @@ const Census = struct {
             held = false;
         }
         assert(held == (std.mem.min(u64, &census.trailers_heard) >= 1 and
+            std.mem.min(u64, &census.interims_heard) >= 1 and
             std.mem.min(u64, &census.request_trailers) >= 1));
         return held;
     }
@@ -1325,7 +1337,7 @@ fn checkCensus(options: *const Sweep, census: *const Census) bool {
         return true;
     }
     if (!census.verify(options.iterations)) return false;
-    std.debug.print("sim: census ok, {d} counter(s) fired, {d} exempt; {d} extension counter(s) fired; {d} seam op(s), {d} exempt; {d} body(ies) verified; trailers heard {d}/{d}/{d}, sent {d}/{d}/{d} (http1/2/3); IPv6 clients {d} announced upstream, {d} forwarded; HTTP/2 windows met {d}, table resizes heard {d}; HTTP/2 over TLS streams {d}\n", .{
+    std.debug.print("sim: census ok, {d} counter(s) fired, {d} exempt; {d} extension counter(s) fired; {d} seam op(s), {d} exempt; {d} body(ies) verified; trailers heard {d}/{d}/{d}, sent {d}/{d}/{d}, interims heard {d}/{d}/{d} (http1/2/3); IPv6 clients {d} announced upstream, {d} forwarded; HTTP/2 windows met {d}, table resizes heard {d}; HTTP/2 over TLS streams {d}\n", .{
         Counters.names.len - uncovered.len,
         uncovered.len,
         extension_counters.len,
@@ -1338,6 +1350,9 @@ fn checkCensus(options: *const Sweep, census: *const Census) bool {
         census.request_trailers[@backingInt(Census.Population.http1)],
         census.request_trailers[@backingInt(Census.Population.http2)],
         census.request_trailers[@backingInt(Census.Population.http3)],
+        census.interims_heard[@backingInt(Census.Population.http1)],
+        census.interims_heard[@backingInt(Census.Population.http2)],
+        census.interims_heard[@backingInt(Census.Population.http3)],
         census.upstream_ip6_announced,
         census.forwarded_ip6_verified,
         census.h2_windows_met,

@@ -41,6 +41,9 @@ pub const ClientError = error{
     BodyCorrupted,
     /// A clean seed whose streams did not all end in a whole 200.
     GoldenOutcomeMissed,
+    /// An origin's 200 arrived with no interim head, on a seed whose
+    /// origin prefixes one to every answer (#232).
+    InterimUnrelayed,
     /// A trailer section (§7) other than the trailing origin's one field,
     /// after anything but its whole chunked 200, or more than one.
     TrailersCorrupted,
@@ -80,6 +83,9 @@ pub fn Client(comptime IoType: type) type {
         streams: u8,
         salt: u32,
         clean: bool,
+        /// Set by the harness after `prepare`: the seed's origin prefixes an
+        /// interim `100` to every answer (#232).
+        interim_owed: bool,
         seed: [64]u8,
         requests: [requests_max]TestClient.Request,
         headers: [requests_max][3]TestClient.Field,
@@ -112,6 +118,7 @@ pub fn Client(comptime IoType: type) type {
             client.streams = @intCast(plans.len);
             client.salt = salt;
             client.clean = clean;
+            client.interim_owed = false;
             client.seed = seed;
             client.began = false;
             client.ended = false;
@@ -227,10 +234,28 @@ pub fn Client(comptime IoType: type) type {
                 try checkTrailers(answer);
                 try checkTrailersOwed(answer);
                 if (answer.status == 200) try checkBody(answer, client.clean);
+                // An interim precedes the final head on the wire, so no cut
+                // removes it from a 200 that arrived.
+                if (client.interim_owed and answer.status == 200 and plan.originAnswers() and answer.interims == 0) {
+                    return error.InterimUnrelayed;
+                }
                 if (!client.clean or capped) continue;
                 if (answer.status != 200) return error.GoldenOutcomeMissed;
                 if (!answer.finished) return error.GoldenOutcomeMissed;
             }
+        }
+
+        /// Origin 200s heard behind an interim, on a seed that owed one,
+        /// for the census (§9); read once `verify` has passed.
+        pub fn interimsHeard(client: *const Self) u32 {
+            assert(client.streams >= 1);
+            if (!client.interim_owed) return 0;
+            var heard: u32 = 0;
+            for (client.transport.answers[0..client.streams]) |*answer| {
+                heard += @intFromBool(answer.status == 200 and answer.interims >= 1);
+            }
+            assert(heard <= client.streams);
+            return heard;
         }
 
         /// Streams whose trailer section reached this client, for the

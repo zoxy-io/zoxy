@@ -67,6 +67,9 @@ pub const ClientError = error{
     BodyCorrupted,
     /// A clean seed whose streams did not all end in a whole 200.
     GoldenOutcomeMissed,
+    /// An origin's 200 arrived with no interim head, on a seed whose
+    /// origin prefixes one to every answer (#232).
+    InterimUnrelayed,
     /// A stream that ended whole without the trailer section (§7) its
     /// head owed, or with one its head did not.
     TrailersMismatched,
@@ -246,6 +249,16 @@ pub const Plan = struct {
         };
     }
 
+    /// Whether the origin answers this ask: not the handler (#434), and
+    /// not a gRPC call, which the origin leaves to the proxy's deadline.
+    pub fn originAnswers(plan: Plan) bool {
+        assert(plan.frames <= body_frames_max);
+        return switch (plan.ask) {
+            .get, .post_declared, .post_undeclared, .consult_get => true,
+            .grpc_call, .handler_get, .handler_post => false,
+        };
+    }
+
     /// The path this stream asks for.
     pub fn path(plan: Plan) []const u8 {
         assert(canon.consult_prefix.len >= 1);
@@ -349,6 +362,9 @@ pub fn Client(comptime IoType: type) type {
         on_ended: ?*const fn (?*anyopaque) void = null,
         context: ?*anyopaque = null,
         clean: bool = false,
+        /// Set by the harness after `prepare`: the seed's origin prefixes an
+        /// interim `100` to every answer (#232).
+        interim_owed: bool = false,
         mode: Mode = .exchange,
         streams: u8 = 0,
         plans: [streams_max]Plan = @splat(.{}),
@@ -426,6 +442,8 @@ pub fn Client(comptime IoType: type) type {
             trailers: bool = false,
             /// The final head said a trailer section is coming.
             trailers_owed: bool = false,
+            /// An interim head came before the final one.
+            interim_heard: bool = false,
             /// The final head's `grpc-status`, when it carried one: a gRPC
             /// call answered Trailers-Only (§8).
             grpc_status: ?u8 = null,
@@ -748,6 +766,22 @@ pub fn Client(comptime IoType: type) type {
             if (client.on_ended) |hook| hook(client.context);
         }
 
+        /// Origin 200s heard behind an interim, on a seed that owed one,
+        /// for the census; on `trailersHeard`'s terms.
+        pub fn interimsHeard(client: *const Self) u32 {
+            assert(client.streams >= 1);
+            if (client.mode != .exchange or !client.interim_owed) return 0;
+            var answers: [streams_max]Answer = @splat(.{});
+            const plans = client.plans[0..client.streams];
+            _ = readAnswers(client.receive_buffer[0..client.received_len], plans, &answers) catch |err| {
+                std.debug.panic("interimsHeard after a failed verify: {s}", .{@errorName(err)});
+            };
+            var heard: u32 = 0;
+            for (answers[0..client.streams]) |*answer| heard += @intFromBool(answer.interim_heard);
+            assert(heard <= client.streams);
+            return heard;
+        }
+
         /// Streams whose trailer section reached this client, for the
         /// census (§9). Read only once `verify` has judged this client (the
         /// census skips a seed whose drain gave up, which judges none): it
@@ -821,6 +855,11 @@ pub fn Client(comptime IoType: type) type {
                 // other; a cut one may end before it (reset, never ended).
                 if (answer.ended and !answer.reset and answer.trailers != answer.trailers_owed) {
                     return error.TrailersMismatched;
+                }
+                // An interim precedes the final head on the wire, so no cut
+                // removes it from a 200 that arrived.
+                if (client.interim_owed and answer.status == 200 and plan.originAnswers() and !answer.interim_heard) {
+                    return error.InterimUnrelayed;
                 }
                 if (!client.clean) continue;
                 // A clean seed meets no adversary: every stream is answered,
@@ -1383,7 +1422,11 @@ pub fn Client(comptime IoType: type) type {
                     }
                     const value = ResponseReader.value(fields, ":status") orelse return error.FieldsCorrupted;
                     const status = std.fmt.parseUnsigned(u16, value, 10) catch return error.FieldsCorrupted;
-                    if (status < 200) return; // Interim: the final one follows.
+                    if (status < 200) {
+                        // Interim: the final one follows.
+                        answer.interim_heard = true;
+                        return;
+                    }
                     if (answer.status != 0) return error.StreamUnexpected;
                     // HTTP/1.1's trailer announcement stops at the mapping
                     // (§7); the origin's own field says one is owed.
