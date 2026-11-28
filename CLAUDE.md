@@ -26,11 +26,15 @@ direnv activates the shell). Read before writing code:
   the format gate (a
   PostToolUse hook auto-formats files as they are edited).
 - `zig build h2spec` (h2spec against the shipped build, over h2c and TLS;
-  its failures must equal DESIGN.md §12's recorded deviations) runs at
-  merge, beside the bench.
-- `zig build h3spec` (h3spec 0.1.15 against the shipped build, over QUIC;
+  its failures must equal DESIGN.md §12's recorded deviations) and
+  `zig build h3spec` (h3spec 0.1.15 against the shipped build, over QUIC;
   its failures must equal §12's recorded deviations — none — and its one
-  pending case the 0-RTT one §12 records) runs at merge too.
+  pending case the 0-RTT one §12 records) run in CI's `conformance` job on
+  every PR. Locally they need the binaries: the dev shell's h2spec, and
+  h3spec from its release (`-- --h3spec <path>`).
+- CI's `backends` job compiles the builds `ci` never runs:
+  `zig build -Dtarget=aarch64-macos`, `-Dtarget=x86_64-macos` (kqueue)
+  and `zig build -Dio-backend=epoll`.
 - `zig build bench` (Tier 1: zrk against an nginx origin) runs at merge,
   not per change — compare bands across runs, never single numbers.
 

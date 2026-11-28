@@ -62,6 +62,19 @@ const requests_per_connection_max: u32 = 4096;
 /// answered by dropping the connection.
 const request_head_bytes_max: u32 = 2048;
 
+/// Body bytes one request may carry. h2spec sends a few octets a case, so
+/// past this the peer is looping, answered by dropping the connection.
+const request_body_bytes_max: u64 = 1024 * 1024;
+/// Chunks one chunked body may come in, on the same terms.
+const request_chunks_max: u32 = 4096;
+
+/// What follows a request head, as the head framed it (RFC 9112 §6).
+const Body = union(enum) { none, length: u64, chunked };
+
+/// What this origin reads from a head: which answer it asks for, and what
+/// body follows it.
+const Head = struct { large: bool, body: Body };
+
 /// Both responses, rendered once at comptime — a target picks one, and
 /// nothing else about a request changes a byte of it, so there is nothing
 /// to format per exchange.
@@ -242,30 +255,27 @@ fn serveConnection(origin: *Origin, stream: Io.net.Stream, buffers: *TaskBuffers
     var writer = stream.writer(origin.io, &buffers.write);
     var served: u32 = 0;
     while (served < requests_per_connection_max) : (served += 1) {
-        const large = readRequestHead(&reader.interface) orelse return;
+        const head = readRequestHead(&reader.interface) orelse return;
+        if (!readRequestBody(&reader.interface, head.body)) return;
         // One `writeAll` into a buffer that holds the whole thing, then
         // one flush: the large response has to reach the kernel as a
         // single write or the delivery it exists to provoke is split
         // before zoxy ever sees it.
-        writer.interface.writeAll(if (large) large_response else response) catch return;
+        writer.interface.writeAll(if (head.large) large_response else response) catch return;
         writer.interface.flush() catch return;
         _ = origin.served.fetchAdd(1, .monotonic);
     }
 }
 
-/// Read one request head. Only its target matters — one of two responses
-/// is chosen by it and nothing else in the head changes a byte — so the
-/// answer is whether that target was the large one. Null means the
-/// connection is over: an orderly close between requests (what a proxy
-/// draining its parked connections looks like), a reset, or a head this
-/// origin will not read past.
-///
-/// No body is read, because none is ever sent: the harness issues GETs
-/// and zoxy's health probes are GETs, so a request with a body would be a
-/// desync this origin should not paper over.
-fn readRequestHead(reader: *Io.Reader) ?bool {
+/// Read one request head. Its target picks one of two responses, and
+/// nothing else in the head changes a byte of either; its framing says
+/// what body follows. Null means the connection is over: an orderly close
+/// between requests (what a proxy draining its parked connections looks
+/// like), a reset, or a head this origin will not read past.
+fn readRequestHead(reader: *Io.Reader) ?Head {
     assert(reader.buffer.len == request_head_bytes_max);
     var large = false;
+    var framed: Body = .none;
     var lines: u32 = 0;
     // Every legal head is bounded by its own blank line; the cap is the
     // header count a broken peer could otherwise dribble forever. Two
@@ -280,12 +290,95 @@ fn readRequestHead(reader: *Io.Reader) ?bool {
         // The blank line ends the head. Both spellings are accepted: what
         // arrives here is zoxy's rendering, and the gate is not the place
         // to re-litigate its CRLF discipline (§7 already does).
-        if (line.len == 0) return large;
-        if (line.len == 1 and line[0] == '\r') return large;
-        if (lines == 0) large = requestsLarge(line);
+        const trimmed = std.mem.trimEnd(u8, line, "\r");
+        if (trimmed.len == 0) return .{ .large = large, .body = framed };
+        if (lines == 0) {
+            large = requestsLarge(trimmed);
+        } else {
+            framed = framing(framed, trimmed) orelse return null;
+        }
     }
     assert(lines == lines_max);
     return null;
+}
+
+/// The framing a head says after one more of its header lines. Null for
+/// a line this origin will not read past: a length that is no number or
+/// is past the cap, or a coding it cannot undo.
+fn framing(framed: Body, line: []const u8) ?Body {
+    assert(line.len >= 1);
+    const length_name = "content-length:";
+    const coding_name = "transfer-encoding:";
+    if (std.ascii.startsWithIgnoreCase(line, coding_name)) {
+        const coding = std.mem.trim(u8, line[coding_name.len..], " \t");
+        // `chunked` is last when present (RFC 9112 §6.1), and it overrides
+        // any length (§6.3).
+        return if (std.ascii.endsWithIgnoreCase(coding, "chunked")) .chunked else null;
+    }
+    if (!std.ascii.startsWithIgnoreCase(line, length_name)) return framed;
+    if (framed == .chunked) return framed;
+    const value = std.mem.trim(u8, line[length_name.len..], " \t");
+    const length = std.fmt.parseInt(u64, value, 10) catch return null;
+    if (length > request_body_bytes_max) return null;
+    assert(length <= request_body_bytes_max);
+    return .{ .length = length };
+}
+
+/// Read the body a head framed through its end, before the answer. The
+/// smoke harness's requests carry none; h2spec's do, and an answer sent
+/// before a request has ended races whatever stream error h2spec provokes
+/// after it. Its 8.1/1 sends DATA and then a malformed trailer section,
+/// and reads the answer's DATA where it waits for the RST_STREAM. Read
+/// through, the request never ends here, so the answer can never come
+/// first. False means the connection is over.
+fn readRequestBody(reader: *Io.Reader, framed: Body) bool {
+    assert(reader.buffer.len == request_head_bytes_max);
+    switch (framed) {
+        .none => return true,
+        .length => |length| {
+            assert(length <= request_body_bytes_max);
+            reader.discardAll64(length) catch return false;
+            return true;
+        },
+        .chunked => return readChunked(reader),
+    }
+}
+
+/// A chunked body (RFC 9112 §7.1): sized chunks to the zero-sized last
+/// one, then its trailer section.
+fn readChunked(reader: *Io.Reader) bool {
+    var total: u64 = 0;
+    var chunks: u32 = 0;
+    while (chunks < request_chunks_max) : (chunks += 1) {
+        const taken = reader.takeDelimiter('\n') catch return false;
+        const line = std.mem.trimEnd(u8, taken orelse return false, "\r");
+        // Its size, then any extensions after a `;` (§7.1.1).
+        const size_end = std.mem.indexOfScalar(u8, line, ';') orelse line.len;
+        const size_text = std.mem.trim(u8, line[0..size_end], " \t");
+        const size = std.fmt.parseInt(u64, size_text, 16) catch return false;
+        if (size == 0) return readLines(reader);
+        if (size > request_body_bytes_max - total) return false;
+        total += size;
+        reader.discardAll64(size) catch return false;
+        const end = reader.takeDelimiter('\n') catch return false;
+        if (std.mem.trimEnd(u8, end orelse return false, "\r").len != 0) return false;
+    }
+    assert(chunks == request_chunks_max);
+    assert(total <= request_body_bytes_max);
+    return false;
+}
+
+/// Header lines to the blank one: a chunked body's trailer section.
+fn readLines(reader: *Io.Reader) bool {
+    const lines_max = @divFloor(request_head_bytes_max, 2);
+    var lines: u32 = 0;
+    while (lines < lines_max) : (lines += 1) {
+        const taken = reader.takeDelimiter('\n') catch return false;
+        const line = taken orelse return false;
+        if (std.mem.trimEnd(u8, line, "\r").len == 0) return true;
+    }
+    assert(lines == lines_max);
+    return false;
 }
 
 /// Does this request line ask for `large_path`? Matched on the target

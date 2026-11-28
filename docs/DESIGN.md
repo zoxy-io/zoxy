@@ -1616,7 +1616,9 @@ flowchart TB
 
 A feature without its gate is not done. `zig build ci` runs every gate
 that makes no claim about speed, except h2spec and h3spec, which need
-external binaries. They and the speed gates run at merge.
+external binaries. CI runs those two on every change as well, in a job
+that installs each suite's own release by a pinned digest. The speed
+gates run at merge.
 
 | gate | command | when | what it proves |
 |---|---|---|---|
@@ -1626,8 +1628,9 @@ external binaries. They and the speed gates run at merge.
 | simulation | `zig build sim` | every change (4096 seeds); nightly (8 × 500k) | the real data path under an adversary; every counter and op reached |
 | live gate | `zig build smoke`, `smoke-release` | every change | the shipped binary, on a real kernel, judged by equalities |
 | a dependent's build | `zig build`, `test`, `smoke` in `examples/edge` | every change (CI's consumer job) | a build on the fetched package runs, its own extensions held to `zoxy.testing`'s gate (§13) |
-| HTTP/2 conformance | `zig build h2spec` | at merge | an independent RFC 9113 implementation agrees, except §12's deviations |
-| HTTP/3 conformance | `zig build h3spec` | at merge | an independent QUIC and HTTP/3 implementation agrees, except §12's deviations |
+| HTTP/2 conformance | `zig build h2spec` | every change (CI's conformance job) | an independent RFC 9113 implementation agrees, except §12's deviations |
+| HTTP/3 conformance | `zig build h3spec` | every change (CI's conformance job) | an independent QUIC and HTTP/3 implementation agrees, except §12's deviations |
+| other backends | `zig build -Dtarget=aarch64-macos`, `-Dtarget=x86_64-macos`, `-Dio-backend=epoll` | every change (CI's backends job) | the kqueue and epoll builds compile; only release.yml's macOS legs run kqueue |
 | benchmark | `zig build bench` | at merge | bands compared across runs, plus hard RSS and drain gates |
 
 - **Simulation** (`sim/`). `SimIo` runs the real `Server` against
@@ -1922,6 +1925,13 @@ external binaries. They and the speed gates run at merge.
   The failing cases must equal `smoke/h2spec.zig`'s list exactly. That
   list is the one §12 deviation h2spec can observe. A deviation that gets
   fixed fails the gate as loudly as a regression.
+  - Every case must report: the count is what the binary's own dry run
+    lists, 146 for 2.6.0.
+  - The harness's origin reads each request through its end before it
+    answers. An answer sent earlier races the stream error a case
+    provokes after its request: 8.1/1 sends DATA and then a malformed
+    trailer section, and reads the answer where it waits for the
+    RST_STREAM.
 - **h3spec** (0.1.15, 86 cases) runs over QUIC against the ReleaseSafe
   build, on a listener whose pool holds every case's connection. Its
   failures must equal `smoke/h3spec.zig`'s list — empty — and its one
