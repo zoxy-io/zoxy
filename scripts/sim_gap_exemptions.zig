@@ -99,9 +99,9 @@ const grpc_service = "a `grpc` check naming a service: the sweep's ask about the
 const grpc_timeout = "a `grpc-timeout` in hours, minutes or seconds, or a gRPC content type with " ++
     "parameters: the sweep's calls send `5m` and a bare `application/grpc`; grpc.zig's tests " ++
     "and its fuzz target drive the rest";
-const h3_peer = "a QUIC or HTTP/3 peer the sweep's clients never are — past the three rules " ++
-    "its violators break, one that needs version negotiation or a retry, or whose request is " ++
-    "refused or capped mid-connection; src/http/h3's tests and h3spec drive it";
+const h3_peer = "a QUIC or HTTP/3 peer the sweep's clients never are — one whose request is " ++
+    "refused or capped mid-connection; its violators break three rules and its probe offers a " ++
+    "version the server does not speak, but no other; src/http/h3's tests and h3spec drive it";
 const head_shape = "a request or response head no script, client or origin sends — percent-escapes, " ++
     "dot segments, chunk extensions or a malformed size line, an obsolete, repeated or escaped " ++
     "field, an asterisk target, a chunked body to a handler, a host-less redirect, a target past " ++
@@ -155,7 +155,6 @@ const dns_shape_part = dns_shape ++ partly_rare;
 const extension_part = extension ++ partly_rare;
 const h2_peer_part = h2_peer ++ partly_rare;
 const h2_tls_part = h2_tls ++ partly_rare;
-const h3_peer_part = h3_peer ++ partly_rare;
 const head_shape_part = head_shape ++ partly_rare;
 const log_sink_part = log_sink ++ partly_rare;
 const origin_answer_part = origin_answer ++ partly_rare;
@@ -378,10 +377,6 @@ pub const exemptions = [_]Exemption{
     .{ .path = "http/h2/origin_pool.zig", .owner = "tlsFailed", .lines = 5, .reason = h2_origin_tls },
     .{ .path = "http/h2/response.zig", .owner = "carried", .lines = 2, .reason = origin_answer },
     .{ .path = "http/h2/response.zig", .owner = "nominated", .lines = 7, .reason = origin_answer },
-    .{ .path = "http/h3/Endpoint.zig", .owner = "constantTimeEql", .lines = 1, .reason = h3_peer },
-    .{ .path = "http/h3/Endpoint.zig", .owner = "dispatch", .lines = 1, .reason = rare },
-    .{ .path = "http/h3/Endpoint.zig", .owner = "negotiateVersion", .lines = 6, .reason = h3_peer_part },
-    .{ .path = "http/h3/Endpoint.zig", .owner = "retry", .lines = 1, .reason = h3_peer },
     .{ .path = "http/h3/driver.zig", .owner = "refreshDeadline", .lines = 1, .reason = rare },
     .{ .path = "http/h3/exchange.zig", .owner = "capRequests", .lines = 6, .reason = h3_peer },
     .{ .path = "http/parser.zig", .owner = "appendNameByte", .lines = 1, .reason = rare },
