@@ -64,7 +64,23 @@ pub const Request = struct {
     /// A field section sent as it is, in place of the one the fields above
     /// encode to: what a test of the server's QPACK decoder sends.
     raw_section: ?[]const u8 = null,
+    /// The request stream's octets as given, frames and all, in place of
+    /// everything above: what a test of the server's frame rules sends.
+    raw_stream: ?[]const u8 = null,
 };
+
+/// The application codes a test judges a server's refusals by (RFC 9114
+/// §8.1, RFC 9204 §6), named here because only `src/http/h3/` imports h3.
+pub const code_no_error: u64 = @backingInt(quic.error_code.Application.no_error);
+pub const code_internal_error: u64 = @backingInt(quic.error_code.Application.internal_error);
+pub const code_frame_unexpected: u64 = @backingInt(quic.error_code.Application.frame_unexpected);
+pub const code_request_cancelled: u64 = @backingInt(quic.error_code.Application.request_cancelled);
+pub const code_message_error: u64 = @backingInt(quic.error_code.Application.message_error);
+pub const code_qpack_decompression_failed: u64 = @backingInt(quic.error_code.Application.qpack_decompression_failed);
+
+/// How the server ended the connection, when it did and this client did
+/// not: the code, and whether it is an application's (RFC 9000 §19.19).
+pub const PeerClose = struct { code: u64, application: bool };
 
 pub const Answer = struct {
     status: u16 = 0,
@@ -74,8 +90,9 @@ pub const Answer = struct {
     finished: bool = false,
     /// Interim heads (RFC 9110 §15.2) before the final one.
     interims: u8 = 0,
-    /// The server reset the stream instead.
+    /// The server reset the stream instead, and the code it reset it with.
     reset: bool = false,
+    reset_code: ?u64 = null,
     /// Trailer sections after the final head, each field kept as a
     /// `name: value\r\n` line in arrival order; `trailers_len` counts
     /// every octet, kept or not, as `body_len` does.
@@ -170,6 +187,9 @@ pub fn TestClient(comptime IoType: type) type {
         /// The identifier of the server's GOAWAY, if one arrived: what tells
         /// a refused request the client may send again from one it lost.
         goaway: ?u64,
+        /// The server's close, when the server ended the connection and
+        /// not an idle timer or this client.
+        peer_close: ?PeerClose,
         /// The port this client's socket bound on loopback: what the
         /// server's access log names it by.
         local_port: u16,
@@ -231,6 +251,7 @@ pub fn TestClient(comptime IoType: type) type {
             client.refused = false;
             client.vanishes = false;
             client.goaway = null;
+            client.peer_close = null;
             client.on_done = on_done;
             client.context = context;
             // The first Destination Connection ID's length, drawn from the
@@ -274,6 +295,7 @@ pub fn TestClient(comptime IoType: type) type {
                     .stream_readable => |id| client.readStream(id),
                     .stream_reset => |reset| if (reset.stream < client.requests.len * 4) {
                         client.answers[@intCast(reset.stream / 4)].reset = true;
+                        client.answers[@intCast(reset.stream / 4)].reset_code = reset.code;
                     },
                     .closed => |closed| {
                         client.notePeerClose(closed.code, closed.application, closed.idle);
@@ -316,6 +338,16 @@ pub fn TestClient(comptime IoType: type) type {
             for (client.requests, 0..) |*request, index| {
                 assert(request.headers.len <= request_headers_max);
                 assert(request.body.len <= request_body_bytes_max);
+                if (request.raw_stream) |raw| {
+                    const raw_id = quic.stream_id.make(.client_bidirectional, @intCast(index));
+                    // As a request's own write below: a stream that takes
+                    // nothing is ended for its caller, with no code, since
+                    // no peer reset it.
+                    _ = client.quic.write(raw_id, raw, true) catch {
+                        client.answers[index].reset = true;
+                    };
+                    continue;
+                }
                 var fields: [4 + request_headers_max]Field = undefined;
                 fields[0] = .{ .name = ":method", .value = request.method };
                 fields[1] = .{ .name = ":scheme", .value = "https" };
@@ -449,6 +481,8 @@ pub fn TestClient(comptime IoType: type) type {
         fn notePeerClose(client: *Self, code: u64, application: bool, idle: bool) void {
             // Its own close, or an idle timeout, is not the server's word.
             if (client.closing or idle) return;
+            assert(client.peer_close == null);
+            client.peer_close = .{ .code = code, .application = application };
             if (!application and code == @backingInt(quic.error_code.Transport.connection_refused)) {
                 client.refused = true;
                 return;

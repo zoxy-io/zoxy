@@ -321,6 +321,8 @@ h2_violation_prng: std.Random.DefaultPrng,
 h2_handler_prng: std.Random.DefaultPrng,
 /// Which h2c and HTTP/3 GETs ask a bodiless path, and which one.
 bodiless_prng: std.Random.DefaultPrng,
+/// Which HTTP/3 clients break RFC 9114 or 9204 once, and how.
+h3_violation_prng: std.Random.DefaultPrng,
 /// Which shape the HTTP/2 origin answers each request in, drawn per
 /// request on clean seeds too (`pickH2Answer`), and how many of each it
 /// staged whole.
@@ -2701,6 +2703,7 @@ fn drawHttpProtocol(harness: *Harness, seed: u64) void {
     harness.h2_violation_prng = std.Random.DefaultPrng.init(seed ^ 0x9113_0005_9113_0005);
     harness.h2_handler_prng = std.Random.DefaultPrng.init(seed ^ 0x0434_0002_0434_0002);
     harness.bodiless_prng = std.Random.DefaultPrng.init(seed ^ 0x0204_0204_0204_0204);
+    harness.h3_violation_prng = std.Random.DefaultPrng.init(seed ^ 0x9114_9204_9114_9204);
     harness.h2_shape_prng = std.Random.DefaultPrng.init(seed ^ 0x9113_0008_9113_0008);
     harness.h2_shapes_answered = @splat(0);
     var protocol_prng = std.Random.DefaultPrng.init(seed ^ 0x0275_0275_0275_0275);
@@ -3685,6 +3688,7 @@ fn prepareH3Clients(harness: *Harness) void {
         seed[32] |= 1;
         client.prepare(&harness.io, tlsBindAddress(), plans[0..streams], @intCast(index), harness.clean, seed, harness.h3_names[index]);
         client.interim_owed = harness.interimOwed();
+        client.breakRules(harness.drawH3Violation());
         client.on_ended = clientEndedHook;
         client.context = harness;
     }
@@ -3702,6 +3706,17 @@ fn bodilessAsk(harness: *Harness, plan: l7.H2Plan) l7.H2Plan {
     const bodiless: l7.H2Plan = .{ .ask = kind };
     assert(!bodiless.carriesBody());
     return bodiless;
+}
+
+/// A fifth of HTTP/3 clients break the rules once (`l7.H3Violation`), on
+/// their own stream so the rest draw as they did.
+fn drawH3Violation(harness: *Harness) l7.H3Violation {
+    const random = harness.h3_violation_prng.random();
+    const breaks = random.uintLessThan(u8, 5) == 0;
+    const violations = l7.H3Violation.violations;
+    const violation = violations[random.uintLessThan(u8, violations.len)];
+    assert(violation != .none);
+    return if (breaks) violation else .none;
 }
 
 /// One HTTP/3 request (#449): `drawH2Plan`'s, its body held within what
@@ -4644,6 +4659,7 @@ pub fn verify(harness: *Harness) !void {
         try client.verify(max_lifetime_ns);
         try harness.verifyH3Certificate(client, index);
     }
+    try harness.verifyH3ProtocolErrors();
     for (harness.admin_scrapers) |*scraper| try scraper.verify(&harness.server.counters);
     try harness.verifyTlsSessions();
     try harness.verifyClientRefusalCount();
@@ -4738,6 +4754,21 @@ fn verifyTlsCertificate(harness: *Harness, client: *const TlsClient, index: usiz
     const choice = expectedChoice(harness.tls_sni, harness.tls_names[index], offer) orelse
         return error.TlsShownRefusedOffer;
     try harness.verifyShown(shown, choice);
+}
+
+/// The alarm `h3_protocol_errors` was, kept as a bound: a protocol error
+/// is the server reading a stream as against the rules, which only a
+/// client sending DATA first gives it cause to (`l7.H3Violation`), once
+/// each. Past their number, it misread one — as it did when a stream its
+/// own read had answered was read again as a new request.
+fn verifyH3ProtocolErrors(harness: *const Harness) !void {
+    var owed: u64 = 0;
+    for (harness.h3_clients[0..harness.h3_count]) |*client| {
+        owed += @intFromBool(client.violation == .frame_unexpected);
+    }
+    assert(owed <= harness.h3_count);
+    const seen = harness.server.counters.get("h3_protocol_errors");
+    if (seen > owed) return error.H3ProtocolErrorUnowed;
 }
 
 /// #297 over QUIC: an HTTP/3 client shown a leaf was shown the one its

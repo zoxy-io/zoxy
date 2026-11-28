@@ -186,13 +186,6 @@ const Uncovered = struct {
 const uncovered = [_]Uncovered{
     // #449's HTTP/3 rungs the sweep's conforming clients cannot reach.
     .{
-        .name = "h3_protocol_errors",
-        .why = .must_stay_zero,
-        .reason = "the sweep's HTTP/3 clients conform and the datagram adversary's corruption " ++
-            "fails the AEAD, so a protocol error here is the server misreading a stream — " ++
-            "as it was when a stream its own read had answered was read again as a new request",
-    },
-    .{
         .name = "h3_shed_tls_crypto",
         .why = .unreached,
         .reason = "shed_tls_crypto's reason, at the QUIC rung: libcrypto refusing a key " ++
@@ -203,18 +196,6 @@ const uncovered = [_]Uncovered{
         .why = .unreached,
         .reason = "the simulated kernel segments as Linux does; a refusal needs a device " ++
             "without checksum offload, which no scenario models",
-    },
-    .{
-        .name = "h3_qpack_failures",
-        .why = .unreached,
-        .reason = "the sweep's clients encode with h3's own QPACK; src/http/h3/server_test.zig " ++
-            "sends a section that does not decode",
-    },
-    .{
-        .name = "h3_malformed_requests",
-        .why = .unreached,
-        .reason = "the sweep's clients send well-formed fields; src/http/h3/server_test.zig " ++
-            "sends an uppercase field name",
     },
     .{
         .name = "h3_events_overflowed",
@@ -741,6 +722,8 @@ const Census = struct {
     h2_origin_shapes: [std.enums.values(Harness.H2OriginShape).len]u64 = @splat(0),
     /// Each RFC 9113 violation's owed answer heard (`H2Mode.violations`).
     h2_violations_answered: [l7.H2Mode.violations.len]u64 = @splat(0),
+    /// HTTP/3 violators that heard their owed answer, by kind.
+    h3_violations_answered: [l7.H3Violation.violations.len]u64 = @splat(0),
     /// gRPC health calls an HTTP/2 origin answered (§7): SERVING, then
     /// NOT_SERVING.
     grpc_health_answered: [2]u64 = @splat(0),
@@ -870,6 +853,11 @@ const Census = struct {
             std.debug.print("sim census: no HTTP/2 {s} was answered by the handler (#434)\n", .{method});
             return false;
         }
+        for (census.h3_violations_answered, l7.H3Violation.violations) |answered, violation| {
+            if (answered >= 1) continue;
+            std.debug.print("sim census: no HTTP/3 {s} heard its owed answer\n", .{@tagName(violation)});
+            return false;
+        }
         for (census.h2_violations_answered, l7.H2Mode.violations) |answered, mode| {
             if (answered >= 1) continue;
             std.debug.print("sim census: no HTTP/2 client's {t} was answered as RFC 9113 owes\n", .{mode});
@@ -909,6 +897,11 @@ const Census = struct {
             census.trailers_heard[@backingInt(Population.http3)] += client.trailersHeard();
             census.interims_heard[@backingInt(Population.http3)] += client.interimsHeard();
             census.addBodiless(.http3, client.bodilessHeard());
+            if (client.violationAnswered()) |violation| {
+                for (l7.H3Violation.violations, &census.h3_violations_answered) |candidate, *answered| {
+                    if (candidate == violation) answered.* += 1;
+                }
+            }
         }
         for (before, census.trailers_heard) |earlier, now| assert(now >= earlier);
         const requests_before = census.request_trailers;
