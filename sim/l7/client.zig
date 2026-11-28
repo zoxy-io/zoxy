@@ -397,6 +397,17 @@ pub fn Client(comptime IoType: type) type {
             return .{ .sticky = client.sticky, .interim_owed = client.interim_owed };
         }
 
+        /// Whole 204s walked, for the census; read once `verify` has passed.
+        pub fn noContentHeard(client: *const Self) u32 {
+            const bytes = client.receive_buffer[0..client.received_len];
+            const walk = walkResponses(bytes, scripts.spec(client.script), client.connectionFacts());
+            assert(walk.violation == null);
+            var heard: u32 = 0;
+            for (walk.statuses[0..walk.complete_count]) |status| heard += @intFromBool(status == 204);
+            assert(heard <= walk.complete_count);
+            return heard;
+        }
+
         /// Interim heads walked, on a seed that owed them, for the census;
         /// read once `verify` has passed. Heads rather than answers, as
         /// HTTP/1.1 relays them, where the HTTP/2 and HTTP/3 clients count
@@ -637,7 +648,9 @@ pub fn Client(comptime IoType: type) type {
             // configured body had grown filter edits.
             const from_memory = pageBodyFor(entry, response.status) != null or
                 (response.status == 200 and entry.answered_here);
-            if (response.status == 200 and !from_memory) {
+            // The render forwards every origin answer, and nothing else
+            // this proxy sends.
+            if (originStatus(response.status) and !from_memory) {
                 if (!stamped) {
                     return ClientError.ResponseEditMissing;
                 }
@@ -690,6 +703,14 @@ pub fn Client(comptime IoType: type) type {
             return null;
         }
 
+        /// The final statuses the sweep's origins answer with: the canonical
+        /// 200s, and the 204 for `canon.no_content_path`. Every other one a
+        /// client hears is this proxy's own, or a `101` that switched.
+        fn originStatus(status: u16) bool {
+            assert(status >= 100);
+            return status == 200 or status == 204;
+        }
+
         /// The #234 oracle over one parsed response head: whatever this
         /// proxy *originates* carries a `Date` and a `Server`, and
         /// whatever it merely *forwards* carries neither.
@@ -704,8 +725,8 @@ pub fn Client(comptime IoType: type) type {
         /// but the placeholder comparison.
         ///
         /// Which is which comes from the same predicate `#175`'s oracle
-        /// uses, because it is the same distinction: a `200` that is not
-        /// a #159 page came from an origin, a `101` is the origin's
+        /// uses, because it is the same distinction: an `originStatus` that
+        /// is not a #159 page came from an origin, a `101` is the origin's
         /// switch (#180), and every other status here is one this proxy
         /// raised — the §8 ladder's, a filter's reject, a redirect.
         fn dateViolation(entry: Spec, response: *const parser.ResponseHead) ?ClientError {
@@ -713,7 +734,7 @@ pub fn Client(comptime IoType: type) type {
             const from_memory = pageBodyFor(entry, response.status) != null or
                 (response.status == 200 and entry.answered_here);
             const forwarded = !from_memory and
-                (response.status == 200 or response.status == 101);
+                (originStatus(response.status) or response.status == 101);
             const stamped_server = headerEquals(response.headers, "Server", "zoxy");
             const date = parser.headerValue(response.headers, "Date");
             if (forwarded) {
@@ -770,7 +791,7 @@ pub fn Client(comptime IoType: type) type {
             // runs no response render, so a cookie on one would be the
             // stamp path firing for an exchange that never happened.
             const raised_here = pageBodyFor(entry, response.status) != null or entry.answered_here;
-            if (response.status != 200 or raised_here) {
+            if (!originStatus(response.status) or raised_here) {
                 if (named) return ClientError.StickyStampForged;
                 return null;
             }
@@ -937,39 +958,10 @@ pub fn Client(comptime IoType: type) type {
             if (response.status == 101) {
                 return .{ .body_len = 0, .violation = null };
             }
+            if (response.status == 204) return noContentVerdict(&response);
             const page_body = pageBodyFor(entry, response.status);
             switch (response.framing) {
-                .content_length => |length| {
-                    // A configured page's body, byte-exact (#159): it is
-                    // rendered once at load, so any drift here is the
-                    // static path corrupting immutable memory.
-                    if (page_body) |expected| {
-                        if (length != expected.len) {
-                            return .{ .body_len = 0, .violation = ClientError.ResponseBodyCorrupted };
-                        }
-                        return prefixVerdict(body, expected, @intCast(length));
-                    }
-                    // The #240 final-recipient answer: the one 200 in the
-                    // sweep that is neither an origin's canonical body nor
-                    // a configured page's, because "stop here and describe
-                    // yourself" is answered in headers alone.
-                    if (response.status == 200 and entry.answered_here) {
-                        if (length != 0) {
-                            return .{ .body_len = 0, .violation = ClientError.ResponseBodyCorrupted };
-                        }
-                        return .{ .body_len = 0, .violation = null };
-                    }
-                    if (response.status == 200) {
-                        if (length != canon.sized_body.len) {
-                            return .{ .body_len = 0, .violation = ClientError.ResponseBodyCorrupted };
-                        }
-                        return prefixVerdict(body, canon.sized_body, @intCast(length));
-                    }
-                    if (length != 0) {
-                        return .{ .body_len = 0, .violation = ClientError.ResponseBodyCorrupted };
-                    }
-                    return .{ .body_len = 0, .violation = null };
-                },
+                .content_length => |length| return sizedVerdict(response.status, body, entry, page_body, length),
                 // A page is always Content-Length framed — the loader
                 // renders it that way — so either streaming framing on
                 // one is the render inventing a shape.
@@ -983,19 +975,7 @@ pub fn Client(comptime IoType: type) type {
                     if (response.status != 200 or page_body != null or entry.answered_here) {
                         return .{ .body_len = 0, .violation = ClientError.ResponseCorrupted };
                     }
-                    // The FIN delimits this body, so it is transcript-
-                    // final: bytes beyond the canonical body — or past
-                    // where the close must fall — are corruption, and
-                    // whatever arrived counts as the (possibly cut)
-                    // complete response.
-                    if (body.len > canon.until_close_body.len) {
-                        return .{ .body_len = 0, .violation = ClientError.ResponseBodyCorrupted };
-                    }
-                    const have: u32 = @intCast(body.len);
-                    if (!std.mem.eql(u8, body[0..have], canon.until_close_body[0..have])) {
-                        return .{ .body_len = have, .violation = ClientError.ResponseBodyCorrupted };
-                    }
-                    return .{ .body_len = have, .violation = null };
+                    return untilCloseVerdict(body);
                 },
                 // No canonical 200 is bodiless, and the statics carry an
                 // explicit Content-Length: 0.
@@ -1004,6 +984,54 @@ pub fn Client(comptime IoType: type) type {
                     .violation = ClientError.ResponseCorrupted,
                 },
             }
+        }
+
+        /// A 204 says by its status that nothing follows (RFC 9110
+        /// §15.3.5), so a framing field on one is a lie in either
+        /// direction (§8.6, §6.4.1) — whatever framing it implies.
+        fn noContentVerdict(response: *const parser.ResponseHead) BodyVerdict {
+            assert(response.status == 204);
+            const framed = headerPresent(response.headers, "Content-Length") or
+                headerPresent(response.headers, "Transfer-Encoding");
+            if (framed) return .{ .body_len = 0, .violation = ClientError.ResponseCorrupted };
+            return .{ .body_len = 0, .violation = null };
+        }
+
+        /// A Content-Length body: a configured page's, byte-exact (#159) —
+        /// rendered once at load, so any drift is the static path
+        /// corrupting immutable memory; the #240 final recipient's, which
+        /// answers in headers alone; the origin's canonical sized one; or a
+        /// static's empty one.
+        fn sizedVerdict(status: u16, body: []const u8, entry: Spec, page_body: ?[]const u8, length: u64) ?BodyVerdict {
+            assert(status >= 200);
+            if (page_body) |expected| {
+                if (length != expected.len) return body_corrupted;
+                return prefixVerdict(body, expected, @intCast(length));
+            }
+            if (status == 200 and entry.answered_here) {
+                if (length != 0) return body_corrupted;
+                return .{ .body_len = 0, .violation = null };
+            }
+            if (status == 200) {
+                if (length != canon.sized_body.len) return body_corrupted;
+                return prefixVerdict(body, canon.sized_body, @intCast(length));
+            }
+            if (length != 0) return body_corrupted;
+            return .{ .body_len = 0, .violation = null };
+        }
+
+        /// The FIN delimits this body, so it is transcript-final: bytes
+        /// beyond the canonical body — or past where the close must fall —
+        /// are corruption, and whatever arrived counts as the (possibly
+        /// cut) complete response.
+        fn untilCloseVerdict(body: []const u8) BodyVerdict {
+            assert(canon.until_close_body.len >= 1);
+            if (body.len > canon.until_close_body.len) return body_corrupted;
+            const have: u32 = @intCast(body.len);
+            if (!std.mem.eql(u8, body[0..have], canon.until_close_body[0..have])) {
+                return .{ .body_len = have, .violation = ClientError.ResponseBodyCorrupted };
+            }
+            return .{ .body_len = have, .violation = null };
         }
 
         /// Counts one complete response into the walk — its status, its

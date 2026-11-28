@@ -319,6 +319,8 @@ h2_violation_prng: std.Random.DefaultPrng,
 /// #434 over HTTP/2: which h2c streams ask the build's handler route
 /// rather than the origin. Its own stream, so the plans draw as they did.
 h2_handler_prng: std.Random.DefaultPrng,
+/// Which h2c and HTTP/3 GETs ask `canon.no_content_path`, answered 204.
+no_content_prng: std.Random.DefaultPrng,
 /// Which shape the HTTP/2 origin answers each request in, drawn per
 /// request on clean seeds too (`pickH2Answer`), and how many of each it
 /// staged whole.
@@ -2698,6 +2700,7 @@ fn drawHttpProtocol(harness: *Harness, seed: u64) void {
     harness.h2_tuning_prng = std.Random.DefaultPrng.init(seed ^ 0x0009_0113_0009_0113);
     harness.h2_violation_prng = std.Random.DefaultPrng.init(seed ^ 0x9113_0005_9113_0005);
     harness.h2_handler_prng = std.Random.DefaultPrng.init(seed ^ 0x0434_0002_0434_0002);
+    harness.no_content_prng = std.Random.DefaultPrng.init(seed ^ 0x0204_0204_0204_0204);
     harness.h2_shape_prng = std.Random.DefaultPrng.init(seed ^ 0x9113_0008_9113_0008);
     harness.h2_shapes_answered = @splat(0);
     var protocol_prng = std.Random.DefaultPrng.init(seed ^ 0x0275_0275_0275_0275);
@@ -2739,6 +2742,9 @@ const h2_origin_headers = [_]zoxy.http.h2.Pair{
 /// (GOAWAY, §6.8), refusing every later stream on it. What the clients may hear of those
 /// is what an adversary's cut leaves, or a replay's whole answer, or a
 /// 502 — never a whole answer that is wrong.
+///
+/// And last, never drawn: `no_content`, the `204` every origin answers
+/// `canon.no_content_path` with, chosen by the request's path.
 pub const H2OriginShape = enum(u8) {
     sized,
     chunked,
@@ -2748,9 +2754,12 @@ pub const H2OriginShape = enum(u8) {
     reset_mid_body,
     reset_mid_chunked,
     draining,
+    no_content,
 };
 /// The shapes a clean seed draws: the first four.
 const h2_shapes_well_formed: u8 = 4;
+/// The shapes any seed draws: all but `no_content`, which a path chooses.
+const h2_shapes_drawn: u8 = h2_origin_shapes.len - 1;
 const h2_origin_shapes = [_]zoxy.http.h2.Answer{
     .{ .status = "200", .headers = &h2_origin_headers, .body = l7.canon.sized_body },
     .{ .status = "200", .body = l7.h2_canonical_chunked_body },
@@ -2781,12 +2790,15 @@ const h2_origin_shapes = [_]zoxy.http.h2.Answer{
         .reset_after = .internal_error,
     },
     .{ .status = "200", .headers = &h2_origin_headers, .body = l7.canon.sized_body, .goaway = true },
+    .{ .status = "204", .headers = &.{.{ l7.canon.log_response_header, l7.canon.log_response_value }} },
 };
 
 comptime {
     assert(h2_origin_shapes.len == std.enums.values(H2OriginShape).len);
     assert(@backingInt(H2OriginShape.interim_then_sized) < h2_shapes_well_formed);
     assert(@backingInt(H2OriginShape.refused) == h2_shapes_well_formed);
+    assert(@backingInt(H2OriginShape.no_content) == h2_shapes_drawn);
+    assert(h2_origin_shapes[h2_shapes_drawn].body.len == 0);
     for (h2_origin_shapes[0..h2_shapes_well_formed]) |shape| {
         assert(!shape.refuse and shape.reset_after == null and !shape.goaway);
     }
@@ -2800,17 +2812,19 @@ comptime {
 /// the proxy framed wrong is refused by its own scanner, and the cut that
 /// leaves passes as the adversary's. The misbehaving shapes are an
 /// adversary's, so only an adversarial seed draws them.
-fn pickH2Answer(context: *anyopaque) ?*const zoxy.http.h2.Answer {
+fn pickH2Answer(context: *anyopaque, path: []const u8) ?*const zoxy.http.h2.Answer {
     const harness: *Harness = @ptrCast(@alignCast(context));
     const random = harness.h2_shape_prng.random();
-    const shape: H2OriginShape = if (harness.interim_http)
+    const shape: H2OriginShape = if (std.mem.eql(u8, path, l7.canon.no_content_path))
+        .no_content
+    else if (harness.interim_http)
         .interim_then_sized
     else if (harness.clean)
         @fromBackingInt(random.uintLessThan(u8, h2_shapes_well_formed))
     else
-        random.enumValue(H2OriginShape);
-    assert(!harness.interim_http or shape == .interim_then_sized);
-    assert(!harness.clean or @backingInt(shape) < h2_shapes_well_formed);
+        @fromBackingInt(random.uintLessThan(u8, h2_shapes_drawn));
+    assert(!harness.interim_http or shape == .interim_then_sized or shape == .no_content);
+    assert(!harness.clean or shape == .no_content or @backingInt(shape) < h2_shapes_well_formed);
     assert(@backingInt(shape) < h2_origin_shapes.len);
     return &h2_origin_shapes[@backingInt(shape)];
 }
@@ -3347,7 +3361,10 @@ fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: st
     // endpoint whichever protocol reaches it.
     // On every seed, started or not: its zero counts are what the verdict
     // reads where no HTTPS cluster ran.
-    harness.https_origin = .{ .response = l7.canon.sized_response };
+    harness.https_origin = .{
+        .response = l7.canon.sized_response,
+        .routes = &.{.{ .target = l7.canon.no_content_path, .response = l7.canon.no_content_response }},
+    };
     if (harness.http_protocol.http2()) {
         try harness.h2_origin.start(arena, &harness.io, &.{ .ip = Harness.httpOriginAddress() });
     } else if (harness.http_tls) {
@@ -3442,6 +3459,7 @@ fn prepareH2Client(harness: *Harness, random: std.Random) void {
         const asks_handler = harness.h2_handler_prng.random().uintLessThan(u8, 6) == 0;
         const splits_cookie = harness.h2_handler_prng.random().uintLessThan(u8, 6) == 0;
         if (asks_handler) plan.* = handlerPlan(plan.*);
+        plan.* = harness.noContentAsk(plan.*);
         // And a sixth of the origin's GETs split their cookie (§8.2.3).
         if (plan.ask == .get) plan.split_cookie = splits_cookie;
         if (!harness.http_protocol.http2()) continue;
@@ -3628,7 +3646,7 @@ fn prepareH3Clients(harness: *Harness) void {
     for (harness.h3_clients[0..harness.h3_count], 0..) |*client, index| {
         const streams = 1 + random.uintLessThan(u8, H3Client.streams_max);
         var plans: [H3Client.streams_max]l7.H2Plan = @splat(.{});
-        for (plans[0..streams]) |*plan| plan.* = drawH3Plan(random);
+        for (plans[0..streams]) |*plan| plan.* = harness.noContentAsk(drawH3Plan(random));
         var seed: [64]u8 = undefined;
         random.bytes(&seed);
         // A key share's private half may not be zero; one octet set is
@@ -3639,6 +3657,17 @@ fn prepareH3Clients(harness: *Harness) void {
         client.on_ended = clientEndedHook;
         client.context = harness;
     }
+}
+
+/// An eighth of GETs ask `canon.no_content_path` instead, which every
+/// origin answers 204, drawn on their own stream so the rest draw as they
+/// did.
+fn noContentAsk(harness: *Harness, plan: l7.H2Plan) l7.H2Plan {
+    const asks = harness.no_content_prng.random().uintLessThan(u8, 8) == 0;
+    if (!asks or plan.ask != .get) return plan;
+    const no_content: l7.H2Plan = .{ .ask = .no_content };
+    assert(!no_content.carriesBody());
+    return no_content;
 }
 
 /// One HTTP/3 request (#449): `drawH2Plan`'s, its body held within what

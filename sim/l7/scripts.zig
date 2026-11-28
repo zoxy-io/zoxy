@@ -24,6 +24,11 @@ const repeat = zoxy.testing.repeat;
 pub const Script = enum(u8) {
     /// A bodyless GET; expects one canonical 200.
     get,
+    /// A GET of `canon.no_content_path`, which every origin answers `204`:
+    /// a head with no body and no framing field, on a connection that
+    /// goes on. An origin drawn to answer at accept answers before the
+    /// request is read, so a 200 is legal too, off clean seeds.
+    no_content,
     /// A POST with a 24-byte sized body; expects one canonical 200.
     post_sized,
     /// A POST with a 6000-byte sized body: bigger than one virtual-socket
@@ -450,6 +455,14 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .method = .get,
         .allowed_statuses = statuses_routed,
         .routed_canonical = true,
+    },
+    .no_content = .{
+        .request = "GET " ++ canon.no_content_path ++ " HTTP/1.1\r\nHost: sim\r\n" ++ trace_line ++ "\r\n",
+        .expected_responses = 1,
+        .transcript_cap = 1,
+        .golden_status = 204,
+        .method = .get,
+        .allowed_statuses = &.{ 200, 204, 408, 502, 503, 504 },
     },
     .post_sized = .{
         .request = post_request,
@@ -970,6 +983,7 @@ comptime {
 /// draw takes a follow-up.
 pub const terminating_scripts = [_]Script{
     .get,
+    .no_content,
     .post_sized,
     .post_big,
     .post_chunked,

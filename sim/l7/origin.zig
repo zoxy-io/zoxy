@@ -189,6 +189,9 @@ pub fn HttpOrigin(comptime IoType: type) type {
             mode: OriginMode = .sized,
             /// What this connection answers with, per its mode.
             response_bytes: []const u8 = canon.sized_response,
+            /// The request in flight's own answer, where its path names one
+            /// (`canon.no_content_path`); the mode answers the rest.
+            answer_override: ?[]const u8 = null,
             /// Close right after the response: until-close and truncated
             /// bodies are delimited by the FIN itself.
             close_after_response: bool = false,
@@ -372,6 +375,12 @@ pub fn HttpOrigin(comptime IoType: type) type {
                 if (parser.headerValue(request.headers, "upgrade") != null) {
                     conn.response_bytes = canon.switching_response;
                     conn.drain_only = true;
+                }
+                // Decided from the request too, for the same reasons: every
+                // origin answers this path `204`, whatever its mode.
+                assert(conn.answer_override == null);
+                if (std.mem.eql(u8, request.target, canon.no_content_path)) {
+                    conn.answer_override = canon.no_content_response;
                 }
                 // §7 canonical forwarding: the proxy sends the canonical
                 // path the router matched on, so what the origin receives
@@ -693,6 +702,13 @@ pub fn HttpOrigin(comptime IoType: type) type {
                 conn.armRecv();
             }
 
+            /// The bytes the request in flight is answered with.
+            fn answerBytes(conn: *const Conn) []const u8 {
+                const answer = conn.answer_override orelse conn.response_bytes;
+                assert(answer.len >= 1);
+                return answer;
+            }
+
             fn beginRespond(conn: *Conn) void {
                 assert(conn.phase == .respond);
                 conn.response_sent = 0;
@@ -700,10 +716,11 @@ pub fn HttpOrigin(comptime IoType: type) type {
             }
 
             fn armSend(conn: *Conn) void {
-                assert(conn.response_sent < conn.response_bytes.len);
+                const answer = conn.answerBytes();
+                assert(conn.response_sent < answer.len);
                 conn.origin.io.send(
                     conn.socket,
-                    conn.response_bytes[conn.response_sent..],
+                    answer[conn.response_sent..],
                     &conn.send_completion,
                     Conn,
                     conn,
@@ -717,12 +734,13 @@ pub fn HttpOrigin(comptime IoType: type) type {
                     return;
                 };
                 conn.response_sent += sent;
-                assert(conn.response_sent <= conn.response_bytes.len);
-                if (conn.response_sent < conn.response_bytes.len) {
+                assert(conn.response_sent <= conn.answerBytes().len);
+                if (conn.response_sent < conn.answerBytes().len) {
                     conn.armSend();
                     return;
                 }
                 conn.requests_served += 1;
+                conn.answer_override = null;
                 if (conn.close_after_response) {
                     // The FIN is the delimiter (until-close), or the
                     // truncation itself (truncated).

@@ -1705,6 +1705,11 @@ external binaries. They and the speed gates run at merge.
       each 200 it gave reaches its client behind one, over HTTP/1.1,
       HTTP/2 and HTTP/3 alike: §7 relays a `1xx`, and an interim comes
       before the final head on the wire, so no cut excuses its absence;
+    - every origin that answers a parsed request answers
+      `/sim/no-content` with a 204, which reaches its client with no body
+      and neither `Content-Length` nor `Transfer-Encoding` (RFC 9110
+      §8.6, §6.4.1), over HTTP/1.1, HTTP/2 and HTTP/3 alike, and is
+      stamped as every forwarded answer is;
     - a chunked 200 is judged by what it carries, not how it is framed:
       the proxy chunks an HTTP/2 origin's answer one DATA run at a time,
       so an HTTP/1.1 client decodes the sizes, and the payload must be a
@@ -1763,7 +1768,7 @@ external binaries. They and the speed gates run at merge.
     kind of HTTP/2 violation must hear its owed answer, the HTTP/2 origin
     must answer in each of its shapes, the handler must answer an HTTP/2
     GET and POST, some split cookie must arrive joined, and every
-    population must hear an interim its seed owed it.
+    population must hear an interim its seed owed it and a whole 204.
     - Exemptions are named, each with its reason.
     - An exemption that *does* fire fails the census too, so widening a
       scenario deletes its excuse.

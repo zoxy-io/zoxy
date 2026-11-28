@@ -45,8 +45,9 @@ pub const Answer = struct {
 /// and counts which it gave. Neither a health call nor a muted one asks.
 pub const Picker = struct {
     context: *anyopaque,
-    /// The answer for the next request; null answers it with the script.
-    pick: *const fn (context: *anyopaque) ?*const Answer,
+    /// The answer for the next request, given its `:path`; null answers it
+    /// with the script.
+    pick: *const fn (context: *anyopaque, path: []const u8) ?*const Answer,
     answered: *const fn (context: *anyopaque, answer: *const Answer) void,
 };
 
@@ -255,10 +256,14 @@ pub fn TestOriginSized(comptime IoType: type, comptime conns_max_value: u32) typ
                 origin.last_body_len = 0;
                 origin.last_te = .{};
                 origin.last_content_type = .{};
+                var path: []const u8 = "";
                 for (request.fields) |*field| {
                     const value = field.value;
                     if (std.mem.eql(u8, field.name, ":method")) origin.last_method.set(value);
-                    if (std.mem.eql(u8, field.name, ":path")) origin.last_path.set(value);
+                    if (std.mem.eql(u8, field.name, ":path")) {
+                        path = value;
+                        origin.last_path.set(value);
+                    }
                     if (std.mem.eql(u8, field.name, ":authority")) origin.last_authority.set(value);
                     if (std.mem.eql(u8, field.name, "te")) origin.last_te.set(value);
                     if (std.mem.eql(u8, field.name, "content-type")) origin.last_content_type.set(value);
@@ -270,7 +275,7 @@ pub fn TestOriginSized(comptime IoType: type, comptime conns_max_value: u32) typ
                 };
                 job.* = .{ .stream = request.stream, .muted = origin.mutes(request), .health = origin.asksHealth(request) };
                 if (origin.picker) |picker| {
-                    if (!job.muted and !job.health) job.picked = picker.pick(picker.context);
+                    if (!job.muted and !job.health) job.picked = picker.pick(picker.context, path);
                 }
                 if (origin.answer_at_head and !origin.mute and !job.muted and !job.health) {
                     job.started = true;

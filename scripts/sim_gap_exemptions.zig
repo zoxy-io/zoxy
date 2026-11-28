@@ -91,9 +91,9 @@ const h2_origin_tls = "TLS to an HTTP/2 origin failing: the sweep's h2 origin se
     "scenarios refuse a chain";
 const origin_answer = "an origin answer the sweep's scripted origins never give — bytes past a " ++
     "declared length, a `101` to a request that asked no upgrade, a malformed head under a " ++
-    "borrowed scratch, an HTTP/2 origin's 204 or HEAD answer, nominated `te`, or asterisk " ++
+    "borrowed scratch, an HTTP/2 origin's 304 or HEAD answer, nominated `te`, or asterisk " ++
     "target: they answer the canonical sized, chunked and trailered 200s, the HTTP/2 one " ++
-    "behind an interim too; http_proxy_test.zig drives it";
+    "behind an interim too, and the no-content path's 204; http_proxy_test.zig drives it";
 const grpc_service = "a `grpc` check naming a service: the sweep's ask about the server as a " ++
     "whole (`service = \"\"`); origin_pool's tests compose a named one";
 const grpc_timeout = "a `grpc-timeout` in hours, minutes or seconds, or a gRPC content type with " ++

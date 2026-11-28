@@ -211,6 +211,9 @@ pub const Ask = enum(u8) {
     /// A POST of `canon.handler_post_payload` there, which the handler
     /// reads and answers with.
     handler_post,
+    /// A GET of `canon.no_content_path`, which every origin answers `204`:
+    /// a head that ends the stream, with no DATA and no length.
+    no_content,
 };
 
 /// `get`'s path, which every stream asks for but a consult's.
@@ -232,7 +235,7 @@ pub const Plan = struct {
 
     pub fn carriesBody(plan: Plan) bool {
         return switch (plan.ask) {
-            .get, .consult_get, .handler_get => false,
+            .get, .consult_get, .handler_get, .no_content => false,
             .post_declared, .post_undeclared, .grpc_call, .handler_post => true,
         };
     }
@@ -246,6 +249,7 @@ pub const Plan = struct {
             .post_declared, .post_undeclared, .grpc_call => .post_sized,
             .handler_get => .handler_get,
             .handler_post => .handler_post,
+            .no_content => .no_content,
         };
     }
 
@@ -254,7 +258,7 @@ pub const Plan = struct {
     pub fn originAnswers(plan: Plan) bool {
         assert(plan.frames <= body_frames_max);
         return switch (plan.ask) {
-            .get, .post_declared, .post_undeclared, .consult_get => true,
+            .get, .post_declared, .post_undeclared, .consult_get, .no_content => true,
             .grpc_call, .handler_get, .handler_post => false,
         };
     }
@@ -267,6 +271,7 @@ pub const Plan = struct {
             .consult_get => canon.consult_prefix,
             .grpc_call => canon.grpc_path,
             .handler_get, .handler_post => canon.handler_prefix,
+            .no_content => canon.no_content_path,
             else => get_path,
         };
     }
@@ -444,6 +449,8 @@ pub fn Client(comptime IoType: type) type {
             trailers_owed: bool = false,
             /// An interim head came before the final one.
             interim_heard: bool = false,
+            /// The final head carried `content-length`.
+            length_declared: bool = false,
             /// The final head's `grpc-status`, when it carried one: a gRPC
             /// call answered Trailers-Only (§8).
             grpc_status: ?u8 = null,
@@ -766,6 +773,21 @@ pub fn Client(comptime IoType: type) type {
             if (client.on_ended) |hook| hook(client.context);
         }
 
+        /// Whole 204s heard, for the census; on `trailersHeard`'s terms.
+        pub fn noContentHeard(client: *const Self) u32 {
+            assert(client.streams >= 1);
+            if (client.mode != .exchange) return 0;
+            var answers: [streams_max]Answer = @splat(.{});
+            const plans = client.plans[0..client.streams];
+            _ = readAnswers(client.receive_buffer[0..client.received_len], plans, &answers) catch |err| {
+                std.debug.panic("noContentHeard after a failed verify: {s}", .{@errorName(err)});
+            };
+            var heard: u32 = 0;
+            for (answers[0..client.streams]) |*answer| heard += @intFromBool(answer.status == 204 and answer.ended);
+            assert(heard <= client.streams);
+            return heard;
+        }
+
         /// Origin 200s heard behind an interim, on a seed that owed one,
         /// for the census; on `trailersHeard`'s terms.
         pub fn interimsHeard(client: *const Self) u32 {
@@ -842,6 +864,10 @@ pub fn Client(comptime IoType: type) type {
                 if (goaway_last) |last| {
                     if (answer.status != 0 and streamId(@intCast(index)) > last) return error.StreamPastGoaway;
                 }
+                // A 204 has no content to frame (RFC 9110 §15.3.5, §8.6).
+                if (answer.status == 204 and (answer.body_len != 0 or answer.length_declared)) {
+                    return error.BodyCorrupted;
+                }
                 if (plan.ask == .grpc_call) {
                     try checkGrpcDeadline(answer);
                 } else if (answer.status == 200) {
@@ -869,7 +895,8 @@ pub fn Client(comptime IoType: type) type {
                 // answer can finish before the server has read them, and
                 // RST_STREAM(NO_ERROR) then ends the half it no longer
                 // wants (RFC 9113 §8.1); the trailers go no further anyway.
-                if (answer.status != 200 or !answer.ended) return error.GoldenOutcomeMissed;
+                const golden = scripts.spec(plan.scriptOf()).golden_status;
+                if (answer.status != golden or !answer.ended) return error.GoldenOutcomeMissed;
                 if (answer.reset) return error.GoldenOutcomeMissed;
                 // A gRPC call is answered at its deadline, which needs no
                 // more of it, so the rest of its half may be stopped too.
@@ -1432,6 +1459,7 @@ pub fn Client(comptime IoType: type) type {
                     // (§7); the origin's own field says one is owed.
                     if (ResponseReader.value(fields, "trailer") != null) return error.FieldsCorrupted;
                     answer.status = status;
+                    answer.length_declared = ResponseReader.value(fields, "content-length") != null;
                     answer.trailers_owed = ResponseReader.value(fields, canon.response_trailer_owed_header) != null;
                     if (ResponseReader.value(fields, "grpc-status")) |grpc| {
                         answer.grpc_status = std.fmt.parseUnsigned(u8, grpc, 10) catch return error.FieldsCorrupted;
