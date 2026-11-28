@@ -523,6 +523,19 @@
         // libcrypto's (§4). Its one dependency is hpack, the same pin h2
         // carries.
         //
+        // Audit for 0125c60, 2026-11-28: zoxy-io/h3#14, one commit over
+        // ba373f8, from this sweep's finding: a FIN alone, sent after its
+        // reader took every octet, never reached the reader. It raised no
+        // `stream_readable`, and it moved the stream to "Data Read" on
+        // arrival, so an acknowledgement in the same packet let the sweep
+        // retire it unread. The STREAM handler now announces a FIN newly in
+        // reach, and the end is delivered — the stream settled, never swept
+        // under a caller's slice — when the reader asks `readableFin` or
+        // reads `readable` empty. Both are what `src/http/h3/` already does,
+        // so nothing here changes. No allocation, import or I/O was added;
+        // gated in h3's three legs, with a simulator oracle that fails
+        // seed 1 without it.
+        //
         // Audit for ba373f8, 2026-11-23: zoxy-io/h3#13, one commit over
         // 004f04a: `endpoint.writeRefusal`, the stateless Initial carrying
         // CONNECTION_CLOSE with CONNECTION_REFUSED (RFC 9000 §5.2.2) that
@@ -599,8 +612,8 @@
         // docs/VERIFICATION.md §5.5). The interop matrix's loopback cases
         // and h3's simulator pass.
         .h3 = .{
-            .url = "git+https://github.com/zoxy-io/h3#ba373f85d588d7d1696979b5e5d92f98144e67f6",
-            .hash = "h3-0.0.0-RBkp8rgeGwAQpwLNSGP_DsTFjBFpKYaU1GxjeSiDHmh0",
+            .url = "git+https://github.com/zoxy-io/h3#0125c60d4e35f5058c5ca8c107ed7f03b2a132f7",
+            .hash = "h3-0.0.0-RBkp8nhBGwCtJV7zP4tlhJ5aC2HKew8GlDssOjCQO3ig",
         },
         // libcrypto, built by Zig rather than found on the system.
         //
