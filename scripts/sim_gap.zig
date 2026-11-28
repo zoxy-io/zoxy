@@ -20,13 +20,21 @@
 //! census exempts a counter: a loader line that refuses a config (the sim
 //! builds only configs zoxy accepts), a function only startup code names,
 //! and the functions `sim_gap_exemptions.zig` names, each with the most
-//! lines it may excuse. The report fails on a serving-path gap nothing
-//! explains, and on an excused function whose gap outgrew its entry — a
-//! change that opens a new gap is judged, not absorbed. An entry whose
-//! function the sweep now reaches whole is named for deletion. The bound
-//! is a ceiling rather than an exact count because kcov attributes lines
-//! differently across architectures and toolchains: the entries hold the
-//! larger of what arm64 and CI's x86_64 report.
+//! lines it may excuse.
+//!
+//! What gates is a function: the report fails on a serving-path function
+//! the sweep never enters, never compiles or never runs a line of, that
+//! nothing explains — a feature no seed turns on — and on an unexplained
+//! branch of `branch_lines_gated` lines or more, a block no seed takes. A line is not a stable
+//! enough unit to gate on. kcov attributes a Debug binary's hits to lines
+//! by address, so a hit lands on a neighbouring line of the same function,
+//! and the attribution moves whenever the program is compiled differently:
+//! another architecture, another toolchain, or a change elsewhere in the
+//! code (seen for #271: a harness change moved a hundred one-line gaps in
+//! files it never touched, a config check that runs on every seed among
+//! them). So an unexplained branch inside a function the sweep runs, an
+//! excused function whose gap outgrew its entry, and an entry that excuses
+//! nothing are all reported, for the next judgement, and none fails.
 //!
 //! Each failure is written to stderr as well as the report, so a run whose
 //! report a failing build step does not install still says what failed.
@@ -119,6 +127,9 @@ const Source = struct {
     marks: []Mark,
     /// Each line's owner: the nearest `fn` declared at or above it.
     owners: []const []const u8,
+    /// Each line's span: the index of that declaration's line, which tells
+    /// two functions apart that share a name in one file.
+    spans: []const u32,
 };
 
 const Tree = struct {
@@ -212,12 +223,14 @@ pub fn main(init: std.process.Init) !u8 {
     var file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
     try writeReport(&file_writer.interface, rows);
     try file_writer.interface.flush();
-    const explained = everyGapExplained(rows);
-    return if (exemptionsHold(&tree) and explained) 0 else 1;
+    reportExemptions(&tree);
+    return if (everyGapExplained(rows)) 0 else 1;
 }
 
-/// Every serving-path gap is swept or set apart (#487): one that is
-/// neither is a scenario to widen or an exemption to write.
+/// Every serving-path function the sweep never enters is swept or set
+/// apart (#487): one that is neither is a scenario to widen or an
+/// exemption to write, and fails the report. An unexplained branch of a
+/// function the sweep does run is named and passes (see the header).
 fn everyGapExplained(rows: []const Row) bool {
     assert(rows.len >= 1);
     var explained = true;
@@ -226,19 +239,45 @@ fn everyGapExplained(rows: []const Row) bool {
         for (row.groups) |*group| {
             assert(group.numbers.items.len >= 1);
             if (group.kind != .executed_never and group.kind != .unreferenced) continue;
-            std.debug.print("sim_gap: unexplained {s}:{s} ({t}, {d} line(s)): sweep it or exempt it\n", .{
-                row.source.path, group.owner, group.kind, group.numbers.items.len,
+            const entered = everySpanEntered(row.source, group.numbers.items);
+            const block = group.numbers.items.len >= branch_lines_gated;
+            std.debug.print("sim_gap: unexplained {s} {s}:{s} ({t}, {d} line(s)): sweep it or exempt it\n", .{
+                if (entered) "branch of" else "function", row.source.path, group.owner, group.kind,
+                group.numbers.items.len,
             });
-            explained = false;
+            if (!entered or block) explained = false;
         }
     }
     return explained;
 }
 
-/// Every exemption must still excuse a gap: one whose function the sweep
-/// now reaches, or that no longer exists, would read as though it did.
-fn exemptionsHold(tree: *const Tree) bool {
-    var holds = true;
+/// Whether the sweep runs a line of every function `numbers` fall in —
+/// each by its own span, so a same-named function the sweep does enter
+/// cannot stand in for one it never does.
+fn everySpanEntered(source: *const Source, numbers: []const u32) bool {
+    assert(source.marks.len == source.spans.len);
+    assert(numbers.len >= 1);
+    for (numbers) |number| {
+        const span = source.spans[number - 1];
+        const entered = for (source.marks, source.spans) |mark, line_span| {
+            if (line_span == span and mark.sim_hit) break true;
+        } else false;
+        if (!entered) return false;
+    }
+    return true;
+}
+
+/// An unexplained branch this long fails the report even in a function
+/// the sweep enters: attribution drift moves a line or two at a time (the
+/// largest seen, six), and a feature added as a branch is a block.
+const branch_lines_gated: u32 = 8;
+
+/// What the table's entries now excuse, said for the next judgement: an
+/// entry that matched nothing here, and one whose function's gap outgrew
+/// it. Neither fails (see the header): both are as often kcov attributing
+/// a line differently as the code changing.
+fn reportExemptions(tree: *const Tree) void {
+    assert(exemptions.len >= 1);
     for (exemptions, tree.exemptions_matched) |exemption, matched| {
         assert(exemption.reason.len >= 1);
         assert(exemption.lines >= 1);
@@ -248,11 +287,11 @@ fn exemptionsHold(tree: *const Tree) bool {
             continue;
         }
         if (matched <= exemption.lines) continue;
+        // Reported, not failed: a ceiling outgrown by a line or two is as
+        // often attribution moving as a new branch (see the header).
         std.debug.print("sim_gap: exemption {s}:{s} allows {d} line(s) and the gap holds {d}: " ++
             "judge the new ones\n", .{ exemption.path, exemption.owner, exemption.lines, matched });
-        holds = false;
     }
-    return holds;
 }
 
 /// Every production `.zig` file under the root, with its test blocks and
@@ -298,8 +337,16 @@ fn loadSource(arena: std.mem.Allocator, path: []const u8, contents: []const u8) 
         return error.UnclosedTestBlock;
     }
     const owners = try arena.alloc([]const u8, count);
-    assignOwners(lines, owners);
-    return .{ .path = path, .bucket = bucketOf(path), .lines = lines, .marks = marks, .owners = owners };
+    const spans = try arena.alloc(u32, count);
+    assignOwners(lines, owners, spans);
+    return .{
+        .path = path,
+        .bucket = bucketOf(path),
+        .lines = lines,
+        .marks = marks,
+        .owners = owners,
+        .spans = spans,
+    };
 }
 
 /// Marks every line of every `test "..." { }` block, header to closing
@@ -347,12 +394,18 @@ fn closingLine(lines: []const []const u8, open: usize, indent: usize) ?usize {
     return null;
 }
 
-fn assignOwners(lines: []const []const u8, owners: [][]const u8) void {
+fn assignOwners(lines: []const []const u8, owners: [][]const u8, spans: []u32) void {
     assert(lines.len == owners.len);
+    assert(lines.len == spans.len);
     var current: []const u8 = "<top level>";
-    for (lines, owners) |line, *owner| {
-        if (fnName(line)) |name| current = name;
+    var span: u32 = 0;
+    for (lines, owners, spans, 0..) |line, *owner, *line_span, index| {
+        if (fnName(line)) |name| {
+            current = name;
+            span = @intCast(index);
+        }
         owner.* = current;
+        line_span.* = span;
     }
     assert(owners.len == 0 or owners[owners.len - 1].len >= 1);
 }

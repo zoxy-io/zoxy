@@ -1734,13 +1734,21 @@ external binaries. They and the speed gates run at merge.
     function only startup code names, and `scripts/sim_gap_exemptions.zig`,
     which names each remaining function with the most lines it may
     excuse and a reason. A reason says what keeps the sweep away and what
-    reaches the lines instead, much as a census exemption does. The report
-    fails on a gap nothing explains, and on an excused function whose gap
-    outgrew its entry, so a new gap is judged rather than absorbed. An
-    entry whose function the sweep reaches whole is named for deletion.
-    The bound is a ceiling because kcov attributes lines differently
-    across architectures; the entries hold the larger of arm64's and
-    CI's x86_64 count.
+    reaches the lines instead, much as a census exemption does. What gates
+    is a function: the report fails on a serving-path function the sweep
+    never enters that nothing explains, a feature no seed turns on, and on
+    an unexplained branch of eight lines or more, a block no seed takes.
+    A function counts as entered by a line of its own span, so a
+    same-named one cannot stand in for it. A single line is too unstable
+    to gate on. kcov attributes a Debug binary's hits by
+    address, so a hit lands on a neighbouring line of the same function,
+    and the attribution moves with any change to how the program compiles:
+    an architecture, a toolchain, or code elsewhere. One harness change
+    for HTTP/2 over TLS moved about a hundred one-line gaps in files it
+    never touched. So an unexplained branch of a function the sweep runs,
+    an entry whose gap outgrew it, and one that excuses nothing are
+    reported, not failed. The entries' counts are ceilings, the larger of
+    arm64's and CI's x86_64.
 - **Fuzzing.** Twenty-one `std.testing.fuzz` targets cover every parser
   edge:
   - the HTTP/1.1 head and chunked parsers, and the render;
