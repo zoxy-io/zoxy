@@ -652,6 +652,9 @@ const extension_counters: []const ExtensionCounter = blk: {
     break :blk collected;
 };
 
+/// The bodiless paths the census counts answers to (`canon.bodiless_answers`).
+const bodiless_kinds = l7.canon.bodiless_answers.len;
+
 /// What every counter totalled across a swept range, and the coverage
 /// verdict those totals carry (§9).
 ///
@@ -696,9 +699,9 @@ const Census = struct {
     /// Interim heads owed and heard before an origin's 200 (#232), by
     /// population.
     interims_heard: [Population.count]u64 = @splat(0),
-    /// Whole 204s an origin answered `canon.no_content_path` with, by
-    /// population.
-    no_content_heard: [Population.count]u64 = @splat(0),
+    /// Whole bodiless answers heard (`canon.bodiless_answers`: the 204,
+    /// the HEAD's 200, the 304), by kind and population.
+    bodiless_heard: [bodiless_kinds][Population.count]u64 = @splat(@splat(0)),
     /// Requests that ended with a trailer section and were answered, by
     /// population: HTTP/1.1's are the sections an origin read exactly as
     /// their head owed them (its relay, reached); HTTP/2's and HTTP/3's
@@ -895,17 +898,17 @@ const Census = struct {
         for (harness.l7_clients[0..harness.l7_count]) |*client| {
             census.trailers_heard[@backingInt(Population.http1)] += client.trailersHeard();
             census.interims_heard[@backingInt(Population.http1)] += client.interimsHeard();
-            census.no_content_heard[@backingInt(Population.http1)] += client.noContentHeard();
+            census.addBodiless(.http1, client.bodilessHeard());
         }
         for (harness.h2_clients[0..harness.h2_count]) |*client| {
             census.trailers_heard[@backingInt(Population.http2)] += client.trailersHeard();
             census.interims_heard[@backingInt(Population.http2)] += client.interimsHeard();
-            census.no_content_heard[@backingInt(Population.http2)] += client.noContentHeard();
+            census.addBodiless(.http2, client.bodilessHeard());
         }
         for (harness.h3_clients[0..harness.h3_count]) |*client| {
             census.trailers_heard[@backingInt(Population.http3)] += client.trailersHeard();
             census.interims_heard[@backingInt(Population.http3)] += client.interimsHeard();
-            census.no_content_heard[@backingInt(Population.http3)] += client.noContentHeard();
+            census.addBodiless(.http3, client.bodilessHeard());
         }
         for (before, census.trailers_heard) |earlier, now| assert(now >= earlier);
         const requests_before = census.request_trailers;
@@ -937,6 +940,37 @@ const Census = struct {
         }
     }
 
+    fn addBodiless(census: *Census, population: Population, heard: [bodiless_kinds]u32) void {
+        const before = census.bodiless_heard;
+        for (&census.bodiless_heard, heard) |*kind, count| kind[@backingInt(population)] += count;
+        for (before, census.bodiless_heard) |earlier, now| {
+            assert(now[@backingInt(population)] >= earlier[@backingInt(population)]);
+        }
+    }
+
+    /// Every bodiless path answered whole somewhere, and every population
+    /// hearing one of them: three framings with nothing to frame, by three
+    /// relays (§7).
+    fn verifyBodiless(census: *const Census) bool {
+        comptime assert(bodiless_kinds == 3); // The 204, the HEAD's 200, the 304.
+        var held = true;
+        for (census.bodiless_heard, l7.canon.bodiless_answers) |kind, bodiless| {
+            var total: u64 = 0;
+            for (kind) |count| total += count;
+            if (total >= 1) continue;
+            std.debug.print("sim census: no client heard {s} answered whole\n", .{bodiless.path});
+            held = false;
+        }
+        for (std.enums.values(Population)) |population| {
+            var total: u64 = 0;
+            for (census.bodiless_heard) |kind| total += kind[@backingInt(population)];
+            if (total >= 1) continue;
+            std.debug.print("sim census: no {s} client heard a bodiless answer whole\n", .{@tagName(population)});
+            held = false;
+        }
+        return held;
+    }
+
     /// Every population must hear a trailer section somewhere in the
     /// range: each relays it by a different path (§7), and a path no seed
     /// walks is one the clients' trailer oracles never judged.
@@ -951,11 +985,7 @@ const Census = struct {
             );
             held = false;
         }
-        for (std.enums.values(Population), census.no_content_heard) |population, heard| {
-            if (heard >= 1) continue;
-            std.debug.print("sim census: no {s} client heard a whole 204 (canon.no_content_path)\n", .{@tagName(population)});
-            held = false;
-        }
+        held = census.verifyBodiless() and held;
         for (std.enums.values(Population), census.interims_heard) |population, heard| {
             if (heard >= 1) continue;
             std.debug.print("sim census: no {s} client heard the interim an interim seed owes it (#232)\n", .{@tagName(population)});
@@ -972,7 +1002,6 @@ const Census = struct {
         }
         assert(held == (std.mem.min(u64, &census.trailers_heard) >= 1 and
             std.mem.min(u64, &census.interims_heard) >= 1 and
-            std.mem.min(u64, &census.no_content_heard) >= 1 and
             std.mem.min(u64, &census.request_trailers) >= 1));
         return held;
     }
@@ -1344,7 +1373,7 @@ fn checkCensus(options: *const Sweep, census: *const Census) bool {
         return true;
     }
     if (!census.verify(options.iterations)) return false;
-    std.debug.print("sim: census ok, {d} counter(s) fired, {d} exempt; {d} extension counter(s) fired; {d} seam op(s), {d} exempt; {d} body(ies) verified; trailers heard {d}/{d}/{d}, sent {d}/{d}/{d}, interims heard {d}/{d}/{d}, 204s heard {d}/{d}/{d} (http1/2/3); IPv6 clients {d} announced upstream, {d} forwarded; HTTP/2 windows met {d}, table resizes heard {d}; HTTP/2 over TLS streams {d}\n", .{
+    std.debug.print("sim: census ok, {d} counter(s) fired, {d} exempt; {d} extension counter(s) fired; {d} seam op(s), {d} exempt; {d} body(ies) verified; trailers heard {d}/{d}/{d}, sent {d}/{d}/{d}, interims heard {d}/{d}/{d}, 204/HEAD/304 heard {d}/{d}/{d}, {d}/{d}/{d}, {d}/{d}/{d} (http1/2/3); IPv6 clients {d} announced upstream, {d} forwarded; HTTP/2 windows met {d}, table resizes heard {d}; HTTP/2 over TLS streams {d}\n", .{
         Counters.names.len - uncovered.len,
         uncovered.len,
         extension_counters.len,
@@ -1360,9 +1389,15 @@ fn checkCensus(options: *const Sweep, census: *const Census) bool {
         census.interims_heard[@backingInt(Census.Population.http1)],
         census.interims_heard[@backingInt(Census.Population.http2)],
         census.interims_heard[@backingInt(Census.Population.http3)],
-        census.no_content_heard[@backingInt(Census.Population.http1)],
-        census.no_content_heard[@backingInt(Census.Population.http2)],
-        census.no_content_heard[@backingInt(Census.Population.http3)],
+        census.bodiless_heard[0][@backingInt(Census.Population.http1)],
+        census.bodiless_heard[0][@backingInt(Census.Population.http2)],
+        census.bodiless_heard[0][@backingInt(Census.Population.http3)],
+        census.bodiless_heard[1][@backingInt(Census.Population.http1)],
+        census.bodiless_heard[1][@backingInt(Census.Population.http2)],
+        census.bodiless_heard[1][@backingInt(Census.Population.http3)],
+        census.bodiless_heard[2][@backingInt(Census.Population.http1)],
+        census.bodiless_heard[2][@backingInt(Census.Population.http2)],
+        census.bodiless_heard[2][@backingInt(Census.Population.http3)],
         census.upstream_ip6_announced,
         census.forwarded_ip6_verified,
         census.h2_windows_met,

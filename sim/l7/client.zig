@@ -397,14 +397,20 @@ pub fn Client(comptime IoType: type) type {
             return .{ .sticky = client.sticky, .interim_owed = client.interim_owed };
         }
 
-        /// Whole 204s walked, for the census; read once `verify` has passed.
-        pub fn noContentHeard(client: *const Self) u32 {
+        /// Whole bodiless answers walked — the 204, the HEAD's 200, the 304,
+        /// in `canon.bodiless_answers`' order — for the census; read once
+        /// `verify` has passed.
+        pub fn bodilessHeard(client: *const Self) [canon.bodiless_answers.len]u32 {
             const bytes = client.receive_buffer[0..client.received_len];
             const walk = walkResponses(bytes, scripts.spec(client.script), client.connectionFacts());
             assert(walk.violation == null);
-            var heard: u32 = 0;
-            for (walk.statuses[0..walk.complete_count]) |status| heard += @intFromBool(status == 204);
-            assert(heard <= walk.complete_count);
+            var heard: [canon.bodiless_answers.len]u32 = @splat(0);
+            for (walk.statuses[0..walk.complete_count]) |status| {
+                heard[0] += @intFromBool(status == 204);
+                heard[1] += @intFromBool(status == 200 and client.script == .head);
+                heard[2] += @intFromBool(status == 304);
+            }
+            assert(heard[0] + heard[1] + heard[2] <= walk.complete_count);
             return heard;
         }
 
@@ -704,11 +710,11 @@ pub fn Client(comptime IoType: type) type {
         }
 
         /// The final statuses the sweep's origins answer with: the canonical
-        /// 200s, and the 204 for `canon.no_content_path`. Every other one a
-        /// client hears is this proxy's own, or a `101` that switched.
+        /// 200s, and the 204 and 304 of the bodiless paths. Every other one
+        /// a client hears is this proxy's own, or a `101` that switched.
         fn originStatus(status: u16) bool {
             assert(status >= 100);
-            return status == 200 or status == 204;
+            return status == 200 or status == 204 or status == 304;
         }
 
         /// The #234 oracle over one parsed response head: whatever this
@@ -879,6 +885,8 @@ pub fn Client(comptime IoType: type) type {
         fn originAnswered(entry: Spec, status: u16) bool {
             assert(status >= 100);
             if (status != 200) return false;
+            // A bodiless path is answered in its own way, with no interim.
+            if (entry.method == .head) return false;
             // A handler's 200 is a page's too: `pageBodyFor` names its body.
             if (pageBodyFor(entry, status) != null) return false;
             assert(entry.handler_body == null);
@@ -959,6 +967,8 @@ pub fn Client(comptime IoType: type) type {
                 return .{ .body_len = 0, .violation = null };
             }
             if (response.status == 204) return noContentVerdict(&response);
+            if (response.status == 304) return notModifiedVerdict(&response);
+            if (entry.method == .head) return headVerdict(&response, entry);
             const page_body = pageBodyFor(entry, response.status);
             switch (response.framing) {
                 .content_length => |length| return sizedVerdict(response.status, body, entry, page_body, length),
@@ -994,6 +1004,39 @@ pub fn Client(comptime IoType: type) type {
             const framed = headerPresent(response.headers, "Content-Length") or
                 headerPresent(response.headers, "Transfer-Encoding");
             if (framed) return .{ .body_len = 0, .violation = ClientError.ResponseCorrupted };
+            return .{ .body_len = 0, .violation = null };
+        }
+
+        /// A 304 has no content either (RFC 9110 §15.4.5): no body, no
+        /// transfer coding to frame one, and a length only if it is the one
+        /// the GET would have carried (§8.6). Its origin declares none.
+        fn notModifiedVerdict(response: *const parser.ResponseHead) BodyVerdict {
+            assert(response.status == 304);
+            if (headerPresent(response.headers, "Transfer-Encoding")) {
+                return .{ .body_len = 0, .violation = ClientError.ResponseCorrupted };
+            }
+            if (parser.headerValue(response.headers, "Content-Length")) |length| {
+                const declared = std.fmt.parseUnsigned(u32, length, 10) catch
+                    return .{ .body_len = 0, .violation = ClientError.ResponseCorrupted };
+                if (declared != canon.sized_body.len) return .{ .body_len = 0, .violation = ClientError.ResponseCorrupted };
+            }
+            return .{ .body_len = 0, .violation = null };
+        }
+
+        /// A HEAD is answered with a head alone (RFC 9110 §9.3.2). The
+        /// origin's 200 says the length a GET would carry, and the proxy
+        /// relays it as it does any other field; anything else it says is
+        /// the proxy's own, with no body after it either way.
+        fn headVerdict(response: *const parser.ResponseHead, entry: Spec) BodyVerdict {
+            assert(entry.method == .head);
+            assert(response.status >= 200);
+            if (response.status == 200 and pageBodyFor(entry, response.status) == null) {
+                const length = parser.headerValue(response.headers, "Content-Length") orelse
+                    return .{ .body_len = 0, .violation = ClientError.ResponseCorrupted };
+                const declared = std.fmt.parseUnsigned(u32, length, 10) catch
+                    return .{ .body_len = 0, .violation = ClientError.ResponseCorrupted };
+                if (declared != canon.sized_body.len) return body_corrupted;
+            }
             return .{ .body_len = 0, .violation = null };
         }
 

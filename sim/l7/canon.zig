@@ -89,6 +89,25 @@ pub const sized_response = sized_head ++ sized_body;
 pub const no_content_path = "/sim/no-content";
 pub const no_content_response = "HTTP/1.1 204 No Content\r\n" ++
     log_response_header ++ ": " ++ log_response_value ++ "\r\n\r\n";
+/// The path every origin answers a HEAD on with the sized 200's head and
+/// nothing after it: the length a GET would carry, and no body (RFC 9110
+/// §9.3.2).
+pub const head_path = "/sim/head";
+pub const head_response = sized_head;
+/// The path every origin answers `304 Not Modified` on, to the GET that
+/// names its validator in `If-None-Match` (RFC 9110 §15.4.5): no body.
+pub const not_modified_path = "/sim/not-modified";
+pub const not_modified_etag = "\"sim\"";
+pub const not_modified_response = "HTTP/1.1 304 Not Modified\r\nETag: " ++ not_modified_etag ++ "\r\n" ++
+    log_response_header ++ ": " ++ log_response_value ++ "\r\n\r\n";
+/// Each bodiless path and the HTTP/1.1 answer every origin gives it, in
+/// its mode's place.
+pub const BodilessAnswer = struct { path: []const u8, response: []const u8 };
+pub const bodiless_answers = [_]BodilessAnswer{
+    .{ .path = no_content_path, .response = no_content_response },
+    .{ .path = head_path, .response = head_response },
+    .{ .path = not_modified_path, .response = not_modified_response },
+};
 /// The payload both chunked origins answer, whatever chunks carry it.
 pub const chunked_body = "chunked-body-16b";
 pub const chunked_wire = "10\r\n" ++ chunked_body ++ "\r\n0\r\n\r\n";

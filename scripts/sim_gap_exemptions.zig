@@ -361,6 +361,7 @@ pub const exemptions = [_]Exemption{
     .{ .path = "http/h2/downgrade.zig", .owner = "string", .lines = 4, .reason = test_support },
     .{ .path = "http/h2/downgrade.zig", .owner = "validated", .lines = 5, .reason = test_support },
     .{ .path = "http/h2/exchange.zig", .owner = "bytesFor", .lines = 1, .reason = h2_request },
+    .{ .path = "http/h2/exchange.zig", .owner = "drop", .lines = 5, .reason = rare },
     .{ .path = "http/h2/exchange.zig", .owner = "init", .lines = 1, .reason = h2_request },
     .{ .path = "http/h2/exchange.zig", .owner = "requestWindow", .lines = 1, .reason = h2_request },
     .{ .path = "http/h2/origin.zig", .owner = "noBody", .lines = 6, .reason = origin_answer },

@@ -906,10 +906,13 @@ pub fn Mux(comptime runtime: Runtime) type {
             assert(leg.payload == 0 and leg.end_text == 0);
             const head_room = server.h2_origin_head_bytes -| leg.head_text;
             const free = stagingTail(leg);
+            // The declared length, bound or not: a bodiless answer frames
+            // nothing whatever it says (`framingFor` reads `bodiless` first),
+            // and a HEAD's or a 304's is relayed in its head (`noBody`).
             const head = origin.responseHead(&.{
                 .status = response.status,
                 .fields = response.fields,
-                .content_length = response.content_length,
+                .content_length = response.declared_length,
                 .interim = response.interim,
                 .end_stream = response.end_stream,
                 .bodiless = leg.bodiless,

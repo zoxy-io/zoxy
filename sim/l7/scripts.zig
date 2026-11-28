@@ -29,6 +29,13 @@ pub const Script = enum(u8) {
     /// goes on. An origin drawn to answer at accept answers before the
     /// request is read, so a 200 is legal too, off clean seeds.
     no_content,
+    /// A HEAD of `canon.head_path`, answered with the sized 200's head and
+    /// no body (RFC 9110 §9.3.2).
+    head,
+    /// A GET of `canon.not_modified_path` naming its validator, answered
+    /// `304` with no body (RFC 9110 §15.4.5); a 200 off clean seeds, as
+    /// `no_content`'s.
+    not_modified,
     /// A POST with a 24-byte sized body; expects one canonical 200.
     post_sized,
     /// A POST with a 6000-byte sized body: bigger than one virtual-socket
@@ -463,6 +470,23 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .golden_status = 204,
         .method = .get,
         .allowed_statuses = &.{ 200, 204, 408, 502, 503, 504 },
+    },
+    .head = .{
+        .request = "HEAD " ++ canon.head_path ++ " HTTP/1.1\r\nHost: sim\r\n" ++ trace_line ++ "\r\n",
+        .expected_responses = 1,
+        .transcript_cap = 1,
+        .golden_status = 200,
+        .method = .head,
+        .allowed_statuses = statuses_routed,
+    },
+    .not_modified = .{
+        .request = "GET " ++ canon.not_modified_path ++ " HTTP/1.1\r\nHost: sim\r\n" ++
+            "If-None-Match: " ++ canon.not_modified_etag ++ "\r\n" ++ trace_line ++ "\r\n",
+        .expected_responses = 1,
+        .transcript_cap = 1,
+        .golden_status = 304,
+        .method = .get,
+        .allowed_statuses = &.{ 200, 304, 408, 502, 503, 504 },
     },
     .post_sized = .{
         .request = post_request,
@@ -984,6 +1008,7 @@ comptime {
 pub const terminating_scripts = [_]Script{
     .get,
     .no_content,
+    .not_modified,
     .post_sized,
     .post_big,
     .post_chunked,
@@ -1037,12 +1062,18 @@ comptime {
     // covered on the plaintext listener, which is the one the #180 draw
     // configures — and an upgrade over a terminated connection is its
     // own feature, not this script run through a different socket.
+    //
+    // `head` is excepted because the TLS test client frames an answer by
+    // its own headers, and a HEAD's answer declares a length with no body
+    // behind it: the client refuses a scripted HEAD rather than mis-frame
+    // whatever follows. The plaintext and HTTP/2 and HTTP/3 clients ask
+    // it.
 
     // Quadratic in the table, which grows: the quota follows it.
     @setEvalBranchQuota(4 * std.enums.values(Script).len * terminating_scripts.len);
     for (std.enums.values(Script)) |script| {
         const excepted = script == .silent or script == .keepalive_pair or
-            script == .upgrade_request;
+            script == .upgrade_request or script == .head;
         var drawable = false;
         for (terminating_scripts) |candidate| {
             if (candidate == script) drawable = true;

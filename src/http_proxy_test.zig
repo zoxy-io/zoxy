@@ -2013,6 +2013,37 @@ test "h2 origin: a declared length goes both ways as itself, and an origin's tra
     try trailed.expectDrained();
 }
 
+test "h2 origin: a HEAD's answer keeps the length a GET would carry, and a 304 its own (RFC 9110 §8.6)" {
+    // The session binds no body to a bodiless answer's length, which is
+    // right, and once handed only the binding the downgrade had nothing to
+    // write: an origin's HEAD answer reached the client without the length
+    // it declared. The sweep's HEAD clients found it.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, h2OriginOptions(90));
+    defer bed.tearDown();
+    bed.h2_origin.headers = &.{.{ "content-length", "32" }};
+    try bed.exchange("HEAD / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+    const response = bed.client.response();
+    try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, response, "content-length: 32\r\n") != null);
+    // A head alone: nothing after its blank line.
+    try std.testing.expect(std.mem.endsWith(u8, response, "\r\n\r\n"));
+    try std.testing.expectEqualStrings("HEAD", bed.h2_origin.last_method.slice());
+    try bed.expectDrained();
+
+    var revalidated: Http1Bed = undefined;
+    try revalidated.setUp(std.testing.allocator, h2OriginOptions(91));
+    defer revalidated.tearDown();
+    revalidated.h2_origin.status = "304";
+    revalidated.h2_origin.headers = &.{.{ "content-length", "32" }};
+    try revalidated.exchange("GET / HTTP/1.1\r\nHost: a\r\nIf-None-Match: \"v\"\r\nConnection: close\r\n\r\n");
+    const not_modified = revalidated.client.response();
+    try std.testing.expect(std.mem.startsWith(u8, not_modified, "HTTP/1.1 304 Not Modified\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, not_modified, "content-length: 32\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, not_modified, "\r\n\r\n"));
+    try revalidated.expectDrained();
+}
+
 test "h2 origin: a gRPC call from an HTTP/2 client reaches the origin and its trailers come back" {
     for ([_]bool{ false, true }) |partial_io| {
         var options = h2BedOptions(74 + @as(u64, @intFromBool(partial_io)));
