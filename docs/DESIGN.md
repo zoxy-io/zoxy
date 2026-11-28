@@ -1668,7 +1668,9 @@ external binaries. They and the speed gates run at merge.
     - HTTP/3 clients, which name a certificate the same way, and a fifth
       of which break the rules once, on their first stream: an uppercase
       field name (RFC 9114 §4.2), a field section that cannot decode
-      (RFC 9204 §2.2), DATA before HEADERS (RFC 9114 §4.1); and on half
+      (RFC 9204 §2.2), DATA before HEADERS (RFC 9114 §4.1); a third that
+      offer ChaCha20-Poly1305 alone and a third AES-256-GCM alone, the
+      suites the server's own preference never picks; and on half
       the seeds that speak HTTP/3, a probe that sends one datagram in a
       version the server does not speak;
     - admin scrapers, on a third of seeds: each reads the exposition to
@@ -1735,6 +1737,8 @@ external binaries. They and the speed gates run at merge.
       QPACK_DECOMPRESSION_FAILED and H3_FRAME_UNEXPECTED; a clean seed
       hears the owed answer itself, and no seed counts more protocol
       errors than it has DATA-first violators;
+    - an HTTP/3 client that offered one suite keys its session under it,
+      and on a clean seed keys one;
     - a version probe hears a Version Negotiation that echoes its
       connection IDs swapped, offers version 1 and not its own, and is no
       longer than the probe (RFC 9000 §6, §17.2.1, §8); a clean seed's
@@ -1793,8 +1797,9 @@ external binaries. They and the speed gates run at merge.
     GET and POST, some split cookie must arrive joined, and every
     population must hear an interim its seed owed it and a whole bodiless
     answer, each bodiless path must be answered whole somewhere, every
-    kind of HTTP/3 violation must hear its owed answer, and some probe
-    must hear a Version Negotiation.
+    kind of HTTP/3 violation must hear its owed answer, some probe must
+    hear a Version Negotiation, and some QUIC session must key under each
+    of ChaCha20-Poly1305 and AES-256-GCM.
     - Exemptions are named, each with its reason.
     - An exemption that *does* fire fails the census too, so widening a
       scenario deletes its excuse.

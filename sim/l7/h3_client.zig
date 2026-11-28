@@ -58,6 +58,38 @@ pub const ClientError = error{
     ViolationCodeUnexpected,
     /// A clean seed's violator never heard its owed answer.
     ViolationUnanswered,
+    /// A session keyed under a suite its hello did not offer, or — on a
+    /// clean seed — a narrowed offer that never keyed one at all.
+    SuiteUnoffered,
+};
+
+/// What a client's QUIC hello offers: every suite, AES-128-GCM first, or
+/// one alone — which is how the sweep keys sessions under the two the
+/// server's preference never picks (RFC 8446 §B.4, RFC 9001 §5).
+pub const SuiteOffer = enum(u8) {
+    every,
+    chacha20_only,
+    aes256_only,
+
+    pub const narrowed = [_]SuiteOffer{ .chacha20_only, .aes256_only };
+
+    /// The suite a narrowed offer keys under; null for `every`.
+    pub fn only(offer: SuiteOffer) ?TestClient.CipherSuite {
+        return switch (offer) {
+            .every => null,
+            .chacha20_only => .chacha20_poly1305_sha256,
+            .aes256_only => .aes_256_gcm_sha384,
+        };
+    }
+
+    /// The hello's list: static, since the handshake keeps the slice.
+    fn list(offer: SuiteOffer) []const TestClient.CipherSuite {
+        return switch (offer) {
+            .every => TestClient.offer_default,
+            .chacha20_only => &[_]TestClient.CipherSuite{.chacha20_poly1305_sha256},
+            .aes256_only => &[_]TestClient.CipherSuite{.aes_256_gcm_sha384},
+        };
+    }
 };
 
 /// An HTTP/3 client that breaks the rules once, on its first stream, and
@@ -138,6 +170,8 @@ pub fn Client(comptime IoType: type) type {
         interim_owed: bool,
         /// Set by the harness after `prepare` (`breakRules`).
         violation: Violation,
+        /// Set by the harness after `prepare`.
+        suite_offer: SuiteOffer,
         seed: [64]u8,
         requests: [requests_max]TestClient.Request,
         headers: [requests_max][3]TestClient.Field,
@@ -172,6 +206,7 @@ pub fn Client(comptime IoType: type) type {
             client.clean = clean;
             client.interim_owed = false;
             client.violation = .none;
+            client.suite_offer = .every;
             client.seed = seed;
             client.began = false;
             client.ended = false;
@@ -221,12 +256,13 @@ pub fn Client(comptime IoType: type) type {
         pub fn begin(client: *Self) void {
             assert(!client.began);
             client.began = true;
-            client.transport.startNamed(
+            client.transport.startOffering(
                 client.io,
                 client.address,
                 client.requests[0..client.streams],
                 client.seed,
                 client.server_name,
+                client.suite_offer.list(),
                 onDone,
                 client,
             ) catch return client.end(); // No socket to bind: nothing ran.
@@ -306,6 +342,7 @@ pub fn Client(comptime IoType: type) type {
             // before it does not.
             const capped = max_lifetime_ns != 0 and client.began and
                 client.transport.peerClosedGracefully(max_lifetime_ns);
+            try client.verifySuite();
             const owed = client.violation.owed();
             if (owed) |violation| try client.verifyViolation(violation);
             // A connection error may cut what else was in flight.
@@ -369,6 +406,27 @@ pub fn Client(comptime IoType: type) type {
             }
             assert(heard <= client.streams);
             return heard;
+        }
+
+        /// A narrowed offer keys the session under its one suite, and a clean
+        /// seed's session must have keyed (zssl refuses any other: §4.1.3).
+        fn verifySuite(client: *const Self) ClientError!void {
+            assert(client.began or client.transport.negotiatedSuite() == null);
+            const offered = client.suite_offer.only() orelse return;
+            if (client.transport.negotiatedSuite()) |keyed| {
+                if (keyed != offered) return error.SuiteUnoffered;
+                return;
+            }
+            if (client.clean) return error.SuiteUnoffered;
+        }
+
+        /// The suite a narrowed offer keyed this client's session under,
+        /// for the census; null for a default offer or no session.
+        pub fn narrowedSuiteKeyed(client: *const Self) ?SuiteOffer {
+            if (client.suite_offer == .every) return null;
+            const keyed = client.transport.negotiatedSuite() orelse return null;
+            assert(keyed == client.suite_offer.only().?);
+            return client.suite_offer;
         }
 
         /// A violator's first stream: never answered as a request, and, where

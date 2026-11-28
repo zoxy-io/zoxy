@@ -82,6 +82,11 @@ pub const code_qpack_decompression_failed: u64 = @backingInt(quic.error_code.App
 /// not: the code, and whether it is an application's (RFC 9000 §19.19).
 pub const PeerClose = struct { code: u64, application: bool };
 
+/// A TLS 1.3 cipher suite, as the QUIC handshake names them, and what a
+/// hello offers unless told otherwise.
+pub const CipherSuite = QuicClient.CipherSuite;
+pub const offer_default = QuicClient.offer_default;
+
 pub const Answer = struct {
     status: u16 = 0,
     body: [body_bytes_max]u8 = undefined,
@@ -222,7 +227,28 @@ pub fn TestClient(comptime IoType: type) type {
             on_done: *const fn (*anyopaque) void,
             context: *anyopaque,
         ) !void {
+            return client.startOffering(io, server, requests, seed, server_name, QuicClient.offer_default, on_done, context);
+        }
+
+        /// `startNamed`, the hello offering `suites` in preference order:
+        /// one suite alone keys the session under it.
+        pub fn startOffering(
+            client: *Self,
+            io: *IoType,
+            server: IpAddress,
+            requests: []const Request,
+            seed: [64]u8,
+            server_name: []const u8,
+            suites: []const CipherSuite,
+            on_done: *const fn (*anyopaque) void,
+            context: *anyopaque,
+        ) !void {
             assert(server_name.len >= 1);
+            assert(suites.len >= 1);
+            // Before anything that can fail: `negotiatedSuite` reads these
+            // whether or not the handshake began.
+            client.tls.suite = null;
+            client.tls.connected = false;
             assert(requests.len >= 1);
             assert(requests.len <= requests_max);
             // Field by field: the client is hundreds of KiB, and a literal of
@@ -277,6 +303,7 @@ pub fn TestClient(comptime IoType: type) type {
                 .server_name = server_name,
                 .transport_parameters = try client.quic.localTransportParameters(&parameters),
                 .seed = seed,
+                .cipher_suites = suites,
             }, &sink);
             client.armReceive();
             client.armTimer();
@@ -461,6 +488,13 @@ pub fn TestClient(comptime IoType: type) type {
             const index = id / 4;
             if (index >= client.requests.len) return null;
             return &client.answers[@intCast(index)];
+        }
+
+        /// The suite the session keyed under, or null for one that never
+        /// connected.
+        pub fn negotiatedSuite(client: *const Self) ?CipherSuite {
+            if (client.tls.suite != null) assert(client.tls.connected);
+            return client.tls.suite;
         }
 
         /// The public key the server's leaf carried (#297), or null before
