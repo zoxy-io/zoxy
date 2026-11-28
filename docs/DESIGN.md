@@ -1614,6 +1614,12 @@ external binaries. They and the speed gates run at merge.
   - **The adversary:**
     - partial reads and writes, down to one byte;
     - refused, black-holed and pressure-failed connects;
+    - on adversarial seeds with at least two upstream slots, pools
+      narrower than those slots, each on a third of the seeds it applies
+      to — an HTTP/2 cluster's origin streams, an HTTPS cluster's
+      sessions — so their own rungs of §8's ladder shed, as a 503 every
+      script allows there; an HTTP/2 cluster's origin connections held to
+      one on another third;
     - resets at every point in an exchange;
     - misbehaving origins;
     - an IPv6 peer for every stream client on a third of seeds, and

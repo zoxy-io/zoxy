@@ -407,7 +407,6 @@ pub const exemptions = [_]Exemption{
     .{ .path = "http/parser.zig", .owner = "upperHexDigit", .lines = 5, .reason = head_shape },
     .{ .path = "http/parser.zig", .owner = "versionFromRaw", .lines = 1, .reason = rare },
     .{ .path = "http/proxy.zig", .owner = "acquireUpstreamHeadOrShed", .lines = 1, .reason = census },
-    .{ .path = "http/proxy.zig", .owner = "acquireUpstreamTlsOrShed", .lines = 2, .reason = census },
     .{ .path = "http/proxy.zig", .owner = "admitRequest", .lines = 2, .reason = head_shape },
     .{ .path = "http/proxy.zig", .owner = "admitUpgrade", .lines = 1, .reason = rare },
     .{ .path = "http/proxy.zig", .owner = "answerHeadOverflow", .lines = 1, .reason = census },

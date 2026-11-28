@@ -249,7 +249,8 @@ const uncovered = [_]Uncovered{
         .why = .unreached,
         .reason = "the sweep's HTTP/2 clusters have one endpoint, since only a retry budget adds a " ++
             "second and HTTP/2 takes none, and their gRPC probe rides that endpoint's connection or " ++
-            "dials one in the room the loader's default pool leaves, two per endpoint; " ++
+            "dials one in the room the pool leaves, so it is skipped only when the one connection " ++
+            "a third of adversarial seeds hold is going away as the pool fills; " ++
             "http_proxy_test's grpc probe scenarios fill the pool",
     },
     .{
@@ -265,23 +266,13 @@ const uncovered = [_]Uncovered{
             "origin scenarios refuse a misnamed chain",
     },
     .{
-        .name = "l7_shed_upstream_tls",
-        .why = .unreached,
-        .reason = "the sweep's HTTPS cluster holds as many sessions as upstream slots, so the " ++
-            "slot rung answers first; http_proxy_test's https origin scenarios starve the pool",
-    },
-    .{
         .name = "l7_shed_h2_origin_connections",
         .why = .unreached,
-        .reason = "the sweep's HTTP/2 clusters have one endpoint and the loader's two " ++
-            "connections for it, which multiplex every request the upstream slots admit; " ++
-            "http_proxy_test's h2 origin scenarios starve the pool",
-    },
-    .{
-        .name = "l7_shed_h2_origin_streams",
-        .why = .unreached,
-        .reason = "the stream pool is the upstream slots' size, as the loader's default is, " ++
-            "so the slot rung answers first; http_proxy_test's h2 origin scenarios starve it",
+        .reason = "has not fired in the gate's range: a third of adversarial HTTP/2 seeds hold " ++
+            "one origin connection, which multiplexes every admitted request, and the sim " ++
+            "origin's GOAWAYs rarely overlap a new admission — the rung is reachable, a " ++
+            "going-away connection still holding the only slot; http_proxy_test's h2 origin " ++
+            "scenarios starve the pool",
     },
     .{
         .name = "health_probe_deadline_raced",
