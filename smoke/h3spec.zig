@@ -169,7 +169,39 @@ fn runH3spec(arena: std.mem.Allocator, io: Io, h3spec_path: []const u8, port: u1
     // run is bounded by its own per-case timeout (two seconds) over a
     // fixed number of cases.
     _ = try child.wait(io);
-    return Io.Dir.cwd().readFileAlloc(io, report_path, arena, .limited(report_bytes_max));
+    const written = try Io.Dir.cwd().readFileAlloc(io, report_path, arena, .limited(report_bytes_max));
+    return plainText(arena, written);
+}
+
+/// `bytes` without their ANSI escape sequences. hspec, which h3spec runs
+/// on, colours its marks and summary whenever it decides to, and not only
+/// on a terminal. On GitHub Actions it writes `[\x1b[32m✔\x1b[0m]` into a
+/// plain file, and no case line then ends in a mark this gate reads. A
+/// control sequence is ESC `[`, parameters, and one final byte in
+/// 0x40..0x7e (ECMA-48 §5.4); any other ESC takes the byte after it.
+fn plainText(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+    const escape = 0x1b;
+    if (std.mem.indexOfScalar(u8, bytes, escape) == null) return bytes;
+    const plain = try arena.alloc(u8, bytes.len);
+    var kept: usize = 0;
+    var index: usize = 0;
+    while (index < bytes.len) {
+        if (bytes[index] != escape) {
+            plain[kept] = bytes[index];
+            kept += 1;
+            index += 1;
+            continue;
+        }
+        index += 1;
+        if (index < bytes.len and bytes[index] == '[') {
+            index += 1;
+            while (index < bytes.len and (bytes[index] < 0x40 or bytes[index] > 0x7e)) index += 1;
+        }
+        index = @min(index + 1, bytes.len);
+    }
+    assert(kept < bytes.len);
+    assert(std.mem.indexOfScalar(u8, plain[0..kept], escape) == null);
+    return plain[0..kept];
 }
 
 /// Walk the report's case lines — each ending in h3spec's mark — into a
