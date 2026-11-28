@@ -214,6 +214,12 @@ pub const Ask = enum(u8) {
     /// A GET of `canon.no_content_path`, which every origin answers `204`:
     /// a head that ends the stream, with no DATA and no length.
     no_content,
+    /// A HEAD of `canon.head_path`, answered with the sized 200's head and
+    /// no DATA (RFC 9110 §9.3.2).
+    head_only,
+    /// A GET of `canon.not_modified_path` naming its validator, answered
+    /// `304` with no DATA.
+    not_modified,
 };
 
 /// `get`'s path, which every stream asks for but a consult's.
@@ -235,7 +241,7 @@ pub const Plan = struct {
 
     pub fn carriesBody(plan: Plan) bool {
         return switch (plan.ask) {
-            .get, .consult_get, .handler_get, .no_content => false,
+            .get, .consult_get, .handler_get, .no_content, .head_only, .not_modified => false,
             .post_declared, .post_undeclared, .grpc_call, .handler_post => true,
         };
     }
@@ -250,6 +256,8 @@ pub const Plan = struct {
             .handler_get => .handler_get,
             .handler_post => .handler_post,
             .no_content => .no_content,
+            .head_only => .head,
+            .not_modified => .not_modified,
         };
     }
 
@@ -259,8 +267,16 @@ pub const Plan = struct {
         assert(plan.frames <= body_frames_max);
         return switch (plan.ask) {
             .get, .post_declared, .post_undeclared, .consult_get, .no_content => true,
-            .grpc_call, .handler_get, .handler_post => false,
+            // The bodiless paths are answered their own way, with no interim.
+            .grpc_call, .handler_get, .handler_post, .head_only, .not_modified => false,
         };
+    }
+
+    /// The method this stream asks with.
+    pub fn method(plan: Plan) []const u8 {
+        assert(plan.ask != .head_only or !plan.carriesBody());
+        if (plan.ask == .head_only) return "HEAD";
+        return if (plan.carriesBody()) "POST" else "GET";
     }
 
     /// The path this stream asks for.
@@ -272,6 +288,8 @@ pub const Plan = struct {
             .grpc_call => canon.grpc_path,
             .handler_get, .handler_post => canon.handler_prefix,
             .no_content => canon.no_content_path,
+            .head_only => canon.head_path,
+            .not_modified => canon.not_modified_path,
             else => get_path,
         };
     }
@@ -773,18 +791,24 @@ pub fn Client(comptime IoType: type) type {
             if (client.on_ended) |hook| hook(client.context);
         }
 
-        /// Whole 204s heard, for the census; on `trailersHeard`'s terms.
-        pub fn noContentHeard(client: *const Self) u32 {
+        /// Whole bodiless answers heard, in `canon.bodiless_answers`' order,
+        /// for the census; on `trailersHeard`'s terms.
+        pub fn bodilessHeard(client: *const Self) [canon.bodiless_answers.len]u32 {
             assert(client.streams >= 1);
-            if (client.mode != .exchange) return 0;
+            if (client.mode != .exchange) return @splat(0);
             var answers: [streams_max]Answer = @splat(.{});
             const plans = client.plans[0..client.streams];
             _ = readAnswers(client.receive_buffer[0..client.received_len], plans, &answers) catch |err| {
-                std.debug.panic("noContentHeard after a failed verify: {s}", .{@errorName(err)});
+                std.debug.panic("bodilessHeard after a failed verify: {s}", .{@errorName(err)});
             };
-            var heard: u32 = 0;
-            for (answers[0..client.streams]) |*answer| heard += @intFromBool(answer.status == 204 and answer.ended);
-            assert(heard <= client.streams);
+            var heard: [canon.bodiless_answers.len]u32 = @splat(0);
+            for (answers[0..client.streams], plans) |*answer, plan| {
+                if (!answer.ended or answer.reset) continue;
+                heard[0] += @intFromBool(answer.status == 204);
+                heard[1] += @intFromBool(answer.status == 200 and plan.ask == .head_only);
+                heard[2] += @intFromBool(answer.status == 304);
+            }
+            assert(heard[0] + heard[1] + heard[2] <= client.streams);
             return heard;
         }
 
@@ -864,13 +888,21 @@ pub fn Client(comptime IoType: type) type {
                 if (goaway_last) |last| {
                     if (answer.status != 0 and streamId(@intCast(index)) > last) return error.StreamPastGoaway;
                 }
-                // A 204 has no content to frame (RFC 9110 §15.3.5, §8.6).
+                // A 204 has no content to frame (RFC 9110 §15.3.5, §8.6); a
+                // 304 and a HEAD's answer none to carry.
                 if (answer.status == 204 and (answer.body_len != 0 or answer.length_declared)) {
+                    return error.BodyCorrupted;
+                }
+                const bodiless = answer.status == 304 or plan.ask == .head_only;
+                if (bodiless and answer.body_len != 0) return error.BodyCorrupted;
+                // The origin's HEAD 200 says the length a GET would carry
+                // (RFC 9110 §9.3.2), and the proxy relays it.
+                if (plan.ask == .head_only and answer.status == 200 and !answer.length_declared) {
                     return error.BodyCorrupted;
                 }
                 if (plan.ask == .grpc_call) {
                     try checkGrpcDeadline(answer);
-                } else if (answer.status == 200) {
+                } else if (answer.status == 200 and !bodiless) {
                     if (handlerBody(plan)) |expected| {
                         try checkHandlerBody(answer, expected);
                     } else {
@@ -1614,9 +1646,10 @@ pub fn Client(comptime IoType: type) type {
             return @as(u32, client.salt) << 8 | id;
         }
 
-        /// A stream's head: `get`'s, which ends the stream, or a POST's,
-        /// whose body follows, with its length declared if the plan says
-        /// so and its mark (#373) whichever way.
+        /// A stream's head: a bodiless ask's — `get`'s, a HEAD, the 304's
+        /// with its validator — which ends the stream, or a POST's, whose
+        /// body follows, with its length declared if the plan says so and
+        /// its mark (#373) whichever way.
         fn writeRequestHead(out: *[request_bytes_max]u8, len: *u32, id: u31, salt: u32, plan: Plan) void {
             assert(plan.carriesBody() == (plan.frames >= 1));
             const start = len.*;
@@ -1634,8 +1667,15 @@ pub fn Client(comptime IoType: type) type {
                 assert(len.* - start <= head_bytes_max);
                 return;
             }
+            if (plan.ask == .not_modified) {
+                const validator = [_][2][]const u8{.{ "if-none-match", canon.not_modified_etag }};
+                const flags = flag_end_stream | flag_end_headers;
+                writeHeadTraced(out, len, id, "GET", plan.path(), flags, canon.log_request_value, &validator);
+                assert(len.* - start <= head_bytes_max);
+                return;
+            }
             if (!plan.carriesBody()) {
-                writeHead(out, len, id, "GET", plan.path(), flag_end_stream | flag_end_headers);
+                writeHead(out, len, id, plan.method(), plan.path(), flag_end_stream | flag_end_headers);
                 return;
             }
             assert(plan.frames <= body_frames_max);

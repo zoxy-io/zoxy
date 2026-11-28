@@ -478,6 +478,11 @@ pub const Step = union(enum) {
         /// declared, and on an answer that carries no body whatever it
         /// declares: an interim one, a 204 or 304, or a HEAD's.
         content_length: ?u64,
+        /// The length the final head declared, bound or not: a HEAD's or a
+        /// 304's says what a GET would carry (RFC 9110 §8.6), which an
+        /// HTTP/1.1 head relays though no body follows. Null on an interim
+        /// head, and where none was declared.
+        declared_length: ?u64,
         /// A 1xx: the final head is still to come (§8.1).
         interim: bool,
         /// The head was the whole response: no body, no trailers follow.
@@ -1846,6 +1851,7 @@ fn takeResponseHead(session: *Session, slot: *StreamTable.Slot, end_stream: bool
         .status = status,
         .fields = fields,
         .content_length = binding,
+        .declared_length = if (interim) null else content_length,
         .interim = interim,
         .end_stream = end_stream,
     } };

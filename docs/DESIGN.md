@@ -1337,7 +1337,9 @@ gates startup.
   - Outbound, the rendered request head is read back and said as HTTP/2
     fields (`origin.zig`).
   - Inbound, the answer is written as an HTTP/1.1 head and parsed like
-    any origin's.
+    any origin's. A bodiless answer's declared length binds nothing, but
+    a HEAD's or a 304's is still written: it says what a GET would carry
+    (RFC 9110 §8.6).
 - **Ring cost.** A leg's ops complete on the exchange's own completions,
   through a zero-delay timer, so an exchange costs the same ring ops as
   before. The connection's own ops are a separate budget term.
@@ -1705,11 +1707,17 @@ external binaries. They and the speed gates run at merge.
       each 200 it gave reaches its client behind one, over HTTP/1.1,
       HTTP/2 and HTTP/3 alike: §7 relays a `1xx`, and an interim comes
       before the final head on the wire, so no cut excuses its absence;
-    - every origin that answers a parsed request answers
-      `/sim/no-content` with a 204, which reaches its client with no body
-      and neither `Content-Length` nor `Transfer-Encoding` (RFC 9110
-      §8.6, §6.4.1), over HTTP/1.1, HTTP/2 and HTTP/3 alike, and is
-      stamped as every forwarded answer is;
+    - every origin that answers a parsed request answers three bodiless
+      paths its own way, and each answer reaches its client with no body,
+      over HTTP/1.1, HTTP/2 and HTTP/3 alike, stamped as every forwarded
+      answer is:
+      - `/sim/no-content` a 204, with neither `Content-Length` nor
+        `Transfer-Encoding` (RFC 9110 §8.6, §6.4.1);
+      - a HEAD of `/sim/head` the sized 200's head, whose length every
+        client still reads as what a GET would carry (RFC 9110 §9.3.2);
+      - `/sim/not-modified`, asked with its validator, a 304, with no
+        transfer coding and no length but the GET's (RFC 9110 §15.4.5,
+        §8.6);
     - a chunked 200 is judged by what it carries, not how it is framed:
       the proxy chunks an HTTP/2 origin's answer one DATA run at a time,
       so an HTTP/1.1 client decodes the sizes, and the payload must be a
@@ -1768,7 +1776,8 @@ external binaries. They and the speed gates run at merge.
     kind of HTTP/2 violation must hear its owed answer, the HTTP/2 origin
     must answer in each of its shapes, the handler must answer an HTTP/2
     GET and POST, some split cookie must arrive joined, and every
-    population must hear an interim its seed owed it and a whole 204.
+    population must hear an interim its seed owed it and a whole bodiless
+    answer, and each bodiless path must be answered whole somewhere.
     - Exemptions are named, each with its reason.
     - An exemption that *does* fire fails the census too, so widening a
       scenario deletes its excuse.

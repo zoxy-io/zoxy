@@ -166,6 +166,7 @@ pub const testing = struct {
     /// An HTTPS origin (#296): HTTP/1.1 behind TLS, for a sweep's HTTPS
     /// clusters and the directed scenarios alike.
     pub const HttpsOrigin = @import("testing/https_origin.zig").HttpsOrigin;
+    pub const HttpsOriginRoute = @import("testing/https_origin.zig").Route;
     /// Scripted nameservers and the zone they answer (#481).
     pub const Nameserver = @import("testing/nameserver.zig").Nameserver;
     pub const Zone = @import("testing/nameserver.zig").Zone;

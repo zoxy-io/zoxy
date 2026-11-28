@@ -141,8 +141,12 @@ pub fn Client(comptime IoType: type) type {
             assert(plan.ask != .grpc_call);
             const headers = &client.headers[index];
             headers[0] = .{ .name = canon.log_request_header, .value = canon.log_request_h3_value };
+            if (plan.ask == .not_modified) {
+                headers[1] = .{ .name = "if-none-match", .value = canon.not_modified_etag };
+                return .{ .method = "GET", .path = plan.path(), .headers = headers[0..2] };
+            }
             if (!plan.carriesBody()) {
-                return .{ .method = "GET", .path = plan.path(), .headers = headers[0..1] };
+                return .{ .method = plan.method(), .path = plan.path(), .headers = headers[0..1] };
             }
             assert(plan.body_len >= 1);
             assert(plan.body_len <= body_bytes_max);
@@ -233,7 +237,15 @@ pub fn Client(comptime IoType: type) type {
                 }
                 try checkTrailers(answer);
                 try checkTrailersOwed(answer);
-                if (answer.status == 200) try checkBody(answer, client.clean);
+                const bodiless = answer.status == 304 or plan.ask == .head_only;
+                if (bodiless and answer.body_len != 0) return error.BodyCorrupted;
+                // The origin's HEAD 200 says the length a GET would carry
+                // (RFC 9110 §9.3.2), and the proxy relays it.
+                if (plan.ask == .head_only and answer.status == 200) {
+                    const length = headLine(answer.headBytes(), "content-length") orelse return error.BodyCorrupted;
+                    if (!std.mem.eql(u8, length, "32")) return error.BodyCorrupted;
+                }
+                if (answer.status == 200 and !bodiless) try checkBody(answer, client.clean);
                 // A 204 has no content to frame (RFC 9110 §15.3.5, §8.6).
                 if (answer.status == 204) {
                     const framed = headLine(answer.headBytes(), "content-length") != null;
@@ -250,15 +262,18 @@ pub fn Client(comptime IoType: type) type {
             }
         }
 
-        /// Whole 204s heard, for the census (§9); read once `verify` has
-        /// passed.
-        pub fn noContentHeard(client: *const Self) u32 {
+        /// Whole bodiless answers heard, in `canon.bodiless_answers`' order,
+        /// for the census (§9); read once `verify` has passed.
+        pub fn bodilessHeard(client: *const Self) [canon.bodiless_answers.len]u32 {
             assert(client.streams >= 1);
-            var heard: u32 = 0;
-            for (client.transport.answers[0..client.streams]) |*answer| {
-                heard += @intFromBool(answer.status == 204 and answer.finished);
+            var heard: [canon.bodiless_answers.len]u32 = @splat(0);
+            for (client.plans[0..client.streams], client.transport.answers[0..client.streams]) |plan, *answer| {
+                if (!answer.finished) continue;
+                heard[0] += @intFromBool(answer.status == 204);
+                heard[1] += @intFromBool(answer.status == 200 and plan.ask == .head_only);
+                heard[2] += @intFromBool(answer.status == 304);
             }
-            assert(heard <= client.streams);
+            assert(heard[0] + heard[1] + heard[2] <= client.streams);
             return heard;
         }
 

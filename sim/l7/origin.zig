@@ -190,7 +190,7 @@ pub fn HttpOrigin(comptime IoType: type) type {
             /// What this connection answers with, per its mode.
             response_bytes: []const u8 = canon.sized_response,
             /// The request in flight's own answer, where its path names one
-            /// (`canon.no_content_path`); the mode answers the rest.
+            /// (`canon.bodiless_answers`); the mode answers the rest.
             answer_override: ?[]const u8 = null,
             /// Close right after the response: until-close and truncated
             /// bodies are delimited by the FIN itself.
@@ -377,10 +377,13 @@ pub fn HttpOrigin(comptime IoType: type) type {
                     conn.drain_only = true;
                 }
                 // Decided from the request too, for the same reasons: every
-                // origin answers this path `204`, whatever its mode.
+                // origin answers the bodiless paths its own way, whatever its
+                // mode.
                 assert(conn.answer_override == null);
-                if (std.mem.eql(u8, request.target, canon.no_content_path)) {
-                    conn.answer_override = canon.no_content_response;
+                for (canon.bodiless_answers) |bodiless| {
+                    if (!std.mem.eql(u8, request.target, bodiless.path)) continue;
+                    conn.answer_override = bodiless.response;
+                    break;
                 }
                 // §7 canonical forwarding: the proxy sends the canonical
                 // path the router matched on, so what the origin receives
