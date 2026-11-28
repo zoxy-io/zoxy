@@ -89,6 +89,12 @@ pub const ClientError = error{
     /// A client that lowered its HPACK table (RFC 7541 §4.2) heard a
     /// first field block that did not open with the size update.
     TableResizeMissed,
+    /// A reset with a code the violation is not owed, nor a pool's
+    /// REFUSED_STREAM.
+    ResetUnexpected,
+    /// A clean seed's violation that never heard the GOAWAY or the reset
+    /// RFC 9113 owes it.
+    ViolationUnanswered,
     /// A stream answered past the last stream a GOAWAY named. RFC 9113
     /// §6.8: the server did not act on streams past that one, so none of
     /// them may carry a status. Every seed holds this. A drain, the idle
@@ -109,10 +115,54 @@ pub const Mode = enum {
     continuation,
     field_block,
 
+    // A client breaking RFC 9113 once, in a way the server owes a stated
+    // answer for (`owed`): the connection's GOAWAY, or stream 1's reset.
+    settings_missing,
+    idle_data,
+    small_frame_size,
+    bad_hpack,
+    closed_data,
+    window_overflow,
+    short_body,
+
     pub const floods = [_]Mode{
         .rapid_reset, .ping,       .settings,     .window_update,
         .ignored,     .empty_data, .continuation, .field_block,
     };
+
+    pub const violations = [_]Mode{
+        .settings_missing, .idle_data,       .small_frame_size, .bad_hpack,
+        .closed_data,      .window_overflow, .short_body,
+    };
+
+    /// What a violation is owed, by RFC 9113's section for it.
+    pub const Owed = union(enum) {
+        /// A connection error: GOAWAY with this code, and the close.
+        goaway: u32,
+        /// A stream error on stream 1: RST_STREAM with this code, the
+        /// connection kept.
+        reset: u32,
+    };
+
+    pub fn owed(mode: Mode) ?Owed {
+        return switch (mode) {
+            // §3.4: a preface whose first frame is not SETTINGS. §5.1: a
+            // frame other than PRIORITY on an idle stream. §6.5.2: a
+            // SETTINGS_MAX_FRAME_SIZE under 16,384. (A wrong preface never
+            // reaches the session: the h2c listener reads it as the
+            // HTTP/1.1 request line it then is, and answers 400.)
+            .settings_missing, .idle_data, .small_frame_size => .{ .goaway = code_protocol_error },
+            // §4.3: a field block that does not decode.
+            .bad_hpack => .{ .goaway = code_compression_error },
+            // §5.1: DATA on a stream half-closed (remote).
+            .closed_data => .{ .reset = code_stream_closed },
+            // §6.9.1: a window pushed past 2^31-1.
+            .window_overflow => .{ .reset = code_flow_control_error },
+            // §8.1.1: fewer body octets than `content-length` declared.
+            .short_body => .{ .reset = code_protocol_error },
+            else => null,
+        };
+    }
 };
 
 /// What an exchange client asks of its connection in its opening
@@ -227,6 +277,11 @@ const flag_end_stream: u8 = 0x1;
 const flag_ack: u8 = 0x1;
 const flag_end_headers: u8 = 0x4;
 const code_no_error: u32 = 0x0;
+const code_protocol_error: u32 = 0x1;
+const code_internal_error: u32 = 0x2;
+const code_flow_control_error: u32 = 0x3;
+const code_stream_closed: u32 = 0x5;
+const code_compression_error: u32 = 0x9;
 const code_refused_stream: u32 = 0x7;
 const code_cancel: u32 = 0x8;
 const code_enhance_your_calm: u32 = 0xb;
@@ -374,11 +429,20 @@ pub fn Client(comptime IoType: type) type {
             client.received_before_credit = null;
             var len: u32 = 0;
             append(&client.request, &len, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
-            var settings: [settings_bytes_max]u8 = undefined;
-            writeFrame(&client.request, &len, frame_settings, 0, 0, settingsPayload(tuning, &settings));
+            if (mode == .settings_missing) {
+                // The preface, then a PING where its SETTINGS belongs.
+                writeFrame(&client.request, &len, frame_ping, 0, 0, "preface!");
+            } else {
+                var settings: [settings_bytes_max]u8 = undefined;
+                writeFrame(&client.request, &len, frame_settings, 0, 0, settingsPayload(tuning, &settings));
+            }
             switch (mode) {
                 .exchange => client.writeExchange(&len),
                 .rapid_reset => client.writeRounds(&len),
+                .settings_missing => {},
+                .idle_data, .small_frame_size, .bad_hpack, .closed_data, .window_overflow, .short_body => {
+                    writeViolation(&client.request, &len, mode);
+                },
                 else => writeFlood(&client.request, &len, mode),
             }
             client.credit_start = len;
@@ -532,7 +596,14 @@ pub fn Client(comptime IoType: type) type {
                     client.satisfied = true;
                     return client.settleIfTerminal();
                 },
-                // A flood waits for the server to end the connection.
+                // A stream error is owed a reset, and the connection
+                // stays: once the reset is in, there is nothing to wait for.
+                .closed_data, .window_overflow, .short_body => if (heardViolation(bytes, client.mode.owed().?)) {
+                    client.satisfied = true;
+                    return client.settleIfTerminal();
+                },
+                // A flood, or a connection error, waits for the server to
+                // end the connection.
                 else => {},
             }
             client.armRecv();
@@ -665,6 +736,7 @@ pub fn Client(comptime IoType: type) type {
             assert(client.streams >= 1);
             assert(client.streams <= streams_max);
             if (client.overrun) return error.ResponseOverrun;
+            if (client.mode.owed()) |owed| return client.verifyViolation(owed);
             if (client.mode != .exchange) return client.verifyFlood();
             var answers: [streams_max]Answer = @splat(.{});
             const plans = client.plans[0..client.streams];
@@ -888,6 +960,99 @@ pub fn Client(comptime IoType: type) type {
             if (goaway != code_enhance_your_calm) return error.CalmMissed;
         }
 
+        /// What a violation may hear back: whole frames, on stream 1 at most;
+        /// a GOAWAY only with the code it is owed or a drain's NO_ERROR; a
+        /// reset only with the code it is owed, REFUSED_STREAM (a pool with
+        /// no room), or NO_ERROR once its response has ended (RFC 9113 §8.1:
+        /// answered early, and asked to stop sending). On a clean seed, the
+        /// owed answer itself.
+        fn verifyViolation(client: *const Self, owed: Mode.Owed) ClientError!void {
+            assert(client.mode.owed() != null);
+            assert(client.received_len <= client.receive_buffer.len);
+            const bytes = client.receive_buffer[0..client.received_len];
+            var reader: ResponseReader = undefined;
+            reader.init();
+            var answered = false;
+            var offset: usize = 0;
+            var frames: u32 = 0;
+            while (bytes.len - offset >= 9) : (frames += 1) {
+                assert(frames < receive_bytes_max / 9 + 1);
+                const header = bytes[offset..][0..9];
+                const length = std.mem.readInt(u24, header[0..3], .big);
+                const id: u31 = @intCast(std.mem.readInt(u32, header[5..9], .big) & 0x7fff_ffff);
+                if (bytes.len - offset - 9 < length) break; // A cut.
+                const payload = bytes[offset + 9 ..][0..length];
+                offset += 9 + length;
+                const ends = header[4] & flag_end_stream != 0;
+                if (id != 0 and ends and (header[3] == frame_data or header[3] == frame_headers)) answered = true;
+                if (id == 0) {
+                    if (header[3] != frame_goaway) continue;
+                    const code = try goawayCode(payload);
+                    const owed_code = switch (owed) {
+                        .goaway => |goaway| goaway,
+                        .reset => code_no_error,
+                    };
+                    if (code != owed_code and code != code_no_error) return error.GoawayUnexpected;
+                    continue;
+                }
+                if (id % 2 == 0 or id > client.openedMax()) return error.StreamUnexpected;
+                switch (header[3]) {
+                    frame_headers => _ = reader.decode(payload) catch return error.FieldsCorrupted,
+                    frame_rst_stream => {
+                        if (payload.len != 4) return error.FramesCorrupted;
+                        const code = std.mem.readInt(u32, payload[0..4], .big);
+                        const owed_code = switch (owed) {
+                            .reset => |reset| reset,
+                            .goaway => code_refused_stream,
+                        };
+                        if (code == code_no_error and answered) continue;
+                        // An adversarial origin can die before the breach is
+                        // read, and the proxy then gives the stream up as it
+                        // would any (exchange.zig's `abandon`).
+                        if (!client.clean and (code == code_internal_error or code == code_cancel)) continue;
+                        if (code != owed_code and code != code_refused_stream) return error.ResetUnexpected;
+                    },
+                    else => {},
+                }
+            }
+            if (client.clean and !heardViolation(bytes, owed)) return error.ViolationUnanswered;
+        }
+
+        /// Whether `bytes` hold the answer a violation is owed: its GOAWAY,
+        /// or stream 1's reset, with the owed code.
+        fn heardViolation(bytes: []const u8, owed: Mode.Owed) bool {
+            switch (owed) {
+                inline else => |code| assert(code != code_no_error),
+            }
+            var offset: usize = 0;
+            var frames: u32 = 0;
+            while (bytes.len - offset >= 9) : (frames += 1) {
+                assert(frames < receive_bytes_max / 9 + 1);
+                const header = bytes[offset..][0..9];
+                const length = std.mem.readInt(u24, header[0..3], .big);
+                const id = std.mem.readInt(u32, header[5..9], .big) & 0x7fff_ffff;
+                if (bytes.len - offset - 9 < length) return false;
+                const payload = bytes[offset + 9 ..][0..length];
+                offset += 9 + length;
+                const code_at = switch (owed) {
+                    .goaway => |code| if (header[3] == frame_goaway and id == 0 and length >= 8) code else continue,
+                    .reset => |code| if (header[3] == frame_rst_stream and id == 1 and length == 4) code else continue,
+                };
+                const at: usize = if (owed == .goaway) 4 else 0;
+                if (std.mem.readInt(u32, payload[at..][0..4], .big) == code_at) return true;
+            }
+            return false;
+        }
+
+        /// The violation this client made and heard answered, for the
+        /// census: run only once `verify` passed.
+        pub fn violationAnswered(client: *const Self) ?Mode {
+            const owed = client.mode.owed() orelse return null;
+            assert(client.received_len <= client.receive_buffer.len);
+            const bytes = client.receive_buffer[0..client.received_len];
+            return if (heardViolation(bytes, owed)) client.mode else null;
+        }
+
         /// The highest stream this client's flood opens: none, for one
         /// that opens no stream — PRIORITY names an idle one, and opens
         /// nothing.
@@ -898,6 +1063,9 @@ pub fn Client(comptime IoType: type) type {
                 .rapid_reset => @intCast(2 * rounds_max * resets_per_round - 1),
                 .empty_data, .continuation, .field_block => 1,
                 .ping, .settings, .window_update, .ignored => 0,
+                // DATA on an idle stream opens nothing; the rest open one.
+                .settings_missing, .idle_data, .small_frame_size => 0,
+                .bad_hpack, .closed_data, .window_overflow, .short_body => 1,
             };
         }
 
@@ -945,6 +1113,34 @@ pub fn Client(comptime IoType: type) type {
             assert(id == client.openedMax() + 2);
         }
 
+        /// The one breach a violation's mode names, after a good preface.
+        fn writeViolation(out: *[request_bytes_max]u8, len: *u32, mode: Mode) void {
+            assert(mode.owed() != null);
+            const start = len.*;
+            switch (mode) {
+                .idle_data => writeFrame(out, len, frame_data, flag_end_stream, 1, "x"),
+                .small_frame_size => writeFrame(out, len, frame_settings, 0, 0, "\x00\x05\x00\x00\x00\x64"),
+                // An indexed field at index 0, which no table holds.
+                .bad_hpack => writeFrame(out, len, frame_headers, flag_end_stream | flag_end_headers, 1, "\x80"),
+                .closed_data => {
+                    writeFloodHead(out, len, 1, "GET", flag_end_stream | flag_end_headers);
+                    writeFrame(out, len, frame_data, flag_end_stream, 1, "x");
+                },
+                .window_overflow => {
+                    writeFloodHead(out, len, 1, "GET", flag_end_stream | flag_end_headers);
+                    writeFrame(out, len, frame_window_update, 0, 1, "\x7f\xff\xff\xff");
+                },
+                .short_body => {
+                    writeHeadTraced(out, len, 1, "POST", get_path, flag_end_headers, canon.log_request_flood_value, &.{
+                        .{ "content-length", "10" },
+                    });
+                    writeFrame(out, len, frame_data, flag_end_stream, 1, "12345");
+                },
+                else => unreachable,
+            }
+            assert(len.* > start);
+        }
+
         /// One past `mode`'s budget, after the opening's SETTINGS — which
         /// counts against the SETTINGS budget too, so that flood is past
         /// it by two.
@@ -952,6 +1148,8 @@ pub fn Client(comptime IoType: type) type {
             const unpaid = budgets.Unpaid.max;
             switch (mode) {
                 .exchange, .rapid_reset => unreachable,
+                .settings_missing, .idle_data, .small_frame_size, .bad_hpack => unreachable,
+                .closed_data, .window_overflow, .short_body => unreachable,
                 .ping => for (0..unpaid.ping + 1) |_| writeFrame(out, len, frame_ping, 0, 0, "pingpong"),
                 .settings => for (0..unpaid.settings + 1) |_| writeFrame(out, len, frame_settings, 0, 0, ""),
                 .window_update => for (0..unpaid.window_update + 1) |_| {

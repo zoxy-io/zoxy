@@ -312,6 +312,10 @@ grpc_health: ?zoxy.http.h2.Answer,
 /// RFC 9113 §6.5.2's SETTINGS an exchange client opens with: its own
 /// stream, so the tuning moves no other draw.
 h2_tuning_prng: std.Random.DefaultPrng,
+/// RFC 9113's violations (`H2Mode.violations`): which exchange clients
+/// break the protocol once instead, each owed a stated answer. Its own
+/// stream, so the floods and plans draw as they did.
+h2_violation_prng: std.Random.DefaultPrng,
 quic_http: bool,
 quic_connections: u32,
 h3_prng: std.Random.DefaultPrng,
@@ -2683,6 +2687,7 @@ fn drawHttpProtocol(harness: *Harness, seed: u64) void {
     harness.grpc_prng = std.Random.DefaultPrng.init(seed ^ 0x0004_0004_0004_0004);
     harness.tls_h2_prng = std.Random.DefaultPrng.init(seed ^ 0x0271_0002_0271_0002);
     harness.h2_tuning_prng = std.Random.DefaultPrng.init(seed ^ 0x0009_0113_0009_0113);
+    harness.h2_violation_prng = std.Random.DefaultPrng.init(seed ^ 0x9113_0005_9113_0005);
     var protocol_prng = std.Random.DefaultPrng.init(seed ^ 0x0275_0275_0275_0275);
     const random = protocol_prng.random();
     const roll = random.uintLessThan(u8, 8);
@@ -3309,6 +3314,11 @@ fn prepareH2Client(harness: *Harness, random: std.Random) void {
         .exchange;
     // Its lines need the staging `h2_rapid_reset` sized for them.
     if (mode == .rapid_reset and !harness.h2_rapid_reset) mode = .exchange;
+    // A fifth of exchanges break RFC 9113 once instead.
+    const violates = harness.h2_violation_prng.random();
+    const violation = violates.uintLessThan(u8, 5) == 0;
+    const which = l7.H2Mode.violations[violates.uintLessThan(usize, l7.H2Mode.violations.len)];
+    if (mode == .exchange and violation) mode = which;
     var plans: [H2Client.streams_max]l7.H2Plan = @splat(.{});
     for (plans[0..streams]) |*plan| {
         plan.* = drawH2Plan(random, harness.h2_consult_prng.random());
