@@ -392,7 +392,8 @@ pub const Question = struct {
 };
 
 /// The question of query `bytes`, or null when it is no standard query
-/// with one question.
+/// with one question naming a host. The root names none: the resolver
+/// never asks for it, but a query the datagram adversary corrupted can.
 pub fn readQuery(bytes: []const u8) ?Question {
     if (bytes.len < header_bytes) return null;
     const flags = std.mem.readInt(u16, bytes[2..4], .big);
@@ -400,6 +401,7 @@ pub fn readQuery(bytes: []const u8) ?Question {
     if (std.mem.readInt(u16, bytes[4..6], .big) != 1) return null;
     var name: Name = .{};
     const after_name = readName(bytes, header_bytes, &name) catch return null;
+    if (name.length == 0) return null;
     if (after_name + 4 > bytes.len) return null;
     var question: Question = .{
         .id = std.mem.readInt(u16, bytes[0..2], .big),
@@ -638,6 +640,7 @@ fn fuzzReadReply(context: void, smith: *std.testing.Smith) !void {
     } else |err| assert(err == error.Malformed);
     // The responder's half reads the same bytes as a query.
     if (readQuery(bytes)) |question| {
+        assert(question.host_length >= 1);
         assert(question.host_length <= name_text_bytes_max);
     }
 }
