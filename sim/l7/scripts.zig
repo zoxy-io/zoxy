@@ -435,6 +435,11 @@ const statuses_routed_body: []const u16 = &.{ 200, 408, 413, 502, 503, 504 };
 /// before the proxy ever pumps the malformed body (which it then
 /// contains, never forwarding it: the origin's §7 oracle still holds).
 const statuses_body_reject: []const u16 = &.{ 400, 200, 408, 502, 503, 504 };
+/// The same, plus the #236 body cap's `413`, for a script whose refusal
+/// lies past whole body bytes: a cap drawn under them is met first. A
+/// framing violation in the first body byte is refused before any byte is
+/// counted, so `post_chunked_malformed` keeps the set without it.
+const statuses_body_reject_capped: []const u16 = &.{ 400, 200, 408, 413, 502, 503, 504 };
 
 const specs = std.enums.EnumArray(Script, Spec).init(.{
     .get = .{
@@ -507,7 +512,9 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
     },
     .post_chunked_trailer_managed = .{
         // Owes no trailer, so the origin's oracle fails the seed if the
-        // managed field is ever forwarded.
+        // managed field is ever forwarded. Its eight body octets come
+        // before the managed field, so a body cap under them is met first
+        // (seed 11656: a 413 where the field would have earned a 400).
         .request = "POST /sim HTTP/1.1\r\nHost: sim\r\n" ++
             "Transfer-Encoding: chunked\r\n\r\n" ++
             "8\r\nabcdefgh\r\n0\r\nContent-Length: 8\r\n\r\n",
@@ -515,7 +522,7 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .transcript_cap = 1,
         .golden_status = 400,
         .method = .post,
-        .allowed_statuses = statuses_body_reject,
+        .allowed_statuses = statuses_body_reject_capped,
     },
     .post_chunked_malformed = .{
         // "Z" is no chunk-size digit: the framing violation is in the

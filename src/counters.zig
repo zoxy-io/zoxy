@@ -697,6 +697,13 @@ pub const Counters = struct {
     /// probing: the same shape during a stop is discarded with the rest
     /// of the prober's drain, where no verdict is waiting on it.
     ///
+    /// A fire in the same instant its cancel went out is a tie, not this
+    /// race, and is not counted: the verdict landed as the budget ran out,
+    /// which a `grpc` probe whose pool dial times out at the connect budget
+    /// — the check's default `timeout_ms` — meets on every black-holed
+    /// endpoint, and which burns no budget. The instant is the loop's
+    /// clock: in production, one tick of it.
+    ///
     /// It exists to be small. A prober that reaches its verdict and then
     /// forgets to cancel the deadline still reports every check
     /// correctly; the only thing it gets wrong is how long each probe
