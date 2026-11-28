@@ -23,6 +23,10 @@ const xev = switch (@import("io_options").backend) {
     .default => xev_root,
     .epoll => xev_root.Epoll,
 };
+/// Socket addresses are POSIX, not a backend's: libxev exports `net` from
+/// its root only, so `xev.net` does not exist once `xev` is one backend's
+/// own API (`-Dio-backend=epoll`).
+const xev_net = xev_root.net;
 
 const constants = @import("../constants.zig");
 const Io = @import("io.zig");
@@ -189,7 +193,7 @@ pub const DatagramCompletion = struct {
     const Segmented = struct {
         msghdr: linux.msghdr_const,
         iov: [1]posix.iovec_const,
-        address: xev.net.Address,
+        address: xev_net.Address,
         control: SegmentControl,
     };
 };
@@ -472,7 +476,7 @@ pub fn listen(io: *XevIo, address: *const Io.Address, mode: ?Io.FileMode) Io.Lis
 fn listenUnix(io: *XevIo, path: []const u8, mode: ?Io.FileMode) Io.ListenError!Listener {
     assert(path.len >= 1);
     assert(io.listeners_count < io.listeners.len);
-    const address = xev.net.Address.initUnix(path) catch {
+    const address = xev_net.Address.initUnix(path) catch {
         // The loader bounds the path (§5), so this is a caller past it.
         return error.Unexpected;
     };
@@ -518,7 +522,7 @@ fn listenUnix(io: *XevIo, path: []const u8, mode: ?Io.FileMode) Io.ListenError!L
 /// write the directory, which is the same permission this feature asks
 /// an operator to set anyway (§7), and the loser of the race is a
 /// startup that fails loudly rather than a request served wrongly.
-fn clearStaleSocket(address: *const xev.net.Address) Io.ListenError!void {
+fn clearStaleSocket(address: *const xev_net.Address) Io.ListenError!void {
     const path: [*:0]const u8 = @ptrCast(&address.un.path);
     // Nothing there is the ordinary case, and every other failure to
     // look is answered by the bind that follows — reporting it here
@@ -754,7 +758,7 @@ fn unlinkSocketPath(path: []const u8) void {
     // The same path bound successfully, so it fits — this cannot fail
     // for a reason the caller could act on, and silently returning would
     // leave the file behind with nothing said.
-    const address = xev.net.Address.initUnix(path) catch unreachable;
+    const address = xev_net.Address.initUnix(path) catch unreachable;
     _ = posix.system.unlink(@as([*:0]const u8, @ptrCast(&address.un.path)));
 }
 
@@ -883,10 +887,10 @@ pub fn connect(
 
 /// The posix form of a seam address, built here because a `sockaddr` is
 /// a syscall's shape and §4 keeps those in this file.
-fn posixAddressOf(address: *const Io.Address) error{NameTooLong}!xev.net.Address {
+fn posixAddressOf(address: *const Io.Address) error{NameTooLong}!xev_net.Address {
     return switch (address.*) {
-        .ip => |ip| xev.net.Address.fromIpAddress(ip),
-        .unix => |path| try xev.net.Address.initUnix(path),
+        .ip => |ip| xev_net.Address.fromIpAddress(ip),
+        .unix => |path| try xev_net.Address.initUnix(path),
     };
 }
 
@@ -1999,7 +2003,7 @@ pub fn udpBind(io: *XevIo, address: std.Io.net.IpAddress) Io.ListenError!UdpSock
     // budget it asserts first is what keeps those out of reach.
     io.last_pressure = Io.Pressure.none;
     const udp = xev.UDP.init(address) catch return error.Unexpected;
-    const posix_address = xev.net.Address.fromIpAddress(address);
+    const posix_address = xev_net.Address.fromIpAddress(address);
     const rc = posix.system.bind(udp.fd, &posix_address.any, posix_address.getOsSockLen());
     const errno = posix.errno(rc);
     if (errno != .SUCCESS) {
@@ -2024,7 +2028,7 @@ pub fn udpAddress(io: *XevIo, socket: UdpSocket) std.Io.net.IpAddress {
     const rc = posix.system.getsockname(@backingInt(socket), @ptrCast(&storage), &length);
     // A bound socket this process owns: getsockname has nothing to refuse.
     assert(posix.errno(rc) == .SUCCESS);
-    const address = xev.net.Address.initPosix(@ptrCast(&storage)).toIpAddress();
+    const address = xev_net.Address.initPosix(@ptrCast(&storage)).toIpAddress();
     assert(address.getPort() != 0);
     return address;
 }
@@ -2155,7 +2159,7 @@ fn sendSegmented(
     assert(bytes.len > segment);
     assert(bytes.len <= @as(usize, segment) * udp_segments_max);
     const message = &completion.segmented;
-    message.address = xev.net.Address.fromIpAddress(peer.*);
+    message.address = xev_net.Address.fromIpAddress(peer.*);
     message.iov = .{.{ .base = bytes.ptr, .len = bytes.len }};
     message.control = .{
         .len = SegmentControl.length,

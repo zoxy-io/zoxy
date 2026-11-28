@@ -6,10 +6,11 @@
 //! fails the gate as loudly as a regression does, so the record cannot
 //! rot into excuses.
 //!
-//! Merge tier, like `zig build bench`, and not in `ci`: h2spec is a Go
-//! binary, and §9's rule is that a per-change gate adds no dependency.
-//! The dev shell provides it (devenv.nix); the harness runs it from PATH,
-//! or from where `--h2spec` points.
+//! Not in `zig build ci`: h2spec is a Go binary, and §9's rule is that
+//! that gate adds no dependency. CI runs this one in a job of its own
+//! (ci.yml's `conformance`), with h2spec's own release pinned by digest;
+//! the dev shell provides it locally (devenv.nix). The harness runs it
+//! from PATH, or from where `--h2spec` points.
 //!
 //! The origin is smoke's own (smoke/origin.zig), in this process. The
 //! config is the defaults but for what HTTP/2 needs said — `h2c`, `h2` in
@@ -32,11 +33,20 @@ const tls_key_path = work_directory ++ "/key.pem";
 const tls_cert_pem = @embedFile("tls_cert_pem");
 const tls_key_pem = @embedFile("tls_key_pem");
 
-/// Every case h2spec has, on either transport: a run that reports fewer
-/// lost some, and is not the run this gate judges.
-const cases_expected: u32 = 145;
-/// h2spec's report for 145 cases is some 20 KiB; past this, it is not one.
+/// More cases than any h2spec has (2.6.0 lists 146): a dry run or a
+/// report counting past this is not h2spec's.
+const cases_max: u32 = 1024;
+/// h2spec's report for its 146 cases is some 30 KiB; past this, it is not
+/// one.
 const report_bytes_max: usize = 1024 * 1024;
+/// Its dry run's listing of those cases is some 11 KiB; past this, it is
+/// not one either.
+const listing_bytes_max: usize = 256 * 1024;
+/// Go's TLS 1.3 switch. h2spec's own 2.6.0 release is built with Go 1.12,
+/// which offers TLS 1.3 only when asked this way, and this proxy speaks
+/// nothing older, so without it every TLS case fails at the handshake.
+/// Go ignores it from 1.14 on, so a newer build is unaffected.
+const go_tls13 = "tls13=1";
 
 /// The longest field value h2spec writes in its header cases. Its default,
 /// 4000, makes the two fields of 6.10/1 a list past the 8 KiB this proxy
@@ -98,14 +108,16 @@ pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const args = try init.minimal.args.toSlice(arena);
     const flags = try parseFlags(args);
-    return run(arena, io, &flags) catch |err| {
+    try askTls13(arena, init.environ_map);
+    return run(arena, io, &flags, init.environ_map) catch |err| {
         std.debug.print("FAIL: the h2spec run could not finish ({t})\n", .{err});
         printZoxyLog(io);
         return 1;
     };
 }
 
-fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
+fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags, environ: *const std.process.Environ.Map) !u8 {
+    const cases_expected = try casesListed(arena, io, flags.h2spec_path, environ);
     try Io.Dir.cwd().createDirPath(io, work_directory);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = tls_cert_path, .data = tls_cert_pem });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = tls_key_path, .data = tls_key_pem });
@@ -129,9 +141,9 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
             .h2c => ports.h2c,
             .tls => ports.tls,
         };
-        const report = try runH2spec(arena, io, flags.h2spec_path, transport, port);
+        const report = try runH2spec(arena, io, flags.h2spec_path, environ, transport, port);
         const tally = try judge(transport, report);
-        if (!transportPassed(transport, &tally)) passed = false;
+        if (!transportPassed(transport, &tally, cases_expected)) passed = false;
     }
     try std.posix.kill(child.id.?, .TERM);
     const term = try child.wait(io);
@@ -156,6 +168,71 @@ fn exitedCleanly(term: std.process.Child.Term) bool {
     return term.exited == 0;
 }
 
+/// GODEBUG for h2spec with `go_tls13` in it, beside whatever the caller
+/// already set there.
+fn askTls13(arena: std.mem.Allocator, environ: *std.process.Environ.Map) !void {
+    const current = environ.get("GODEBUG") orelse "";
+    if (std.mem.indexOf(u8, current, go_tls13) != null) return;
+    const separator = if (current.len == 0) "" else ",";
+    const value = try std.mem.concat(arena, u8, &.{ current, separator, go_tls13 });
+    assert(value.len >= go_tls13.len);
+    try environ.put("GODEBUG", value);
+    assert(std.mem.indexOf(u8, environ.get("GODEBUG").?, go_tls13) != null);
+}
+
+/// Every case this h2spec has: the ones its dry run lists. A report that
+/// holds fewer lost some, and is not the run this gate judges. Counted
+/// from the binary rather than written here, because the count is the
+/// build's: the dev shell's h2spec and the 2.6.0 release need not agree.
+fn casesListed(
+    arena: std.mem.Allocator,
+    io: Io,
+    h2spec_path: []const u8,
+    environ: *const std.process.Environ.Map,
+) !u32 {
+    const result = std.process.run(arena, io, .{
+        .argv = &.{ h2spec_path, "--dryrun" },
+        .environ_map = environ,
+        .stdout_limit = .limited(listing_bytes_max),
+    }) catch |err| {
+        std.debug.print(
+            "h2spec: could not run {s} ({t}); it is in the dev shell (devenv.nix), or pass --h2spec\n",
+            .{ h2spec_path, err },
+        );
+        return err;
+    };
+    // A dry run that died part way listed only some cases, and would pass
+    // a report short by the rest.
+    if (!exitedCleanly(result.term)) {
+        std.debug.print("FAIL: {s} --dryrun did not exit cleanly ({any})\n", .{ h2spec_path, result.term });
+        return error.H2specListingFailed;
+    }
+    assert(result.stdout.len <= listing_bytes_max);
+    var cases: u32 = 0;
+    var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+    while (lines.next()) |line| {
+        if (isCaseLine(line)) cases += 1;
+        if (cases > cases_max) return error.H2specCasesOverrun;
+    }
+    if (cases == 0) {
+        std.debug.print("FAIL: {s} --dryrun listed no cases\n", .{h2spec_path});
+        return error.H2specListedNoCases;
+    }
+    assert(cases <= cases_max);
+    return cases;
+}
+
+/// A case in the dry run's listing — `    2: Sends a PRIORITY frame` — as
+/// against a section, whose number ends in a dot: `  3.1. DATA`.
+fn isCaseLine(line: []const u8) bool {
+    const text = std.mem.trimStart(u8, line, " ");
+    var digits: usize = 0;
+    while (digits < text.len and std.ascii.isDigit(text[digits])) digits += 1;
+    if (digits == 0 or digits + 1 >= text.len) return false;
+    assert(std.ascii.isDigit(text[0]));
+    return text[digits] == ':' and text[digits + 1] == ' ';
+}
+
 /// h2spec over one transport, its report read back whole. Its exit
 /// status is not the verdict — it fails whenever any case does, the
 /// recorded ones included — so the JUnit report is, and one left by an
@@ -165,6 +242,7 @@ fn runH2spec(
     arena: std.mem.Allocator,
     io: Io,
     h2spec_path: []const u8,
+    environ: *const std.process.Environ.Map,
     transport: Transport,
     port: u16,
 ) ![]const u8 {
@@ -189,6 +267,7 @@ fn runH2spec(
     defer log_file.close(io);
     var child = std.process.spawn(io, .{
         .argv = argv,
+        .environ_map = environ,
         .stdout = .{ .file = log_file },
         .stderr = .{ .file = log_file },
     }) catch |err| {
@@ -217,9 +296,9 @@ fn judge(transport: Transport, report: []const u8) !Tally {
     }
     var rest = report;
     var cases: u32 = 0;
-    // Bounded: a report holding twice the cases h2spec has is not its.
+    // Bounded: a report holding more cases than any h2spec has is not its.
     while (std.mem.indexOf(u8, rest, "<testcase ")) |start| : (cases += 1) {
-        if (cases == cases_expected * 2) return error.H2specReportOverrun;
+        if (cases == cases_max) return error.H2specReportOverrun;
         rest = rest[start + 1 ..];
         // A case ends at its close, or — were one ever written
         // self-closed — where the next begins, so a failure is never read
@@ -264,8 +343,9 @@ fn judge(transport: Transport, report: []const u8) !Tally {
     return tally;
 }
 
-fn transportPassed(transport: Transport, tally: *const Tally) bool {
+fn transportPassed(transport: Transport, tally: *const Tally, cases_expected: u32) bool {
     assert(tally.expected_failed <= tally.failed);
+    assert(cases_expected <= cases_max);
     var passed = tally.unexpected == 0;
     if (tally.cases != cases_expected) {
         std.debug.print(

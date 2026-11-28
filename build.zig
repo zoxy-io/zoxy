@@ -517,10 +517,11 @@ pub fn build(b: *std.Build) void {
 
     // The HTTP/2 conformance gate (#277, DESIGN.md §9, §12): h2spec
     // against the shipped build, over h2c and TLS, its failures held equal
-    // to the deviations §12 records. Merge tier, beside `bench`, and not
-    // in `ci`: h2spec is a Go binary the dev shell provides, and a
-    // per-change gate adds no dependency. Same TLS fixture as smoke, and
-    // smoke's own origin; nothing here links the proxy.
+    // to the deviations §12 records. Not in `ci`, which adds no
+    // dependency: h2spec is a Go binary, which the dev shell provides and
+    // CI's `conformance` job installs from its release, pinned by digest.
+    // Same TLS fixture as smoke, and smoke's own origin; nothing here
+    // links the proxy.
     const h2spec_exe = b.addExecutable(.{
         .name = "zoxy-h2spec",
         .root_module = b.createModule(.{
@@ -542,15 +543,16 @@ pub fn build(b: *std.Build) void {
     h2spec_run.has_side_effects = true;
     const h2spec_step = b.step(
         "h2spec",
-        "HTTP/2 conformance at merge: h2spec against the ReleaseSafe twin, failures equal to §12's deviations",
+        "HTTP/2 conformance: h2spec against the ReleaseSafe twin, failures equal to §12's deviations",
     );
     h2spec_step.dependOn(&h2spec_run.step);
 
     // The HTTP/3 conformance gate (#449, DESIGN.md §9, §12): h3spec 0.1.15
     // against the shipped build, over QUIC, its failures held equal to the
     // deviations §12 records and its pending case to the one it records.
-    // Merge tier, as h2spec is: a Haskell binary, run from PATH or from
-    // where `--h3spec` points. Same fixture, smoke's own origin.
+    // Outside `ci`, as h2spec is, and in CI's `conformance` job beside it:
+    // a Haskell binary, run from PATH or from where `--h3spec` points.
+    // Same fixture, smoke's own origin.
     const h3spec_exe = b.addExecutable(.{
         .name = "zoxy-h3spec",
         .root_module = b.createModule(.{
@@ -572,7 +574,7 @@ pub fn build(b: *std.Build) void {
     h3spec_run.has_side_effects = true;
     const h3spec_step = b.step(
         "h3spec",
-        "HTTP/3 conformance at merge: h3spec 0.1.15 against the ReleaseSafe twin, failures equal to §12's deviations",
+        "HTTP/3 conformance: h3spec 0.1.15 against the ReleaseSafe twin, failures equal to §12's deviations",
     );
     h3spec_step.dependOn(&h3spec_run.step);
 
@@ -658,8 +660,8 @@ pub fn build(b: *std.Build) void {
     ci_step.dependOn(micro_step);
     ci_step.dependOn(load_generator.bench_exe);
     ci_step.dependOn(load_generator.profile_harness);
-    // The h2spec and h3spec harnesses, on the same terms: run at merge,
-    // compiled here.
+    // The h2spec and h3spec harnesses, on the same terms: run by CI's
+    // `conformance` job, compiled here.
     ci_step.dependOn(&h2spec_exe.step);
     ci_step.dependOn(&h3spec_exe.step);
     // And the sim gap report's, which only `coverage` runs, on Linux:
