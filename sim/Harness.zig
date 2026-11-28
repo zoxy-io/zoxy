@@ -3397,9 +3397,9 @@ fn corruptionEligible(harness: *const Harness, index: usize) bool {
 /// clean seed must have heard, and no other alert; and nothing served —
 /// on a clean seed, and on an `l4` listener, where nothing but an echo of
 /// what failed to decrypt could have come back. An HTTP/2 slot hears the
-/// server's preface first, so for it nothing served means no stream. An adversarial seed's
-/// proxied slot can be answered `408` before its record lands. True when
-/// the slot was one, and so is accounted for here.
+/// server's preface first, so for it nothing served means no stream. An
+/// adversarial seed's proxied slot can be answered `408` before its record
+/// lands. True when the slot was one, and so is accounted for here.
 fn verifyTlsCorruption(harness: *Harness, client: *const TlsClient, index: usize, back: []const u8) !bool {
     assert(index < harness.tls_clients_live);
     const corruption = harness.tls_corruptions[index];
@@ -3414,9 +3414,25 @@ fn verifyTlsCorruption(harness: *Harness, client: *const TlsClient, index: usize
     const served = if (harness.slotSpeaksH2(index)) !h2ConnectionFramesOnly(back) else back.len != 0;
     if (served and (harness.clean or harness.tls_protocol == .l4)) return error.TlsCorruptRecordServed;
     if (client.peerAlert() != null and !client.heardBadRecordMac()) return error.TlsCorruptRecordMisanswered;
-    if (harness.clean and !client.heardBadRecordMac()) return error.TlsBadRecordMacMissing;
+    if (harness.clean and !client.heardBadRecordMac() and !prefaceCutShort(harness, index, corruption, back)) {
+        return error.TlsBadRecordMacMissing;
+    }
     harness.tls_bad_record_macs_heard[@intFromBool(corruption == .first_payload)] += @intFromBool(client.heardBadRecordMac());
     return true;
+}
+
+/// Whether a corrupted first payload landed while the server's HTTP/2
+/// preface was still on its way: a clean seed reaches that, and it is owed
+/// no alert. RFC 8446 §5.2's alert is staged only behind an empty outbox
+/// (`Server.oweRecordAlert`, §4), and teardown cuts the preface short, so
+/// the slot hears nothing at all. A preface that arrived, even one byte of
+/// it, means its send completed before the record failed: the outbox was
+/// empty, and the alert owed. The nightly sweep met it on 23 seeds.
+fn prefaceCutShort(harness: *const Harness, index: usize, corruption: TlsClient.Corruption, back: []const u8) bool {
+    assert(index < harness.tls_clients_live);
+    assert(corruption != .none);
+    if (corruption != .first_payload) return false;
+    return harness.slotSpeaksH2(index) and back.len == 0;
 }
 
 /// Whether HTTP/2 bytes a session heard are frames on stream 0 alone — the

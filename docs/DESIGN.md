@@ -1708,7 +1708,10 @@ gates run at merge.
       admission with no session free sheds before its handshake. A sixteenth of the
       slots owed no refusal send the flight carrying their Finished with
       its last tag octet flipped, and a sixteenth their first application
-      record, each owed `bad_record_mac` and nothing back;
+      record, each owed `bad_record_mac` and nothing back. The one
+      exception is an HTTP/2 slot whose record lands while the server's
+      own preface is still on the wire. §4 leaves that unanswered, and it
+      hears nothing at all;
     - HTTP/3 clients, which name a certificate the same way, and a fifth
       of which break the rules once, on their first stream: an uppercase
       field name (RFC 9114 §4.2), a field section that cannot decode
