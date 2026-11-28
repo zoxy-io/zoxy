@@ -941,6 +941,37 @@ pub fn refuseMissingCertificate(engine: *Engine) void {
     engine.refused = true;
 }
 
+/// Stage RFC 8446 §5.2's `bad_record_mac`: a record from the client
+/// failed to decrypt — corrupted, forged or replayed — and the section
+/// makes the alert a MUST. It is the one exception §4's bare teardown
+/// takes for something the client may not know, and still no oracle: only
+/// a record altered on its way fails, so the alert tells its sender
+/// nothing it did not do. Answers whether it was staged — there is room
+/// for it, and keys to seal it under (zssl answers an empty record past
+/// §5.5's sequence space). The transport flushes it ahead of its close.
+pub fn stageRecordAlert(engine: *Engine) bool {
+    const room = engine.outboundRoom();
+    if (room < control_record_bytes_max) return false;
+    const wire = engine.hs.sendAlert(.bad_record_mac, &engine.out);
+    if (wire.len == 0) return false;
+    assert(wire.len <= control_record_bytes_max);
+    engine.stage(wire);
+    assert(engine.outboundRoom() == room - wire.len);
+    return true;
+}
+
+/// §5.2's alert in the handshake — a client's Finished that did not
+/// decrypt, say — answered as a refusal is: flushed, then the close
+/// lingers (`isRefused`). Answers whether it was staged; when it was not,
+/// the teardown goes alone, as every other handshake failure's does.
+pub fn refuseCorruptRecord(engine: *Engine) bool {
+    assert(!engine.refused);
+    assert(!engine.isConnected());
+    if (!engine.stageRecordAlert()) return false;
+    engine.refused = true;
+    return true;
+}
+
 /// The verified client's names (#432), or null with no verified client.
 pub fn clientNames(engine: *const Engine) ?*const trust.ClientNames {
     if (engine.client_fingerprint == null) return null;
@@ -1014,7 +1045,8 @@ fn refuseClientChain(engine: *Engine) bool {
     return false;
 }
 
-/// True once `refuseApplicationProtocol` has staged the refusal.
+/// True once a refusal is staged: `refuseApplicationProtocol`,
+/// `refuseMissingCertificate` or `refuseCorruptRecord`.
 pub fn isRefused(engine: *const Engine) bool {
     return engine.refused;
 }

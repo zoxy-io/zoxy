@@ -493,8 +493,8 @@ pub fn Driver(comptime runtime: Runtime) type {
             assert(slot.backlog.len == 0); // The buffer below is free.
             var plaintext: Plaintext = .{ .engine = engine };
             const sink = plaintext.sink();
-            engine.received(received, &sink) catch {
-                server.counters.increment("tls_relay_failed");
+            engine.received(received, &sink) catch |err| {
+                server.noteTlsRecordFailed(conn, err);
                 server.beginTeardown(conn);
                 return false;
             };

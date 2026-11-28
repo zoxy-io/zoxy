@@ -270,8 +270,8 @@ pub fn Proxy(comptime runtime: Runtime) type {
             assert(received >= 1);
             var head: HeadPlaintext = .{ .server = server, .stream = stream };
             const sink = head.sink();
-            conn.tls.?.received(received, &sink) catch {
-                server.counters.increment("tls_relay_failed");
+            conn.tls.?.received(received, &sink) catch |err| {
+                server.noteTlsRecordFailed(conn, err);
                 server.beginTeardown(conn);
                 return;
             };
@@ -2820,8 +2820,8 @@ pub fn Proxy(comptime runtime: Runtime) type {
                 const engine = conn.tls orelse return chunk;
                 var out: BodyPlaintext = .{ .conn = conn };
                 const sink = out.sink();
-                engine.received(chunk.len, &sink) catch {
-                    conn.server.counters.increment("tls_relay_failed");
+                engine.received(chunk.len, &sink) catch |err| {
+                    conn.server.noteTlsRecordFailed(conn, err);
                     return null;
                 };
                 return engine.body_plaintext[0..out.len];

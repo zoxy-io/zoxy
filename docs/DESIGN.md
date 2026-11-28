@@ -360,11 +360,25 @@ listener parses it.
     policy that authorizes on a name's absence must refuse on that.
   - *Not checked:* revocation, which is unbounded work, and extended key
     usage. Short-lived certificates from a dedicated CA are the answer.
-- **Alerts.** `no_application_protocol` and `certificate_required` are
-  the only error alerts this proxy sends; an orderly close sends
-  `close_notify`. Every other handshake failure is a bare teardown,
-  counted in `tls_handshake_failed`, except a client chain that
-  `client_ca` refuses, which counts in `tls_client_cert_refused`.
+- **Alerts.** `no_application_protocol`, `certificate_required` and
+  `bad_record_mac` are the only error alerts this proxy sends; an
+  orderly close sends `close_notify`. Every other handshake failure is a
+  bare teardown, counted in `tls_handshake_failed`, except a client
+  chain that `client_ca` refuses, which counts in
+  `tls_client_cert_refused`.
+  - *A record that does not decrypt* is owed `bad_record_mac` (RFC 8446
+    §5.2), and the alert is no oracle: only a record altered on its way
+    fails, so it tells the sender only what it did.
+  - In the handshake it is counted in `tls_handshake_failed`. Before the
+    session connects it is answered as a refusal is, flushed before the
+    close lingers; a bad record riding the client's Finished is flushed
+    by teardown, as a session's is.
+  - On a session that is up it is counted in `tls_relay_failed`, and
+    teardown flushes it before the write side closes, under the deadline
+    the connection already runs, so a client that stopped reading holds
+    its slot no longer than that deadline would have. A send already on
+    the wire to the client cannot be interleaved with, so then the
+    teardown goes alone.
 
 ### TLS origination
 
@@ -562,7 +576,9 @@ banner, and exits:
   and any shared stream.
   - Teardown is a *state*, not an event. It shuts down the sockets so a
     pending recv completes, then cancels the timer and any in-flight
-    dial.
+    dial. The one exception is an owed `bad_record_mac` (§4): the client's
+    write side stays open for its flush, and the timer stays armed to
+    bound it.
   - The last completion closes the fds synchronously and releases the
     slot.
 - **Every slot carries a generation,** asserted on every delivery. The
@@ -1676,7 +1692,10 @@ external binaries. They and the speed gates run at merge.
       free. On half of those the terminator offers `h2` alone instead: a
       slot offering `h2` first is served it, one offering HTTP/1.1 alone is
       refused, one offering nothing is answered HTTP/1.1, and an admission
-      with no session free sheds before its handshake;
+      with no session free sheds before its handshake. A sixteenth of the
+      slots owed no refusal send the flight carrying their Finished with
+      its last tag octet flipped, and a sixteenth their first application
+      record, each owed `bad_record_mac` and nothing back;
     - HTTP/3 clients, which name a certificate the same way, and a fifth
       of which break the rules once, on their first stream: an uppercase
       field name (RFC 9114 §4.2), a field section that cannot decode

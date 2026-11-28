@@ -375,6 +375,17 @@ tls_scripts: [tls_client_slots]l7.Script,
 /// same two places: `startTlsClient` to make the offer, and
 /// `verifyTlsSessions` to hold the outcome to what the listener implies.
 tls_alpn_offers: [tls_client_slots]TlsAlpnOffer,
+/// Each slot's corrupted record (RFC 8446 §5.2), on a stream of its own
+/// (`drawTlsCorruptions`) so no other draw moves — and settled to `.none`
+/// at the slot's start wherever a refusal it is owed would end its
+/// handshake before the record was read (`corruptionEligible`).
+tls_corruptions: [tls_client_slots]TlsClient.Corruption,
+/// The `bad_record_mac`s corrupted slots heard, finished then first
+/// payload, for the census.
+tls_bad_record_macs_heard: [2]u32,
+/// Handshakes corrupted slots failed on purpose: excused from
+/// `tls_handshake_failed`'s allowance as #411's refusals are.
+tls_corrupt_handshakes_owed: u32,
 /// HTTP/2 over the terminating listener (#271, §7): on a seed whose http
 /// listener speaks HTTP/2 and whose terminator is http, half have it offer
 /// `h2` — after HTTP/1.1, or on half of those alone (`tls_h2_only`). A
@@ -787,6 +798,7 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
     }
     harness.drain_at_ns = deriveDrainAt(harness.clean, random);
     harness.drawSni(seed);
+    harness.drawTlsCorruptions(seed);
     harness.drawL4Sni(seed);
     harness.drawHttpProtocol(seed);
     harness.drawDns(seed);
@@ -1356,6 +1368,23 @@ fn deriveTlsH2(harness: *Harness) void {
     harness.h2_connections += tls_client_slots;
     harness.stream_slots += @as(u32, tls_client_slots) * H2Client.streams_max;
     assert(harness.stream_slots <= SimIo.stream_slots_max);
+}
+
+/// Whether slot `index`'s ALPN offer is one the listener cannot meet
+/// (RFC 7301 §3.2): `h2` alone where the listener does not speak it, and
+/// HTTP/1.1 alone where it speaks HTTP/2 alone.
+fn alpnRefusable(harness: *const Harness, index: usize) bool {
+    assert(index < tls_client_slots);
+    const offer = harness.tls_alpn_offers[index];
+    if (harness.tls_protocol != .http) return false;
+    return (offer == .h2_only and !harness.tls_h2) or (offer == .http_1_1 and harness.tls_h2_only);
+}
+
+/// Whether slot `index` can be refused for its offer at all: refusable,
+/// or, off a clean seed, an `h2` slot no session was free for.
+fn alpnRefusalPossible(harness: *const Harness, index: usize) bool {
+    assert(index < tls_client_slots);
+    return harness.alpnRefusable(index) or (harness.slotSpeaksH2(index) and !harness.clean);
 }
 
 /// Whether TLS slot `index` is served HTTP/2 (`tls_h2`): it offers `h2`
@@ -3294,6 +3323,79 @@ fn drawSni(harness: *Harness, seed: u64) void {
     if (!harness.tls_sni) assert(std.mem.eql(u8, harness.tls_names[0], zoxy.tls.testdata.host_name));
 }
 
+/// A sixteenth of the terminating slots send the flight carrying their
+/// Finished corrupted, and a sixteenth their first application record
+/// (RFC 8446 §5.2): one octet of the last record's tag flipped, so each is
+/// owed `bad_record_mac` and nothing else. The TCP adversary never alters
+/// a byte, so without these no record of the sweep's ever failed.
+fn drawTlsCorruptions(harness: *Harness, seed: u64) void {
+    var corruption_prng = std.Random.DefaultPrng.init(seed ^ 0x8446_0502_8446_0502);
+    const random = corruption_prng.random();
+    harness.tls_bad_record_macs_heard = @splat(0);
+    harness.tls_corrupt_handshakes_owed = 0;
+    for (&harness.tls_corruptions) |*corruption| {
+        corruption.* = switch (random.uintLessThan(u8, 16)) {
+            0 => .finished,
+            1 => .first_payload,
+            else => .none,
+        };
+    }
+    assert(harness.tls_corruptions.len == tls_client_slots);
+}
+
+/// Whether slot `index` may send its corrupted record: owed no refusal
+/// that would end its handshake before the record was read — for its ALPN
+/// offer, its signature schemes (#411), or its certificate (#304).
+fn corruptionEligible(harness: *const Harness, index: usize) bool {
+    assert(index < tls_client_slots);
+    if (harness.alpnRefusalPossible(index)) return false;
+    return !harness.schemeRefusable(index) and !harness.clientRefusalOwed(index);
+}
+
+/// A slot that sent a record it corrupted: owed `bad_record_mac`, which a
+/// clean seed must have heard, and no other alert; and nothing served —
+/// on a clean seed, and on an `l4` listener, where nothing but an echo of
+/// what failed to decrypt could have come back. An adversarial seed's
+/// proxied slot can be answered `408` before its record lands. True when
+/// the slot was one, and so is accounted for here.
+fn verifyTlsCorruption(harness: *Harness, client: *const TlsClient, index: usize, back: []const u8) !bool {
+    assert(index < harness.tls_clients_live);
+    const corruption = harness.tls_corruptions[index];
+    // The alert is the server's to a record it could not open: owed only
+    // where one was altered, and the adversary alters none.
+    if (corruption == .none) {
+        if (client.heardBadRecordMac()) return error.TlsBadRecordMacUnowed;
+        return false;
+    }
+    if (back.len != 0 and (harness.clean or harness.tls_protocol == .l4)) return error.TlsCorruptRecordServed;
+    if (client.peerAlert() != null and !client.heardBadRecordMac()) return error.TlsCorruptRecordMisanswered;
+    if (harness.clean and !client.heardBadRecordMac()) return error.TlsBadRecordMacMissing;
+    harness.tls_bad_record_macs_heard[@intFromBool(corruption == .first_payload)] += @intFromBool(client.heardBadRecordMac());
+    return true;
+}
+
+/// The counters corrupted slots answer to. No relay fails but by a
+/// corrupted payload — the counter never moved before any slot sent one —
+/// and what remains of those payloads failed a handshake instead, having
+/// ridden the client's Finished into it. On a clean seed every corrupted
+/// record reached the server, so each failed something.
+fn verifyTlsCorruptions(harness: *Harness) !void {
+    var finished: u32 = 0;
+    var payload: u32 = 0;
+    for (harness.tls_corruptions[0..harness.tls_clients_live]) |corruption| switch (corruption) {
+        .none => {},
+        .finished => finished += 1,
+        .first_payload => payload += 1,
+    };
+    const relay_failed = harness.server.counters.get("tls_relay_failed");
+    if (relay_failed > payload) return error.TlsRelayFailuresDiverged;
+    harness.tls_corrupt_handshakes_owed = finished + payload - @as(u32, @intCast(relay_failed));
+    assert(harness.tls_corrupt_handshakes_owed <= harness.tls_clients_live);
+    if (!harness.clean) return;
+    const failed = harness.server.counters.get("tls_handshake_failed");
+    if (failed < harness.tls_scheme_refusals + harness.tls_corrupt_handshakes_owed) return error.TlsCorruptionsDiverged;
+}
+
 /// The terminating listener's choices, as `App` builds them: the default
 /// first, then each further certificate with the names its leaf covers.
 fn loadCertificateSet(harness: *Harness, arena: std.mem.Allocator) !void {
@@ -4004,6 +4106,7 @@ fn startTlsClient(
 ) void {
     assert(index < harness.tls_clients_live);
     const client = &harness.tls_clients_storage[index];
+    if (!harness.corruptionEligible(index)) harness.tls_corruptions[index] = .none;
     // What this slot drew, and the one property of it the session's shape
     // turns on: a script whose response is judged exactly as a plain
     // GET's can be followed by one (#204's keep-alive turnaround, judged
@@ -4019,6 +4122,7 @@ fn startTlsClient(
         .client_credentials = harness.clientIdentity(index),
         .resume_with = resume_with,
         .alpn = harness.tls_alpn_offers[index].protocols(),
+        .corruption = harness.tls_corruptions[index],
         // An echo token for a relayed session, a real request for a
         // proxied one — the terminated stream has to be what the
         // listener behind it expects, or the head parser answers 400
@@ -4087,6 +4191,7 @@ fn startTlsH2Client(
         .client_credentials = harness.clientIdentity(index),
         .resume_with = resume_with,
         .alpn = harness.tls_alpn_offers[index].protocols(),
+        .corruption = harness.tls_corruptions[index],
         .app_data = exchange.flight(),
         .exchange_end = .judged,
         .judge = .{ .context = exchange, .complete = H2Client.judgeComplete },
@@ -4966,6 +5071,7 @@ fn verifyTlsSessions(harness: *Harness) !void {
     // refused for its offer is one failed handshake the counter holds.
     const failed = harness.server.counters.get("tls_handshake_failed");
     if (harness.clean and failed < harness.tls_scheme_refusals) return error.TlsSchemeRefusalsDiverged;
+    try harness.verifyTlsCorruptions();
 }
 
 /// One terminating client's verdict, for `verifyTlsSessions`: true when
@@ -4976,6 +5082,7 @@ fn verifyTlsSlot(harness: *Harness, client: *const TlsClient, index: usize, refu
     assert(index < harness.tls_clients_live);
     try harness.verifyTlsCertificate(client, index);
     const back = client.app_received[0..client.app_received_len];
+    if (try harness.verifyTlsCorruption(client, index, back)) return false;
     if (try harness.verifyTlsAlpn(client, index, back, refusals)) {
         // Refusable on both counts, a slot is refused for its offer:
         // zssl picks a scheme before it reads ALPN. Unless it resumed,
@@ -5072,11 +5179,7 @@ fn verifyTlsAlpn(
     }
     // A clean seed has a session for every `h2` slot, so it is never
     // refused there: the check below fails it as any wrong refusal.
-    // Refused unless the listener speaks HTTP/2 too, which serves it; and
-    // HTTP/1.1 alone refused by a listener that speaks HTTP/2 alone.
-    const refusable = harness.tls_protocol == .http and
-        ((offer == .h2_only and !harness.tls_h2) or (offer == .http_1_1 and harness.tls_h2_only));
-    if (refusable) {
+    if (harness.alpnRefusable(index)) {
         refusals.possible += 1;
         if (client.refusedForAlpn()) refusals.heard += 1;
         // Refused in the handshake, so nothing may have been served: a

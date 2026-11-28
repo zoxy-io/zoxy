@@ -234,8 +234,8 @@ pub fn Relay(comptime runtime: Runtime) type {
                     if (!hasOutboundRoom(conn.server, stream)) return null;
                     var out: Decrypted = .{ .conn = conn };
                     const sink = out.sink();
-                    engine.received(chunk.len, &sink) catch {
-                        conn.server.counters.increment("tls_relay_failed");
+                    engine.received(chunk.len, &sink) catch |err| {
+                        conn.server.noteTlsRecordFailed(conn, err);
                         return null;
                     };
                     return engine.plaintext[0..out.len];

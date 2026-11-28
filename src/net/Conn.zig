@@ -109,6 +109,11 @@ pub fn Conn(comptime runtime: Runtime) type {
         /// tickets were still going out — the same send error, two
         /// different things to count.
         tls_session_up: bool,
+        /// A record from the client failed to decrypt and its engine
+        /// staged RFC 8446 §5.2's `bad_record_mac` (`noteTlsRecordFailed`):
+        /// teardown owes it a flush before the write side closes. Cleared
+        /// once the flush is over, or when teardown finds it cannot run one.
+        tls_alert_owed: bool,
         /// The listener's §7 route table, never empty — an l4 listener
         /// resolves to the one catch-all route it can never consult, since
         /// it has no path to match. Set once at admission and constant for
@@ -446,6 +451,7 @@ pub fn Conn(comptime runtime: Runtime) type {
             conn.tls = engine;
             conn.tls_pending_len = 0;
             conn.tls_session_up = false;
+            conn.tls_alert_owed = false;
             // Placeholders until the admission tail installs the
             // listener's real tables (§7); L4 never reads them.
             conn.listener_index = 0;

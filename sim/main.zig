@@ -356,16 +356,6 @@ const uncovered = [_]Uncovered{
             "limit sits below the engine's own decrypt floor",
     },
     .{
-        .name = "tls_relay_failed",
-        .why = .unreached,
-        .reason = "seeds do terminate TLS now, but an established session " ++
-            "fails mid-relay only for a peer corrupting records or a far " ++
-            "side too slow to drain the outbox. The adversary reorders and " ++
-            "splits deliveries but never alters a byte, so no schedule it " ++
-            "can produce reaches this — and no directed test drives it " ++
-            "either, which is the honest gap",
-    },
-    .{
         .name = "l7_no_route",
         .why = .unreached,
         .reason = "the sim's route table is a single \"/\" prefix, which no " ++
@@ -670,6 +660,9 @@ const Census = struct {
     /// Streams answered whole over HTTP/2 on a terminating TLS listener
     /// (#271): what proves the sweep drives `h2` over TLS at all.
     h2_tls_streams: u64 = 0,
+    /// `bad_record_mac`s heard by terminating slots that corrupted a
+    /// record (RFC 8446 §5.2), the Finished's then the first payload's.
+    tls_bad_record_macs: [2]u64 = @splat(0),
     /// HTTP/2 streams the build's handler answered whole (#434), GET then
     /// POST.
     h2_handler_answered: [2]u64 = @splat(0),
@@ -705,7 +698,7 @@ const Census = struct {
             // owed its failed handshake, by the harness's own draw — held
             // against the allowance below only past what was owed.
             const excused = if (comptime std.mem.eql(u8, name, "tls_handshake_failed"))
-                @min(counted, harness.tls_scheme_refusals)
+                @min(counted, harness.tls_scheme_refusals + harness.tls_corrupt_handshakes_owed)
             else
                 0;
             census.totals[index] += counted - excused;
@@ -837,6 +830,11 @@ const Census = struct {
             std.debug.print("sim census: no stream was answered over HTTP/2 on a TLS listener (#271)\n", .{});
             return false;
         }
+        for (census.tls_bad_record_macs, [_][]const u8{ "Finished", "first payload" }) |heard, record| {
+            if (heard >= 1) continue;
+            std.debug.print("sim census: no corrupted {s} was answered bad_record_mac (RFC 8446 §5.2)\n", .{record});
+            return false;
+        }
         for (census.grpc_health_answered, [_][]const u8{ "SERVING", "NOT_SERVING" }) |answered, said| {
             if (answered >= 1) continue;
             std.debug.print("sim census: no HTTP/2 origin answered a gRPC health call {s} (§7)\n", .{said});
@@ -903,6 +901,7 @@ const Census = struct {
         }
         for (requests_before, census.request_trailers) |earlier, now| assert(now >= earlier);
         census.h2_tls_streams += harness.tls_h2_streams;
+        for (&census.tls_bad_record_macs, harness.tls_bad_record_macs_heard) |*total, heard| total.* += heard;
         census.version_negotiations_heard += @intFromBool(harness.version_probing and harness.version_probe.answered());
         if (harness.grpc_health) |*answer| {
             const index: usize = if (Harness.grpcHealthServing(answer)) 0 else 1;
@@ -1343,7 +1342,7 @@ fn checkCensus(options: *const Sweep, census: *const Census) bool {
         return true;
     }
     if (!census.verify(options.iterations)) return false;
-    std.debug.print("sim: census ok, {d} counter(s) fired, {d} exempt; {d} extension counter(s) fired; {d} seam op(s), {d} exempt; {d} body(ies) verified; trailers heard {d}/{d}/{d}, sent {d}/{d}/{d}, interims heard {d}/{d}/{d}, 204/HEAD/304 heard {d}/{d}/{d}, {d}/{d}/{d}, {d}/{d}/{d} (http1/2/3); IPv6 clients {d} announced upstream, {d} forwarded; HTTP/2 windows met {d}, table resizes heard {d}; HTTP/2 over TLS streams {d}\n", .{
+    std.debug.print("sim: census ok, {d} counter(s) fired, {d} exempt; {d} extension counter(s) fired; {d} seam op(s), {d} exempt; {d} body(ies) verified; trailers heard {d}/{d}/{d}, sent {d}/{d}/{d}, interims heard {d}/{d}/{d}, 204/HEAD/304 heard {d}/{d}/{d}, {d}/{d}/{d}, {d}/{d}/{d} (http1/2/3); IPv6 clients {d} announced upstream, {d} forwarded; HTTP/2 windows met {d}, table resizes heard {d}; HTTP/2 over TLS streams {d}; bad_record_mac heard {d}/{d} (Finished/payload)\n", .{
         Counters.names.len - uncovered.len,
         uncovered.len,
         extension_counters.len,
@@ -1373,6 +1372,8 @@ fn checkCensus(options: *const Sweep, census: *const Census) bool {
         census.h2_windows_met,
         census.h2_table_resizes,
         census.h2_tls_streams,
+        census.tls_bad_record_macs[0],
+        census.tls_bad_record_macs[1],
     });
     return true;
 }

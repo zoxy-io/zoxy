@@ -2436,6 +2436,72 @@ test "tls: an L4 listener offers no ALPN, so an h2-only client is relayed, not r
     try bed.expectDrained();
 }
 
+test "tls: a record that does not decrypt is answered bad_record_mac, and nothing is relayed (RFC 8446 §5.2)" {
+    // The session comes up, and its first application record arrives with
+    // a flipped tag. §5.2 makes `bad_record_mac` a MUST, and it is no
+    // oracle: the client learns only that the record it sent was altered.
+    // Nothing reaches the echo origin, so nothing comes back but the alert,
+    // and the teardown that flushed it still drains every pool.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 44 },
+        .server = .{ .conn_slots = 4, .relay_buffers = 2, .tls_engines = 2 },
+        .tls = true,
+    });
+    defer bed.tearDown();
+
+    var client: TlsClient = undefined;
+    try client.start(&bed.sim_io, TestBed.bindAddress(), .{
+        .host_name = fixture_host_name,
+        .app_data = echo_token,
+        .corruption = .first_payload,
+    });
+    var wind_down: TlsWindDown = .{ .bed = &bed, .expected = 1 };
+    wind_down.attach(&client);
+    try bed.sim_io.run();
+
+    try std.testing.expect(client.heardBadRecordMac());
+    try std.testing.expectEqual(@as(u32, 0), client.app_received_len);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("tls_handshakes_completed"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("tls_relay_failed"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("tls_handshake_failed"));
+    try std.testing.expect(bed.server.reconcile());
+    try bed.expectDrained();
+}
+
+test "tls: a Finished that does not decrypt is refused with bad_record_mac (RFC 8446 §5.2)" {
+    // The same failure a flight earlier: the client's Finished carries the
+    // flipped tag, so the handshake fails under its own keys. Counted as a
+    // failed handshake, as every handshake failure is, but answered the way
+    // a refusal is — the alert flushed, then the close lingers over the
+    // request the client sent straight after its Finished.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 45 },
+        .server = .{ .conn_slots = 4, .relay_buffers = 2, .tls_engines = 2 },
+        .tls = true,
+    });
+    defer bed.tearDown();
+
+    var client: TlsClient = undefined;
+    try client.start(&bed.sim_io, TestBed.bindAddress(), .{
+        .host_name = fixture_host_name,
+        .app_data = echo_token,
+        .corruption = .finished,
+    });
+    var wind_down: TlsWindDown = .{ .bed = &bed, .expected = 1 };
+    wind_down.attach(&client);
+    try bed.sim_io.run();
+
+    try std.testing.expect(client.heardBadRecordMac());
+    try std.testing.expectEqual(@as(u32, 0), client.app_received_len);
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("tls_handshakes_completed"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("tls_handshake_failed"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("tls_relay_failed"));
+    try std.testing.expect(bed.server.reconcile());
+    try bed.expectDrained();
+}
+
 test "tls: an L4 listener terminates, and relays the plaintext both ways" {
     // The whole promise in one scenario: a real zssl client handshakes
     // against the proxy, sends application data, and the origin — which
