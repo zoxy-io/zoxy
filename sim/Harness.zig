@@ -297,6 +297,12 @@ h2_origin: H2Origin,
 /// #296: on a seed whose http cluster speaks HTTP/1.1, the origin may be
 /// behind TLS: `https_origin` answers, under the origin fixture's leaf.
 http_tls: bool,
+/// An eighth of the adversarial seeds whose origin speaks TLS — HTTPS, or
+/// HTTP/2 over TLS — name it `misnamed_origin`, which the origin's leaf
+/// does not cover: every dial's handshake fails verification, every
+/// request it would have carried is answered 502, and the origin, which
+/// could not prove whose it was, is sent nothing (`drawHttpProtocol`).
+origin_misnamed: bool,
 https_origin: HttpsOrigin,
 /// #481: on a seed that draws it, the L4 cluster follows a name its two
 /// scripted nameservers answer — the origin, and on an adversarial seed
@@ -383,14 +389,6 @@ tls_corruptions: [tls_client_slots]TlsClient.Corruption,
 /// The `bad_record_mac`s corrupted slots heard, finished then first
 /// payload, for the census.
 tls_bad_record_macs_heard: [2]u32,
-/// Handshakes corrupted slots failed on purpose: excused from
-/// `tls_handshake_failed`'s allowance as #411's refusals are.
-tls_corrupt_handshakes_owed: u32,
-/// Slots a listener offering `h2` alone refused for naming no protocol
-/// (§4, `verifyTlsUnnamed`): failed handshakes owed the same way. Exact
-/// on a clean seed; an upper bound on an adversarial one, where an
-/// admission shed leaves a client looking the same and fails nothing.
-tls_unnamed_refusals: u32,
 /// HTTP/2 over the terminating listener (#271, §7): on a seed whose http
 /// listener speaks HTTP/2 and whose terminator is http, half have it offer
 /// `h2` — after HTTP/1.1, or on half of those alone (`tls_h2_only`). A
@@ -1405,19 +1403,17 @@ fn alpnUnnamedRefused(harness: *const Harness, index: usize) bool {
 }
 
 /// The refusal `alpnUnnamedRefused` owes: a bare teardown at the hello, so
-/// no session, nothing back and no alert, and one failed handshake owed
-/// — unless the slot's schemes refused it first, which #411's count holds.
-/// True when the slot was one, and so is accounted for here.
+/// no session, nothing back and no alert. The failed handshake it owes is
+/// `handshakeFailuresOwed`'s, unless the slot's schemes refused it first,
+/// which #411's count holds. True when the slot was one, and so is
+/// accounted for here.
 fn verifyTlsUnnamed(harness: *Harness, client: *const TlsClient, index: usize, back: []const u8) !bool {
     if (!harness.alpnUnnamedRefused(index)) return false;
     assert(harness.tls_corruptions[index] == .none);
     if (back.len != 0 or client.handshake_done) return error.TlsUnnamedServed;
     if (client.peerAlert() != null) return error.TlsUnnamedAlerted;
-    if (!client.helloSent()) return true;
-    const scheme_refused = harness.schemeRefusable(index);
-    if (scheme_refused) harness.noteSchemeRefusal(client);
-    if (!scheme_refused) harness.tls_unnamed_refusals += 1;
-    assert(harness.tls_unnamed_refusals <= tls_client_slots);
+    if (harness.schemeRefusable(index)) harness.noteSchemeRefusal(client);
+    assert(harness.tls_scheme_refusals <= tls_client_slots);
     return true;
 }
 
@@ -1700,6 +1696,9 @@ fn l4Cluster(
     };
 }
 
+/// A name the origin fixture's leaf does not cover (`origin_misnamed`).
+const misnamed_origin = "elsewhere.zoxy.test";
+
 /// The http cluster, on the same terms: a weights coin, a tiers coin on a
 /// two-endpoint seed, the panic threshold, slow start, the cluster cap,
 /// and the #393 retry budget, in the record's own order.
@@ -1748,10 +1747,10 @@ fn httpCluster(
         // #428: room for the set and the one endpoint draining out of it.
         .endpoint_slots = if (harness.churns()) 3 else null,
         .protocol = harness.http_protocol,
-        .tls = if (harness.http_protocol == .h2 or harness.http_tls)
-            .{ .server_name = zoxy.tls.testdata.origin_host_name, .ca_pem = zoxy.tls.testdata.origin_ca_pem }
-        else
-            null,
+        .tls = if (harness.http_protocol == .h2 or harness.http_tls) .{
+            .server_name = if (harness.origin_misnamed) misnamed_origin else zoxy.tls.testdata.origin_host_name,
+            .ca_pem = zoxy.tls.testdata.origin_ca_pem,
+        } else null,
     };
 }
 
@@ -2855,6 +2854,15 @@ fn drawHttpProtocol(harness: *Harness, seed: u64) void {
     // HTTP/2 or not, the cluster's origin answers at one address: the one
     // the #178 sticky tag is minted from.
     assert(harness.http_protocol.http2() == (harness.http_protocol != .http1));
+    // Its own stream, so the roll above keeps the values it always gave.
+    // After `clean`, which `setUp` draws first, so a clean seed's golden
+    // outcomes never meet a refused origin.
+    var misname_prng = std.Random.DefaultPrng.init(seed ^ 0x0296_0297_0296_0297);
+    const misnamed = misname_prng.random().uintLessThan(u8, 8) == 0;
+    const origin_tls = harness.http_protocol == .h2 or harness.http_tls;
+    harness.origin_misnamed = false;
+    if (misnamed and origin_tls) harness.origin_misnamed = !harness.clean;
+    assert(!harness.origin_misnamed or origin_tls);
 }
 
 /// The canonical sized 200 in HTTP/2's terms: the length stated, so the
@@ -3366,8 +3374,6 @@ fn drawTlsCorruptions(harness: *Harness, seed: u64) void {
     var corruption_prng = std.Random.DefaultPrng.init(seed ^ 0x8446_0502_8446_0502);
     const random = corruption_prng.random();
     harness.tls_bad_record_macs_heard = @splat(0);
-    harness.tls_corrupt_handshakes_owed = 0;
-    harness.tls_unnamed_refusals = 0;
     for (&harness.tls_corruptions) |*corruption| {
         corruption.* = switch (random.uintLessThan(u8, 16)) {
             0 => .finished,
@@ -3390,7 +3396,8 @@ fn corruptionEligible(harness: *const Harness, index: usize) bool {
 /// A slot that sent a record it corrupted: owed `bad_record_mac`, which a
 /// clean seed must have heard, and no other alert; and nothing served —
 /// on a clean seed, and on an `l4` listener, where nothing but an echo of
-/// what failed to decrypt could have come back. An adversarial seed's
+/// what failed to decrypt could have come back. An HTTP/2 slot hears the
+/// server's preface first, so for it nothing served means no stream. An adversarial seed's
 /// proxied slot can be answered `408` before its record lands. True when
 /// the slot was one, and so is accounted for here.
 fn verifyTlsCorruption(harness: *Harness, client: *const TlsClient, index: usize, back: []const u8) !bool {
@@ -3402,34 +3409,79 @@ fn verifyTlsCorruption(harness: *Harness, client: *const TlsClient, index: usize
         if (client.heardBadRecordMac()) return error.TlsBadRecordMacUnowed;
         return false;
     }
-    if (back.len != 0 and (harness.clean or harness.tls_protocol == .l4)) return error.TlsCorruptRecordServed;
+    // An HTTP/2 session hears the server's preface before a byte of its
+    // own is read (RFC 9113 §3.4): what it must not hear is a stream.
+    const served = if (harness.slotSpeaksH2(index)) !h2ConnectionFramesOnly(back) else back.len != 0;
+    if (served and (harness.clean or harness.tls_protocol == .l4)) return error.TlsCorruptRecordServed;
     if (client.peerAlert() != null and !client.heardBadRecordMac()) return error.TlsCorruptRecordMisanswered;
     if (harness.clean and !client.heardBadRecordMac()) return error.TlsBadRecordMacMissing;
     harness.tls_bad_record_macs_heard[@intFromBool(corruption == .first_payload)] += @intFromBool(client.heardBadRecordMac());
     return true;
 }
 
-/// The counters corrupted slots answer to. No relay fails but by a
+/// Whether HTTP/2 bytes a session heard are frames on stream 0 alone — the
+/// server's preface SETTINGS, its window updates — so no stream of the
+/// session's was answered. A frame cut short at the end is judged by its
+/// header, which is whole or absent.
+fn h2ConnectionFramesOnly(bytes: []const u8) bool {
+    const frame_header_bytes = 9;
+    var rest = bytes;
+    // Bounded: each pass consumes a whole header at least, so it runs at
+    // most `bytes.len / 9` times.
+    while (rest.len >= frame_header_bytes) {
+        const before = rest.len;
+        const length: usize = std.mem.readInt(u24, rest[0..3], .big);
+        const stream = std.mem.readInt(u32, rest[5..9], .big) & 0x7fff_ffff;
+        if (stream != 0) return false;
+        if (rest.len < frame_header_bytes + length) return true;
+        rest = rest[frame_header_bytes + length ..];
+        assert(rest.len < before);
+    }
+    assert(rest.len < frame_header_bytes);
+    return true;
+}
+
+/// The counters the owed failures answer to. No relay fails but by a
 /// corrupted payload — the counter never moved before any slot sent one —
-/// and what remains of those payloads failed a handshake instead, having
-/// ridden the client's Finished into it. On a clean seed every corrupted
-/// record reached the server, so each failed something.
+/// and on a clean seed every failed handshake the draws owe was counted.
 fn verifyTlsCorruptions(harness: *Harness) !void {
-    var finished: u32 = 0;
-    var payload: u32 = 0;
-    for (harness.tls_corruptions[0..harness.tls_clients_live]) |corruption| switch (corruption) {
-        .none => {},
-        .finished => finished += 1,
-        .first_payload => payload += 1,
-    };
-    const relay_failed = harness.server.counters.get("tls_relay_failed");
-    if (relay_failed > payload) return error.TlsRelayFailuresDiverged;
-    harness.tls_corrupt_handshakes_owed = finished + payload - @as(u32, @intCast(relay_failed));
-    assert(harness.tls_corrupt_handshakes_owed <= harness.tls_clients_live);
+    var payload: u64 = 0;
+    for (harness.tls_corruptions[0..harness.tls_clients_live]) |corruption| {
+        payload += @intFromBool(corruption == .first_payload);
+    }
+    if (harness.server.counters.get("tls_relay_failed") > payload) return error.TlsRelayFailuresDiverged;
     if (!harness.clean) return;
     const failed = harness.server.counters.get("tls_handshake_failed");
-    const owed = harness.tls_scheme_refusals + harness.tls_corrupt_handshakes_owed + harness.tls_unnamed_refusals;
-    if (failed < owed) return error.TlsCorruptionsDiverged;
+    if (failed < harness.handshakeFailuresOwed()) return error.TlsOwedHandshakesDiverged;
+}
+
+/// The failed handshakes this seed's own draws owe `tls_handshake_failed`:
+/// #411's scheme refusals as the verdicts counted them; every corrupted
+/// record a relay failure does not account for, the rest having ridden or
+/// been the client's Finished; and each client an h2-only listener refused
+/// for naming nothing whose hello went out, its schemes not refusing it
+/// first. The last two come from the draws rather than the verdicts, so a
+/// run that gave up before its verdicts (`verifyGaveUp`) still owes them.
+/// Exact on a clean seed; off one an upper bound, since a record or a
+/// hello can be cut before it lands.
+pub fn handshakeFailuresOwed(harness: *const Harness) u64 {
+    assert(harness.tls_clients_live <= tls_client_slots);
+    var owed: u64 = harness.tls_scheme_refusals;
+    var payload: u64 = 0;
+    for (0..harness.tls_clients_live) |index| {
+        switch (harness.tls_corruptions[index]) {
+            .none => {},
+            .finished => owed += 1,
+            .first_payload => payload += 1,
+        }
+        const unnamed = harness.alpnUnnamedRefused(index) and !harness.schemeRefusable(index);
+        if (unnamed and harness.tls_clients_storage[index].helloSent()) owed += 1;
+    }
+    const relay_failed = harness.server.counters.get("tls_relay_failed");
+    // Disjoint per slot: a corrupted one is owed no refusal, and an
+    // unnamed one is not the schemes' to refuse.
+    assert(owed + payload <= harness.tls_clients_live);
+    return owed + payload - @min(payload, relay_failed);
 }
 
 /// The terminating listener's choices, as `App` builds them: the default
@@ -4856,6 +4908,10 @@ pub fn verify(harness: *Harness) !void {
     if (harness.h2_origin.requests_dropped != 0) return error.H2OriginDroppedRequest;
     // #296: what the HTTPS origin decrypted was every time a request.
     if (harness.https_origin.violations != 0) return error.OriginSawMalformedBytes;
+    // And an origin the proxy could not verify is sent nothing of one.
+    if (harness.origin_misnamed and harness.https_origin.requests + harness.h2_origin.requests != 0) {
+        return error.OriginServedUnverified;
+    }
     // §7: a forwarded-for chain holds the scripts' hops and, last, the
     // client the proxy observed, written bare in either family.
     if (harness.origin_http.forwarded_mismatches != 0) return error.OriginSawWrongForwardedFor;

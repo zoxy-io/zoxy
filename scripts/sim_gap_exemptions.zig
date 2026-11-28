@@ -86,9 +86,6 @@ const h2_request = "an HTTP/2 request the sweep's clients never make — refused
 const h2_tls = "HTTP/2 over a terminating TLS listener (ALPN `h2`): the sweep's TLS clients speak " ++
     "HTTP/1.1 and its HTTP/2 clients h2c, and a listener offered `h2` alone refuses it (#271); " ++
     "server_test.zig's h2 TLS scenarios drive it";
-const h2_origin_tls = "TLS to an HTTP/2 origin failing: the sweep's h2 origin serves the chain its " ++
-    "cluster trusts over a byte-faithful TCP adversary; http_proxy_test.zig's h2 origin " ++
-    "scenarios refuse a chain";
 const origin_answer = "an origin answer the sweep's scripted origins never give — bytes past a " ++
     "declared length, a `101` to a request that asked no upgrade, a malformed head under a " ++
     "borrowed scratch, an HTTP/2 origin's 304 or HEAD answer, nominated `te`, or asterisk " ++
@@ -369,7 +366,6 @@ pub const exemptions = [_]Exemption{
     .{ .path = "http/h2/origin_pool.zig", .owner = "onConnect", .lines = 1, .reason = rare },
     .{ .path = "http/h2/origin_pool.zig", .owner = "stepEvents", .lines = 2, .reason = rare },
     .{ .path = "http/h2/origin_pool.zig", .owner = "streamWindow", .lines = 1, .reason = kcov_line },
-    .{ .path = "http/h2/origin_pool.zig", .owner = "tlsFailed", .lines = 5, .reason = h2_origin_tls },
     .{ .path = "http/h2/response.zig", .owner = "carried", .lines = 2, .reason = origin_answer },
     .{ .path = "http/h2/response.zig", .owner = "nominated", .lines = 7, .reason = origin_answer },
     .{ .path = "http/h3/driver.zig", .owner = "refreshDeadline", .lines = 1, .reason = rare },
@@ -484,7 +480,6 @@ pub const exemptions = [_]Exemption{
     .{ .path = "net/pump.zig", .owner = "sendSlice", .lines = 3, .reason = pump_policy },
     .{ .path = "net/sni_router.zig", .owner = "route", .lines = 3, .reason = test_support },
     .{ .path = "net/upstream.zig", .owner = "park", .lines = 1, .reason = rare },
-    .{ .path = "net/upstream_tls.zig", .owner = "failTls", .lines = 3, .reason = rare },
     .{ .path = "pickers.zig", .owner = "bind", .lines = 6, .reason = extension },
     .{ .path = "pickers.zig", .owner = "loopback", .lines = 2, .reason = test_support },
     .{ .path = "pickers.zig", .owner = "materialOf", .lines = 2, .reason = extension },

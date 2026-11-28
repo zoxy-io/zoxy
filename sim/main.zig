@@ -238,13 +238,6 @@ const uncovered = [_]Uncovered{
             "origin.zig's tests and fuzz cover the refused answers",
     },
     .{
-        .name = "h2_origin_tls_failed",
-        .why = .unreached,
-        .reason = "the sweep's HTTP/2 origin serves the chain its cluster trusts, and the " ++
-            "adversary never corrupts a byte; OriginClient's tests and the h2 origin TLS " ++
-            "scenarios refuse chains",
-    },
-    .{
         .name = "health_probes_skipped",
         .why = .must_stay_zero,
         // A rate, since one origin connection (`narrowPools`) made it
@@ -265,10 +258,10 @@ const uncovered = [_]Uncovered{
         // One per 10k sits at three times that and orders of magnitude
         // under a regression, which would fail most HTTPS seeds' dials.
         .allowance = .{ .at_most_one_per = 10_000 },
-        .reason = "the sweep's HTTPS origin (#296) serves the chain its cluster trusts, and the " ++
-            "TCP adversary never corrupts a byte, so the one failure left is a hangup " ++
-            "mid-handshake, which its resets reach about once per 30k seeds; the https " ++
-            "origin scenarios refuse a misnamed chain",
+        .reason = "the sweep's HTTPS origin (#296) serves the chain its cluster trusts, bar on " ++
+            "a misnamed seed, whose refusals are owed and excused whole (`excusedCount`), and " ++
+            "the TCP adversary never corrupts a byte, so the one failure left is a hangup " ++
+            "mid-handshake, which its resets reach about once per 30k seeds",
     },
     .{
         .name = "health_probe_deadline_raced",
@@ -663,6 +656,9 @@ const Census = struct {
     /// `bad_record_mac`s heard by terminating slots that corrupted a
     /// record (RFC 8446 §5.2), the Finished's then the first payload's.
     tls_bad_record_macs: [2]u64 = @splat(0),
+    /// Handshakes to a misnamed origin (`origin_misnamed`) that failed
+    /// verification, HTTPS then HTTP/2 over TLS.
+    origin_tls_refused: [2]u64 = @splat(0),
     /// HTTP/2 streams the build's handler answered whole (#434), GET then
     /// POST.
     h2_handler_answered: [2]u64 = @splat(0),
@@ -690,17 +686,28 @@ const Census = struct {
         const count = std.enums.values(Population).len;
     };
 
+    /// The part of a counter's reading that this seed's own draws owed, and
+    /// that is therefore held against no allowance. #411's scheme
+    /// refusals, corrupted records (RFC 8446 §5.2) and an h2-only
+    /// listener's unnamed clients each owe a failed handshake; a misnamed
+    /// origin (#296) owes every failed origin handshake its seed counts.
+    fn excusedCount(comptime name: []const u8, harness: *const Harness, counted: u64) u64 {
+        const excused: u64 = if (comptime std.mem.eql(u8, name, "tls_handshake_failed"))
+            @min(counted, harness.handshakeFailuresOwed())
+        else if (comptime std.mem.eql(u8, name, "upstream_tls_failed"))
+            (if (harness.origin_misnamed) counted else 0)
+        else
+            0;
+        assert(excused <= counted);
+        assert(!harness.clean or !harness.origin_misnamed);
+        return excused;
+    }
+
     fn add(census: *Census, harness: *const Harness) void {
         inline for (Counters.names, 0..) |name, index| {
             const before = census.totals[index];
             const counted = harness.server.counters.get(name);
-            // #411: a slot whose offer no certificate could sign under is
-            // owed its failed handshake, by the harness's own draw — held
-            // against the allowance below only past what was owed.
-            const excused = if (comptime std.mem.eql(u8, name, "tls_handshake_failed"))
-                @min(counted, harness.tls_scheme_refusals + harness.tls_corrupt_handshakes_owed + harness.tls_unnamed_refusals)
-            else
-                0;
+            const excused = excusedCount(name, harness, counted);
             census.totals[index] += counted - excused;
             // A sweep is bounded by `iterations`, so no honest total can
             // wrap — one that did would read as a rung going quiet.
@@ -830,6 +837,11 @@ const Census = struct {
             std.debug.print("sim census: no stream was answered over HTTP/2 on a TLS listener (#271)\n", .{});
             return false;
         }
+        for (census.origin_tls_refused, [_][]const u8{ "HTTPS", "HTTP/2 over TLS" }) |refused, origin| {
+            if (refused >= 1) continue;
+            std.debug.print("sim census: no misnamed {s} origin's handshake failed verification (#296)\n", .{origin});
+            return false;
+        }
         for (census.tls_bad_record_macs, [_][]const u8{ "Finished", "first payload" }) |heard, record| {
             if (heard >= 1) continue;
             std.debug.print("sim census: no corrupted {s} was answered bad_record_mac (RFC 8446 §5.2)\n", .{record});
@@ -902,6 +914,10 @@ const Census = struct {
         for (requests_before, census.request_trailers) |earlier, now| assert(now >= earlier);
         census.h2_tls_streams += harness.tls_h2_streams;
         for (&census.tls_bad_record_macs, harness.tls_bad_record_macs_heard) |*total, heard| total.* += heard;
+        if (harness.origin_misnamed) {
+            census.origin_tls_refused[0] += harness.server.counters.get("upstream_tls_failed");
+            census.origin_tls_refused[1] += harness.server.counters.get("h2_origin_tls_failed");
+        }
         census.version_negotiations_heard += @intFromBool(harness.version_probing and harness.version_probe.answered());
         if (harness.grpc_health) |*answer| {
             const index: usize = if (Harness.grpcHealthServing(answer)) 0 else 1;
@@ -1342,7 +1358,7 @@ fn checkCensus(options: *const Sweep, census: *const Census) bool {
         return true;
     }
     if (!census.verify(options.iterations)) return false;
-    std.debug.print("sim: census ok, {d} counter(s) fired, {d} exempt; {d} extension counter(s) fired; {d} seam op(s), {d} exempt; {d} body(ies) verified; trailers heard {d}/{d}/{d}, sent {d}/{d}/{d}, interims heard {d}/{d}/{d}, 204/HEAD/304 heard {d}/{d}/{d}, {d}/{d}/{d}, {d}/{d}/{d} (http1/2/3); IPv6 clients {d} announced upstream, {d} forwarded; HTTP/2 windows met {d}, table resizes heard {d}; HTTP/2 over TLS streams {d}; bad_record_mac heard {d}/{d} (Finished/payload)\n", .{
+    std.debug.print("sim: census ok, {d} counter(s) fired, {d} exempt; {d} extension counter(s) fired; {d} seam op(s), {d} exempt; {d} body(ies) verified; trailers heard {d}/{d}/{d}, sent {d}/{d}/{d}, interims heard {d}/{d}/{d}, 204/HEAD/304 heard {d}/{d}/{d}, {d}/{d}/{d}, {d}/{d}/{d} (http1/2/3); IPv6 clients {d} announced upstream, {d} forwarded; HTTP/2 windows met {d}, table resizes heard {d}; HTTP/2 over TLS streams {d}\n", .{
         Counters.names.len - uncovered.len,
         uncovered.len,
         extension_counters.len,
@@ -1372,8 +1388,12 @@ fn checkCensus(options: *const Sweep, census: *const Census) bool {
         census.h2_windows_met,
         census.h2_table_resizes,
         census.h2_tls_streams,
+    });
+    std.debug.print("sim: TLS failures: bad_record_mac heard {d}/{d} (Finished/payload); misnamed origins refused {d}/{d} (HTTPS/h2)\n", .{
         census.tls_bad_record_macs[0],
         census.tls_bad_record_macs[1],
+        census.origin_tls_refused[0],
+        census.origin_tls_refused[1],
     });
     return true;
 }
