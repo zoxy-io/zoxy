@@ -25,7 +25,7 @@ name: Nightly simulation
 # remainder is never revisited. Now a shard censuses its own slice
 # instead of stopping, and `fail-fast: false` keeps the siblings running,
 # so a *failing* night still reports its whole block. Sharding also buys
-# the block size back in wall clock: the night's 4M seeds take one
+# the block size back in wall clock: the night's block takes one
 # shard's time, whatever the shard count.
 
 on:
@@ -37,11 +37,11 @@ on:
       seeds:
         description: "Seeds per shard"
         required: false
-        default: "200000"
+        default: "100000"
       shards:
         description: "Parallel shards (block = shards x seeds)"
         required: false
-        default: "20"
+        default: "10"
       start_seed:
         description: "First seed (blank = continue the nightly range)"
         required: false
@@ -59,7 +59,7 @@ jobs:
   #
   #  - moving the epoch restarts the range on purpose, so the union across
   #    epochs repeats whatever the previous one had reached (runs 1..4
-  #    swept 1..4,000,000, and the epoch below sweeps it again);
+  #    swept 1..4,000,000, and the epoch from run 5 swept it again);
   #  - changing `seeds`/`shards` between runs re-tiles the blocks;
   #  - a manual run with `start_seed` still consumes a run number, leaving
   #    that block unswept.
@@ -81,8 +81,8 @@ jobs:
       - name: Compute seed range
         id: range
         env:
-          SEEDS: ${{ inputs.seeds || '200000' }}
-          SHARDS: ${{ inputs.shards || '20' }}
+          SEEDS: ${{ inputs.seeds || '100000' }}
+          SHARDS: ${{ inputs.shards || '10' }}
           START_OVERRIDE: ${{ inputs.start_seed }}
           RUN_NUMBER: ${{ github.run_number }}
           # The tiling epoch: run EPOCH_RUN sweeps the block starting at
@@ -94,17 +94,18 @@ jobs:
           # everything between the old tiling's end and the new block's
           # start.
           #
-          # Set to 1 / 5 to restart the sweep. Runs 1..4 swept 1..4,000,000
-          # but as four separate builds, a million each; at 4M a night one
-          # run now re-covers that whole range against a single commit, so
-          # the claim becomes "this build swept 1..N" rather than "four
-          # builds each swept a different million". Worth repeating
-          # whenever the gate gains detection power — a new oracle or a
-          # closed coverage gap makes every earlier sweep a weaker check
-          # than today's, and re-treading them is then real evidence
-          # rather than a repeat.
-          EPOCH_SEED: "1"
-          EPOCH_RUN: "5"
+          # Runs 5..159 tiled 1..620,000,000 in 4M blocks, from an epoch of
+          # 1 / 5 that restarted the sweep: runs 1..4 had swept
+          # 1..4,000,000 as four separate builds, a million each, and one
+          # 4M night re-covered that range against a single commit. From
+          # run 160 the block is 1M, so the epoch moved with it to
+          # 620000001 / 160, resuming where #159's block ended. Restarting
+          # at 1 is worth doing whenever the gate gains detection power: a
+          # new oracle or a closed coverage gap makes every earlier sweep a
+          # weaker check than today's, and re-treading them is then real
+          # evidence rather than a repeat.
+          EPOCH_SEED: "620000001"
+          EPOCH_RUN: "160"
         run: |
           set -euo pipefail
           block=$(( SHARDS * SEEDS ))
@@ -177,11 +178,16 @@ jobs:
     # seeds on the dev box: 51 s at 1.3.0, 109 s after), and shared runners
     # differ by more than that: #158's shards swept 52 to 126 seeds/s,
     # where #156's had swept up to 272. Seven of #158's eight were
-    # cancelled at the cap. So the night is 20 shards of 200k — the same 4M
-    # block again — at 26 to 64 min a shard on #158's runners. Twenty is
-    # the free plan's concurrent-job limit: a wider split would queue
-    # rather than run, so the next time seeds grow dearer the block must
-    # shrink, and the epoch in `plan` move with it.
+    # cancelled at the cap. So #159 ran 20 shards of 200k, the same 4M
+    # block again, at an expected 26 to 64 min a shard.
+    #
+    # From run #160 the night is 10 shards of 100k: a 1M block, with the
+    # epoch in `plan` moved to match. At #158's rates a shard takes 13 to
+    # 32 min, and the night holds 10 of the free plan's 20 concurrent
+    # jobs, leaving the rest to CI. If seeds grow dearer again, widen
+    # `shards` toward that limit or shrink `seeds`; either changes the
+    # block unless the other compensates, and a changed block moves the
+    # epoch.
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
