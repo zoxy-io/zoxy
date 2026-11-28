@@ -712,6 +712,8 @@ const Census = struct {
     h3_violations_answered: [l7.H3Violation.violations.len]u64 = @splat(0),
     /// Version Negotiations a probe heard and judged (RFC 9000 §6).
     version_negotiations_heard: u64 = 0,
+    /// QUIC sessions a narrowed offer keyed under its one suite, by suite.
+    quic_suites_keyed: [l7.H3SuiteOffer.narrowed.len]u64 = @splat(0),
     /// gRPC health calls an HTTP/2 origin answered (§7): SERVING, then
     /// NOT_SERVING.
     grpc_health_answered: [2]u64 = @splat(0),
@@ -841,6 +843,11 @@ const Census = struct {
             std.debug.print("sim census: no HTTP/2 {s} was answered by the handler (#434)\n", .{method});
             return false;
         }
+        for (census.quic_suites_keyed, l7.H3SuiteOffer.narrowed) |keyed, offer| {
+            if (keyed >= 1) continue;
+            std.debug.print("sim census: no QUIC session keyed under {s}\n", .{@tagName(offer)});
+            return false;
+        }
         if (census.version_negotiations_heard == 0) {
             std.debug.print("sim census: no probe heard a Version Negotiation\n", .{});
             return false;
@@ -889,6 +896,11 @@ const Census = struct {
             census.trailers_heard[@backingInt(Population.http3)] += client.trailersHeard();
             census.interims_heard[@backingInt(Population.http3)] += client.interimsHeard();
             census.addBodiless(.http3, client.bodilessHeard());
+            if (client.narrowedSuiteKeyed()) |offer| {
+                for (l7.H3SuiteOffer.narrowed, &census.quic_suites_keyed) |candidate, *keyed| {
+                    if (candidate == offer) keyed.* += 1;
+                }
+            }
             if (client.violationAnswered()) |violation| {
                 assert(violation != .none);
                 for (l7.H3Violation.violations, &census.h3_violations_answered) |candidate, *answered| {

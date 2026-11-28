@@ -328,6 +328,8 @@ h2_handler_prng: std.Random.DefaultPrng,
 bodiless_prng: std.Random.DefaultPrng,
 /// Which HTTP/3 clients break RFC 9114 or 9204 once, and how.
 h3_violation_prng: std.Random.DefaultPrng,
+/// Which HTTP/3 clients offer one cipher suite alone, and which.
+quic_suite_prng: std.Random.DefaultPrng,
 /// Which shape the HTTP/2 origin answers each request in, drawn per
 /// request on clean seeds too (`pickH2Answer`), and how many of each it
 /// staged whole.
@@ -2709,6 +2711,7 @@ fn drawHttpProtocol(harness: *Harness, seed: u64) void {
     harness.h2_handler_prng = std.Random.DefaultPrng.init(seed ^ 0x0434_0002_0434_0002);
     harness.bodiless_prng = std.Random.DefaultPrng.init(seed ^ 0x0204_0204_0204_0204);
     harness.h3_violation_prng = std.Random.DefaultPrng.init(seed ^ 0x9114_9204_9114_9204);
+    harness.quic_suite_prng = std.Random.DefaultPrng.init(seed ^ 0x1303_1302_1303_1302);
     harness.h2_shape_prng = std.Random.DefaultPrng.init(seed ^ 0x9113_0008_9113_0008);
     harness.h2_shapes_answered = @splat(0);
     var protocol_prng = std.Random.DefaultPrng.init(seed ^ 0x0275_0275_0275_0275);
@@ -3694,6 +3697,8 @@ fn prepareH3Clients(harness: *Harness) void {
         client.prepare(&harness.io, tlsBindAddress(), plans[0..streams], @intCast(index), harness.clean, seed, harness.h3_names[index]);
         client.interim_owed = harness.interimOwed();
         client.breakRules(harness.drawH3Violation());
+        // A third offer ChaCha20-Poly1305 alone, a third AES-256-GCM.
+        client.suite_offer = harness.quic_suite_prng.random().enumValue(l7.H3SuiteOffer);
         client.on_ended = clientEndedHook;
         client.context = harness;
     }

@@ -33,6 +33,15 @@ tickets: u32,
 /// the transport deinits `hs` when it ends, and a gate reads this after.
 server_key: [zssl.peer_certificate.public_key_bytes_max]u8,
 server_key_bytes: u16,
+/// The suite the session keyed under, kept once it connects: readable after
+/// `deinit`, as the key is.
+suite: ?CipherSuite,
+
+/// A TLS 1.3 cipher suite (RFC 8446 §B.4), as zssl names them: what the
+/// hello offers, and what the session keys under.
+pub const CipherSuite = zssl.cipher_suite.CipherSuite;
+/// What a hello offers unless told otherwise: all three, AES-128-GCM first.
+pub const offer_default: []const CipherSuite = &zssl.cipher_suite.offer_default;
 
 /// What a server's flight may need reassembled before the client reads it:
 /// a certificate chain of a few kilobytes, with room to spare.
@@ -45,6 +54,11 @@ pub const Config = struct {
     /// The client random, then the key share's private half: the caller's
     /// entropy, so a simulator's seed decides the handshake.
     seed: [64]u8,
+    /// The suites the hello offers, in preference order. The server picks
+    /// from these alone, so offering one keys the session under it: what
+    /// a gate sweeps ChaCha20-Poly1305 and AES-256-GCM through, which the
+    /// server's own preference never picks over AES-128-GCM.
+    cipher_suites: []const CipherSuite = &zssl.cipher_suite.offer_default,
 };
 
 /// In place — the handshake borrows `reassembly` — and the ClientHello
@@ -55,6 +69,7 @@ pub fn init(client: *QuicClient, config: *const Config, sink: *const Engine.Quic
     client.connected = false;
     client.tickets = 0;
     client.server_key_bytes = 0;
+    client.suite = null;
     client.hs = zssl.ClientHandshake.init(&.{
         .client_random = config.seed[0..32].*,
         .x25519_private = config.seed[32..64].*,
@@ -62,6 +77,7 @@ pub fn init(client: *QuicClient, config: *const Config, sink: *const Engine.Quic
         .alpn_protocols = Engine.quic_alpn,
         .certificate_policy = .leaf_signature,
         .reassembly = &client.reassembly,
+        .cipher_suites = config.cipher_suites,
         .quic = .{ .transport_parameters = config.transport_parameters },
     });
     const hello = client.hs.startCrypto();
@@ -110,6 +126,9 @@ pub fn deliver(client: *QuicClient, level: Engine.QuicLevel, bytes: []const u8, 
                 assert(!client.connected);
                 client.connected = true;
                 client.keepServerKey();
+                client.suite = std.meta.activeTag(client.hs.ladder.?);
+                // zssl refuses a ServerHello naming a suite it did not offer.
+                assert(std.mem.indexOfScalar(CipherSuite, client.hs.config.cipher_suites, client.suite.?) != null);
                 sink.connected(sink.ctx);
             },
         }

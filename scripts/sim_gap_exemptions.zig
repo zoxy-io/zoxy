@@ -113,9 +113,6 @@ const tls_shape = "a TLS shape the sweep's clients never take — a client chain
 const origin_tls = "TLS to an HTTPS origin failing mid-session: the sweep's HTTPS origin serves " ++
     "its chain over a byte-faithful TCP adversary, and a hangup mid-handshake reaches the " ++
     "counter (a census rate) more often than these legs; upstream_tls's tests drive them";
-const quic_suites = "QUIC under a cipher suite the server never picks for the sim's client — " ++
-    "ChaCha20-Poly1305 or AES-256-GCM, where every client offers AES-128-GCM first; " ++
-    "QuicCrypto's tests and RFC 9001's vectors drive them";
 const hello_shape = "a ClientHello shape the sweep's L4 clients never send — a server-name list " ++
     "with more than one entry, an extension block that fails mid-vector; client_hello's tests " ++
     "and its fuzz target drive it";
@@ -518,14 +515,7 @@ pub const exemptions = [_]Exemption{
     .{ .path = "tls/OriginClient.zig", .owner = "feed", .lines = 11, .reason = test_support },
     .{ .path = "tls/OriginClient.zig", .owner = "init", .lines = 2, .reason = test_support },
     .{ .path = "tls/OriginClient.zig", .owner = "initServing", .lines = 10, .reason = test_support },
-    .{ .path = "tls/QuicCrypto.zig", .owner = "aes256EncryptBlock", .lines = 2, .reason = quic_suites },
-    .{ .path = "tls/QuicCrypto.zig", .owner = "aes256GcmOpen", .lines = 2, .reason = quic_suites },
-    .{ .path = "tls/QuicCrypto.zig", .owner = "aes256GcmSeal", .lines = 2, .reason = quic_suites },
-    .{ .path = "tls/QuicCrypto.zig", .owner = "chacha20Keystream", .lines = 9, .reason = quic_suites },
-    .{ .path = "tls/QuicCrypto.zig", .owner = "chacha20Poly1305Open", .lines = 2, .reason = quic_suites },
-    .{ .path = "tls/QuicCrypto.zig", .owner = "chacha20Poly1305Seal", .lines = 2, .reason = quic_suites },
     .{ .path = "tls/QuicCrypto.zig", .owner = "deinit", .lines = 4, .reason = test_teardown },
-    .{ .path = "tls/QuicCrypto.zig", .owner = "hkdfSha384Expand", .lines = 4, .reason = quic_suites },
     .{ .path = "tls/Tickets.zig", .owner = "open", .lines = 2, .reason = tls_shape_part },
     .{ .path = "tls/Tickets.zig", .owner = "slotFor", .lines = 1, .reason = tls_shape },
     .{ .path = "tls/alpn.zig", .owner = "fromToken", .lines = 2, .reason = config_shape },
