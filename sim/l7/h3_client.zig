@@ -51,7 +51,57 @@ pub const ClientError = error{
     /// owed, or with one it did not; or a head that carried HTTP/1.1's
     /// `Trailer` announcement across the mapping.
     TrailersMismatched,
+    /// A violator's request was answered, as if it had been one.
+    ViolationAnswered,
+    /// A violator's stream was reset, or its connection closed, with a
+    /// code other than the one RFC 9114 or RFC 9204 owes it.
+    ViolationCodeUnexpected,
+    /// A clean seed's violator never heard its owed answer.
+    ViolationUnanswered,
 };
+
+/// An HTTP/3 client that breaks the rules once, on its first stream, and
+/// what each is owed (`owed`). Every other stream it opens is an ordinary
+/// one: a stream error leaves them to be answered, a connection error
+/// may cut them.
+pub const Violation = enum(u8) {
+    none,
+    /// A field name with an uppercase letter (RFC 9114 §4.2): malformed, so
+    /// that stream is reset with H3_MESSAGE_ERROR (§4.1.2).
+    malformed_field,
+    /// A field section naming a dynamic table entry the server never
+    /// offered (RFC 9204 §2.2): QPACK_DECOMPRESSION_FAILED closes the
+    /// connection.
+    qpack_failure,
+    /// DATA before any HEADERS on a request stream (RFC 9114 §4.1):
+    /// H3_FRAME_UNEXPECTED closes the connection.
+    frame_unexpected,
+
+    pub const violations = [_]Violation{ .malformed_field, .qpack_failure, .frame_unexpected };
+
+    pub const Owed = union(enum) {
+        /// The violating stream's reset, with this code.
+        reset: u64,
+        /// The connection's close, with this application code.
+        close: u64,
+    };
+
+    pub fn owed(violation: Violation) ?Owed {
+        return switch (violation) {
+            .none => null,
+            .malformed_field => .{ .reset = TestClient.code_message_error },
+            .qpack_failure => .{ .close = TestClient.code_qpack_decompression_failed },
+            .frame_unexpected => .{ .close = TestClient.code_frame_unexpected },
+        };
+    }
+};
+
+const malformed_fields = [_]TestClient.Field{.{ .name = "X-Upper", .value = "1" }};
+/// HEADERS whose one representation is the dynamic table's entry 0, in a
+/// table of no capacity.
+const undecodable_section = [_]u8{ 0x00, 0x00, 0x80 };
+/// A DATA frame of one octet, where the request's HEADERS must come first.
+const data_first = [_]u8{ 0x00, 0x01, 'x' };
 
 /// The trailing origin's section as the test client keeps it.
 const canonical_trailer_line = canon.response_trailer_name ++ ": " ++ canon.response_trailer_value ++ "\r\n";
@@ -86,6 +136,8 @@ pub fn Client(comptime IoType: type) type {
         /// Set by the harness after `prepare`: the seed's origin prefixes an
         /// interim `100` to every answer (#232).
         interim_owed: bool,
+        /// Set by the harness after `prepare` (`breakRules`).
+        violation: Violation,
         seed: [64]u8,
         requests: [requests_max]TestClient.Request,
         headers: [requests_max][3]TestClient.Field,
@@ -119,6 +171,7 @@ pub fn Client(comptime IoType: type) type {
             client.salt = salt;
             client.clean = clean;
             client.interim_owed = false;
+            client.violation = .none;
             client.seed = seed;
             client.began = false;
             client.ended = false;
@@ -179,6 +232,29 @@ pub fn Client(comptime IoType: type) type {
             ) catch return client.end(); // No socket to bind: nothing ran.
         }
 
+        /// Break the rules once, on the first stream, in `violation`'s way:
+        /// its request is replaced, and the rest are sent as planned.
+        pub fn breakRules(client: *Self, violation: Violation) void {
+            assert(!client.began);
+            assert(client.violation == .none);
+            client.violation = violation;
+            client.requests[0] = switch (violation) {
+                .none => return,
+                .malformed_field => .{ .method = "GET", .path = "/sim", .headers = &malformed_fields },
+                .qpack_failure => .{ .raw_section = &undecodable_section },
+                .frame_unexpected => .{ .raw_stream = &data_first },
+            };
+        }
+
+        /// The violation this client's run answered as owed, for the census
+        /// (§9); read once `verify` has passed.
+        pub fn violationAnswered(client: *const Self) ?Violation {
+            const owed = client.violation.owed() orelse return null;
+            assert(client.violation != .none);
+            if (!heardOwed(&client.transport, owed)) return null;
+            return client.violation;
+        }
+
         /// The public key of the leaf the server showed, or null before
         /// one arrived (#297).
         pub fn serverPublicKey(client: *const Self) ?[]const u8 {
@@ -230,7 +306,12 @@ pub fn Client(comptime IoType: type) type {
             // before it does not.
             const capped = max_lifetime_ns != 0 and client.began and
                 client.transport.peerClosedGracefully(max_lifetime_ns);
-            for (client.plans[0..client.streams], client.transport.answers[0..client.streams]) |plan, *answer| {
+            const owed = client.violation.owed();
+            if (owed) |violation| try client.verifyViolation(violation);
+            // A connection error may cut what else was in flight.
+            const cut_allowed = if (owed) |violation| violation == .close else false;
+            for (client.plans[0..client.streams], client.transport.answers[0..client.streams], 0..) |plan, *answer, index| {
+                if (owed != null and index == 0) continue; // Judged above.
                 const allowed = scripts.spec(plan.scriptOf()).allowed_statuses;
                 if (answer.status != 0 and std.mem.indexOfScalar(u16, allowed, answer.status) == null) {
                     return error.StatusUnexpected;
@@ -256,7 +337,7 @@ pub fn Client(comptime IoType: type) type {
                 if (client.interim_owed and answer.status == 200 and plan.originAnswers() and answer.interims == 0) {
                     return error.InterimUnrelayed;
                 }
-                if (!client.clean or capped) continue;
+                if (!client.clean or capped or cut_allowed) continue;
                 if (answer.status != scripts.spec(plan.scriptOf()).golden_status) return error.GoldenOutcomeMissed;
                 if (!answer.finished) return error.GoldenOutcomeMissed;
             }
@@ -288,6 +369,41 @@ pub fn Client(comptime IoType: type) type {
             }
             assert(heard <= client.streams);
             return heard;
+        }
+
+        /// A violator's first stream: never answered as a request, and, where
+        /// the server said anything, the code it is owed. Off a clean seed a
+        /// stream the adversary cut is also reset H3_REQUEST_CANCELLED, or
+        /// H3_INTERNAL_ERROR when an adversarial origin died first; a clean
+        /// seed must hear the owed answer itself.
+        fn verifyViolation(client: *const Self, owed: Violation.Owed) ClientError!void {
+            assert(client.violation != .none);
+            assert(std.meta.eql(owed, client.violation.owed().?));
+            const answer = &client.transport.answers[0];
+            if (answer.status != 0) return error.ViolationAnswered;
+            switch (owed) {
+                .reset => |code| if (answer.reset_code) |got| {
+                    const excused = !client.clean and
+                        (got == TestClient.code_request_cancelled or got == TestClient.code_internal_error);
+                    if (got != code and !excused) return error.ViolationCodeUnexpected;
+                },
+                .close => |code| if (client.transport.peer_close) |close| {
+                    const drained = close.application and close.code == TestClient.code_no_error;
+                    if (close.application and close.code != code and !drained) return error.ViolationCodeUnexpected;
+                },
+            }
+            if (client.clean and !heardOwed(&client.transport, owed)) return error.ViolationUnanswered;
+        }
+
+        /// Whether the owed answer itself arrived: the reset with its code,
+        /// or the application close with its own.
+        fn heardOwed(transport: *const Transport, owed: Violation.Owed) bool {
+            assert(transport.requests.len >= 1);
+            assert(transport.requests.len <= transport.answers.len);
+            return switch (owed) {
+                .reset => |code| transport.answers[0].reset_code == code,
+                .close => |code| if (transport.peer_close) |close| close.application and close.code == code else false,
+            };
         }
 
         /// Streams whose trailer section reached this client, for the

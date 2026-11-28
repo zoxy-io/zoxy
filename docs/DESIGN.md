@@ -1665,7 +1665,10 @@ external binaries. They and the speed gates run at merge.
       offers `h2` after HTTP/1.1, and a slot offering `h2` alone runs an
       HTTP/2 exchange over its session, refused only when no session is
       free;
-    - HTTP/3 clients, which name a certificate the same way;
+    - HTTP/3 clients, which name a certificate the same way, and a fifth
+      of which break the rules once, on their first stream: an uppercase
+      field name (RFC 9114 §4.2), a field section that cannot decode
+      (RFC 9204 §2.2), DATA before HEADERS (RFC 9114 §4.1);
     - admin scrapers, on a third of seeds: each reads the exposition to
       the plane's FIN, and some hold their half open for the drain to
       tear down.
@@ -1724,6 +1727,12 @@ external binaries. They and the speed gates run at merge.
       prefix of the canonical body, whole once the last chunk says the
       end, with exactly the trailer section its head owed, or none where
       it owed none;
+    - an HTTP/3 violator's first stream is never answered as a request:
+      the malformed one is reset with H3_MESSAGE_ERROR while the rest are
+      answered, and the other two close the connection with
+      QPACK_DECOMPRESSION_FAILED and H3_FRAME_UNEXPECTED; a clean seed
+      hears the owed answer itself, and no seed counts more protocol
+      errors than it has DATA-first violators;
     - an HTTP/2 violator hears only the answer RFC 9113 owes it — the
       connection's GOAWAY with its code, or stream 1's reset with its code
       while the connection stays — and on a clean seed hears it;
@@ -1777,7 +1786,8 @@ external binaries. They and the speed gates run at merge.
     must answer in each of its shapes, the handler must answer an HTTP/2
     GET and POST, some split cookie must arrive joined, and every
     population must hear an interim its seed owed it and a whole bodiless
-    answer, and each bodiless path must be answered whole somewhere.
+    answer, each bodiless path must be answered whole somewhere, and every
+    kind of HTTP/3 violation must hear its owed answer.
     - Exemptions are named, each with its reason.
     - An exemption that *does* fire fails the census too, so widening a
       scenario deletes its excuse.
