@@ -217,7 +217,7 @@ jobs:
 
           tar czf "dist/zoxy-$version-${{ matrix.label }}.tar.gz" -C out/bin zoxy
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: zoxy-${{ matrix.label }}
           path: dist/*.tar.gz
@@ -271,7 +271,7 @@ jobs:
             echo "dry=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: staging
 
