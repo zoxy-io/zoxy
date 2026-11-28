@@ -158,6 +158,7 @@ pub fn TestClient(comptime IoType: type) type {
         /// (`Options.exchange_end`), the payload to send once it has, and
         /// whether that one has gone.
         exchange_end: ExchangeEnd,
+        judge: ?Judge,
         followup_data: []const u8,
         followup_sent: bool,
         /// How many application payloads have gone out. The
@@ -200,6 +201,17 @@ pub fn TestClient(comptime IoType: type) type {
             /// response is not the length of its request, so waiting for
             /// one by size either fires early or never fires at all.
             http_response,
+            /// Whatever `Options.judge` says of what came back: a protocol
+            /// this client does not frame itself, such as HTTP/2's
+            /// streams over the session, judged by the client that wrote
+            /// them.
+            judged,
+        };
+
+        /// The caller's verdict on what came back, for `.judged`.
+        pub const Judge = struct {
+            context: *const anyopaque,
+            complete: *const fn (context: *const anyopaque, received: []const u8) bool,
         };
 
         pub const Options = struct {
@@ -251,6 +263,8 @@ pub fn TestClient(comptime IoType: type) type {
             /// asks this — the KeyUpdate's ordering, the two echo-shaped
             /// closes, and `followup_data`.
             exchange_end: ExchangeEnd = .echo,
+            /// The verdict `.judged` asks; null for every other rule.
+            judge: ?Judge = null,
             /// A second payload, sent on the same session once the first
             /// exchange completes. This is the keep-alive turnaround: one
             /// connection, two requests, the L7 state re-entered between
@@ -341,6 +355,7 @@ pub fn TestClient(comptime IoType: type) type {
             client.close_with_data = options.close_with_data;
             client.close_in_handshake = options.close_in_handshake;
             client.exchange_end = options.exchange_end;
+            client.judge = options.judge;
             client.followup_data = options.followup_data;
             client.followup_sent = false;
             client.payloads_sent = 0;
@@ -361,6 +376,8 @@ pub fn TestClient(comptime IoType: type) type {
             // apart, so the follow-up would go before the first response.
             assert(options.followup_data.len == 0 or
                 options.exchange_end == .http_response);
+            // A judged exchange needs its judge, and nothing else has one.
+            assert((options.exchange_end == .judged) == (options.judge != null));
             // The KeyUpdate and both echo-shaped closes hang off that same
             // gate and their steps run first, so combining any of them
             // with a follow-up does not suppress it — it *delays* it
@@ -610,6 +627,7 @@ pub fn TestClient(comptime IoType: type) type {
             return switch (client.exchange_end) {
                 .echo => back.len >= client.app_to_send.len,
                 .http_response => completeResponses(back) >= client.payloads_sent,
+                .judged => client.judge.?.complete(client.judge.?.context, back),
             };
         }
 

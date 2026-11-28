@@ -419,6 +419,53 @@ pub fn Client(comptime IoType: type) type {
             assert(len.* - client.credit_start == (@as(u32, client.streams) + 1) * 13);
         }
 
+        /// The whole request flight, for a client whose transport is a TLS
+        /// session rather than this one's own socket: an exchange sent in
+        /// one write, with no pacing to hold any of it back.
+        pub fn flight(client: *const Self) []const u8 {
+            assert(client.mode == .exchange);
+            assert(!client.tuning.tuned());
+            assert(client.send_limit == client.request_len);
+            return client.request[0..client.request_len];
+        }
+
+        /// Whether every stream has ended in `received` — the TLS session's
+        /// `Judge` for an exchange sent as `flight`.
+        pub fn judgeComplete(context: *const anyopaque, received: []const u8) bool {
+            const client: *const Self = @ptrCast(@alignCast(context));
+            assert(client.mode == .exchange);
+            return allEnded(received, client.streams);
+        }
+
+        /// What a TLS session heard, taken as what this client's socket
+        /// would have: `verify` and the census read it from here. More than
+        /// the buffer holds is an overrun, as it is on the socket.
+        pub fn adoptTranscript(client: *Self, received: []const u8) void {
+            assert(client.received_len == 0);
+            const take = @min(received.len, client.receive_buffer.len);
+            @memcpy(client.receive_buffer[0..take], received[0..take]);
+            client.received_len = @intCast(take);
+            client.overrun = received.len > client.receive_buffer.len;
+            assert(client.received_len <= client.receive_buffer.len);
+        }
+
+        /// Streams answered whole with a `200`, for the census.
+        pub fn streamsAnswered(client: *const Self) u32 {
+            assert(client.streams >= 1);
+            if (client.mode != .exchange) return 0;
+            var answers: [streams_max]Answer = @splat(.{});
+            const plans = client.plans[0..client.streams];
+            _ = readAnswers(client.receive_buffer[0..client.received_len], plans, &answers) catch |err| {
+                std.debug.panic("streamsAnswered after a failed verify: {s}", .{@errorName(err)});
+            };
+            var answered: u32 = 0;
+            for (answers[0..client.streams]) |*answer| {
+                answered += @intFromBool(answer.status == 200 and answer.ended and !answer.reset);
+            }
+            assert(answered <= client.streams);
+            return answered;
+        }
+
         pub fn begin(client: *Self) void {
             assert(client.request_len >= 1);
             client.io.connect(&.{ .ip = client.address }, &client.connect_completion, Self, client, onConnect);

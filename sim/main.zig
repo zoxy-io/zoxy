@@ -724,6 +724,9 @@ const Census = struct {
     /// HPACK table and heard the encoder's resize (RFC 7541 §4.2).
     h2_windows_met: u64 = 0,
     h2_table_resizes: u64 = 0,
+    /// Streams answered whole over HTTP/2 on a terminating TLS listener
+    /// (#271): what proves the sweep drives `h2` over TLS at all.
+    h2_tls_streams: u64 = 0,
     /// gRPC health calls an HTTP/2 origin answered (§7): SERVING, then
     /// NOT_SERVING.
     grpc_health_answered: [2]u64 = @splat(0),
@@ -836,6 +839,10 @@ const Census = struct {
             std.debug.print("sim census: no HTTP/2 client heard its HPACK table resized\n", .{});
             return false;
         }
+        if (census.h2_tls_streams == 0) {
+            std.debug.print("sim census: no stream was answered over HTTP/2 on a TLS listener (#271)\n", .{});
+            return false;
+        }
         for (census.grpc_health_answered, [_][]const u8{ "SERVING", "NOT_SERVING" }) |answered, said| {
             if (answered >= 1) continue;
             std.debug.print("sim census: no HTTP/2 origin answered a gRPC health call {s} (§7)\n", .{said});
@@ -877,6 +884,7 @@ const Census = struct {
             census.h2_table_resizes += @intFromBool(tuning.resized);
         }
         for (requests_before, census.request_trailers) |earlier, now| assert(now >= earlier);
+        census.h2_tls_streams += harness.tls_h2_streams;
         if (harness.grpc_health) |*answer| {
             const index: usize = if (Harness.grpcHealthServing(answer)) 0 else 1;
             census.grpc_health_answered[index] += harness.h2_origin.health_answered;
@@ -1278,7 +1286,7 @@ fn checkCensus(options: *const Sweep, census: *const Census) bool {
         return true;
     }
     if (!census.verify(options.iterations)) return false;
-    std.debug.print("sim: census ok, {d} counter(s) fired, {d} exempt; {d} extension counter(s) fired; {d} seam op(s), {d} exempt; {d} body(ies) verified; trailers heard {d}/{d}/{d}, sent {d}/{d}/{d} (http1/2/3); IPv6 clients {d} announced upstream, {d} forwarded; HTTP/2 windows met {d}, table resizes heard {d}\n", .{
+    std.debug.print("sim: census ok, {d} counter(s) fired, {d} exempt; {d} extension counter(s) fired; {d} seam op(s), {d} exempt; {d} body(ies) verified; trailers heard {d}/{d}/{d}, sent {d}/{d}/{d} (http1/2/3); IPv6 clients {d} announced upstream, {d} forwarded; HTTP/2 windows met {d}, table resizes heard {d}; HTTP/2 over TLS streams {d}\n", .{
         Counters.names.len - uncovered.len,
         uncovered.len,
         extension_counters.len,
@@ -1295,6 +1303,7 @@ fn checkCensus(options: *const Sweep, census: *const Census) bool {
         census.forwarded_ip6_verified,
         census.h2_windows_met,
         census.h2_table_resizes,
+        census.h2_tls_streams,
     });
     return true;
 }
