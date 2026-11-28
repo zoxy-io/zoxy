@@ -122,11 +122,12 @@ const tls_token_bytes: u8 = 24;
 const tls_http_followup = l7.scripts.get_request_close;
 
 /// What one terminating client offers in ALPN (#271). The server's side
-/// is fixed by the listener — HTTP/1.1 on an `http` terminator, nothing on
-/// an `l4` one — so the draw is on the client's, which is where every
-/// verdict RFC 7301 §3.2 can reach comes from: a match, no offer at all,
-/// a match that is not the client's first choice, and an offer the
-/// listener cannot meet.
+/// is fixed by the listener — HTTP/1.1 on an `http` terminator, with `h2`
+/// after it or alone where it speaks HTTP/2 (`tls_h2`, `tls_h2_only`), and
+/// nothing on an `l4` one — so the draw is on the client's, which is
+/// where every verdict RFC 7301 §3.2 can reach comes from: a match, no
+/// offer at all, a match that is not the client's first choice, and an
+/// offer the listener cannot meet.
 const TlsAlpnOffer = enum {
     none,
     http_1_1,
@@ -376,11 +377,23 @@ tls_scripts: [tls_client_slots]l7.Script,
 tls_alpn_offers: [tls_client_slots]TlsAlpnOffer,
 /// HTTP/2 over the terminating listener (#271, §7): on a seed whose http
 /// listener speaks HTTP/2 and whose terminator is http, half have it offer
-/// `h2` after HTTP/1.1. A slot that offers `h2` alone is then served
-/// HTTP/2 over its session, by an exchange `tls_h2_clients` writes and
-/// judges, where any other offer is still answered HTTP/1.1. Its own
-/// stream, so no other draw moves.
+/// `h2` — after HTTP/1.1, or on half of those alone (`tls_h2_only`). A
+/// slot the listener serves `h2` (`slotSpeaksH2`) runs HTTP/2 over its
+/// session, by an exchange `tls_h2_clients` writes and judges; any other
+/// offer it meets is answered HTTP/1.1. Its own stream, so no other draw
+/// moves.
 tls_h2: bool,
+/// On half the seeds whose terminator speaks HTTP/2, it offers `h2` alone:
+/// no HTTP/1.1 to fall back to, so an admission with no HTTP/2 session
+/// free sheds (`shed_h2_sessions`, #275), and a client offering `h2` first
+/// is served it.
+tls_h2_only: bool,
+/// The seed holds its HTTP/2 cluster to one origin connection
+/// (`narrowPools`), and that origin goes away once, after its first
+/// request: the streams it refuses replay while the going-away connection
+/// still holds the only slot, which is what sheds
+/// `l7_shed_h2_origin_connections`.
+h2_connections_narrowed: bool,
 tls_h2_prng: std.Random.DefaultPrng,
 tls_h2_clients: [tls_client_slots]H2Client,
 /// Streams the HTTP/2 TLS slots heard answered whole, for the census.
@@ -1329,11 +1342,15 @@ fn deriveUpgrades(harness: *Harness, random: std.Random) void {
 /// room its sessions need. An `h2` TLS session takes an HTTP/2 session
 /// slot as an h2c one does, so a seed with room for every h2c client's
 /// streams gets room for every TLS slot's as well; a starved one keeps
-/// its starved pools, which are its coverage.
+/// its starved pools, which are its coverage. Whether it speaks HTTP/2
+/// alone (`tls_h2_only`) is drawn beside it.
 fn deriveTlsH2(harness: *Harness) void {
     harness.tls_h2_streams = 0;
     const drawn = harness.tls_h2_prng.random().boolean();
+    const alone = harness.tls_h2_prng.random().boolean();
     harness.tls_h2 = drawn and harness.tls_protocol == .http and harness.h2c_http and harness.tls_clients >= 1;
+    harness.tls_h2_only = harness.tls_h2 and alone;
+    assert(!harness.tls_h2_only or harness.tls_h2);
     if (!harness.tls_h2) return;
     if (harness.h2_connections < clients_max) return; // Starved.
     harness.h2_connections += tls_client_slots;
@@ -1342,10 +1359,14 @@ fn deriveTlsH2(harness: *Harness) void {
 }
 
 /// Whether TLS slot `index` is served HTTP/2 (`tls_h2`): it offers `h2`
-/// alone, on a listener that now speaks it.
+/// alone, on a listener that now speaks it — or `h2` first, on one that
+/// speaks nothing else (`tls_h2_only`).
 fn slotSpeaksH2(harness: *const Harness, index: usize) bool {
     assert(index < tls_client_slots);
-    return harness.tls_h2 and harness.tls_alpn_offers[index] == .h2_only;
+    assert(!harness.tls_h2_only or harness.tls_h2);
+    const offer = harness.tls_alpn_offers[index];
+    if (!harness.tls_h2) return false;
+    return offer == .h2_only or (harness.tls_h2_only and offer == .h2_then_http_1_1);
 }
 
 /// The exchange an HTTP/2 TLS slot sends: `drawH2Plan`'s streams, their
@@ -2477,7 +2498,7 @@ fn terminatingListener(harness: *Harness) zoxy.Options.Listener {
         // HTTP/1.1 first: zssl picks by the listener's order (RFC 7301
         // §3.2 leaves it to the server), so a slot offering both keeps its
         // HTTP/1.1 script, and only one offering `h2` alone meets HTTP/2.
-        .alpn = if (harness.tls_h2) &.{ .http_1_1, .h2 } else null,
+        .alpn = if (harness.tls_h2_only) &.{.h2} else if (harness.tls_h2) &.{ .http_1_1, .h2 } else null,
     } else null;
     return .{
         .bind = .{ .ip = tlsBindAddress() },
@@ -2595,25 +2616,38 @@ fn deriveInitOptions(harness: *const Harness, random: std.Random) ServerSim.Init
 /// Off clean seeds with at least two upstream slots, a pool narrower than
 /// the slots in front of it, so its own rung of §8's ladder sheds rather
 /// than the slot rung's: an HTTP/2 cluster's origin streams, or an HTTPS
-/// cluster's sessions. An HTTP/2 cluster's origin connections are held to
-/// one besides, for a draining origin's GOAWAY to press on. Each is drawn
-/// on a third of the seeds it can apply to. What a client hears of a shed
-/// is a 503, which every script allows off a clean seed; that it was
-/// accounted for is the per-seed reconciliation's to judge.
+/// cluster's sessions, or every cluster's upstream heads. An HTTP/2
+/// cluster's origin connections are held to one besides, for a draining
+/// origin's GOAWAY to press on (`h2_connections_narrowed`). Each is drawn
+/// on a third of the seeds it can apply to — the heads only where nothing
+/// else is narrowed, since a head is acquired ahead of every other rung
+/// and would shed in its place. What a client hears of a shed is a 503,
+/// which every script allows off a clean seed; that it was accounted for
+/// is the per-seed reconciliation's to judge.
 fn narrowPools(harness: *const Harness, options: *ServerSim.InitOptions, random: std.Random) void {
     const narrow_streams = random.uintLessThan(u8, 3) == 0;
     const narrow_connections = random.uintLessThan(u8, 3) == 0;
     const narrow_sessions = random.uintLessThan(u8, 3) == 0;
+    const narrow_heads = random.uintLessThan(u8, 3) == 0;
     if (harness.clean or options.upstream_slots < 2) return;
     assert(options.upstream_slots >= 2);
-    if (harness.http_protocol != .http1) {
+    const h2 = harness.http_protocol != .http1;
+    const others_narrowed = (h2 and (narrow_streams or narrow_connections)) or (harness.http_tls and narrow_sessions);
+    // Fewer heads than slots, so renders admitted together contend for
+    // them (#57's rung).
+    if (narrow_heads and !others_narrowed) {
+        options.upstream_head_buffers = 1 + random.uintLessThan(u32, options.upstream_slots - 1);
+        assert(options.upstream_head_buffers < options.upstream_slots);
+    }
+    assert(options.upstream_head_buffers <= options.upstream_slots);
+    if (h2) {
         if (narrow_streams) options.h2_origin_streams = 1 + random.uintLessThan(u32, options.upstream_slots - 1);
         if (narrow_connections) options.h2_origin_connections = 1;
         assert(options.h2_origin_connections >= 1);
         assert(options.h2_origin_streams >= 1);
     }
     if (harness.http_tls and narrow_sessions) {
-        options.upstream_tls_sessions = 1 + random.uintLessThan(u32, options.upstream_slots - 1);
+        options.upstream_tls_sessions = 1;
         assert(options.upstream_tls_sessions >= 1);
         assert(options.upstream_tls_sessions < options.upstream_slots);
     }
@@ -3383,6 +3417,8 @@ fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: st
     // than running a shape production cannot load.
     harness.config = try zoxy.config.resolve(arena, &harness.options);
     const options = harness.deriveInitOptions(random);
+    harness.h2_connections_narrowed = !harness.clean and harness.http_protocol.http2() and
+        options.h2_origin_connections == 1;
     try harness.server.init(arena, &harness.io, &harness.config, options);
     try harness.server.bindExtensions(&.{ .arena = arena });
     harness.tls_credentials = .{ null, null, null };
@@ -3428,6 +3464,7 @@ fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: st
         .body = l7.canon.sized_body,
         // §8: a gRPC call is left to its deadline.
         .mute_path_prefix = l7.canon.grpc_mute_prefix,
+        .goaway_after_first = harness.h2_connections_narrowed,
         .health = harness.grpc_health,
         .picker = .{ .context = harness, .pick = pickH2Answer, .answered = countH2Answer },
     };
@@ -5022,8 +5059,10 @@ fn verifyTlsAlpn(
     if (harness.slotSpeaksH2(index) and !harness.clean) {
         // Served HTTP/2 when a session is free, and otherwise offered the
         // list less `h2` (`alpn_fallback`, #275), which an `h2`-only offer
-        // cannot meet. Possible whether or not the alert landed: the
-        // adversary can cut the socket between the refusal and its alert.
+        // cannot meet — or, on a listener offering `h2` alone, with no
+        // list left, shed at admission, before any alert could be sent.
+        // Possible whether or not the alert landed: the adversary can cut
+        // the socket between the refusal and its alert.
         refusals.possible += 1;
         if (client.refusedForAlpn()) {
             refusals.heard += 1;
@@ -5033,8 +5072,10 @@ fn verifyTlsAlpn(
     }
     // A clean seed has a session for every `h2` slot, so it is never
     // refused there: the check below fails it as any wrong refusal.
-    // Refused unless the listener speaks HTTP/2 too, which serves it.
-    const refusable = harness.tls_protocol == .http and offer == .h2_only and !harness.tls_h2;
+    // Refused unless the listener speaks HTTP/2 too, which serves it; and
+    // HTTP/1.1 alone refused by a listener that speaks HTTP/2 alone.
+    const refusable = harness.tls_protocol == .http and
+        ((offer == .h2_only and !harness.tls_h2) or (offer == .http_1_1 and harness.tls_h2_only));
     if (refusable) {
         refusals.possible += 1;
         if (client.refusedForAlpn()) refusals.heard += 1;
@@ -5398,6 +5439,10 @@ fn l7OutcomeTotal(counters: *const zoxy.counters.Counters) u64 {
         "l7_shed_h2_origin_connections",
         "l7_shed_h2_origin_streams",
         "l7_shed_upstream_tls",
+        // The upstream head the render needs (#57): shed through `respond`
+        // like the slot it follows, so owing a line the same way. Missing
+        // from this list until a sweep first reached the rung.
+        "l7_shed_upstream_head_buffers",
         "l7_shed_endpoint_inflight",
         // #392's cluster-wide cap: a shed answered through `respond`,
         // owing a line like the endpoint cap beside it.
