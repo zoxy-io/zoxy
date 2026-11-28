@@ -2565,11 +2565,6 @@ fn deriveAccessLogBuffer(harness: *const Harness) u32 {
     return floor;
 }
 
-/// The pool sizes this seed runs the server with. A quarter of
-/// adversarial seeds shrink them to force the §8 rungs; clean seeds keep
-/// ample pools so golden outcomes never meet a shed. Decided in `setUp`
-/// (see `force_exhaustion`) because the ring size had to precede
-/// `io.init`.
 /// The pool sizes the server runs with. Authoritative here, not the
 /// resolved `config.limits`: a starved seed sizes pools past what options
 /// may state (`limitsStated`).
@@ -2591,10 +2586,45 @@ fn deriveInitOptions(harness: *const Harness, random: std.Random) ServerSim.Init
         options.upstream_tls_sessions = options.upstream_slots;
         assert(options.upstream_tls_sessions <= zoxy.constants.upstream_tls_sessions_max);
     }
+    var narrowing = std.Random.DefaultPrng.init(random.int(u64));
+    harness.narrowPools(&options, narrowing.random());
     assert(options.h2_origin_streams <= options.upstream_slots);
     return options;
 }
 
+/// Off clean seeds with at least two upstream slots, a pool narrower than
+/// the slots in front of it, so its own rung of §8's ladder sheds rather
+/// than the slot rung's: an HTTP/2 cluster's origin streams, or an HTTPS
+/// cluster's sessions. An HTTP/2 cluster's origin connections are held to
+/// one besides, for a draining origin's GOAWAY to press on. Each is drawn
+/// on a third of the seeds it can apply to. What a client hears of a shed
+/// is a 503, which every script allows off a clean seed; that it was
+/// accounted for is the per-seed reconciliation's to judge.
+fn narrowPools(harness: *const Harness, options: *ServerSim.InitOptions, random: std.Random) void {
+    const narrow_streams = random.uintLessThan(u8, 3) == 0;
+    const narrow_connections = random.uintLessThan(u8, 3) == 0;
+    const narrow_sessions = random.uintLessThan(u8, 3) == 0;
+    if (harness.clean or options.upstream_slots < 2) return;
+    assert(options.upstream_slots >= 2);
+    if (harness.http_protocol != .http1) {
+        if (narrow_streams) options.h2_origin_streams = 1 + random.uintLessThan(u32, options.upstream_slots - 1);
+        if (narrow_connections) options.h2_origin_connections = 1;
+        assert(options.h2_origin_connections >= 1);
+        assert(options.h2_origin_streams >= 1);
+    }
+    if (harness.http_tls and narrow_sessions) {
+        options.upstream_tls_sessions = 1 + random.uintLessThan(u32, options.upstream_slots - 1);
+        assert(options.upstream_tls_sessions >= 1);
+        assert(options.upstream_tls_sessions < options.upstream_slots);
+    }
+    assert(options.h2_origin_streams <= options.upstream_slots);
+}
+
+/// The pool sizes this seed runs the server with. A quarter of
+/// adversarial seeds shrink them to force the §8 rungs; clean seeds keep
+/// ample pools so golden outcomes never meet a shed. Decided in `setUp`
+/// (see `force_exhaustion`) because the ring size had to precede
+/// `io.init`.
 fn derivePoolOptions(harness: *const Harness, random: std.Random) ServerSim.InitOptions {
     const force_exhaustion = harness.force_exhaustion;
     const access_log_buffer_bytes = harness.deriveAccessLogBuffer();
