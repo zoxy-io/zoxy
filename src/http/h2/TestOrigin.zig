@@ -28,6 +28,16 @@ pub const Answer = struct {
     body: []const u8 = "",
     trailers: []const Pair = &.{},
     interim: []const u8 = "",
+    /// Nothing of the answer: RST_STREAM(REFUSED_STREAM) at once, a
+    /// stream the origin did not process and the client may retry (RFC
+    /// 9113 §8.7).
+    refuse: bool = false,
+    /// The head and `body`, then RST_STREAM with this code in END_STREAM's
+    /// place: an origin that broke off mid-answer.
+    reset_after: ?h2.frame.ErrorCode = null,
+    /// Once the answer is staged, GOAWAY: the connection drains, and the
+    /// client's later streams on it are refused (§6.8).
+    goaway: bool = false,
 };
 
 /// Chooses each request's answer in the script's place, and hears when
@@ -299,11 +309,14 @@ pub fn TestOriginSized(comptime IoType: type, comptime conns_max_value: u32) typ
                     .body = origin.body,
                     .trailers = origin.trailers,
                 };
+                if (answer.refuse) return conn.breakOff(job, .refused_stream);
                 if (!conn.sendInterim(job, &answer)) return;
                 var fields: [32]hpack.Field = undefined;
                 // A bidirectional answer ends only after the request has;
-                // a health call is answered as gRPC answers one, whole.
-                const holds = origin.answer_at_head and !job.request_ended and !job.health;
+                // a health call is answered as gRPC answers one, whole; one
+                // scripted to break off ends in a reset rather than either.
+                const bidirectional = origin.answer_at_head and !job.request_ended and !job.health;
+                const holds = bidirectional or answer.reset_after != null;
                 const stalls = origin.stall_after_body and !job.health;
                 if (!job.head_sent) {
                     fields[0] = .{ .name = ":status", .value = answer.status };
@@ -324,6 +337,7 @@ pub fn TestOriginSized(comptime IoType: type, comptime conns_max_value: u32) typ
                     if (job.body_offset < answer.body.len) return;
                     if (sent.ended) return conn.finished(job);
                 }
+                if (answer.reset_after) |code| return conn.breakOff(job, code);
                 if (stalls or holds) return;
                 if (answer.trailers.len == 0) {
                     // A body-less answer whose head did not end the stream.
@@ -337,6 +351,15 @@ pub fn TestOriginSized(comptime IoType: type, comptime conns_max_value: u32) typ
                     .blocked => {},
                     .refused => unreachable,
                 }
+            }
+
+            /// RST_STREAM(`code`) in the answer's place, as the script says: a
+            /// refusal before any of it, or a break after the body it sent.
+            fn breakOff(conn: *Conn, job: *Job, code: h2.frame.ErrorCode) void {
+                assert(job.picked != null);
+                assert(code != .no_error);
+                if (conn.session.resettable(job.stream)) conn.session.resetStream(job.stream, code);
+                conn.finished(job);
             }
 
             /// The answer's informational head, ahead of the rest, once: false
@@ -363,6 +386,7 @@ pub fn TestOriginSized(comptime IoType: type, comptime conns_max_value: u32) typ
                 if (job.picked) |picked| {
                     const picker = conn.origin.picker.?;
                     picker.answered(picker.context, picked);
+                    if (picked.goaway and conn.session.state != .closed) conn.session.goAway();
                 }
                 job.* = .{};
             }

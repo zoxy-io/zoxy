@@ -2731,7 +2731,25 @@ const h2_origin_headers = [_]zoxy.http.h2.Pair{
 /// frame, and the origin sends one. A trailer section closes the chunked
 /// stream for HTTP/1.1, and goes on as trailing HEADERS for HTTP/2 and
 /// HTTP/3. An interim `100` comes ahead of the sized answer (#232).
-pub const H2OriginShape = enum(u8) { sized, chunked, chunked_trailers, interim_then_sized };
+///
+/// Past those, off clean seeds only, an origin that misbehaves within RFC
+/// 9113: one that refuses the stream unprocessed (REFUSED_STREAM, §8.7),
+/// one that breaks off half way through the sized body (INTERNAL_ERROR),
+/// and one that answers and then drains its connection (GOAWAY, §6.8),
+/// refusing every later stream on it. What the clients may hear of those
+/// is what an adversary's cut leaves, or a replay's whole answer, or a
+/// 502 — never a whole answer that is wrong.
+pub const H2OriginShape = enum(u8) {
+    sized,
+    chunked,
+    chunked_trailers,
+    interim_then_sized,
+    refused,
+    reset_mid_body,
+    draining,
+};
+/// The shapes a clean seed draws: the first four.
+const h2_shapes_well_formed: u8 = 4;
 const h2_origin_shapes = [_]zoxy.http.h2.Answer{
     .{ .status = "200", .headers = &h2_origin_headers, .body = l7.canon.sized_body },
     .{ .status = "200", .body = l7.h2_canonical_chunked_body },
@@ -2745,26 +2763,49 @@ const h2_origin_shapes = [_]zoxy.http.h2.Answer{
         .trailers = &.{.{ l7.canon.response_trailer_name, l7.canon.response_trailer_value }},
     },
     .{ .status = "200", .headers = &h2_origin_headers, .body = l7.canon.sized_body, .interim = "100" },
+    .{ .status = "200", .refuse = true },
+    // Sized, not chunked: the proxy frames each DATA run as its own chunk,
+    // so a chunked answer cut short is legal octets that no canonical wire
+    // starts with, and the HTTP/1.1 client judges the wire octet for octet.
+    // A proxy that took the reset for the end still shows: an HTTP/2 or
+    // HTTP/3 client would hear the stream end short of its length.
+    .{
+        .status = "200",
+        .headers = &h2_origin_headers,
+        .body = l7.canon.sized_body[0 .. l7.canon.sized_body.len / 2],
+        .reset_after = .internal_error,
+    },
+    .{ .status = "200", .headers = &h2_origin_headers, .body = l7.canon.sized_body, .goaway = true },
 };
 
 comptime {
     assert(h2_origin_shapes.len == std.enums.values(H2OriginShape).len);
+    assert(@backingInt(H2OriginShape.interim_then_sized) < h2_shapes_well_formed);
+    assert(@backingInt(H2OriginShape.refused) == h2_shapes_well_formed);
+    for (h2_origin_shapes[0..h2_shapes_well_formed]) |shape| {
+        assert(!shape.refuse and shape.reset_after == null and !shape.goaway);
+    }
     assert(h2_origin_shapes[@backingInt(H2OriginShape.chunked_trailers)].trailers.len == 1);
 }
 
 /// Each request's shape: behind an interim on an interim seed, as the
 /// HTTP/1.1 origin answers there (`pickHttpOriginMode`), and drawn
-/// otherwise — on clean seeds too. Every shape is well-formed, and only
-/// a clean seed's golden oracle demands the whole answer: off one, a
-/// chunk the proxy framed wrong is refused by its own scanner, and the
-/// cut that leaves passes as the adversary's.
+/// otherwise — on clean seeds too, from the well-formed ones. Only a
+/// clean seed's golden oracle demands the whole answer: off one, a chunk
+/// the proxy framed wrong is refused by its own scanner, and the cut that
+/// leaves passes as the adversary's. The misbehaving shapes are an
+/// adversary's, so only an adversarial seed draws them.
 fn pickH2Answer(context: *anyopaque) ?*const zoxy.http.h2.Answer {
     const harness: *Harness = @ptrCast(@alignCast(context));
+    const random = harness.h2_shape_prng.random();
     const shape: H2OriginShape = if (harness.interim_http)
         .interim_then_sized
+    else if (harness.clean)
+        @fromBackingInt(random.uintLessThan(u8, h2_shapes_well_formed))
     else
-        harness.h2_shape_prng.random().enumValue(H2OriginShape);
+        random.enumValue(H2OriginShape);
     assert(!harness.interim_http or shape == .interim_then_sized);
+    assert(!harness.clean or @backingInt(shape) < h2_shapes_well_formed);
     assert(@backingInt(shape) < h2_origin_shapes.len);
     return &h2_origin_shapes[@backingInt(shape)];
 }
