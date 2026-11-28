@@ -75,6 +75,7 @@ pub const code_no_error: u64 = @backingInt(quic.error_code.Application.no_error)
 pub const code_internal_error: u64 = @backingInt(quic.error_code.Application.internal_error);
 pub const code_frame_unexpected: u64 = @backingInt(quic.error_code.Application.frame_unexpected);
 pub const code_request_cancelled: u64 = @backingInt(quic.error_code.Application.request_cancelled);
+pub const code_request_rejected: u64 = @backingInt(quic.error_code.Application.request_rejected);
 pub const code_message_error: u64 = @backingInt(quic.error_code.Application.message_error);
 pub const code_qpack_decompression_failed: u64 = @backingInt(quic.error_code.Application.qpack_decompression_failed);
 

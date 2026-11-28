@@ -432,8 +432,14 @@ pub fn Client(comptime IoType: type) type {
         /// A violator's first stream: never answered as a request, and, where
         /// the server said anything, the code it is owed. Off a clean seed a
         /// stream the adversary cut is also reset H3_REQUEST_CANCELLED, or
-        /// H3_INTERNAL_ERROR when an adversarial origin died first; a clean
-        /// seed must hear the owed answer itself.
+        /// H3_INTERNAL_ERROR when an adversarial origin died first, and a
+        /// stream shed for want of a shared stream or its head
+        /// H3_REQUEST_REJECTED (§8's ladder): both are acquired before the
+        /// fields are judged as a message (exchange.zig's `open`), so a shed
+        /// stream's breach is never read, and RFC 9114 §4.1.1 lets a server
+        /// reject a request it did not process. The nightly sweep met that
+        /// on 8 seeds in 612000001..616000000. A clean seed's pools never
+        /// shed, and it must hear the owed answer itself.
         fn verifyViolation(client: *const Self, owed: Violation.Owed) ClientError!void {
             assert(client.violation != .none);
             assert(std.meta.eql(owed, client.violation.owed().?));
@@ -441,8 +447,8 @@ pub fn Client(comptime IoType: type) type {
             if (answer.status != 0) return error.ViolationAnswered;
             switch (owed) {
                 .reset => |code| if (answer.reset_code) |got| {
-                    const excused = !client.clean and
-                        (got == TestClient.code_request_cancelled or got == TestClient.code_internal_error);
+                    const excused = !client.clean and (got == TestClient.code_request_cancelled or
+                        got == TestClient.code_internal_error or got == TestClient.code_request_rejected);
                     if (got != code and !excused) return error.ViolationCodeUnexpected;
                 },
                 .close => |code| if (client.transport.peer_close) |close| {
