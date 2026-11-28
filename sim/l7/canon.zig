@@ -83,6 +83,12 @@ pub const sized_head = "HTTP/1.1 200 OK\r\nContent-Length: 32\r\n" ++
     log_response_header ++ ": " ++ log_response_value ++ "\r\n" ++
     hop_by_hop_lines ++ "\r\n";
 pub const sized_response = sized_head ++ sized_body;
+/// The path every origin answers `204 No Content` (RFC 9110 §15.3.5): no
+/// content, so no body and no framing field to say so (§8.6, §6.4.1),
+/// whichever protocol carries it.
+pub const no_content_path = "/sim/no-content";
+pub const no_content_response = "HTTP/1.1 204 No Content\r\n" ++
+    log_response_header ++ ": " ++ log_response_value ++ "\r\n\r\n";
 /// The payload both chunked origins answer, whatever chunks carry it.
 pub const chunked_body = "chunked-body-16b";
 pub const chunked_wire = "10\r\n" ++ chunked_body ++ "\r\n0\r\n\r\n";

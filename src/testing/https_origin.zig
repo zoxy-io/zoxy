@@ -21,6 +21,12 @@ const TestTlsServer = @import("../tls/TestTlsServer.zig");
 
 const assert = std.debug.assert;
 
+/// A target and what a request for it is answered with.
+pub const Route = struct {
+    target: []const u8,
+    response: []const u8,
+};
+
 pub fn HttpsOrigin(comptime IoType: type, comptime conns_count_max: u32) type {
     comptime assert(conns_count_max >= 1);
     return struct {
@@ -29,6 +35,9 @@ pub fn HttpsOrigin(comptime IoType: type, comptime conns_count_max: u32) type {
         accept_completion: IoType.Completion = .{},
         listening: bool = false,
         response: []const u8 = "",
+        /// Answers in `response`'s place for a request whose target is the
+        /// route's: a sweep's origin answers some paths its own way.
+        routes: []const Route = &.{},
         close_after_response: bool = false,
         /// Read every request, and answer none.
         mute: bool = false,
@@ -95,6 +104,8 @@ pub fn HttpsOrigin(comptime IoType: type, comptime conns_count_max: u32) type {
             body_seen: u64 = 0,
             answering: bool = false,
             response_sent: u32 = 0,
+            /// The request in flight's answer: `response`, or its route's.
+            answer: []const u8 = "",
 
             fn armRecv(conn: *Conn) void {
                 if (conn.receiving or conn.closed or conn.failing or conn.answering) return;
@@ -151,6 +162,7 @@ pub fn HttpsOrigin(comptime IoType: type, comptime conns_count_max: u32) type {
                     if (conn.origin.mute) continue;
                     conn.answering = true;
                     conn.response_sent = 0;
+                    assert(conn.answer.len >= 1);
                 }
             }
 
@@ -175,6 +187,13 @@ pub fn HttpsOrigin(comptime IoType: type, comptime conns_count_max: u32) type {
                 };
                 const origin = conn.origin;
                 origin.requests += 1;
+                conn.answer = origin.response;
+                // The first route naming the target answers it.
+                for (origin.routes) |route| {
+                    if (!std.mem.eql(u8, head.target, route.target)) continue;
+                    conn.answer = route.response;
+                    break;
+                }
                 const kept: u32 = @min(head.head_len, origin.last_head.len);
                 @memcpy(origin.last_head[0..kept], conn.pending[0..kept]);
                 origin.last_head_len = kept;
@@ -231,7 +250,7 @@ pub fn HttpsOrigin(comptime IoType: type, comptime conns_count_max: u32) type {
             fn pushSend(conn: *Conn) void {
                 if (conn.sending or conn.closed or conn.failing) return;
                 const tls = conn.tls;
-                const response = conn.origin.response;
+                const response = conn.answer;
                 if (!tls.owes()) {
                     if (!conn.answering or !tls.connected) return;
                     assert(conn.response_sent < response.len);
@@ -246,7 +265,7 @@ pub fn HttpsOrigin(comptime IoType: type, comptime conns_count_max: u32) type {
                 const sent = result catch return conn.fail();
                 if (conn.failing) return conn.fail();
                 conn.response_sent += conn.tls.sent(sent);
-                if (conn.answering and conn.response_sent == conn.origin.response.len) return conn.answered();
+                if (conn.answering and conn.response_sent == conn.answer.len) return conn.answered();
                 conn.tls.process() catch return conn.fail();
                 conn.advance();
             }

@@ -234,15 +234,32 @@ pub fn Client(comptime IoType: type) type {
                 try checkTrailers(answer);
                 try checkTrailersOwed(answer);
                 if (answer.status == 200) try checkBody(answer, client.clean);
+                // A 204 has no content to frame (RFC 9110 §15.3.5, §8.6).
+                if (answer.status == 204) {
+                    const framed = headLine(answer.headBytes(), "content-length") != null;
+                    if (answer.body_len != 0 or framed) return error.BodyCorrupted;
+                }
                 // An interim precedes the final head on the wire, so no cut
                 // removes it from a 200 that arrived.
                 if (client.interim_owed and answer.status == 200 and plan.originAnswers() and answer.interims == 0) {
                     return error.InterimUnrelayed;
                 }
                 if (!client.clean or capped) continue;
-                if (answer.status != 200) return error.GoldenOutcomeMissed;
+                if (answer.status != scripts.spec(plan.scriptOf()).golden_status) return error.GoldenOutcomeMissed;
                 if (!answer.finished) return error.GoldenOutcomeMissed;
             }
+        }
+
+        /// Whole 204s heard, for the census (§9); read once `verify` has
+        /// passed.
+        pub fn noContentHeard(client: *const Self) u32 {
+            assert(client.streams >= 1);
+            var heard: u32 = 0;
+            for (client.transport.answers[0..client.streams]) |*answer| {
+                heard += @intFromBool(answer.status == 204 and answer.finished);
+            }
+            assert(heard <= client.streams);
+            return heard;
         }
 
         /// Origin 200s heard behind an interim, on a seed that owed one,
