@@ -72,6 +72,8 @@ pub const Answer = struct {
     body_len: u32 = 0,
     /// The stream's FIN arrived after the answer.
     finished: bool = false,
+    /// Interim heads (RFC 9110 §15.2) before the final one.
+    interims: u8 = 0,
     /// The server reset the stream instead.
     reset: bool = false,
     /// Trailer sections after the final head, each field kept as a
@@ -401,6 +403,8 @@ pub fn TestClient(comptime IoType: type) type {
                         if (status >= 200) {
                             answer.status = status;
                             final = true;
+                        } else if (status >= 100) {
+                            answer.interims +|= 1;
                         }
                     }
                     if (final) Answer.appendLines(&answer.head, &answer.head_len, decoded.fields);

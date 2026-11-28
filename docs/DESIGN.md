@@ -1698,6 +1698,10 @@ external binaries. They and the speed gates run at merge.
       endpoint the drain cut, and on a clean SERVING seed none failed;
     - an HTTP/2 client's split cookie reaches its HTTP/1.1 origin as one
       line, the crumbs joined by "; " and an empty one left out;
+    - on a seed whose origin prefixes an interim `100` to every answer,
+      each 200 it gave reaches its client behind one, over HTTP/1.1,
+      HTTP/2 and HTTP/3 alike: §7 relays a `1xx`, and an interim comes
+      before the final head on the wire, so no cut excuses its absence;
     - an HTTP/2 violator hears only the answer RFC 9113 owes it — the
       connection's GOAWAY with its code, or stream 1's reset with its code
       while the connection stays — and on a clean seed hears it;
@@ -1749,7 +1753,8 @@ external binaries. They and the speed gates run at merge.
     some stream must be answered over HTTP/2 on a TLS listener, every
     kind of HTTP/2 violation must hear its owed answer, the HTTP/2 origin
     must answer in each of its shapes, the handler must answer an HTTP/2
-    GET and POST, and some split cookie must arrive joined.
+    GET and POST, some split cookie must arrive joined, and every
+    population must hear an interim its seed owed it.
     - Exemptions are named, each with its reason.
     - An exemption that *does* fire fails the census too, so widening a
       scenario deletes its excuse.
