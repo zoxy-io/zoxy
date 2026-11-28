@@ -106,6 +106,10 @@ pub fn HttpOrigin(comptime IoType: type) type {
         /// Chains that held anything else, or the observed client
         /// anywhere but last. Checked by the harness verify.
         forwarded_mismatches: u32 = 0,
+        /// Requests marked `canon.split_cookie_header` whose cookie came
+        /// other than as one joined line, and those that came right.
+        cookie_mismatches: u32 = 0,
+        cookies_joined: u32 = 0,
         /// Chains that ended in an IPv6 observed client, read exactly.
         forwarded_ip6_verified: u32 = 0,
         /// The fingerprint a verified client's requests carry (#304), as
@@ -400,6 +404,11 @@ pub fn HttpOrigin(comptime IoType: type) type {
                     conn.close();
                     return false;
                 }
+                if (!conn.cookieJoined(&request)) {
+                    conn.origin.cookie_mismatches += 1;
+                    conn.close();
+                    return false;
+                }
                 if (!conn.clientCertValid(&request)) {
                     conn.origin.client_cert_mismatches += 1;
                     conn.close();
@@ -434,6 +443,28 @@ pub fn HttpOrigin(comptime IoType: type) type {
                     };
                 }
                 conn.phase = .body;
+                return true;
+            }
+
+            /// A request whose HTTP/2 client split its cookie (#275, RFC 9113
+            /// §8.2.3) reaches HTTP/1.1 with one `cookie` line, the crumbs
+            /// joined by "; " and the empty one gone. A request without the
+            /// mark is not judged here: its cookies, if any, are another
+            /// script's.
+            fn cookieJoined(conn: *Conn, request: *const parser.RequestHead) bool {
+                var marked = false;
+                var lines: u32 = 0;
+                var joined = false;
+                for (request.headers) |header| {
+                    if (std.ascii.eqlIgnoreCase(header.name, canon.split_cookie_header)) marked = true;
+                    if (!std.ascii.eqlIgnoreCase(header.name, "cookie")) continue;
+                    lines += 1;
+                    joined = std.mem.eql(u8, header.value, canon.split_cookie_joined);
+                }
+                assert(lines <= request.headers.len);
+                if (!marked) return true; // Its cookies are another script's.
+                if (lines != 1 or !joined) return false;
+                conn.origin.cookies_joined += 1;
                 return true;
             }
 

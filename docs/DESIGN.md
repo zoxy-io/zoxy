@@ -1635,7 +1635,9 @@ external binaries. They and the speed gates run at merge.
       violators that break RFC 9113 once — a first frame that is not
       SETTINGS, DATA on an idle stream, a frame size under the floor, a
       field block that does not decode, DATA after END_STREAM, a window
-      past 2^31-1, a body shorter than its `content-length` — and on a
+      past 2^31-1, a body shorter than its `content-length` — exchanges
+      that ask the build's handler route, split their cookie into crumbs,
+      or send their own GOAWAY once their requests are out; and on a
       seed whose cluster speaks
       HTTP/2, gRPC calls its origin never answers, left to their
       `grpc-timeout`; a third throttle their streams to a five-octet
@@ -1687,6 +1689,8 @@ external binaries. They and the speed gates run at merge.
     - a gRPC health probe passes only on SERVING: on a NOT_SERVING seed
       every call the origin answered failed its probe, but for one per
       endpoint the drain cut, and on a clean SERVING seed none failed;
+    - an HTTP/2 client's split cookie reaches its HTTP/1.1 origin as one
+      line, the crumbs joined by "; " and an empty one left out;
     - an HTTP/2 violator hears only the answer RFC 9113 owes it — the
       connection's GOAWAY with its code, or stream 1's reset with its code
       while the connection stays — and on a clean seed hears it;
@@ -1735,8 +1739,10 @@ external binaries. They and the speed gates run at merge.
     announced to an origin and forwarded to one, every certificate of
     a listener that holds several must be chosen by a name, and some
     HTTP/2 send must stop at a client's window and some resize be heard,
-    some stream must be answered over HTTP/2 on a TLS listener, and every
-    kind of HTTP/2 violation must hear its owed answer.
+    some stream must be answered over HTTP/2 on a TLS listener, every
+    kind of HTTP/2 violation must hear its owed answer, the handler must
+    answer an HTTP/2 GET and POST, and some split cookie must arrive
+    joined.
     - Exemptions are named, each with its reason.
     - An exemption that *does* fire fails the census too, so widening a
       scenario deletes its excuse.

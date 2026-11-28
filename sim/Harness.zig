@@ -316,6 +316,9 @@ h2_tuning_prng: std.Random.DefaultPrng,
 /// break the protocol once instead, each owed a stated answer. Its own
 /// stream, so the floods and plans draw as they did.
 h2_violation_prng: std.Random.DefaultPrng,
+/// #434 over HTTP/2: which h2c streams ask the build's handler route
+/// rather than the origin. Its own stream, so the plans draw as they did.
+h2_handler_prng: std.Random.DefaultPrng,
 quic_http: bool,
 quic_connections: u32,
 h3_prng: std.Random.DefaultPrng,
@@ -2688,6 +2691,7 @@ fn drawHttpProtocol(harness: *Harness, seed: u64) void {
     harness.tls_h2_prng = std.Random.DefaultPrng.init(seed ^ 0x0271_0002_0271_0002);
     harness.h2_tuning_prng = std.Random.DefaultPrng.init(seed ^ 0x0009_0113_0009_0113);
     harness.h2_violation_prng = std.Random.DefaultPrng.init(seed ^ 0x9113_0005_9113_0005);
+    harness.h2_handler_prng = std.Random.DefaultPrng.init(seed ^ 0x0434_0002_0434_0002);
     var protocol_prng = std.Random.DefaultPrng.init(seed ^ 0x0275_0275_0275_0275);
     const random = protocol_prng.random();
     const roll = random.uintLessThan(u8, 8);
@@ -3322,6 +3326,13 @@ fn prepareH2Client(harness: *Harness, random: std.Random) void {
     var plans: [H2Client.streams_max]l7.H2Plan = @splat(.{});
     for (plans[0..streams]) |*plan| {
         plan.* = drawH2Plan(random, harness.h2_consult_prng.random());
+        // A sixth of streams ask the handler instead (#434): a GET as is,
+        // and a POST of the handler's own payload, in one frame.
+        const asks_handler = harness.h2_handler_prng.random().uintLessThan(u8, 6) == 0;
+        const splits_cookie = harness.h2_handler_prng.random().uintLessThan(u8, 6) == 0;
+        if (asks_handler) plan.* = handlerPlan(plan.*);
+        // And a sixth of the origin's GETs split their cookie (§8.2.3).
+        if (plan.ask == .get) plan.split_cookie = splits_cookie;
         if (!harness.http_protocol.http2()) continue;
         if (plan.ask != .post_declared) continue;
         if (harness.grpc_prng.random().uintLessThan(u8, 3) != 0) continue;
@@ -3346,9 +3357,11 @@ fn drawH2Tuning(harness: *Harness, mode: l7.H2Mode) l7.H2Tuning {
     const random = harness.h2_tuning_prng.random();
     const throttle = random.uintLessThan(u8, 3) == 0;
     const table = random.uintLessThan(u8, 3);
+    const goaway = random.uintLessThan(u8, 4) == 0;
     if (mode != .exchange) return .{};
     const tuning: l7.H2Tuning = .{
         .throttle_window = if (throttle) h2_throttle_window else null,
+        .goaway = goaway,
         .header_table_size = switch (table) {
             0 => 0,
             1 => 256,
@@ -3357,6 +3370,23 @@ fn drawH2Tuning(harness: *Harness, mode: l7.H2Mode) l7.H2Tuning {
     };
     assert(tuning.header_table_size orelse 0 < 4096);
     return tuning;
+}
+
+/// `plan` turned into its handler ask (#434): the same method, the build's
+/// handler route, and for a POST the payload the handler reads.
+fn handlerPlan(plan: l7.H2Plan) l7.H2Plan {
+    if (!plan.carriesBody()) {
+        const get: l7.H2Plan = .{ .ask = .handler_get };
+        assert(!get.carriesBody());
+        return get;
+    }
+    const handler: l7.H2Plan = .{
+        .ask = .handler_post,
+        .body_len = l7.canon.handler_post_payload.len,
+        .frames = 1,
+    };
+    assert(handler.carriesBody());
+    return handler;
 }
 
 /// One stream's request (#373): half are a GET, and half POST a marked
@@ -4411,6 +4441,7 @@ pub fn verify(harness: *Harness) !void {
     // §7: a forwarded-for chain holds the scripts' hops and, last, the
     // client the proxy observed, written bare in either family.
     if (harness.origin_http.forwarded_mismatches != 0) return error.OriginSawWrongForwardedFor;
+    if (harness.origin_http.cookie_mismatches != 0) return error.OriginSawCookieUnjoined;
     // §4: a verified client's fingerprint, once, and no forgery or stale one.
     if (harness.origin_http.client_cert_mismatches != 0) return error.OriginSawWrongClientCert;
     // #142 send: on any seed, garbage where a header belongs is zoxy's

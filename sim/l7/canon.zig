@@ -236,6 +236,14 @@ pub const respond_body = "sim-respond-body\n";
 /// path and its flag, then the body it read — fixed, since the
 /// simulator's handler never flips its flag.
 pub const handler_prefix = "/handled";
+/// An HTTP/2 GET that splits its cookie into crumbs (RFC 9113 §8.2.3),
+/// one of them empty, says so in this header, and the origin then demands
+/// one `cookie` line, the crumbs joined by "; " and the empty one left out.
+pub const split_cookie_header = "x-sim-crumbs";
+pub const split_cookie_crumbs = [_][]const u8{ "sim-a=1", "", "sim-b=2" };
+pub const split_cookie_joined = "sim-a=1; sim-b=2";
+/// What the mark says: the crumbs that carry a cookie, the empty one not.
+pub const split_cookie_crumbs_kept = "2";
 pub const handler_post_payload = "zoxy-handler-body";
 pub const handler_get_body = handler_prefix ++ " flag=false\n";
 pub const handler_post_body = handler_get_body ++ handler_post_payload;

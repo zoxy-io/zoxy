@@ -174,9 +174,12 @@ pub const Mode = enum {
 pub const Tuning = struct {
     throttle_window: ?u32 = null,
     header_table_size: ?u32 = null,
+    /// GOAWAY(NO_ERROR) once its requests are out (RFC 9113 §6.8): it opens
+    /// nothing more, and the server still owes every stream it opened.
+    goaway: bool = false,
 
     pub fn tuned(tuning: Tuning) bool {
-        return tuning.throttle_window != null or tuning.header_table_size != null;
+        return tuning.throttle_window != null or tuning.header_table_size != null or tuning.goaway;
     }
 };
 
@@ -192,7 +195,20 @@ const settings_bytes_max: u32 = 2 * 6;
 /// What an exchange's stream asks (#373): `get`'s GET, a POST whose
 /// body the origin checks octet by octet, its length declared or not, or
 /// `consult_get`'s GET under `canon.consult_prefix` (#437).
-pub const Ask = enum(u8) { get, post_declared, post_undeclared, consult_get, grpc_call };
+pub const Ask = enum(u8) {
+    get,
+    post_declared,
+    post_undeclared,
+    consult_get,
+    grpc_call,
+    /// The build's handler route (#434), over HTTP/2: answered by the
+    /// handler, never the origin, with a body it states — the handler is
+    /// built not to toggle, so every answer is the same.
+    handler_get,
+    /// A POST of `canon.handler_post_payload` there, which the handler
+    /// reads and answers with.
+    handler_post,
+};
 
 /// `get`'s path, which every stream asks for but a consult's.
 const get_path = "/sim";
@@ -207,11 +223,14 @@ pub const Plan = struct {
     /// END_STREAM (§7). It owes the origin none: the proxy ends the
     /// request there and carries the section no further.
     trailers: bool = false,
+    /// A `get` that splits its cookie into crumbs (RFC 9113 §8.2.3), for the
+    /// origin to see joined (`canon.split_cookie_header`).
+    split_cookie: bool = false,
 
     pub fn carriesBody(plan: Plan) bool {
         return switch (plan.ask) {
-            .get, .consult_get => false,
-            .post_declared, .post_undeclared, .grpc_call => true,
+            .get, .consult_get, .handler_get => false,
+            .post_declared, .post_undeclared, .grpc_call, .handler_post => true,
         };
     }
 
@@ -222,6 +241,8 @@ pub const Plan = struct {
             .get => .get,
             .consult_get => .consult_get,
             .post_declared, .post_undeclared, .grpc_call => .post_sized,
+            .handler_get => .handler_get,
+            .handler_post => .handler_post,
         };
     }
 
@@ -232,6 +253,7 @@ pub const Plan = struct {
         return switch (plan.ask) {
             .consult_get => canon.consult_prefix,
             .grpc_call => canon.grpc_path,
+            .handler_get, .handler_post => canon.handler_prefix,
             else => get_path,
         };
     }
@@ -259,6 +281,14 @@ comptime {
     assert(std.mem.indexOf(u8, canon.chunked_wire, canonical_chunked_body) != null);
     assert(std.mem.indexOf(u8, canon.chunked_trailers_wire, canonical_chunked_body) != null);
 }
+
+/// A client's GOAWAY: no server stream to name (last stream 0), and
+/// NO_ERROR — done opening, not failing.
+const goaway_no_error = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 };
+
+/// What an answer keeps of its body: every canonical body whole, and the
+/// handler's answer to a POST, its path, flag and the payload it read.
+const answer_body_bytes_max: u32 = 48;
 
 /// The frame types and flags the client writes and the oracle reads
 /// (RFC 9113 §6).
@@ -304,7 +334,8 @@ const bomb_fields: u32 = 1024;
 comptime {
     // Every canonical body fits what an answer keeps of one, so a body
     // judged equal was compared whole.
-    for (canonical_bodies) |body| assert(body.len <= 32);
+    for (canonical_bodies) |body| assert(body.len <= answer_body_bytes_max);
+    assert(canon.handler_post_body.len <= answer_body_bytes_max);
     assert(rounds_max * resets_per_round > budgets.resets_unpaid_max);
     assert(bomb_fields * 60 > zoxy.constants.head_buffer_bytes_default);
     assert(body_bytes_max <= 1 << 14); // The smallest frame size, and stream window.
@@ -384,7 +415,7 @@ pub fn Client(comptime IoType: type) type {
         /// One stream's answer, as the frames told it.
         const Answer = struct {
             status: u16 = 0,
-            body: [32]u8 = undefined,
+            body: [answer_body_bytes_max]u8 = undefined,
             body_len: u32 = 0,
             ended: bool = false,
             reset: bool = false,
@@ -447,8 +478,14 @@ pub fn Client(comptime IoType: type) type {
             }
             client.credit_start = len;
             if (tuning.throttle_window != null) client.writeCredit(&len);
+            // After the credit, so a throttled client says it last.
+            if (tuning.goaway) writeFrame(&client.request, &len, frame_goaway, 0, 0, &goaway_no_error);
             client.request_len = len;
-            client.send_limit = if (mode == .rapid_reset) client.round_ends[0] else client.credit_start;
+            // Only a throttled exchange holds anything back: its credit, and
+            // a GOAWAY behind it.
+            client.send_limit = if (mode == .rapid_reset)
+                client.round_ends[0]
+            else if (tuning.throttle_window != null) client.credit_start else len;
             assert(client.send_limit <= client.request_len);
         }
 
@@ -511,6 +548,26 @@ pub fn Client(comptime IoType: type) type {
             client.received_len = @intCast(take);
             client.overrun = received.len > client.receive_buffer.len;
             assert(client.received_len <= client.receive_buffer.len);
+        }
+
+        /// Handler asks (#434) answered whole with a `200`, GET then POST,
+        /// for the census; on `trailersHeard`'s terms.
+        pub fn handlerAnswered(client: *const Self) [2]u32 {
+            assert(client.streams >= 1);
+            if (client.mode != .exchange) return .{ 0, 0 };
+            var answers: [streams_max]Answer = @splat(.{});
+            const plans = client.plans[0..client.streams];
+            _ = readAnswers(client.receive_buffer[0..client.received_len], plans, &answers) catch |err| {
+                std.debug.panic("handlerAnswered after a failed verify: {s}", .{@errorName(err)});
+            };
+            var answered: [2]u32 = .{ 0, 0 };
+            for (answers[0..client.streams], plans) |*answer, plan| {
+                const whole = answer.status == 200 and answer.ended and !answer.reset;
+                if (whole and plan.ask == .handler_get) answered[0] += 1;
+                if (whole and plan.ask == .handler_post) answered[1] += 1;
+            }
+            assert(answered[0] + answered[1] <= client.streams);
+            return answered;
         }
 
         /// Streams answered whole with a `200`, for the census.
@@ -754,7 +811,11 @@ pub fn Client(comptime IoType: type) type {
                 if (plan.ask == .grpc_call) {
                     try checkGrpcDeadline(answer);
                 } else if (answer.status == 200) {
-                    try checkBody(answer, client.clean);
+                    if (handlerBody(plan)) |expected| {
+                        try checkHandlerBody(answer, expected);
+                    } else {
+                        try checkBody(answer, client.clean);
+                    }
                 }
                 // A whole answer carries the section its head owed and no
                 // other; a cut one may end before it (reset, never ended).
@@ -1190,6 +1251,27 @@ pub fn Client(comptime IoType: type) type {
             assert(len.* - start == head_len + bomb_fields);
         }
 
+        /// What the handler answers a stream's ask with, or null for one
+        /// the origin answers.
+        fn handlerBody(plan: Plan) ?[]const u8 {
+            return switch (plan.ask) {
+                .handler_get => canon.handler_get_body,
+                .handler_post => canon.handler_post_body,
+                else => null,
+            };
+        }
+
+        /// A handler's 200 carries its stated body: whole once the stream
+        /// ended, a prefix of it on one cut short.
+        fn checkHandlerBody(answer: *const Answer, expected: []const u8) ClientError!void {
+            assert(answer.status == 200);
+            assert(expected.len <= answer.body.len);
+            if (answer.body_len > expected.len) return error.BodyCorrupted;
+            const body = answer.body[0..answer.body_len];
+            if (answer.ended and !answer.reset and !std.mem.eql(u8, body, expected)) return error.BodyCorrupted;
+            if (!std.mem.startsWith(u8, expected, body)) return error.BodyCorrupted;
+        }
+
         /// A whole body is one canonical body, length and octets; one cut
         /// short is a prefix of one. Longer than every canonical body is
         /// neither, whatever its first octets.
@@ -1422,7 +1504,13 @@ pub fn Client(comptime IoType: type) type {
                     assert(size >= 1);
                     const id = streamId(@intCast(index));
                     const ends = last and !plan.trailers;
-                    writeBody(&client.request, len, id, client.bodySalt(id), written[index], size, ends);
+                    if (plan.ask == .handler_post) {
+                        // The handler reads the payload itself, in one frame.
+                        assert(plan.frames == 1 and !plan.trailers);
+                        writeFrame(&client.request, len, frame_data, flag_end_stream, id, canon.handler_post_payload);
+                    } else {
+                        writeBody(&client.request, len, id, client.bodySalt(id), written[index], size, ends);
+                    }
                     written[index] += size;
                 }
             }
@@ -1461,6 +1549,20 @@ pub fn Client(comptime IoType: type) type {
         fn writeRequestHead(out: *[request_bytes_max]u8, len: *u32, id: u31, salt: u32, plan: Plan) void {
             assert(plan.carriesBody() == (plan.frames >= 1));
             const start = len.*;
+            if (plan.split_cookie) {
+                assert(plan.ask == .get);
+                const crumbs = canon.split_cookie_crumbs;
+                const fields = [_][2][]const u8{
+                    .{ canon.split_cookie_header, canon.split_cookie_crumbs_kept },
+                    .{ "cookie", crumbs[0] },
+                    .{ "cookie", crumbs[1] },
+                    .{ "cookie", crumbs[2] },
+                };
+                const flags = flag_end_stream | flag_end_headers;
+                writeHeadTraced(out, len, id, "GET", plan.path(), flags, canon.log_request_value, &fields);
+                assert(len.* - start <= head_bytes_max);
+                return;
+            }
             if (!plan.carriesBody()) {
                 writeHead(out, len, id, "GET", plan.path(), flag_end_stream | flag_end_headers);
                 return;
@@ -1480,9 +1582,11 @@ pub fn Client(comptime IoType: type) type {
                 .{ "grpc-timeout", canon.grpc_timeout },
                 marked[0],
             };
+            const handler = [_][2][]const u8{.{ "content-length", length }};
             const extra: []const [2][]const u8 = switch (plan.ask) {
                 .post_declared => &declared,
                 .grpc_call => &grpc,
+                .handler_post => &handler,
                 else => &marked,
             };
             writeHeadTraced(out, len, id, "POST", plan.path(), flag_end_headers, canon.log_request_value, extra);
