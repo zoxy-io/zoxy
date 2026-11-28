@@ -10,6 +10,7 @@ const std = @import("std");
 const zoxy = @import("zoxy");
 
 const Harness = @import("Harness.zig");
+const l7 = @import("l7.zig");
 
 const assert = std.debug.assert;
 
@@ -727,6 +728,8 @@ const Census = struct {
     /// Streams answered whole over HTTP/2 on a terminating TLS listener
     /// (#271): what proves the sweep drives `h2` over TLS at all.
     h2_tls_streams: u64 = 0,
+    /// Each RFC 9113 violation's owed answer heard (`H2Mode.violations`).
+    h2_violations_answered: [l7.H2Mode.violations.len]u64 = @splat(0),
     /// gRPC health calls an HTTP/2 origin answered (§7): SERVING, then
     /// NOT_SERVING.
     grpc_health_answered: [2]u64 = @splat(0),
@@ -839,6 +842,11 @@ const Census = struct {
             std.debug.print("sim census: no HTTP/2 client heard its HPACK table resized\n", .{});
             return false;
         }
+        for (census.h2_violations_answered, l7.H2Mode.violations) |answered, mode| {
+            if (answered >= 1) continue;
+            std.debug.print("sim census: no HTTP/2 client's {t} was answered as RFC 9113 owes\n", .{mode});
+            return false;
+        }
         if (census.h2_tls_streams == 0) {
             std.debug.print("sim census: no stream was answered over HTTP/2 on a TLS listener (#271)\n", .{});
             return false;
@@ -879,6 +887,10 @@ const Census = struct {
         }
         for (harness.h2_clients[0..harness.h2_count]) |*client| {
             census.grpc_deadlines_heard += client.grpcDeadlinesHeard();
+            if (client.violationAnswered()) |mode| {
+                const index = std.mem.indexOfScalar(l7.H2Mode, &l7.H2Mode.violations, mode).?;
+                census.h2_violations_answered[index] += 1;
+            }
             const tuning = client.tuningHeard();
             census.h2_windows_met += @intFromBool(tuning.window_met);
             census.h2_table_resizes += @intFromBool(tuning.resized);

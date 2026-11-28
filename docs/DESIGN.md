@@ -1631,7 +1631,12 @@ external binaries. They and the speed gates run at merge.
       a ClientHello naming the route, another name, or none, or with
       bytes that are no hello;
     - L7 request scripts;
-    - h2c clients, including flooders, and on a seed whose cluster speaks
+    - h2c clients, including flooders and, a fifth of exchange clients,
+      violators that break RFC 9113 once — a first frame that is not
+      SETTINGS, DATA on an idle stream, a frame size under the floor, a
+      field block that does not decode, DATA after END_STREAM, a window
+      past 2^31-1, a body shorter than its `content-length` — and on a
+      seed whose cluster speaks
       HTTP/2, gRPC calls its origin never answers, left to their
       `grpc-timeout`; a third throttle their streams to a five-octet
       window, granting credit only once the first DATA is back, and a
@@ -1682,6 +1687,9 @@ external binaries. They and the speed gates run at merge.
     - a gRPC health probe passes only on SERVING: on a NOT_SERVING seed
       every call the origin answered failed its probe, but for one per
       endpoint the drain cut, and on a clean SERVING seed none failed;
+    - an HTTP/2 violator hears only the answer RFC 9113 owes it — the
+      connection's GOAWAY with its code, or stream 1's reset with its code
+      while the connection stays — and on a clean seed hears it;
     - an HTTP/2 exchange over a terminating TLS listener is judged as an
       h2c one is, frame by frame and stream by stream, and was chosen by
       ALPN as `h2`;
@@ -1727,7 +1735,8 @@ external binaries. They and the speed gates run at merge.
     announced to an origin and forwarded to one, every certificate of
     a listener that holds several must be chosen by a name, and some
     HTTP/2 send must stop at a client's window and some resize be heard,
-    and some stream must be answered over HTTP/2 on a TLS listener.
+    some stream must be answered over HTTP/2 on a TLS listener, and every
+    kind of HTTP/2 violation must hear its owed answer.
     - Exemptions are named, each with its reason.
     - An exemption that *does* fire fails the census too, so widening a
       scenario deletes its excuse.
