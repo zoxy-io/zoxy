@@ -181,6 +181,10 @@ pub fn TestClient(comptime IoType: type) type {
         /// Borrowed from whoever captured it — normally an earlier
         /// client whose storage outlives this one.
         resume_with: ?*const SessionTicket,
+        /// The one record this client corrupts, from `Options`, and
+        /// whether it has: a flight sends once, so the flip happens once.
+        corruption: Corruption,
+        corrupted: bool,
         /// Runs once the client is done — how a scenario learns to wind
         /// down (drain the server, stop the origin).
         on_end: ?*const fn (ctx: ?*anyopaque) void = null,
@@ -206,6 +210,20 @@ pub fn TestClient(comptime IoType: type) type {
             /// streams over the session, judged by the client that wrote
             /// them.
             judged,
+        };
+
+        /// A record this client sends with one octet of its AEAD tag
+        /// flipped, so it cannot decrypt at the server: RFC 8446 §5.2's
+        /// failure, owed `bad_record_mac`. The record layer underneath is
+        /// intact, so the alert this provokes still decrypts here.
+        pub const Corruption = enum {
+            none,
+            /// The flight carrying the client's Finished: the handshake
+            /// fails under its own keys.
+            finished,
+            /// The first application record: a session that came up and
+            /// then received a record it cannot open.
+            first_payload,
         };
 
         /// The caller's verdict on what came back, for `.judged`.
@@ -287,6 +305,8 @@ pub fn TestClient(comptime IoType: type) type {
             /// The signature schemes the hello offers, and so the ones the
             /// server's CertificateVerify may use (#411).
             scheme_offer: SchemeOffer = .all,
+            /// A record to send corrupted, or none.
+            corruption: Corruption = .none,
             /// Seeds for the two keyshares and the client random.
             x25519_seed: [32]u8 = @splat(0x61),
             p256_seed: [32]u8 = @splat(0x62),
@@ -364,6 +384,8 @@ pub fn TestClient(comptime IoType: type) type {
             client.ticket = .empty;
             client.ticket_captured = false;
             client.resume_with = options.resume_with;
+            client.corruption = options.corruption;
+            client.corrupted = false;
             io.connect(&.{ .ip = address }, &client.connect_completion, Self, client, onConnect);
         }
 
@@ -590,7 +612,21 @@ pub fn TestClient(comptime IoType: type) type {
                 client.finish();
                 return;
             };
+            if (client.corruption == .first_payload and !client.corrupted) client.corruptTail(client.pending_send);
             client.armSend();
+        }
+
+        /// Flip the last octet of `bytes`, staged in this client's own
+        /// `out`: the tag of the last record they carry, whatever came
+        /// before it in the same flight.
+        fn corruptTail(client: *Self, bytes: []const u8) void {
+            assert(!client.corrupted);
+            assert(bytes.len >= 1);
+            assert(@intFromPtr(bytes.ptr) >= @intFromPtr(&client.out));
+            const offset = @intFromPtr(bytes.ptr) + bytes.len - 1 - @intFromPtr(&client.out);
+            assert(offset < client.out.len);
+            client.out[offset] ^= 0x01;
+            client.corrupted = true;
         }
 
         /// The in-band goodbye, on the same render-then-arm sequence.
@@ -702,6 +738,7 @@ pub fn TestClient(comptime IoType: type) type {
                             // both arms are the same instruction: put it
                             // on the wire.
                             .send, .connected => |bytes| {
+                                if (event == .connected and client.corruption == .finished) client.corruptTail(bytes);
                                 // Every event borrows `client.out`, so a
                                 // second send out of one record would not
                                 // merely replace the first — it would
@@ -820,6 +857,20 @@ pub fn TestClient(comptime IoType: type) type {
             if (description != @backingInt(zssl.alert.Description.no_application_protocol)) return false;
             assert(!client.handshake_done);
             return true;
+        }
+
+        /// The description of the alert the server ended this session
+        /// with, if one arrived and decrypted.
+        pub fn peerAlert(client: *const Self) ?u8 {
+            return client.hs.peer_alert_description;
+        }
+
+        /// Whether the server answered RFC 8446 §5.2's `bad_record_mac`:
+        /// the alert a corrupted record is owed, read off the alert itself
+        /// as the other refusals are.
+        pub fn heardBadRecordMac(client: *const Self) bool {
+            const description = client.hs.peer_alert_description orelse return false;
+            return description == @backingInt(zssl.alert.Description.bad_record_mac);
         }
 
         /// The server refused this client's certificate (#304): none

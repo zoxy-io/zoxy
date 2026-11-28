@@ -4165,10 +4165,11 @@ pub fn Server(comptime runtime: Runtime) type {
         }
 
         /// A handshake step returned an error. Any protocol error is this
-        /// connection's — a malformed record, a bad MAC, an unacceptable
-        /// parameter — and the peer gets a teardown rather than a
-        /// diagnosis: telling it which of those it was is telling an
-        /// attacker.
+        /// connection's — a malformed record, an unacceptable parameter —
+        /// and the peer gets a teardown rather than a diagnosis: telling it
+        /// which of those it was is telling an attacker. A record that did
+        /// not decrypt is counted the same but owed `bad_record_mac`
+        /// (RFC 8446 §5.2), which tells its sender only what it did.
         ///
         /// Two exceptions, both the RFCs' rather than ours, and both
         /// counted apart from `tls_handshake_failed`. A client that
@@ -4206,6 +4207,19 @@ pub fn Server(comptime runtime: Runtime) type {
                 return;
             }
             server.counters.increment("tls_handshake_failed");
+            // RFC 8446 §5.2: a record that did not decrypt is owed
+            // `bad_record_mac`, which says only what its sender did — as a
+            // refusal while the handshake is still being built, and as a
+            // session's is once it is connected: a bad record riding the
+            // client's Finished, whose alert teardown flushes.
+            const engine = conn.tls.?;
+            if (err == error.AuthenticationFailed) {
+                if (!engine.isConnected()) {
+                    if (engine.refuseCorruptRecord()) return server.pumpTlsOutbound(conn);
+                } else {
+                    oweRecordAlert(conn);
+                }
+            }
             server.beginTeardown(conn);
         }
 
@@ -4693,12 +4707,20 @@ pub fn Server(comptime runtime: Runtime) type {
         /// Teardown is a state, not an event (§5): shutdown both fds,
         /// cancel pending connect/timer (the only legal cancels, §4),
         /// then wait; the delivery that empties the armed set closes
-        /// both fds synchronously and releases the slot.
+        /// both fds synchronously and releases the slot. An owed
+        /// `bad_record_mac` (§4) is the one exception: the client's write
+        /// side stays open and the timer armed until its flush is over.
         pub fn beginTeardown(server: *Self, conn: *ConnType) void {
             if (conn.isTearingDown()) return;
             assert(conn.isLive());
+            // Decided before the state moves: §5.2's alert, if one is owed
+            // and can be flushed, holds the write side open and keeps the
+            // deadline armed to bound its send (`flushTlsAlert`).
+            conn.tls_alert_owed = tlsAlertFlushable(conn);
             conn.enter(.tearing_down);
-            if (conn.close_with_rst) {
+            if (conn.tls_alert_owed) {
+                server.flushTlsAlert(conn);
+            } else if (conn.close_with_rst) {
                 // #425: refused before anything was read for its protocol,
                 // so nothing is armed on the client socket to force — and a
                 // shutdown would write the FIN the RST is chosen over.
@@ -4723,10 +4745,18 @@ pub fn Server(comptime runtime: Runtime) type {
             // Every exchange it multiplexes ends with it (#275): forced now,
             // released once the last of their ops delivers.
             server.quiesceSharedStreams(conn);
-            // A dial rebase (§8) may already have this timer's cancel in
-            // flight (onDeadlineRebase); submitting a second would double-arm
-            // the op. Its drain routes to teardown via the isTearingDown
-            // checks, so teardown needs no cancel of its own here.
+            if (!conn.tls_alert_owed) server.cancelTeardownDeadline(conn);
+            server.continueTeardown(conn);
+        }
+
+        /// The deadline has nothing left to bound. A dial rebase (§8) may
+        /// already have this timer's cancel in flight (onDeadlineRebase);
+        /// submitting a second would double-arm the op. Its drain routes
+        /// to teardown via the isTearingDown checks, so teardown needs no
+        /// cancel of its own then.
+        fn cancelTeardownDeadline(server: *Self, conn: *ConnType) void {
+            assert(conn.state == .tearing_down);
+            assert(!conn.tls_alert_owed);
             if (conn.armed.deadline and !conn.armed.deadline_cancel) {
                 conn.arm(&conn.op_deadline_cancel, "deadline_cancel");
                 server.io.timerCancel(
@@ -4737,6 +4767,89 @@ pub fn Server(comptime runtime: Runtime) type {
                     onDeadlineCancel,
                 );
             }
+        }
+
+        /// A record from the client failed to decrypt on a session that is
+        /// up (RFC 8446 §5.2), which every TLS transport counts here on its
+        /// way to teardown, and which is owed `bad_record_mac`
+        /// (`oweRecordAlert`).
+        pub fn noteTlsRecordFailed(server: *Self, conn: *ConnType, err: anyerror) void {
+            server.counters.increment("tls_relay_failed");
+            assert(conn.tls != null);
+            assert(!conn.tls_alert_owed);
+            if (err != error.AuthenticationFailed or conn.isTearingDown()) return;
+            oweRecordAlert(conn);
+        }
+
+        /// Stage §5.2's alert for teardown to flush — only with an empty
+        /// outbox. Every byte a TLS transport writes to its client leaves
+        /// from the outbox, and a send's slice stays there until its
+        /// completion credits it, so an empty one means nothing is on the
+        /// wire to the client: a second send could not be interleaved with
+        /// one, so then the teardown goes alone. The flush rides the
+        /// client read's op, which the read that failed has just delivered.
+        fn oweRecordAlert(conn: *ConnType) void {
+            assert(!conn.tls_alert_owed);
+            const engine = conn.tls.?;
+            if (engine.outbound().len != 0 or conn.stream.armed.data_client_to_upstream) return;
+            conn.tls_alert_owed = engine.stageRecordAlert();
+            assert(!conn.tls_alert_owed or engine.outbound().len >= 1);
+        }
+
+        /// Whether teardown can flush an owed alert: a client socket to
+        /// write it on, and a deadline running to bound the send — one with
+        /// a cancel already in flight bounds nothing, and a flush that a
+        /// client which stopped reading could hold open forever would hold
+        /// its slot with it.
+        fn tlsAlertFlushable(conn: *const ConnType) bool {
+            if (!conn.tls_alert_owed) return false;
+            assert(conn.tls != null);
+            assert(!conn.stream.armed.data_client_to_upstream);
+            if (conn.close_with_rst or conn.client_socket == null) return false;
+            return conn.armed.deadline and !conn.armed.deadline_cancel;
+        }
+
+        /// Teardown's first step when §5.2's alert is owed, in place of the
+        /// client socket's `.both`: no read is armed on it to force — the
+        /// one that failed has delivered (`oweRecordAlert`) — so the
+        /// socket is left whole and the outbox goes out on it.
+        fn flushTlsAlert(server: *Self, conn: *ConnType) void {
+            assert(conn.state == .tearing_down);
+            assert(conn.tls_alert_owed);
+            assert(!conn.stream.armed.data_client_to_upstream);
+            const staged = conn.tls.?.outbound();
+            assert(staged.len >= 1);
+            conn.stream.arm(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
+            server.io.send(
+                conn.clientSocket(),
+                staged,
+                &conn.stream.op_data_client_to_upstream.completion,
+                ConnType,
+                conn,
+                onTlsAlertSent,
+            );
+        }
+
+        /// A short send comes back for the rest; a failed one, or the
+        /// deadline forcing it (`onDeadline`), ends the flush where it is.
+        /// Either way the write side then closes and the deadline the flush
+        /// ran under is let go of, and teardown goes on as it always does.
+        fn onTlsAlertSent(conn: *ConnType, result: Io.SendError!u32) void {
+            const server = conn.server;
+            conn.stream.delivered(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
+            assert(conn.state == .tearing_down);
+            assert(conn.tls_alert_owed);
+            const engine = conn.tls.?;
+            if (result) |sent| {
+                assert(sent >= 1);
+                engine.outboundSent(sent);
+                if (engine.outbound().len >= 1) return server.flushTlsAlert(conn);
+            } else |err| {
+                server.witnessKernelPressure(.send, err);
+            }
+            conn.tls_alert_owed = false;
+            server.io.shutdown(conn.clientSocket(), .write);
+            server.cancelTeardownDeadline(conn);
             server.continueTeardown(conn);
         }
 
@@ -7004,7 +7117,11 @@ pub fn Server(comptime runtime: Runtime) type {
             if (result) |_| {
                 if (conn.isTearingDown()) {
                     // Fired while the cancel was in flight — legal race;
-                    // the cancel completion still arrives (§4).
+                    // the cancel completion still arrives (§4). Or while
+                    // §5.2's alert was flushing under it, with no cancel:
+                    // a client that stopped reading has had its bound, and
+                    // the send is forced the way `.both` forces any op.
+                    if (conn.tls_alert_owed) server.io.shutdown(conn.clientSocket(), .both);
                     server.continueTeardown(conn);
                     return;
                 }
